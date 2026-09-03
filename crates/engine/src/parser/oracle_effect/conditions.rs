@@ -2985,6 +2985,20 @@ pub(super) fn strip_target_supertype_conditional(text: &str) -> (Option<AbilityC
         );
     }
 
+    // CR 205.4 + CR 400.7: Thermokarst's "If that land was a snow land"
+    // rider is an LKI test on the land destroyed by the preceding instruction.
+    // Keep the land type in the filter: "snow" is a supertype adjective, not a
+    // standalone type, and the anaphor explicitly names a land.
+    if let Ok((rest, _)) =
+        tag::<_, _, OracleError<'_>>("if that land was a snow land, ").parse(lower.as_str())
+    {
+        let body_start = text.len() - rest.len();
+        return (
+            Some(snow_land_lki_condition()),
+            text[body_start..].to_string(),
+        );
+    }
+
     if let Some((before, after)) = tp.rsplit_around(" if that land was ") {
         if all_consuming(alt((
             tag::<_, _, OracleError<'_>>("nonbasic."),
@@ -2995,6 +3009,21 @@ pub(super) fn strip_target_supertype_conditional(text: &str) -> (Option<AbilityC
         {
             return (
                 Some(nonbasic_land_lki_condition()),
+                before.original.trim_end_matches('.').trim().to_string(),
+            );
+        }
+    }
+
+    if let Some((before, after)) = tp.rsplit_around(" if that land was ") {
+        if all_consuming(alt((
+            tag::<_, _, OracleError<'_>>("a snow land."),
+            tag("a snow land"),
+        )))
+        .parse(after.lower.trim())
+        .is_ok()
+        {
+            return (
+                Some(snow_land_lki_condition()),
                 before.original.trim_end_matches('.').trim().to_string(),
             );
         }
@@ -3040,6 +3069,18 @@ fn nonbasic_land_lki_condition() -> AbilityCondition {
         filter: TargetFilter::Typed(TypedFilter::land().properties(vec![
             FilterProp::NotSupertype {
                 value: Supertype::Basic,
+            },
+        ])),
+        use_lki: true,
+        subject_slot: None,
+    }
+}
+
+fn snow_land_lki_condition() -> AbilityCondition {
+    AbilityCondition::TargetMatchesFilter {
+        filter: TargetFilter::Typed(TypedFilter::land().properties(vec![
+            FilterProp::HasSupertype {
+                value: Supertype::Snow,
             },
         ])),
         use_lki: true,
