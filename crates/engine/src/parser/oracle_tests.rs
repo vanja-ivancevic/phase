@@ -1709,6 +1709,32 @@ fn parse(
     parse_oracle_text(text, name, &keyword_names, &types, &subtypes)
 }
 
+/// CR 614.1a: Urza's three-mana land cycle expresses its replacement branch
+/// as a conditional mana sub-ability.  The runtime already resolves this
+/// shape (and the tests in `game::mana_abilities` pin the one- vs three-mana
+/// outcomes); keep the parser audit from reporting it as swallowed merely
+/// because it is not a top-level `ReplacementDefinition`.
+#[test]
+fn urza_conditional_mana_replacement_is_not_reported_as_swallowed() {
+    let parsed = parse(
+        "{T}: Add {C}. If you control an Urza's Mine and an Urza's Power-Plant, add {C}{C}{C} instead.",
+        "Urza's Tower",
+        &[],
+        &["Land"],
+        &["Urza's", "Tower"],
+    );
+
+    assert!(
+        parsed.parse_warnings.iter().all(|warning| !matches!(
+            warning,
+            OracleDiagnostic::SwallowedClause { detector, .. }
+                if detector == "Replacement_Instead"
+        )),
+        "Urza's Tower's represented conditional mana replacement must not be flagged: {:?}",
+        parsed.parse_warnings
+    );
+}
+
 /// CR 506.3 + CR 508.1d + CR 611.2c + CR 615: Gideon Jura (verbatim MTGJSON
 /// Oracle text) parses all three loyalty abilities with zero residual
 /// `Unimplemented`, and each lands on the exact shape its rules text requires.

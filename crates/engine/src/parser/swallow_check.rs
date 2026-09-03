@@ -1641,8 +1641,28 @@ fn def_is_represented_instead_branch(def: &AbilityDefinition) -> bool {
     def.condition.is_some() && def.else_ability.is_some()
 }
 
+/// CR 614.1a + CR 605.1a: activated mana abilities may carry their
+/// replacement branch as a conditional mana `sub_ability` rather than an
+/// `else_ability`.  This is the canonical shape for the Urza lands (and for
+/// other conditional-mana lands): the parent adds its base production, while
+/// the conditional mana child replaces that production when its gate holds.
+///
+/// Keep this predicate structural and deliberately narrow.  A conditional
+/// non-mana sequel remains a sequel and must not silence the detector; only a
+/// mana effect whose conditional child is itself a mana effect can represent
+/// the replacement of mana production.
+fn def_is_conditional_mana_instead_branch(def: &AbilityDefinition) -> bool {
+    matches!(&*def.effect, Effect::Mana { .. })
+        && def.sub_ability.as_deref().is_some_and(|sub| {
+            sub.condition.is_some() && matches!(&*sub.effect, Effect::Mana { .. })
+        })
+}
+
 fn def_tree_has_replacement_carrier(def: &AbilityDefinition) -> bool {
-    if effect_is_replacement_carrier(&def.effect) || def_is_represented_instead_branch(def) {
+    if effect_is_replacement_carrier(&def.effect)
+        || def_is_represented_instead_branch(def)
+        || def_is_conditional_mana_instead_branch(def)
+    {
         return true;
     }
     if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
