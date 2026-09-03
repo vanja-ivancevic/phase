@@ -4419,35 +4419,51 @@ fn split_for_each_suffix(text: &str) -> Option<(usize, String)> {
     Some((base.len(), tail.to_string()))
 }
 
-pub(super) fn strip_for_each_repeat_suffix(text: &str) -> (Option<QuantityExpr>, String) {
+/// Parse a trailing `for each <set>` multiplier without deciding which effect
+/// is allowed to consume it.  Most callers should use
+/// [`strip_for_each_repeat_suffix`], whose deliberately narrow allow-list
+/// protects effect families with their own quantity semantics.  The effect
+/// chain parser uses this lower-level form for keyword actions whose runtime
+/// representation is an ordinary repeatable `AbilityDefinition` (for example
+/// Tangle Wire's `tap ... for each fade counter`).
+pub(super) fn parse_for_each_repeat_suffix(text: &str) -> Option<(QuantityExpr, String)> {
     let (_, text) = strip_each_copy_targets_distinct_member_suffix(text);
-    if let Some((base_len, tail)) = split_for_each_suffix(&text) {
-        if let Ok((_, qty)) = all_consuming(terminated(
-            nom_quantity::parse_for_each_clause_ref,
-            opt(tag::<_, _, OracleError<'_>>(".")),
-        ))
-        .parse(tail.as_str())
-        {
-            // The repeat-suffix lift is restricted to quantities whose consumer
-            // is `CopySpell`: commander casts, trigger-bound spell history, and
-            // Zada's distinct-copy object count. A player-set `PlayerCount` is
-            // deliberately NOT admitted here — that class routes through the
-            // fieldless-Investigate seam via `for_each_repeatable_repeat_for`.
-            if matches!(
-                &qty,
-                QuantityRef::CommanderCastFromCommandZoneCount
+    let (base_len, tail) = split_for_each_suffix(&text)?;
+    let nom_qty = all_consuming(terminated(
+        nom_quantity::parse_for_each_clause_ref,
+        opt(tag::<_, _, OracleError<'_>>(".")),
+    ))
+    .parse(tail.as_str())
+    .ok()
+    .map(|(_, qty)| QuantityExpr::Ref { qty });
+    // The context-free quantity wrapper also recognizes typed counter phrases
+    // such as `fade counter on this artifact`, which are intentionally outside
+    // the smaller nom reference grammar used by CopySpell's legacy suffix gate.
+    let qty =
+        nom_qty.or_else(|| parse_for_each_clause(&tail).map(|qty| QuantityExpr::Ref { qty }))?;
+    Some((qty, text[..base_len].trim_end().to_string()))
+}
+
+pub(super) fn strip_for_each_repeat_suffix(text: &str) -> (Option<QuantityExpr>, String) {
+    let (_, stripped_text) = strip_each_copy_targets_distinct_member_suffix(text);
+    if let Some((qty, base)) = parse_for_each_repeat_suffix(text) {
+        // The repeat-suffix lift is restricted to quantities whose consumer
+        // is `CopySpell`: commander casts, trigger-bound spell history, and
+        // Zada's distinct-copy object count. A player-set `PlayerCount` is
+        // deliberately NOT admitted here — that class routes through the
+        // fieldless-Investigate seam via `for_each_repeatable_repeat_for`.
+        if matches!(
+            &qty,
+            QuantityExpr::Ref {
+                qty: QuantityRef::CommanderCastFromCommandZoneCount
                     | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
-            ) || zada_repeat_for_implies_distinct_copy_targets(&QuantityExpr::Ref {
-                qty: qty.clone(),
-            }) {
-                return (
-                    Some(QuantityExpr::Ref { qty }),
-                    text[..base_len].trim_end().to_string(),
-                );
             }
+        ) || zada_repeat_for_implies_distinct_copy_targets(&qty)
+        {
+            return (Some(qty), base);
         }
     }
-    (None, text)
+    (None, stripped_text)
 }
 
 /// CR 701.16a + CR 608.2c: Lift a trailing "[once] for each ⟨set⟩" multiplier off a

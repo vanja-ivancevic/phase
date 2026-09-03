@@ -32157,6 +32157,23 @@ fn unimplemented_clause(
     .push();
 }
 
+/// Effects whose printed grammar uses a trailing `for each` as a true
+/// repeat-count rather than as an amount/filter modifier. Keep this allow-list
+/// narrow: quantity-bearing effects must consume their own suffix so the
+/// resolver does not accidentally turn an amount into repeated instructions.
+/// `SetTapState::Single` is the choice-per-iteration shape used by Tangle Wire
+/// (and the corresponding untap wording); each iteration asks for one eligible
+/// permanent and then applies the tap state to that choice.
+fn trailing_for_each_repeat_is_supported(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            ..
+        }
+    )
+}
+
 pub(crate) fn parse_effect_chain_ir(
     text: &str,
     kind: AbilityKind,
@@ -34729,9 +34746,34 @@ pub(crate) fn parse_effect_chain_ir(
         } else if let Some(lose) = difference_lose {
             (lose, repeat_for)
         } else {
-            let (suffix_repeat_for, stripped_text_no_qty) =
+            let (suffix_repeat_for, restricted_text_no_qty) =
                 strip_for_each_repeat_suffix(&text_no_qty);
-            let mut stripped_clause = parse_effect_clause(&stripped_text_no_qty, ctx);
+            // Most trailing `for each` clauses are intentionally handled by
+            // effect-specific quantity slots.  A few keyword actions instead
+            // have a normal, repeatable effect body: Tangle Wire's
+            // "tap ... for each fade counter" is one such shape.  Probe the
+            // stripped body in an isolated context so an unsupported generic
+            // suffix cannot mutate the real chain context before we decide
+            // whether this effect is safe to drive through `repeat_for`.
+            let (mut stripped_clause, suffix_repeat_for) = if suffix_repeat_for.is_some() {
+                (
+                    parse_effect_clause(&restricted_text_no_qty, ctx),
+                    suffix_repeat_for,
+                )
+            } else if let Some((candidate_repeat_for, candidate_text)) =
+                lower::parse_for_each_repeat_suffix(&text_no_qty)
+            {
+                let mut candidate_ctx = ctx.clone();
+                let candidate_clause = parse_effect_clause(&candidate_text, &mut candidate_ctx);
+                if trailing_for_each_repeat_is_supported(&candidate_clause.effect) {
+                    *ctx = candidate_ctx;
+                    (candidate_clause, Some(candidate_repeat_for))
+                } else {
+                    (parse_effect_clause(&restricted_text_no_qty, ctx), None)
+                }
+            } else {
+                (parse_effect_clause(&restricted_text_no_qty, ctx), None)
+            };
             // CR 701.16a + CR 608.2c: a fieldless Investigate (no count slot) drops a
             // trailing "[once] for each <set>" multiplier. Precompute the lift,
             // gated to Investigate + no prior repeat_for, so ONLY the repeatable-for-each
@@ -34764,6 +34806,14 @@ pub(crate) fn parse_effect_chain_ir(
                         *target = TargetFilter::TriggeringSource;
                     }
                 }
+                (stripped_clause, repeat_for.or(suffix_repeat_for))
+            } else if suffix_repeat_for.is_some()
+                && trailing_for_each_repeat_is_supported(&stripped_clause.effect)
+            {
+                // CR 608.2c: keyword-action bodies such as Tangle Wire's Tap
+                // are complete once the suffix is removed, so attach the
+                // parsed quantity to this definition and let the common
+                // resolver repeat the one-choice action.
                 (stripped_clause, repeat_for.or(suffix_repeat_for))
             } else if let Some((fanout_clause, fanout_spec, fanout_ctx)) =
                 parse_for_each_opponent_target_fanout_clause(

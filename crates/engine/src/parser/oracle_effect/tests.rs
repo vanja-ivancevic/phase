@@ -10853,6 +10853,35 @@ fn effect_it_explores_x_times_sets_repeat_for() {
 }
 
 #[test]
+fn tangle_wire_taps_once_per_fade_counter() {
+    // CR 122.1 + CR 608.2c: the trailing counter phrase is an instruction
+    // multiplier, not an amount on Tap. Each iteration must therefore ask for
+    // one eligible permanent and tap it, with the count read from this source.
+    let def = parse_effect_chain(
+        "That player taps an untapped artifact, creature, or land they control for each fade counter on this artifact.",
+        AbilityKind::Activated,
+    );
+
+    assert!(matches!(
+        &*def.effect,
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            state: TapStateChange::Tap,
+            ..
+        }
+    ));
+    assert!(matches!(
+        def.repeat_for,
+        Some(QuantityExpr::Ref {
+            qty: QuantityRef::CountersOn {
+                scope: ObjectScope::Source,
+                counter_type: Some(CounterType::Fade),
+            }
+        })
+    ));
+}
+
+#[test]
 fn effect_proliferate_target_single_target() {
     // CR 701.34a + CR 122.1: Skyship Plunderer / Maulfist Revolutionary —
     // forced single-target proliferate. Must target a permanent-or-player
