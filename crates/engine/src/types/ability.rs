@@ -8824,6 +8824,9 @@ pub enum PlayerFilter {
     ///   `{ EQ, Fixed(0) }` (no matching permanent).
     /// - "each player who controls more creatures than you" (Heidegger) →
     ///   `{ GT, Ref(ObjectCount { filter: <creature>.controller(You) }) }`.
+    /// - "target player who controls more creatures than they do" (Oath of
+    ///   Druids) uses `ScopedPlayer` for the comparison anchor, so the count
+    ///   is relative to the player whose upkeep generated the trigger.
     ///
     /// `count` is boxed to break the `QuantityExpr → QuantityRef::PlayerCount →
     /// PlayerFilter::ControlsCount → QuantityExpr` reference cycle that would
@@ -17950,7 +17953,9 @@ impl TargetFilter {
     pub fn denotes_player_target(&self) -> bool {
         matches!(
             self,
-            TargetFilter::Player | TargetFilter::SpecificPlayer { .. }
+            TargetFilter::Player
+                | TargetFilter::SpecificPlayer { .. }
+                | TargetFilter::PlayerMatching { .. }
         ) || matches!(
             self,
             TargetFilter::Typed(tf) if tf.type_filters.is_empty() && tf.properties.is_empty()
@@ -34184,6 +34189,9 @@ mod player_target_slot_tests {
         for filter in [
             TargetFilter::Player,
             TargetFilter::SpecificPlayer { id: PlayerId(1) },
+            TargetFilter::PlayerMatching {
+                player: Box::new(PlayerFilter::Opponent),
+            },
             empty_typed(Some(ControllerRef::Opponent)),
             empty_typed(Some(ControllerRef::You)),
             // A resolution-chosen player is a player slot by shape; callers that

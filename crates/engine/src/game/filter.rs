@@ -7586,6 +7586,30 @@ pub fn player_matches_target_filter_in_state(
     source_controller: Option<PlayerId>,
     source_id: Option<ObjectId>,
 ) -> bool {
+    player_matches_target_filter_in_state_with_scope(
+        state,
+        filter,
+        player_id,
+        source_controller,
+        source_id,
+        None,
+    )
+}
+
+/// Check a player target with an explicit anchor for relative `PlayerFilter`
+/// predicates. Most filters are still evaluated relative to `source_controller`;
+/// only `TargetFilter::PlayerMatching` uses `scope_controller`. Triggered
+/// "each player's upkeep" abilities pass their `ResolvedAbility::scoped_player`
+/// here so phrases such as "more creatures than they do" compare against the
+/// upkeep player rather than the permanent's controller.
+pub fn player_matches_target_filter_in_state_with_scope(
+    state: &GameState,
+    filter: &TargetFilter,
+    player_id: PlayerId,
+    source_controller: Option<PlayerId>,
+    source_id: Option<ObjectId>,
+    scope_controller: Option<PlayerId>,
+) -> bool {
     player_matches_target_filter_with(
         filter,
         player_id,
@@ -7606,7 +7630,7 @@ pub fn player_matches_target_filter_in_state(
         // re-implementing any predicate here. `source_controller` is CR 109.5
         // "you": with no controller the payload's `relation` axis is unanswerable,
         // so fail closed — likewise with no source object.
-        &|player, candidate| match (source_controller, source_id) {
+        &|player, candidate| match (scope_controller.or(source_controller), source_id) {
             (Some(controller), Some(source)) => crate::game::effects::matches_player_scope(
                 state, candidate, player, controller, source,
             ),

@@ -5154,12 +5154,11 @@ pub(super) fn rebind_subject_only_body_recipient(effect: &mut Effect) {
 /// `(Comparator, QuantityExpr)` pair:
 /// - "controls"/"control" → `(GE, Fixed(1))` (at least one matching permanent).
 /// - "doesn't/does not/don't/do not control" → `(EQ, Fixed(0))` (none).
-/// - "controls/control more <type> than you" → `(GT, Ref(ObjectCount {
-///   filter: <type>.controller(You) }))` — strictly more than the effect
-///   controller's own count of the same type (CR 109.5 — "you" is the controller
-///   of the object the ability is on). The carried `filter` is the BARE type
-///   (no controller axis); the per-candidate control relationship is enforced at
-///   runtime by `player_control_count_compares`.
+/// - "controls/control more <type> than you/they do" → `(GT, Ref(ObjectCount {
+///   filter: <type>.controller(You|ScopedPlayer) }))` — strictly more than the
+///   effect controller's or scoped player's own count of the same type (CR 109.5).
+///   The carried `filter` is the BARE type (no controller axis); the per-candidate
+///   control relationship is enforced at runtime by `player_control_count_compares`.
 ///
 /// The object sub-phrase ("an Elf", "a creature with power 4 or greater")
 /// delegates to the shared `parse_type_phrase_with_ctx` combinator — no bespoke
@@ -5171,7 +5170,12 @@ pub(crate) fn parse_controls_permanent_object<'a>(
     ctx: &mut ParseContext,
 ) -> Option<(Comparator, QuantityExpr, TargetFilter, &'a str)> {
     let lower = rest.to_lowercase();
-    // Comparative form tried FIRST: "who controls more <type> than you".
+    // Comparative form tried FIRST: "who controls more <type> than you" or
+    // "who controls more <type> than they do". The latter is used by Oath of
+    // Druids-style target clauses inside an "each player's upkeep" trigger:
+    // the comparison anchor is the player whose upkeep it is, not the source
+    // controller. Both forms share this parser and the same ControlsCount
+    // runtime predicate; only the anchor on the inner count differs.
     // Mirrors `oracle_nom::condition::parse_that_player_controls_more_comparison`:
     // consume the verb prefix, then split the original-case remainder on
     // " than you" so the isolated type text and the trailing remainder both stay
@@ -5183,18 +5187,29 @@ pub(crate) fn parse_controls_permanent_object<'a>(
         Ok((i, ()))
     }) {
         let after_verb_lower = after_verb.to_lowercase();
-        if let Some((type_text, comparative_remainder)) =
-            split_once_on_lower(after_verb, &after_verb_lower, " than you")
-        {
+        let comparative = [
+            (" than they do", ControllerRef::ScopedPlayer),
+            (" than you do", ControllerRef::You),
+            (" than you", ControllerRef::You),
+        ]
+        .iter()
+        .find_map(|(suffix, controller)| {
+            split_once_on_lower(after_verb, &after_verb_lower, suffix)
+                .map(|(type_text, remainder)| (type_text, remainder, controller.clone()))
+        });
+        if let Some((type_text, comparative_remainder, count_controller)) = comparative {
             let (bare_filter, _) = parse_type_phrase_with_ctx(type_text, ctx);
             if matches!(bare_filter, TargetFilter::Any) {
                 return None;
             }
-            // CR 109.5: the controller's own count uses a `You`-controlled filter.
+            // CR 109.5: the comparison anchor is either the effect controller
+            // ("you") or the scoped player ("they"). The runtime's existing
+            // ControllerRef::ScopedPlayer fallback uses the supplied player
+            // scope when this predicate is evaluated as a target filter.
             let you_count = match &bare_filter {
                 TargetFilter::Typed(tf) => QuantityExpr::Ref {
                     qty: QuantityRef::ObjectCount {
-                        filter: TargetFilter::Typed(tf.clone().controller(ControllerRef::You)),
+                        filter: TargetFilter::Typed(tf.clone().controller(count_controller)),
                     },
                 },
                 // Non-typed filters cannot carry a controller axis; reject rather

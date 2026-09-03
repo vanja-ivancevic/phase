@@ -11,9 +11,10 @@ use nom::Parser;
 use crate::types::ability::{
     AggregateFunction, AttachmentKind, CardTypeSetSource, ChoiceType, CombatRelation,
     CombatRelationSubject, Comparator, ControllerRef, CountScope, DamageKindFilter, FilterProp,
-    ObjectProperty, ObjectScope, ParitySource, PlayerFilter, PropertyAggregate, PtStat,
-    PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality, SharedQualityRelation,
-    TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
+    ObjectProperty, ObjectScope, ParitySource, PlayerFilter, PlayerRelation, PropertyAggregate,
+    PtStat, PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality,
+    SharedQualityRelation, TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter,
+    TypedFilter,
 };
 use crate::types::card_type::{noncreature_subtype_set, SubtypeSet, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -23,7 +24,8 @@ use crate::types::mana::ManaColor;
 use crate::types::zones::Zone;
 
 use super::oracle_effect::{
-    is_bare_object_pronoun, parse_multi_target_count_expr, resolve_it_pronoun,
+    is_bare_object_pronoun, parse_controls_permanent_object, parse_multi_target_count_expr,
+    resolve_it_pronoun,
 };
 use super::oracle_ir::context::ParseContext;
 use super::oracle_ir::diagnostic::OracleDiagnostic;
@@ -1040,6 +1042,50 @@ pub fn parse_target_with_syntax<'a>(
                 &text[lower.len() - rest.len()..],
                 syntax,
             );
+        }
+        // CR 115.1 + CR 109.5: a player target may carry a relative
+        // controlled-count clause, e.g. Oath of Druids' "target player who
+        // controls more creatures than they do and is their opponent". Reuse
+        // the shared `who controls …` parser used by player-scope effects;
+        // this keeps comparative, presence, and future controlled-count
+        // vocabulary in one place instead of growing a target-only grammar.
+        // The `their opponent` tail is a second predicate on the same player,
+        // so it composes as the ControlsCount relation rather than as a
+        // card-specific special case.
+        let player_head = after_target
+            .strip_prefix("player ")
+            .map(|rest| ("player ", PlayerRelation::All, rest))
+            .or_else(|| {
+                after_target
+                    .strip_prefix("opponent ")
+                    .map(|rest| ("opponent ", PlayerRelation::Opponent, rest))
+            });
+        if let Some((head, relation, _)) = player_head {
+            let original_target_offset = target_offset + head.len();
+            let original_clause = &text[original_target_offset..];
+            if let Some((comparator, count, bare_filter, mut remainder)) =
+                parse_controls_permanent_object(original_clause, ctx)
+            {
+                let mut relation = relation;
+                let remainder_lower = remainder.to_lowercase();
+                const OPPONENT_SUFFIX: &str = " and is their opponent";
+                if remainder_lower.starts_with(OPPONENT_SUFFIX) {
+                    relation = PlayerRelation::Opponent;
+                    remainder = &remainder[OPPONENT_SUFFIX.len()..];
+                }
+                return (
+                    TargetFilter::PlayerMatching {
+                        player: Box::new(PlayerFilter::ControlsCount {
+                            relation,
+                            filter: bare_filter,
+                            comparator,
+                            count: Box::new(count),
+                        }),
+                    },
+                    remainder,
+                    syntax,
+                );
+            }
         }
         // CR 115.1: A coordinated target noun phrase may elide "target" after
         // its first player leg: "target opponent, creature an opponent
@@ -10649,6 +10695,39 @@ mod tests {
         assert_eq!(
             f,
             TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
+        );
+    }
+
+    #[test]
+    fn target_player_controls_more_than_scoped_player_and_is_opponent() {
+        let (filter, rest) = parse_target(
+            "target player who controls more creatures than they do and is their opponent",
+        );
+        assert!(rest.trim().is_empty(), "unexpected remainder: {rest:?}");
+        let TargetFilter::PlayerMatching { player } = filter else {
+            panic!("expected PlayerMatching target filter, got {filter:?}");
+        };
+        let PlayerFilter::ControlsCount {
+            relation,
+            filter,
+            comparator,
+            count,
+        } = *player
+        else {
+            panic!("expected controlled-count player predicate");
+        };
+        assert_eq!(relation, PlayerRelation::Opponent);
+        assert_eq!(comparator, Comparator::GT);
+        assert_eq!(filter, TargetFilter::Typed(TypedFilter::creature()));
+        assert_eq!(
+            *count,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(
+                        TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
+                    ),
+                },
+            }
         );
     }
 
