@@ -1735,6 +1735,55 @@ fn urza_conditional_mana_replacement_is_not_reported_as_swallowed() {
     );
 }
 
+/// Cursed Scroll is a high-frequency old-border deck card.  Its random hand
+/// reveal publishes the revealed card as the subject of a typed chosen-name
+/// condition; the full activated ability must therefore not leave a residual
+/// `Condition_If` audit warning.
+#[test]
+fn cursed_scroll_random_reveal_condition_is_not_reported_as_swallowed() {
+    let parsed = parse(
+        "{3}, {T}: Choose a card name, then reveal a card at random from your hand. If that card has the chosen name, this artifact deals 2 damage to any target.",
+        "Cursed Scroll",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+
+    assert!(
+        parsed.parse_warnings.iter().all(|warning| !matches!(
+            warning,
+            OracleDiagnostic::SwallowedClause { detector, .. }
+                if detector == "Condition_If"
+        )),
+        "Cursed Scroll's represented chosen-name condition must not be flagged: {:?}",
+        parsed.parse_warnings
+    );
+}
+
+/// Memory Lapse is another frequent old-border deck card.  The parser folds
+/// its countered-spell destination into the typed `Counter` effect, so the
+/// full card must not be reported as a swallowed `instead` replacement.
+#[test]
+fn memory_lapse_counter_redirect_is_not_reported_as_swallowed() {
+    let parsed = parse(
+        "Counter target spell. If that spell is countered this way, put it on top of its owner's library instead of into that player's graveyard.",
+        "Memory Lapse",
+        &[],
+        &["Instant"],
+        &[],
+    );
+
+    assert!(
+        parsed.parse_warnings.iter().all(|warning| !matches!(
+            warning,
+            OracleDiagnostic::SwallowedClause { detector, .. }
+                if detector == "Replacement_Instead"
+        )),
+        "Memory Lapse's represented counter destination must not be flagged: {:?}",
+        parsed.parse_warnings
+    );
+}
+
 /// CR 506.3 + CR 508.1d + CR 611.2c + CR 615: Gideon Jura (verbatim MTGJSON
 /// Oracle text) parses all three loyalty abilities with zero residual
 /// `Unimplemented`, and each lands on the exact shape its rules text requires.

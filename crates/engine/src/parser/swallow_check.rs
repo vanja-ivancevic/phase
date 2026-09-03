@@ -1613,7 +1613,15 @@ fn effect_is_replacement_carrier(effect: &Effect) -> bool {
         // name IS the replacement, with or without the `on_exile` rider (the
         // Feather return / Lilah plot parameterization is a second consequence
         // folded into the same carrier, so it stays exempt either way).
-        | Effect::ExileResolvingSpellInsteadOfGraveyard { .. } => true,
+        | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
+        // CR 701.6a + CR 614.1a: Memory Lapse / Remand / Spell Crumple fold
+        // "if that spell is countered this way, put it [elsewhere] instead"
+        // into the Counter effect's typed destination field.  The field is
+        // the replacement carrier; no separate sub-ability is expected.
+        | Effect::Counter {
+            countered_spell_zone: Some(_),
+            ..
+        } => true,
         _ => false,
     }
 }
