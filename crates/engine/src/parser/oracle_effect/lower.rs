@@ -6158,6 +6158,18 @@ pub(crate) fn strip_temporal_prefix(text: &str) -> (&str, Option<DelayedTriggerC
     let lower = text.to_lowercase();
     if let Some((condition, rest)) = nom_on_lower(text, &lower, |i| {
         alt((
+            // CR 603.7a + CR 502.2: "during your next untap step, as you
+            // untap your permanents" is a one-shot delayed trigger, not a
+            // continuous duration.  PlayerId(0) is the parse-time controller
+            // placeholder rewritten by delayed-trigger resolution.
+            value(
+                DelayedTriggerCondition::AtNextPhaseForPlayer {
+                    phase: Phase::Untap,
+                    player: crate::types::player::PlayerId(0),
+                    gate: crate::types::ability::TurnGate::None,
+                },
+                tag("during your next untap step, as you untap your permanents, "),
+            ),
             value(
                 DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
                 tag("at the beginning of the next end step, "),

@@ -19471,6 +19471,40 @@ fn temporal_prefix_in_effect_chain() {
     }
 }
 
+/// CR 603.7a + CR 502.2: an activated ability may defer its effect to the
+/// controller's next untap step.  Undiscovered Paradise uses the canonical
+/// "during your next untap step, as you untap your permanents" wording; this
+/// must lower through the shared delayed-trigger mechanism rather than the
+/// continuous-duration parser.
+#[test]
+fn during_next_untap_step_installs_controller_scoped_delayed_trigger() {
+    use crate::types::ability::TurnGate;
+
+    let def = parse_effect_chain(
+        "During your next untap step, as you untap your permanents, return this land to its owner's hand.",
+        AbilityKind::Activated,
+    );
+    let Effect::CreateDelayedTrigger {
+        condition, effect, ..
+    } = &*def.effect
+    else {
+        panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
+    };
+    assert_eq!(
+        *condition,
+        DelayedTriggerCondition::AtNextPhaseForPlayer {
+            phase: Phase::Untap,
+            player: crate::types::player::PlayerId(0),
+            gate: TurnGate::None,
+        }
+    );
+    assert!(
+        matches!(*effect.effect, Effect::Bounce { .. }),
+        "delayed body should return the source land, got {:?}",
+        effect.effect
+    );
+}
+
 #[test]
 fn temporal_prefix_preserves_full_delayed_effect_chain() {
     let def = parse_effect_chain(

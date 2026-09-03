@@ -2504,8 +2504,26 @@ fn try_parse_at_next_phase_delayed_trigger(
     let (effect_text, condition) = strip_temporal_prefix(text);
     let condition = condition?;
     let mut ctx = ParseContext::default();
-    let inner = parse_effect_chain_with_context(effect_text, kind, &mut ctx);
-    Some(ParsedEffectClause {
+    Some(build_at_next_phase_delayed_trigger(
+        effect_text,
+        condition,
+        kind,
+        &mut ctx,
+    ))
+}
+
+/// CR 603.7a: Shared lowering for temporal prefixes reached from both the
+/// top-level spell parser and an activated-ability effect clause.  Keeping the
+/// body parse in the caller's context matters for source-relative pronouns in
+/// activated abilities (for example, "return it" on a land's ability).
+fn build_at_next_phase_delayed_trigger(
+    effect_text: &str,
+    condition: DelayedTriggerCondition,
+    kind: AbilityKind,
+    ctx: &mut ParseContext,
+) -> ParsedEffectClause {
+    let inner = parse_effect_chain_with_context(effect_text, kind, ctx);
+    ParsedEffectClause {
         effect: Effect::CreateDelayedTrigger {
             condition,
             effect: Box::new(inner),
@@ -2518,7 +2536,7 @@ fn try_parse_at_next_phase_delayed_trigger(
         condition: None,
         optional: false,
         unless_pay: None,
-    })
+    }
 }
 
 /// CR 603.7a + CR 603.7c + CR 400.7: Is this delayed trigger's inner chain an impulse-cleanup
@@ -9152,6 +9170,21 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     }
     if counter_unless_payment_is_unsupported(text) {
         return parsed_unless_payment_unsupported_clause(text);
+    }
+    // CR 603.7a: Activated abilities can install delayed effects too.  The
+    // top-level spell parser already owns this temporal recognizer, but effect
+    // clauses reached through an activated ability (notably Undiscovered
+    // Paradise) arrive here instead.  Keep the prefix grammar in `lower.rs`
+    // and reuse the same delayed-trigger lowering so this remains a mechanism,
+    // not a card-specific exception.
+    let (temporal_body, temporal_condition) = strip_temporal_prefix(text);
+    if let Some(condition) = temporal_condition {
+        return build_at_next_phase_delayed_trigger(
+            temporal_body,
+            condition,
+            AbilityKind::Activated,
+            ctx,
+        );
     }
     // CR 608.2c: Self-ref continuation adverb. "also" after a self-ref subject
     // is a natural-language additive connector with no semantic weight — it
