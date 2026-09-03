@@ -1784,6 +1784,31 @@ fn memory_lapse_counter_redirect_is_not_reported_as_swallowed() {
     );
 }
 
+/// Thermokarst's snow-land rider follows a zone-changing destroy effect.  The
+/// target is gone by the time the rider resolves, so the condition must be
+/// represented with last-known information rather than swallowed as a generic
+/// `Condition_If` clause.
+#[test]
+fn thermokarst_snow_land_rider_is_not_reported_as_swallowed() {
+    let parsed = parse(
+        "Destroy target land. If that land was a snow land, you gain 1 life.",
+        "Thermokarst",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+
+    assert!(
+        parsed.parse_warnings.iter().all(|warning| !matches!(
+            warning,
+            OracleDiagnostic::SwallowedClause { detector, .. }
+                if detector == "Condition_If"
+        )),
+        "Thermokarst's represented snow-land condition must not be flagged: {:?}",
+        parsed.parse_warnings
+    );
+}
+
 /// CR 506.3 + CR 508.1d + CR 611.2c + CR 615: Gideon Jura (verbatim MTGJSON
 /// Oracle text) parses all three loyalty abilities with zero residual
 /// `Unimplemented`, and each lands on the exact shape its rules text requires.

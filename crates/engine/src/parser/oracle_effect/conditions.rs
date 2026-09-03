@@ -2985,6 +2985,23 @@ pub(super) fn strip_target_supertype_conditional(text: &str) -> (Option<AbilityC
         );
     }
 
+    // CR 205.4a + CR 608.2c: preserve positive land supertypes in a leading
+    // rider such as Thermokarst's "If that land was a snow land, ...".  The
+    // target has already left the battlefield when the rider resolves, so the
+    // condition must use last-known information just like the nonbasic form.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("if that land was a ").parse(lower.as_str())
+    {
+        if let Ok((rest, supertype)) = parse_supertype_word(rest) {
+            if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" land, ").parse(rest) {
+                let body_start = text.len() - rest.len();
+                return (
+                    Some(target_land_supertype_lki_condition(supertype)),
+                    text[body_start..].to_string(),
+                );
+            }
+        }
+    }
+
     if let Some((before, after)) = tp.rsplit_around(" if that land was ") {
         if all_consuming(alt((
             tag::<_, _, OracleError<'_>>("nonbasic."),
@@ -2997,6 +3014,29 @@ pub(super) fn strip_target_supertype_conditional(text: &str) -> (Option<AbilityC
                 Some(nonbasic_land_lki_condition()),
                 before.original.trim_end_matches('.').trim().to_string(),
             );
+        }
+    }
+
+    // CR 205.4a + CR 608.2c: target-land supertype riders such as
+    // "If that land was a snow land, ..." read the land's last-known
+    // information after the preceding destroy/bounce effect.  Preserve both
+    // the land type and the supertype in the typed condition so the chained
+    // rider is not silently made unconditional.
+    if let Some((before, after)) = tp.rsplit_around(" if that land was ") {
+        let suffix = after.lower.trim_end_matches('.').trim();
+        // The existing nonbasic form above is intentionally kept separate:
+        // "nonbasic" is a negated supertype, not a positive one.
+        if let Some(suffix) = suffix.strip_prefix("a ") {
+            if let Some(supertype_name) = suffix.strip_suffix(" land") {
+                if let Ok((rest, supertype)) = parse_supertype_word(supertype_name) {
+                    if rest.trim().is_empty() {
+                        return (
+                            Some(target_land_supertype_lki_condition(supertype)),
+                            before.original.trim_end_matches('.').trim().to_string(),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -3042,6 +3082,16 @@ fn nonbasic_land_lki_condition() -> AbilityCondition {
                 value: Supertype::Basic,
             },
         ])),
+        use_lki: true,
+        subject_slot: None,
+    }
+}
+
+fn target_land_supertype_lki_condition(supertype: Supertype) -> AbilityCondition {
+    AbilityCondition::TargetMatchesFilter {
+        filter: TargetFilter::Typed(
+            TypedFilter::land().properties(vec![FilterProp::HasSupertype { value: supertype }]),
+        ),
         use_lki: true,
         subject_slot: None,
     }

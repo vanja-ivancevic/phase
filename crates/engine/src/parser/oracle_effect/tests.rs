@@ -41332,6 +41332,37 @@ fn strip_target_supertype_conditional_leading_nonbasic_land_uses_lki() {
 }
 
 #[test]
+fn strip_target_supertype_conditional_leading_snow_land_uses_lki() {
+    use crate::types::card_type::Supertype;
+
+    let (cond, text) =
+        strip_target_supertype_conditional("If that land was a snow land, you gain 1 life.");
+    assert!(cond.is_some(), "should extract snow land condition");
+    assert_eq!(text, "you gain 1 life.");
+    match cond.unwrap() {
+        AbilityCondition::TargetMatchesFilter {
+            filter, use_lki, ..
+        } => {
+            assert!(use_lki);
+            let TargetFilter::Typed(tf) = filter else {
+                panic!("expected Typed filter");
+            };
+            assert!(tf
+                .type_filters
+                .iter()
+                .any(|f| matches!(f, TypeFilter::Land)));
+            assert!(tf.properties.iter().any(|p| matches!(
+                p,
+                FilterProp::HasSupertype {
+                    value: Supertype::Snow
+                }
+            )));
+        }
+        other => panic!("expected TargetMatchesFilter, got: {other:?}"),
+    }
+}
+
+#[test]
 fn strip_target_supertype_conditional_suffix_nonbasic_land_uses_lki() {
     let (cond, text) =
         strip_target_supertype_conditional("~ deals 2 damage if that land was nonbasic.");
