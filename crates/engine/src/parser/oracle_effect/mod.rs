@@ -15576,6 +15576,32 @@ fn try_parse_for_each_effect(text: &str, ctx: &mut ParseContext) -> Option<Parse
                 unless_pay: None,
             });
         }
+
+        // CR 609.3 + CR 115.1d + CR 701.26a/b: a non-targeted tap/untap
+        // instruction can use a dynamic `for each` count (Tangle Wire's
+        // "tap an untapped artifact, creature, or land ... for each fade
+        // counter" is the old-border example).  The ordinary targeted AST
+        // already carries the typed permanent filter and lowers to the
+        // resolution-time SetTapState picker; attach an exact multi-target
+        // bound here instead of inventing a second tap effect.  Resolution's
+        // existing tap chooser then selects the counted set and applies the
+        // action through the normal replacement/event path.
+        if matches!(
+            ast,
+            TargetedImperativeAst::Tap { .. } | TargetedImperativeAst::Untap { .. }
+        ) {
+            let effect = imperative::lower_targeted_action_ast(ast);
+            return Some(ParsedEffectClause {
+                effect,
+                duration,
+                sub_ability: None,
+                distribute: None,
+                multi_target: Some(MultiTargetSpec::exact(quantity)),
+                condition: None,
+                optional: false,
+                unless_pay: None,
+            });
+        }
     }
 
     // CR 120.1: "[subject] deals N damage to [target] for each X" → DealDamage.
@@ -16129,6 +16155,10 @@ fn for_each_subject_application(
         " discard ",
         " sacrifices ",
         " sacrifice ",
+        " taps ",
+        " tap ",
+        " untaps ",
+        " untap ",
         " scries ",
         " scry ",
         " surveils ",

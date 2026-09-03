@@ -19540,6 +19540,75 @@ fn non_targeted_multi_untap_chooses_at_resolution() {
     );
 }
 
+/// CR 609.3 + CR 701.26a: Tangle Wire's upkeep trigger taps one untapped
+/// permanent for each fade counter.  This is a dynamic count over an
+/// at-resolution object choice, not a mass tap of every eligible permanent.
+/// Keep it on the shared for-each path so other counted tap/untap cards inherit
+/// the same picker and replacement handling.
+#[test]
+fn tangle_wire_dynamic_for_each_tap_chooses_at_resolution() {
+    let mut ctx = ParseContext::default();
+    let clause = try_parse_for_each_effect(
+        "that player taps an untapped artifact, creature, or land they control for each fade counter on this artifact",
+        &mut ctx,
+    )
+    .expect("Tangle Wire's dynamic tap clause must parse");
+
+    assert!(matches!(
+        clause.effect,
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            state: TapStateChange::Tap,
+            ..
+        }
+    ));
+    assert_eq!(
+        clause.multi_target,
+        Some(MultiTargetSpec::exact(QuantityExpr::Ref {
+            qty: QuantityRef::CountersOn {
+                scope: ObjectScope::Source,
+                counter_type: Some(CounterType::Fade),
+            },
+        }))
+    );
+}
+
+#[test]
+fn tangle_wire_dynamic_tap_chain_is_resolution_time_and_typed() {
+    let def = parse_effect_chain(
+        "That player taps an untapped artifact, creature, or land they control for each fade counter on this artifact",
+        AbilityKind::Spell,
+    );
+    assert!(
+        matches!(
+            def.effect.as_ref(),
+            Effect::SetTapState {
+                target: TargetFilter::Or { .. },
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
+            }
+        ),
+        "unexpected Tangle Wire chain: {def:?}"
+    );
+    let Effect::SetTapState { target, .. } = def.effect.as_ref() else {
+        unreachable!("the shape was asserted above");
+    };
+    let TargetFilter::Or { filters } = target else {
+        unreachable!("the shape was asserted above");
+    };
+    assert_eq!(filters.len(), 3);
+    assert_eq!(def.target_choice_timing, TargetChoiceTiming::Resolution);
+    assert_eq!(
+        def.multi_target,
+        Some(MultiTargetSpec::exact(QuantityExpr::Ref {
+            qty: QuantityRef::CountersOn {
+                scope: ObjectScope::Source,
+                counter_type: Some(CounterType::Fade),
+            },
+        }))
+    );
+}
+
 /// CR 608.2c + CR 603.7a + CR 505.1 + CR 601.2h: Mana Sculpt end-to-end.
 ///
 /// "Counter target spell. If you control a Wizard, add an amount of {C}

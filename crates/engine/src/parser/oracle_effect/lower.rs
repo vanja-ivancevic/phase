@@ -1855,7 +1855,7 @@ pub(super) fn target_choice_timing_for_clause(clause_ir: &ClauseIr) -> TargetCho
             scope: EffectScope::Single,
             ..
         }
-    ) && clause_ir.multi_target.is_some()
+    ) && (clause_ir.multi_target.is_some() || clause_ir.parsed.multi_target.is_some())
     {
         let lower = clause_ir
             .source
