@@ -14879,6 +14879,155 @@ fn hand_spell_alternative_pay_life_cost_replaces_mana_cost() {
     );
 }
 
+/// Build a minimal Thwart-shaped instant using the real parser-produced
+/// alternative cost.  The effect itself is deliberately non-targeted so this
+/// test can stop after payment and assert the cast/payment state directly.
+fn create_thwart_with_islands(
+    state: &mut GameState,
+    island_count: usize,
+) -> (ObjectId, Vec<ObjectId>) {
+    let spell_id = create_instant_in_hand(state, PlayerId(0));
+    let option = crate::parser::oracle_casting::parse_spell_casting_option_line(
+        "You may return three Islands you control to their owner's hand rather than pay this spell's mana cost.",
+        "Thwart",
+    )
+    .expect("Thwart alternative-cost line must parse");
+    let spell = state.objects.get_mut(&spell_id).unwrap();
+    spell.name = "Thwart".to_string();
+    spell.mana_cost = ManaCost::Cost {
+        shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+        generic: 2,
+    };
+    Arc::make_mut(&mut spell.abilities).clear();
+    Arc::make_mut(&mut spell.abilities).push(AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
+    ));
+    spell.casting_options.clear();
+    spell.casting_options.push(option);
+
+    let mut islands = Vec::with_capacity(island_count);
+    for index in 0..island_count {
+        let island = create_object(
+            state,
+            CardId(0x54_000 + index as u64),
+            PlayerId(0),
+            format!("Island {index}"),
+            Zone::Battlefield,
+        );
+        let object = state.objects.get_mut(&island).unwrap();
+        object.card_types.core_types.push(CoreType::Land);
+        object.card_types.subtypes.push("Island".to_string());
+        islands.push(island);
+    }
+    (spell_id, islands)
+}
+
+/// CR 118.9 + CR 601.2b: two Islands cannot pay Thwart's exact three-Island
+/// alternate cost, and with no mana the spell is not castable at all.
+#[test]
+fn thwart_alternative_cost_requires_three_islands() {
+    let mut state = setup_game_at_main_phase();
+    let (spell_id, _) = create_thwart_with_islands(&mut state, 2);
+
+    assert_eq!(
+        crate::game::casting_costs::payable_spell_alternative_cost_details(
+            &state,
+            PlayerId(0),
+            spell_id,
+        ),
+        None,
+        "two Islands must not expose Thwart's three-Island alternate cost"
+    );
+    assert!(
+        !can_cast_object_now(&state, PlayerId(0), spell_id),
+        "with no mana and only two Islands, Thwart must not be castable"
+    );
+}
+
+/// CR 118.9 + CR 601.2b/h: three eligible Islands expose an interactive
+/// exact-count payment, and selecting them returns all three before the spell
+/// reaches the stack. This guards against the old EffectCost no-op path, which
+/// finalized the alternate-cost cast without moving any Islands.
+#[test]
+fn thwart_alternative_cost_returns_exactly_three_islands_before_cast() {
+    let mut state = setup_game_at_main_phase();
+    let (spell_id, islands) = create_thwart_with_islands(&mut state, 3);
+
+    let details = crate::game::casting_costs::payable_spell_alternative_cost_details(
+        &state,
+        PlayerId(0),
+        spell_id,
+    )
+    .expect("three Islands should expose Thwart's alternate cost");
+    assert!(matches!(
+        details.cost,
+        AbilityCost::ReturnToHand { count: 3, .. }
+    ));
+
+    let mut events = Vec::new();
+    let waiting = handle_cast_spell(&mut state, PlayerId(0), spell_id, CardId(10), &mut events)
+        .expect("three Islands should authorize the alternate-cost cast");
+    state.waiting_for = waiting;
+    assert!(matches!(
+        state.waiting_for,
+        WaitingFor::OptionalCostChoice {
+            cost: AdditionalCost::Choice(AbilityCost::ReturnToHand { count: 3, .. }, _),
+            ..
+        }
+    ));
+
+    apply_as_current(&mut state, GameAction::DecideOptionalCost { pay: true })
+        .expect("accepting Thwart's alternate cost should begin payment");
+    let WaitingFor::PayCost {
+        kind: PayCostKind::ReturnToHand,
+        choices,
+        count,
+        ..
+    } = &state.waiting_for
+    else {
+        panic!(
+            "expected exact three-Island return prompt, got {:?}",
+            state.waiting_for
+        );
+    };
+    assert_eq!(*count, 3);
+    assert_eq!(choices, &islands);
+
+    apply_as_current(
+        &mut state,
+        GameAction::SelectCards {
+            cards: islands.clone(),
+        },
+    )
+    .expect("selecting all three Islands should finish alternate-cost payment");
+
+    assert!(
+        islands.iter().all(|id| state
+            .objects
+            .get(id)
+            .is_some_and(|object| object.zone == Zone::Hand)),
+        "all three selected Islands must be returned to hand"
+    );
+    assert_eq!(
+        state.players[0]
+            .hand
+            .iter()
+            .filter(|id| islands.contains(id))
+            .count(),
+        3,
+        "exactly three Islands must be in the payer's hand"
+    );
+    assert_eq!(
+        state.stack.len(),
+        1,
+        "the spell should reach the stack after payment"
+    );
+}
+
 #[test]
 fn choice_additional_cost_filters_unpayable_casts() {
     let mut state = setup_game_at_main_phase();

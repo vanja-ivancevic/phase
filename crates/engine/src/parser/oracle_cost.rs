@@ -1762,23 +1762,27 @@ fn try_parse_energy_cost(lower: &str) -> Option<QuantityExpr> {
     None
 }
 
-/// Parse "return a land you control to its owner's hand" style bounce costs.
+/// Parse "return N lands you control to their owner's hand" style bounce costs.
 fn try_parse_return_to_hand_cost(rest_lower: &str) -> Option<AbilityCost> {
-    // Must end with "to its owner's hand" or "to your hand"
-    if !scan_contains(rest_lower, "to its owner's hand")
-        && !scan_contains(rest_lower, "to your hand")
-    {
-        return None;
-    }
-    // Strip the destination
-    let filter_text = split_once_on(rest_lower, " to its owner's hand")
-        .map(|(_, (before, _))| before)
-        .or_else(|_| split_once_on(rest_lower, " to your hand").map(|(_, (before, _))| before))
-        .ok()?;
-    // Strip article using nom
-    let filter_text = nom_on_lower(filter_text, filter_text, nom_primitives::parse_article)
-        .map(|((), rest)| rest)
-        .unwrap_or(filter_text);
+    // CR 701.10a + CR 107.3: the destination may use either the singular
+    // "its" or the plural-card "their" possessive, and the quantity must be
+    // retained (Thwart returns exactly three Islands).  Parse the count before
+    // stripping the destination so a multi-object cost cannot fall through to
+    // an EffectCost that the payment path would treat as a no-op.
+    let (count, rest_lower) = parse_number(rest_lower)
+        .map_or((1, rest_lower), |(count, rest)| (count, rest.trim_start()));
+    let filter_text = [
+        " to its owner's hand",
+        " to their owner's hand",
+        " to your hand",
+    ]
+    .into_iter()
+    .find_map(|suffix| {
+        split_once_on(rest_lower, suffix)
+            .ok()
+            .map(|(_, (before, _))| before)
+    })?;
+    let filter_text = filter_text.trim();
     // CR 201.5 / CR 201.5a: "~" / "this X" is the host self-reference; the
     // granter placeholder is a granted body's by-name reference to its granting
     // object. Preserve the explicit filter so the runtime does not treat an
@@ -1803,7 +1807,7 @@ fn try_parse_return_to_hand_cost(rest_lower: &str) -> Option<AbilityCost> {
     }) {
         if rest.trim().is_empty() {
             return Some(AbilityCost::ReturnToHand {
-                count: 1,
+                count,
                 filter: Some(filter),
                 from_zone: None,
             });
@@ -1837,7 +1841,7 @@ fn try_parse_return_to_hand_cost(rest_lower: &str) -> Option<AbilityCost> {
         filter => filter,
     };
     Some(AbilityCost::ReturnToHand {
-        count: 1,
+        count,
         filter: Some(filter),
         from_zone: None,
     })

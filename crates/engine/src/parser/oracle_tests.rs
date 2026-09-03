@@ -1809,6 +1809,39 @@ fn thermokarst_snow_land_rider_is_not_reported_as_swallowed() {
     );
 }
 
+/// CR 118.9 + CR 601.2b: Thwart's printed alternate cost is an exact three-
+/// object return, not an arbitrary effect.  Preserve both the quantity and
+/// the Island quality so the payability gate can reject a two-Island state and
+/// the payment detour can require exactly three selections.
+#[test]
+fn thwart_alternative_cost_preserves_three_island_quantity() {
+    let parsed = parse(
+        "You may return three Islands you control to their owner's hand rather than pay this spell's mana cost.\nCounter target spell.",
+        "Thwart",
+        &[],
+        &["Instant"],
+        &[],
+    );
+
+    assert_eq!(parsed.casting_options.len(), 1, "got {parsed:#?}");
+    match parsed.casting_options[0].cost.as_ref() {
+        Some(AbilityCost::ReturnToHand {
+            count,
+            filter: Some(TargetFilter::Typed(filter)),
+            from_zone: None,
+        }) => {
+            assert_eq!(*count, 3);
+            assert_eq!(filter.get_subtype(), Some("Island"));
+        }
+        other => panic!("expected typed three-Island ReturnToHand cost, got {other:?}"),
+    }
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        parsed.parse_warnings
+    );
+}
+
 /// CR 506.3 + CR 508.1d + CR 611.2c + CR 615: Gideon Jura (verbatim MTGJSON
 /// Oracle text) parses all three loyalty abilities with zero residual
 /// `Unimplemented`, and each lands on the exact shape its rules text requires.
