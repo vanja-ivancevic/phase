@@ -102,6 +102,17 @@ pub fn resolve(
         hand.truncate(n);
     }
 
+    // CR 701.9a + CR 701.20a: a random hand reveal has a concrete result
+    // object even though the card never leaves the hand. Publish that object
+    // through the same resolution-local ledger used by RevealTop/Dig so a
+    // chained condition such as Cursed Scroll's "that card has the chosen
+    // name" can bind to the card selected by the game. This is deliberately
+    // limited to random selection; a normal whole-hand reveal is a population,
+    // not a singular anaphoric result.
+    if random {
+        state.last_revealed_ids = hand.clone();
+    }
+
     let needs_reveal_choice = choice_optional || !matches!(card_filter, TargetFilter::None);
 
     if hand.is_empty() {
@@ -687,6 +698,53 @@ mod tests {
             other => panic!("Expected RevealChoice, got {:?}", other),
         }
         assert_eq!(state.revealed_cards.len(), 1);
+    }
+
+    #[test]
+    fn random_hand_reveal_publishes_result_without_opening_choice() {
+        let mut state = GameState::new_two_player(42);
+        let card1 = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Bolt".to_string(),
+            Zone::Hand,
+        );
+        let card2 = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Bear".to_string(),
+            Zone::Hand,
+        );
+
+        let ability = ResolvedAbility::new(
+            Effect::RevealHand {
+                target: TargetFilter::Any,
+                card_filter: TargetFilter::None,
+                count: Some(crate::types::ability::QuantityExpr::Fixed { value: 1 }),
+                selection: crate::types::ability::CardSelectionMode::Random,
+                choice_optional: false,
+                reveal: true,
+            },
+            vec![TargetRef::Player(PlayerId(1))],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::RevealChoice { .. }),
+            "random reveal must not ask the controller to choose"
+        );
+        assert_eq!(state.last_revealed_ids.len(), 1);
+        assert!([card1, card2].contains(&state.last_revealed_ids[0]));
+        assert_eq!(state.revealed_cards.len(), 1);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::CardsRevealed { card_ids, .. } if card_ids.len() == 1
+        )));
     }
 
     /// CR 701.20a + CR 107.1: A compound `Offset` reveal count (Klaw — "one plus

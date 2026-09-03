@@ -3966,6 +3966,14 @@ fn effect_writes_last_revealed_ids(effect: &Effect) -> bool {
             // a chained "If it's a creature card, …" rider and an anaphoric
             // "turn it face up" follow-up read it (Hauntwoods Shrieker).
             | Effect::Reveal { .. }
+            // CR 701.9a + CR 701.20a: a random hand reveal publishes the
+            // selected card as the result object for a chained condition or
+            // anaphoric follow-up (Cursed Scroll). Ordinary whole-hand reveals
+            // intentionally remain outside this ledger.
+            | Effect::RevealHand {
+                selection: crate::types::ability::CardSelectionMode::Random,
+                ..
+            }
     )
 }
 

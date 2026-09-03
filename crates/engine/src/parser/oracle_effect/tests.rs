@@ -26161,6 +26161,70 @@ fn parse_reveal_a_card_from_target_opponents_hand_preserves_hand_owner() {
 }
 
 #[test]
+fn parse_random_hand_reveal_binds_chosen_name_condition() {
+    // Cursed Scroll: the game selects the revealed card; the damage rider only
+    // resolves when that result object matches the source's chosen name.
+    let def = parse_effect_chain(
+        "Reveal a card at random from your hand. If that card has the chosen name, this artifact deals 2 damage to any target.",
+        AbilityKind::Activated,
+    );
+
+    let Effect::RevealHand {
+        target,
+        card_filter,
+        count,
+        selection,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("Expected RevealHand, got {:?}", def.effect);
+    };
+    assert_eq!(*target, TargetFilter::Controller);
+    assert_eq!(*card_filter, TargetFilter::None);
+    assert_eq!(*count, Some(QuantityExpr::Fixed { value: 1 }));
+    assert!(selection.is_random());
+
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("expected conditional damage rider");
+    assert!(matches!(
+        rider.condition.as_ref(),
+        Some(AbilityCondition::TargetMatchesFilter {
+            filter: TargetFilter::HasChosenName,
+            use_lki: false,
+            subject_slot: None,
+        })
+    ));
+}
+
+#[test]
+fn parse_random_hand_reveal_preserves_target_opponent_axis() {
+    let def = parse_effect_chain(
+        "Reveal one card at random from target opponent's hand.",
+        AbilityKind::Spell,
+    );
+    let Effect::RevealHand {
+        target,
+        count,
+        selection,
+        card_filter,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("Expected RevealHand, got {:?}", def.effect);
+    };
+    assert!(matches!(
+        target,
+        TargetFilter::Typed(tf)
+            if tf.controller == Some(crate::types::ability::ControllerRef::Opponent)
+    ));
+    assert_eq!(*count, Some(QuantityExpr::Fixed { value: 1 }));
+    assert!(selection.is_random());
+    assert_eq!(*card_filter, TargetFilter::None);
+}
+
+#[test]
 fn parse_eladamri_hand_mode_reveal_sets_any_card_filter() {
     let def = parse_effect_chain(
             "Reveal a card from your hand. If it's a creature card, you may put it onto the battlefield.",
