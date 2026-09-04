@@ -110,6 +110,9 @@ fn gilded_drake_illegal_target_rider_is_absorbed_without_gap() {
 
     fn collect<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
         out.push(&def.effect);
+        if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
+            collect(effect, out);
+        }
         if let Some(sub) = &def.sub_ability {
             collect(sub, out);
         }
