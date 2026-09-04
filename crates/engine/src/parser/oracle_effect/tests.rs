@@ -36,6 +36,67 @@ fn assert_tracked_mana_value_source(def: &AbilityDefinition, expected: TrackedAn
     ));
 }
 
+/// Vision Charm's land-type mode is a paired named choice: the first value
+/// selects the lands to affect, while the second value supplies the replacement
+/// basic land type.  Keep this parser shape explicit so a future conjunction
+/// refactor cannot silently drop the second choice or its source persistence.
+#[test]
+fn paired_land_type_choices_feed_second_chosen_type_modification() {
+    let def = parse_effect_chain(
+        "Choose a land type and a basic land type. Each land of the first chosen type becomes the second chosen type until end of turn.",
+        AbilityKind::Spell,
+    );
+
+    let Effect::Choose {
+        choice_type: ChoiceType::LandType,
+        persist: true,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected persistent land-type choice, got {:?}", def.effect);
+    };
+    let second = def
+        .sub_ability
+        .as_deref()
+        .expect("paired choice must retain its second choice");
+    assert!(matches!(
+        second.effect.as_ref(),
+        Effect::Choose {
+            choice_type: ChoiceType::BasicLandType,
+            persist: true,
+            ..
+        }
+    ));
+
+    let replacement = second
+        .sub_ability
+        .as_deref()
+        .expect("paired choices must chain into the replacement effect");
+    let Effect::GenericEffect {
+        static_abilities,
+        duration: Some(Duration::UntilEndOfTurn),
+        ..
+    } = replacement.effect.as_ref()
+    else {
+        panic!("expected end-of-turn replacement effect, got {:?}", replacement.effect);
+    };
+    assert_eq!(static_abilities.len(), 1);
+    assert!(static_abilities[0]
+        .modifications
+        .contains(&ContinuousModification::SetChosenBasicLandType));
+    let affected = static_abilities[0]
+        .affected
+        .as_ref()
+        .expect("replacement must carry its affected filter");
+    let TargetFilter::Typed(typed) = affected else {
+        panic!("expected typed land filter, got {affected:?}");
+    };
+    assert!(typed.type_filters.contains(&TypeFilter::Land));
+    assert!(typed
+        .properties
+        .contains(&FilterProp::IsChosenLandType));
+}
+
 fn nested_batch_aggregate() -> PropertyAggregate {
     PropertyAggregate::new(
         AggregateFunction::Sum,
