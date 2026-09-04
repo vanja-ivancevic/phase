@@ -97,6 +97,47 @@ fn paired_land_type_choices_feed_second_chosen_type_modification() {
         .contains(&FilterProp::IsChosenLandType));
 }
 
+/// CR 608.2b: Gilded Drake's final sentence is a declarative targeting rider.
+/// It must not become an `unbound_subject` effect after the already-supported
+/// exchange/sacrifice chain; the ordinary target-resolution machinery supplies
+/// the stated “still resolves” behavior.
+#[test]
+fn gilded_drake_illegal_target_rider_is_absorbed_without_gap() {
+    let def = parse_effect_chain(
+        "When this creature enters, exchange control of this creature and up to one target creature an opponent controls. If you don't or can't make an exchange, sacrifice this creature. This ability still resolves if its target becomes illegal.",
+        AbilityKind::Spell,
+    );
+
+    fn collect<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+        out.push(&def.effect);
+        if let Some(sub) = &def.sub_ability {
+            collect(sub, out);
+        }
+        if let Some(else_ability) = &def.else_ability {
+            collect(else_ability, out);
+        }
+    }
+    let mut effects = Vec::new();
+    collect(&def, &mut effects);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Unimplemented { .. })),
+        "Gilded Drake's targeting rider must not leave a parser gap: {effects:#?}"
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ExchangeControl { .. }
+        )),
+        "the supported exchange instruction must remain in the chain: {effects:#?}"
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(effect, Effect::NoOp)),
+        "the declarative rider should be represented explicitly as NoOp: {effects:#?}"
+    );
+}
+
 fn nested_batch_aggregate() -> PropertyAggregate {
     PropertyAggregate::new(
         AggregateFunction::Sum,

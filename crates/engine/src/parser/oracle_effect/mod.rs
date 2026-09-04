@@ -9168,6 +9168,21 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
             description: None,
         });
     }
+    // CR 608.2b: "This ability still resolves if its target becomes illegal" is
+    // a declarative targeting rider, not a second game instruction. The engine's
+    // normal resolution path already checks each target independently and keeps
+    // the remaining legal instructions alive, so preserve the rider as an
+    // explicit no-op rather than reporting an unbound subject and marking the
+    // whole card unsupported. Keep this exact and end-anchored: a future rider
+    // with different legality semantics must earn its own parser/runtime proof.
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "this ability still resolves if its target becomes illegal",
+    ))
+    .parse(text.to_lowercase().as_str())
+    .is_ok()
+    {
+        return parsed_clause(Effect::NoOp);
+    }
     // CR 608.2d + CR 608.2c: A single instruction may announce multiple named
     // choices ("choose a land type and a basic land type") before a following
     // sentence consumes both values.  The ordinary named-choice parser is
