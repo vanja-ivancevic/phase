@@ -1938,6 +1938,7 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
         | TriggerCondition::CastVariantPaid { .. }
         | TriggerCondition::CastVariantPaidPersistent { .. }
         | TriggerCondition::ActivatedAbilityIsNonMana
+        | TriggerCondition::SourceAbilityAddedManaThisTurn
         | TriggerCondition::FirstTimeObjectTappedThisTurn
         // Both first-time siblings are terminal here: neither carries a legacy
         // player-filter/quantity ref, so the D5 legacy-batch-prompt flag is
@@ -6690,6 +6691,13 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         | TriggerCondition::TriggeringSpellMatchesFilter { .. } => reads_event_live(),
         TriggerCondition::ManaColorSpent { .. } | TriggerCondition::ManaSpentCondition { .. } => {
             reads_player_of(StateKind::JournalCast)
+        }
+        // CR 106.3 + CR 603.4: the exact-ability mana ledger is mutable
+        // per-turn state with no narrower existing StateKind. Conservatively
+        // classify it as `Other` so sibling-order analysis never assumes that
+        // a mana-producing ability commutes with a trigger that reads this gate.
+        TriggerCondition::SourceAbilityAddedManaThisTurn => {
+            reads_board_of(StateKind::Other)
         }
         TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
             let mut p = RwProfile::empty();

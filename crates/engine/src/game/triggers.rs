@@ -2424,12 +2424,13 @@ fn collect_matching_triggers_inner(
                     // event — the batch-level event is the wrong context.
                     let skip_early_condition = matches!(trig_def.mode, TriggerMode::Attacks);
                     if !skip_early_condition
-                        && !check_trigger_condition_with_source(
+                        && !check_trigger_condition_with_source_and_ability_index(
                             state,
                             condition,
                             controller,
                             Some(&source_context),
                             Some(event),
+                            Some(trig_idx),
                         )
                     {
                         continue;
@@ -2682,12 +2683,13 @@ fn collect_matching_triggers_inner(
                 // instead of the declaration that caused the trigger.
                 if !trig_def.batched {
                     if let Some(ref condition) = trig_def.condition {
-                        if !check_trigger_condition_with_source(
+                        if !check_trigger_condition_with_source_and_ability_index(
                             state,
                             condition,
                             controller,
                             Some(&source_context),
                             Some(&trigger_event),
+                            Some(trig_idx),
                         ) {
                             continue;
                         }
@@ -8934,6 +8936,7 @@ fn resolve_accepted_triggered_mana_body(
             trigger_event: trigger.trigger_event.as_ref(),
             subject_match_count: trigger.subject_match_count,
             die_result: trigger.die_result,
+            ability_index: trigger.ability.ability_index,
         }),
         Some(trigger_events.to_vec()),
     );
@@ -13196,6 +13199,28 @@ pub(crate) fn check_trigger_condition_with_source(
     source_context: Option<&TriggerSourceContext>,
     trigger_event: Option<&GameEvent>,
 ) -> bool {
+    check_trigger_condition_with_source_and_ability_index(
+        state,
+        condition,
+        controller,
+        source_context,
+        trigger_event,
+        None,
+    )
+}
+
+/// CR 603.4: Evaluate a trigger condition with the exact printed ability index
+/// that is being checked. Most conditions do not need this extra identity, but
+/// source-ability-relative predicates (for example Carpet of Flowers) must not
+/// collapse distinct abilities on one permanent into a source-wide flag.
+pub(crate) fn check_trigger_condition_with_source_and_ability_index(
+    state: &GameState,
+    condition: &TriggerCondition,
+    controller: PlayerId,
+    source_context: Option<&TriggerSourceContext>,
+    trigger_event: Option<&GameEvent>,
+    ability_index: Option<usize>,
+) -> bool {
     if trigger_event.is_some_and(|event| !zone_changed_condition_provenance_is_coherent(event)) {
         return false;
     }
@@ -13220,6 +13245,13 @@ pub(crate) fn check_trigger_condition_with_source(
     ) {
         return false;
     }
+    // CR 603.4: source-ability-relative leaves are likewise unanswerable
+    // without both the captured source and the exact printed ability index.
+    // Reject the whole tree before boolean combinators can invert a missing
+    // identity into a false-positive trigger.
+    if !trigger_condition_ability_index_resolvable(condition, source_context, ability_index) {
+        return false;
+    }
 
     evaluate_trigger_condition_with_source(
         state,
@@ -13227,7 +13259,29 @@ pub(crate) fn check_trigger_condition_with_source(
         controller,
         source_context,
         trigger_event,
+        ability_index,
     )
+}
+
+fn trigger_condition_ability_index_resolvable(
+    condition: &TriggerCondition,
+    source_context: Option<&TriggerSourceContext>,
+    ability_index: Option<usize>,
+) -> bool {
+    match condition {
+        TriggerCondition::SourceAbilityAddedManaThisTurn => {
+            source_context.is_some() && ability_index.is_some()
+        }
+        TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
+            conditions.iter().all(|inner| {
+                trigger_condition_ability_index_resolvable(inner, source_context, ability_index)
+            })
+        }
+        TriggerCondition::Not { condition } => {
+            trigger_condition_ability_index_resolvable(condition, source_context, ability_index)
+        }
+        _ => true,
+    }
 }
 
 /// CR 603.4 + CR 109.4: boundary predicate — does every designation leaf in this
@@ -13295,6 +13349,7 @@ fn evaluate_trigger_condition_with_source(
     controller: PlayerId,
     source_context: Option<&TriggerSourceContext>,
     trigger_event: Option<&GameEvent>,
+    ability_index: Option<usize>,
 ) -> bool {
     let source_id = source_context.map(|source| source.identity.reference.object_id);
     match condition {
@@ -13616,6 +13671,20 @@ fn evaluate_trigger_condition_with_source(
             Some(GameEvent::AbilityActivated { .. }) => true,
             _ => false,
         },
+        // CR 106.3 + CR 603.4: "with this ability" is keyed by the exact
+        // source object and printed ability index, and only a successful mana
+        // addition records the marker. Missing identity is unanswerable and
+        // therefore fails closed.
+        TriggerCondition::SourceAbilityAddedManaThisTurn => source_context
+            .and_then(|source| {
+                ability_index.map(|index| {
+                    (
+                        source.identity.reference.object_id,
+                        index,
+                    )
+                })
+            })
+            .is_some_and(|key| state.mana_added_by_abilities_this_turn.contains(&key)),
         // CR 700.4 + CR 120.1: True when the dying creature was dealt damage by the
         // trigger source this turn.
         TriggerCondition::DealtDamageBySourceThisTurn => {
@@ -14367,6 +14436,7 @@ fn evaluate_trigger_condition_with_source(
                 controller,
                 source_context,
                 trigger_event,
+                ability_index,
             )
         }),
         TriggerCondition::Or { conditions } => conditions.iter().any(|c| {
@@ -14376,6 +14446,7 @@ fn evaluate_trigger_condition_with_source(
                 controller,
                 source_context,
                 trigger_event,
+                ability_index,
             )
         }),
         // CR 603.4 + CR 608.2c: Logical negation — invert the wrapped condition's
@@ -14387,6 +14458,7 @@ fn evaluate_trigger_condition_with_source(
             controller,
             source_context,
             trigger_event,
+            ability_index,
         ),
         // CR 309.7: True when the controller has completed a dungeon. `specific: None`
         // matches "any dungeon"; `specific: Some(d)` matches dungeon `d`. Negation
@@ -29486,6 +29558,72 @@ pub mod tests {
             &cond,
             PlayerId(0),
             Some(src),
+            None,
+        ));
+    }
+
+    #[test]
+    fn source_ability_added_mana_tracks_exact_printed_ability_and_fails_closed_without_identity() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Carpet of Flowers".to_string(),
+            Zone::Battlefield,
+        );
+        let source_context = trigger_source_context_for_latch(
+            &state,
+            state.objects.get(&source).expect("source exists"),
+        );
+        let condition = TriggerCondition::Not {
+            condition: Box::new(TriggerCondition::SourceAbilityAddedManaThisTurn),
+        };
+
+        // The ability may fire before it has successfully added mana this turn.
+        assert!(check_trigger_condition_with_source_and_ability_index(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(&source_context),
+            None,
+            Some(0),
+        ));
+
+        // A successful activation of a different printed ability must not close
+        // Carpet's gate ("with this ability" is not source-wide).
+        state
+            .mana_added_by_abilities_this_turn
+            .insert((source, 1));
+        assert!(check_trigger_condition_with_source_and_ability_index(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(&source_context),
+            None,
+            Some(0),
+        ));
+
+        // Once this exact printed ability adds mana, its intervening-if fails.
+        state
+            .mana_added_by_abilities_this_turn
+            .insert((source, 0));
+        assert!(!check_trigger_condition_with_source_and_ability_index(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(&source_context),
+            None,
+            Some(0),
+        ));
+
+        // The compatibility wrapper has no ability identity and must reject the
+        // whole negated condition instead of inverting an unanswerable leaf.
+        assert!(!check_trigger_condition_with_source(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(&source_context),
             None,
         ));
     }

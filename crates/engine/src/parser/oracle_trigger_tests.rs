@@ -20254,6 +20254,20 @@ fn trigger_each_of_your_main_phases_uses_main_phase_constraint() {
         Some(TriggerConstraint::OnlyDuringYourMainPhase)
     );
     assert!(def.optional, "trigger should be optional ('you may')");
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::Not {
+            condition: Box::new(TriggerCondition::SourceAbilityAddedManaThisTurn),
+        }),
+        "Carpet's 'with this ability' gate must remain tied to the exact printed ability"
+    );
+    assert!(
+        matches!(
+            def.execute.as_deref().map(|ability| ability.effect.as_ref()),
+            Some(Effect::Mana { .. })
+        ),
+        "Carpet's payload must remain a mana effect"
+    );
 }
 
 /// Coalition Relic, third ability — Future Sight artifact, issue #130.

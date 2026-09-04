@@ -6483,6 +6483,27 @@ fn extract_if_condition_with_card_name(
         return result;
     }
 
+    // CR 106.3 + CR 603.4: Carpet of Flowers' reusable "with this ability"
+    // gate. This is source-ability-relative rather than a static game-state
+    // predicate, so it cannot be lowered through `parse_inner_condition`.
+    // Keep the grammar generic for any future ability using the same Oracle
+    // wording; the runtime binds the exact printed ability index at collection.
+    if let Some((before, _, rest)) = scan_preceded(
+        &lower,
+        parse_source_ability_added_mana_intervening_if,
+    )
+    .filter(|(before, _, _)| before.trim().is_empty())
+    {
+        let pos = before.len();
+        let clause_len = lower.len() - before.len() - rest.len();
+        return (
+            strip_condition_clause(text, pos, clause_len),
+            Some(TriggerCondition::Not {
+                condition: Box::new(TriggerCondition::SourceAbilityAddedManaThisTurn),
+            }),
+        );
+    }
+
     // CR 207.2c: Adamant — "if at least N [color] mana was spent to cast this/it"
     if let Some(result) = try_extract_adamant_condition(&tp, &lower, text) {
         return result;
@@ -8599,6 +8620,22 @@ fn try_extract_has_counter_condition(
         strip_condition_clause(text, pos, clause_len),
         Some(condition),
     ))
+}
+
+/// CR 106.3 + CR 603.4: Parse the exact reusable phrase used by
+/// "if you haven't added mana with this ability this turn". The leading
+/// `if` is included so `scan_preceded` can enforce that this is an
+/// intervening-if at the head of the trigger effect, not a later conditional.
+fn parse_source_ability_added_mana_intervening_if(
+    input: &str,
+) -> OracleResult<'_, ()> {
+    value(
+        (),
+        tag::<_, _, OracleError<'_>>(
+            "if you haven't added mana with this ability this turn",
+        ),
+    )
+    .parse(input)
 }
 
 /// Consume `" counter"` (or, when already at the word, `"counter"`), an optional

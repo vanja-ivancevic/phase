@@ -3659,7 +3659,8 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
         TriggerCondition::SourceIsAttacking => Axes::NONE,
         TriggerCondition::CastVariantPaid { variant: _ } => Axes::NONE,
         TriggerCondition::CastVariantPaidPersistent { variant: _ } => Axes::NONE,
-        TriggerCondition::ActivatedAbilityIsNonMana => Axes::NONE,
+        TriggerCondition::ActivatedAbilityIsNonMana
+        | TriggerCondition::SourceAbilityAddedManaThisTurn => Axes::NONE,
         TriggerCondition::DealtDamageBySourceThisTurn => Axes {
             event: false,
             sibling: false,

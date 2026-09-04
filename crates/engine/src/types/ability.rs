@@ -24070,6 +24070,14 @@ pub enum TriggerCondition {
     /// on activated-ability trigger events.
     ActivatedAbilityIsNonMana,
 
+    /// CR 106.3 + CR 603.4: True after this exact printed ability has added
+    /// one or more mana during the current turn. The evaluator receives the
+    /// printed ability index from trigger collection/resolution and keys the
+    /// per-turn ledger by the source's exact object id plus that index. This
+    /// models Carpet of Flowers' "with this ability" wording without widening
+    /// the condition to every mana ability on the permanent.
+    SourceAbilityAddedManaThisTurn,
+
     /// CR 700.4 + CR 120.1: "a creature dealt damage by ~ this turn dies" — death trigger
     /// gated on the dying creature having been dealt damage by the trigger source this turn.
     DealtDamageBySourceThisTurn,
@@ -24456,6 +24464,7 @@ impl TriggerCondition {
             | TriggerCondition::CastVariantPaid { .. }
             | TriggerCondition::CastVariantPaidPersistent { .. }
             | TriggerCondition::ActivatedAbilityIsNonMana
+            | TriggerCondition::SourceAbilityAddedManaThisTurn
             | TriggerCondition::DealtDamageBySourceThisTurn
             | TriggerCondition::DealtDamageThisTurnBySource { .. }
             | TriggerCondition::FirstTimeObjectTappedThisTurn

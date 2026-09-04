@@ -4387,6 +4387,7 @@ fn fmt_trigger_condition(cond: &crate::types::ability::TriggerCondition) -> Stri
         TC::CastVariantPaid { .. } => "cast variant was paid".into(),
         TC::CastVariantPaidPersistent { .. } => "cast variant was paid (persistent)".into(),
         TC::ActivatedAbilityIsNonMana => "activated ability is not a mana ability".into(),
+        TC::SourceAbilityAddedManaThisTurn => "source ability added mana this turn".into(),
         TC::DealtDamageBySourceThisTurn => "dealt damage by source this turn".into(),
         TC::DealtDamageThisTurnBySource { source } => {
             format!("dealt damage this turn by {}", fmt_target(source))
