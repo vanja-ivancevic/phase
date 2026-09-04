@@ -1721,6 +1721,8 @@ fn zaffai_once_per_turn_hand_free_casts_with_no_mana() {
             StaticDefinition::new(StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
                 origin: CastFreeOrigin::Hand,
+                all_players: false,
+                grants_flash: false,
             })
             .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant))),
         )
@@ -1815,6 +1817,8 @@ fn zaffai_second_cast_is_suppressed_same_turn() {
             StaticDefinition::new(StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
                 origin: CastFreeOrigin::Hand,
+                all_players: false,
+                grants_flash: false,
             })
             .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant))),
         )
@@ -1852,6 +1856,8 @@ fn cast_spell_for_free_uses_the_named_permission_source() {
             StaticDefinition::new(StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
                 origin: CastFreeOrigin::Hand,
+                all_players: false,
+                grants_flash: false,
             })
             .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant))),
         )
@@ -1862,6 +1868,8 @@ fn cast_spell_for_free_uses_the_named_permission_source() {
             StaticDefinition::new(StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
                 origin: CastFreeOrigin::Hand,
+                all_players: false,
+                grants_flash: false,
             })
             .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant))),
         )
@@ -2028,6 +2036,8 @@ fn hand_only_free_cast_source_does_not_apply_to_command_zone_commander() {
             StaticDefinition::new(StaticMode::CastFromHandFree {
                 frequency: CastFrequency::Unlimited,
                 origin: CastFreeOrigin::Hand,
+                all_players: false,
+                grants_flash: false,
             })
             .affected(TargetFilter::Any),
         );
@@ -2066,6 +2076,8 @@ fn unqualified_free_cast_source_applies_to_dragon_commander_after_hand_only_sour
             StaticDefinition::new(StaticMode::CastFromHandFree {
                 frequency: CastFrequency::Unlimited,
                 origin: CastFreeOrigin::Hand,
+                all_players: false,
+                grants_flash: false,
             })
             .affected(TargetFilter::Any),
         );
@@ -2075,6 +2087,8 @@ fn unqualified_free_cast_source_applies_to_dragon_commander_after_hand_only_sour
             StaticDefinition::new(StaticMode::CastFromHandFree {
                 frequency: CastFrequency::Unlimited,
                 origin: CastFreeOrigin::DefaultCastPermission,
+                all_players: false,
+                grants_flash: false,
             })
             .affected(TargetFilter::Typed(TypedFilter::new(TypeFilter::Subtype(
                 "Dragon".to_string(),

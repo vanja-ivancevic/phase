@@ -905,6 +905,16 @@ fn is_replacement_compound_pattern(lower: &str) -> bool {
     if has_enters_with_counter_tokens(lower) {
         return true;
     }
+    // CR 614.1c + CR 614.12: the Sutured Ghoul class is an as-enters
+    // replacement whose body is a zero-inclusive, unbounded graveyard exile
+    // choice. Keep the classifier guard narrow; the replacement parser remains
+    // the structural authority and rejects malformed variants fail-closed.
+    if lower_starts_with(lower, "as ")
+        && scan_contains(lower, "exile any number of")
+        && scan_contains(lower, "from your graveyard")
+    {
+        return true;
+    }
     if scan_contains(lower, "tapped for mana") && scan_contains(lower, "instead") {
         return true;
     }

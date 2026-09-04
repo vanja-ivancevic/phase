@@ -2424,12 +2424,13 @@ fn collect_matching_triggers_inner(
                     // event — the batch-level event is the wrong context.
                     let skip_early_condition = matches!(trig_def.mode, TriggerMode::Attacks);
                     if !skip_early_condition
-                        && !check_trigger_condition_with_source(
+                        && !check_trigger_condition_with_source_and_ability_index(
                             state,
                             condition,
                             controller,
                             Some(&source_context),
                             Some(event),
+                            Some(trig_idx),
                         )
                     {
                         continue;
@@ -2682,12 +2683,13 @@ fn collect_matching_triggers_inner(
                 // instead of the declaration that caused the trigger.
                 if !trig_def.batched {
                     if let Some(ref condition) = trig_def.condition {
-                        if !check_trigger_condition_with_source(
+                        if !check_trigger_condition_with_source_and_ability_index(
                             state,
                             condition,
                             controller,
                             Some(&source_context),
                             Some(&trigger_event),
+                            Some(trig_idx),
                         ) {
                             continue;
                         }
@@ -8934,6 +8936,7 @@ fn resolve_accepted_triggered_mana_body(
             trigger_event: trigger.trigger_event.as_ref(),
             subject_match_count: trigger.subject_match_count,
             die_result: trigger.die_result,
+            ability_index: trigger.ability.ability_index,
         }),
         Some(trigger_events.to_vec()),
     );
@@ -11100,6 +11103,7 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         | QuantityRef::ColorsInCommandersColorIdentity
         | QuantityRef::CommanderCastFromCommandZoneCount
         | QuantityRef::CommanderManaValue { .. } => false,
+        QuantityRef::TokenSourceCounters { .. } => false,
     }
 }
 
@@ -11513,6 +11517,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         // read live from the same place on both legs — the prop-level
         // counterpart of `TargetFilter::HasChosenName`.
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::ControllerChoseLabel { .. }
@@ -13195,6 +13200,28 @@ pub(crate) fn check_trigger_condition_with_source(
     source_context: Option<&TriggerSourceContext>,
     trigger_event: Option<&GameEvent>,
 ) -> bool {
+    check_trigger_condition_with_source_and_ability_index(
+        state,
+        condition,
+        controller,
+        source_context,
+        trigger_event,
+        None,
+    )
+}
+
+/// CR 603.4: Evaluate a trigger condition with the exact printed ability index
+/// that is being checked. Most conditions do not need this extra identity, but
+/// source-ability-relative predicates (for example Carpet of Flowers) must not
+/// collapse distinct abilities on one permanent into a source-wide flag.
+pub(crate) fn check_trigger_condition_with_source_and_ability_index(
+    state: &GameState,
+    condition: &TriggerCondition,
+    controller: PlayerId,
+    source_context: Option<&TriggerSourceContext>,
+    trigger_event: Option<&GameEvent>,
+    ability_index: Option<usize>,
+) -> bool {
     if trigger_event.is_some_and(|event| !zone_changed_condition_provenance_is_coherent(event)) {
         return false;
     }
@@ -13219,6 +13246,13 @@ pub(crate) fn check_trigger_condition_with_source(
     ) {
         return false;
     }
+    // CR 603.4: source-ability-relative leaves are likewise unanswerable
+    // without both the captured source and the exact printed ability index.
+    // Reject the whole tree before boolean combinators can invert a missing
+    // identity into a false-positive trigger.
+    if !trigger_condition_ability_index_resolvable(condition, source_context, ability_index) {
+        return false;
+    }
 
     evaluate_trigger_condition_with_source(
         state,
@@ -13226,7 +13260,29 @@ pub(crate) fn check_trigger_condition_with_source(
         controller,
         source_context,
         trigger_event,
+        ability_index,
     )
+}
+
+fn trigger_condition_ability_index_resolvable(
+    condition: &TriggerCondition,
+    source_context: Option<&TriggerSourceContext>,
+    ability_index: Option<usize>,
+) -> bool {
+    match condition {
+        TriggerCondition::SourceAbilityAddedManaThisTurn => {
+            source_context.is_some() && ability_index.is_some()
+        }
+        TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
+            conditions.iter().all(|inner| {
+                trigger_condition_ability_index_resolvable(inner, source_context, ability_index)
+            })
+        }
+        TriggerCondition::Not { condition } => {
+            trigger_condition_ability_index_resolvable(condition, source_context, ability_index)
+        }
+        _ => true,
+    }
 }
 
 /// CR 603.4 + CR 109.4: boundary predicate — does every designation leaf in this
@@ -13294,6 +13350,7 @@ fn evaluate_trigger_condition_with_source(
     controller: PlayerId,
     source_context: Option<&TriggerSourceContext>,
     trigger_event: Option<&GameEvent>,
+    ability_index: Option<usize>,
 ) -> bool {
     let source_id = source_context.map(|source| source.identity.reference.object_id);
     match condition {
@@ -13615,6 +13672,20 @@ fn evaluate_trigger_condition_with_source(
             Some(GameEvent::AbilityActivated { .. }) => true,
             _ => false,
         },
+        // CR 106.3 + CR 603.4: "with this ability" is keyed by the exact
+        // source object and printed ability index, and only a successful mana
+        // addition records the marker. Missing identity is unanswerable and
+        // therefore fails closed.
+        TriggerCondition::SourceAbilityAddedManaThisTurn => source_context
+            .and_then(|source| {
+                ability_index.map(|index| {
+                    (
+                        source.identity.reference.object_id,
+                        index,
+                    )
+                })
+            })
+            .is_some_and(|key| state.mana_added_by_abilities_this_turn.contains(&key)),
         // CR 700.4 + CR 120.1: True when the dying creature was dealt damage by the
         // trigger source this turn.
         TriggerCondition::DealtDamageBySourceThisTurn => {
@@ -14178,6 +14249,41 @@ fn evaluate_trigger_condition_with_source(
                     if object.zone == *zone
             )
         }),
+        // CR 404.1 + CR 603.4: the source must remain the exact live object in
+        // the required owner-scoped zone, and the next card in that owner's
+        // graveyard vector (the card immediately above it) must match the
+        // printed filter. Fail closed when either object or adjacency is absent.
+        TriggerCondition::SourceInZoneWithAdjacentFilter { zone, adjacent } => source_context
+            .is_some_and(|source| {
+                let TriggerSourceRead::ExactLive(object) = source.source_read(state) else {
+                    return false;
+                };
+                if object.zone != *zone {
+                    return false;
+                }
+                if *zone != Zone::Graveyard {
+                    return false;
+                }
+                let owner = object.owner;
+                let Some(graveyard) = state.players.get(owner.0 as usize).map(|p| &p.graveyard)
+                else {
+                    return false;
+                };
+                let Some(position) = graveyard.iter().position(|id| *id == object.id) else {
+                    return false;
+                };
+                let Some(adjacent_id) = graveyard.get(position + 1).copied() else {
+                    return false;
+                };
+                let context = FilterContext::from_trigger_source(source);
+                crate::game::filter::matches_target_filter_for_zone(
+                    state,
+                    adjacent_id,
+                    Zone::Graveyard,
+                    adjacent,
+                    &context,
+                )
+            }),
         // CR 702.104b: True when the Tribute ETB replacement resolved without the
         // chosen opponent placing the +1/+1 counters. Read from the creature's
         // persisted `ChosenAttribute::TributeOutcome` — explicit `Declined` or no
@@ -14331,6 +14437,7 @@ fn evaluate_trigger_condition_with_source(
                 controller,
                 source_context,
                 trigger_event,
+                ability_index,
             )
         }),
         TriggerCondition::Or { conditions } => conditions.iter().any(|c| {
@@ -14340,6 +14447,7 @@ fn evaluate_trigger_condition_with_source(
                 controller,
                 source_context,
                 trigger_event,
+                ability_index,
             )
         }),
         // CR 603.4 + CR 608.2c: Logical negation — invert the wrapped condition's
@@ -14351,6 +14459,7 @@ fn evaluate_trigger_condition_with_source(
             controller,
             source_context,
             trigger_event,
+            ability_index,
         ),
         // CR 309.7: True when the controller has completed a dungeon. `specific: None`
         // matches "any dungeon"; `specific: Some(d)` matches dungeon `d`. Negation
@@ -15246,6 +15355,7 @@ fn quantity_ref_refs_cost_paid_object(qty: &QuantityRef) -> bool {
         | QuantityRef::CommanderCastFromCommandZoneCount
         | QuantityRef::CommanderManaValue { .. }
         | QuantityRef::VoteCount { .. } => false,
+        QuantityRef::TokenSourceCounters { .. } => false,
     }
 }
 
@@ -15657,6 +15767,130 @@ pub mod tests {
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
+    }
+
+    #[test]
+    fn source_zone_adjacent_filter_checks_graveyard_order_and_type() {
+        // CR 404.1 + CR 603.4: the source itself and the card immediately
+        // above it are independent live objects; both facts must be true at
+        // trigger time and at the resolution re-check.
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(0x100),
+            PlayerId(0),
+            "Krovikan Horror".to_string(),
+            Zone::Graveyard,
+        );
+        let adjacent = create_object(
+            &mut state,
+            CardId(0x101),
+            PlayerId(0),
+            "Graveyard Creature".to_string(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&adjacent)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        state.players[0].graveyard.push_back(source);
+        state.players[0].graveyard.push_back(adjacent);
+
+        let condition = TriggerCondition::SourceInZoneWithAdjacentFilter {
+            zone: Zone::Graveyard,
+            adjacent: TargetFilter::Typed(TypedFilter::creature()),
+        };
+        assert!(check_trigger_condition(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(source),
+            None,
+        ));
+
+        // A non-creature directly above the source does not satisfy the rider.
+        state
+            .objects
+            .get_mut(&adjacent)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Land];
+        assert!(!check_trigger_condition(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(source),
+            None,
+        ));
+
+        // With no newer card, the adjacency predicate fails closed.
+        state.players[0].graveyard.pop_back();
+        assert!(!check_trigger_condition(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(source),
+            None,
+        ));
+    }
+
+    #[test]
+    fn graveyard_phase_trigger_with_adjacent_filter_fires() {
+        // CR 603.2 + CR 603.4: a Krovikan-style source in the graveyard is
+        // found by its declared trigger zone and then gated by the live
+        // adjacency condition during phase-trigger collection.
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        state.phase = Phase::End;
+        let source = create_object(
+            &mut state,
+            CardId(0x110),
+            PlayerId(0),
+            "Krovikan Horror".to_string(),
+            Zone::Graveyard,
+        );
+        let adjacent = create_object(
+            &mut state,
+            CardId(0x111),
+            PlayerId(0),
+            "Graveyard Creature".to_string(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&adjacent)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        state.players[0].graveyard.push_back(source);
+        state.players[0].graveyard.push_back(adjacent);
+
+        let trigger = TriggerDefinition::new(TriggerMode::Phase)
+            .phase(Phase::End)
+            .valid_target(TargetFilter::Controller)
+            .trigger_zones(vec![Zone::Graveyard])
+            .condition(TriggerCondition::SourceInZoneWithAdjacentFilter {
+                zone: Zone::Graveyard,
+                adjacent: TargetFilter::Typed(TypedFilter::creature()),
+            })
+            .execute(AbilityDefinition::new(
+                AbilityKind::Database,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+            ));
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .trigger_definitions
+            .push(trigger);
+
+        process_triggers(&mut state, &[GameEvent::PhaseChanged { phase: Phase::End }]);
+        assert_eq!(state.stack.len(), 1);
     }
 
     #[test]
@@ -29326,6 +29560,72 @@ pub mod tests {
             &cond,
             PlayerId(0),
             Some(src),
+            None,
+        ));
+    }
+
+    #[test]
+    fn source_ability_added_mana_tracks_exact_printed_ability_and_fails_closed_without_identity() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Carpet of Flowers".to_string(),
+            Zone::Battlefield,
+        );
+        let source_context = trigger_source_context_for_latch(
+            &state,
+            state.objects.get(&source).expect("source exists"),
+        );
+        let condition = TriggerCondition::Not {
+            condition: Box::new(TriggerCondition::SourceAbilityAddedManaThisTurn),
+        };
+
+        // The ability may fire before it has successfully added mana this turn.
+        assert!(check_trigger_condition_with_source_and_ability_index(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(&source_context),
+            None,
+            Some(0),
+        ));
+
+        // A successful activation of a different printed ability must not close
+        // Carpet's gate ("with this ability" is not source-wide).
+        state
+            .mana_added_by_abilities_this_turn
+            .insert((source, 1));
+        assert!(check_trigger_condition_with_source_and_ability_index(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(&source_context),
+            None,
+            Some(0),
+        ));
+
+        // Once this exact printed ability adds mana, its intervening-if fails.
+        state
+            .mana_added_by_abilities_this_turn
+            .insert((source, 0));
+        assert!(!check_trigger_condition_with_source_and_ability_index(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(&source_context),
+            None,
+            Some(0),
+        ));
+
+        // The compatibility wrapper has no ability identity and must reject the
+        // whole negated condition instead of inverting an unanswerable leaf.
+        assert!(!check_trigger_condition_with_source(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(&source_context),
             None,
         ));
     }

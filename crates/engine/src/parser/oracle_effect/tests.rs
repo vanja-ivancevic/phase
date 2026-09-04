@@ -36,6 +36,188 @@ fn assert_tracked_mana_value_source(def: &AbilityDefinition, expected: TrackedAn
     ));
 }
 
+/// Vision Charm's land-type mode is a paired named choice: the first value
+/// selects the lands to affect, while the second value supplies the replacement
+/// basic land type.  Keep this parser shape explicit so a future conjunction
+/// refactor cannot silently drop the second choice or its source persistence.
+#[test]
+fn paired_land_type_choices_feed_second_chosen_type_modification() {
+    let def = parse_effect_chain(
+        "Choose a land type and a basic land type. Each land of the first chosen type becomes the second chosen type until end of turn.",
+        AbilityKind::Spell,
+    );
+
+    let Effect::Choose {
+        choice_type: ChoiceType::LandType,
+        persist: true,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected persistent land-type choice, got {:?}", def.effect);
+    };
+    let second = def
+        .sub_ability
+        .as_deref()
+        .expect("paired choice must retain its second choice");
+    assert!(matches!(
+        second.effect.as_ref(),
+        Effect::Choose {
+            choice_type: ChoiceType::BasicLandType,
+            persist: true,
+            ..
+        }
+    ));
+
+    let replacement = second
+        .sub_ability
+        .as_deref()
+        .expect("paired choices must chain into the replacement effect");
+    let Effect::GenericEffect {
+        static_abilities,
+        duration: Some(Duration::UntilEndOfTurn),
+        ..
+    } = replacement.effect.as_ref()
+    else {
+        panic!("expected end-of-turn replacement effect, got {:?}", replacement.effect);
+    };
+    assert_eq!(static_abilities.len(), 1);
+    assert!(static_abilities[0]
+        .modifications
+        .contains(&ContinuousModification::SetChosenBasicLandType));
+    let affected = static_abilities[0]
+        .affected
+        .as_ref()
+        .expect("replacement must carry its affected filter");
+    let TargetFilter::Typed(typed) = affected else {
+        panic!("expected typed land filter, got {affected:?}");
+    };
+    assert!(typed.type_filters.contains(&TypeFilter::Land));
+    assert!(typed
+        .properties
+        .contains(&FilterProp::IsChosenLandType));
+}
+
+/// CR 608.2b: Gilded Drake's final sentence is a declarative targeting rider.
+/// It must not become an `unbound_subject` effect after the already-supported
+/// exchange/sacrifice chain; the ordinary target-resolution machinery supplies
+/// the stated “still resolves” behavior.
+#[test]
+fn gilded_drake_illegal_target_rider_is_absorbed_without_gap() {
+    let def = parse_effect_chain(
+        "When this creature enters, exchange control of this creature and up to one target creature an opponent controls. If you don't or can't make an exchange, sacrifice this creature. This ability still resolves if its target becomes illegal.",
+        AbilityKind::Spell,
+    );
+
+    fn collect<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+        out.push(&def.effect);
+        if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
+            collect(effect, out);
+        }
+        if let Some(sub) = &def.sub_ability {
+            collect(sub, out);
+        }
+        if let Some(else_ability) = &def.else_ability {
+            collect(else_ability, out);
+        }
+    }
+    let mut effects = Vec::new();
+    collect(&def, &mut effects);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Unimplemented { .. })),
+        "Gilded Drake's targeting rider must not leave a parser gap: {effects:#?}"
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ExchangeControl { .. }
+        )),
+        "the supported exchange instruction must remain in the chain: {effects:#?}"
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(effect, Effect::NoOp)),
+        "the declarative rider should be represented explicitly as NoOp: {effects:#?}"
+    );
+}
+
+/// CR 119.1 + CR 603.2: Wild Dogs' upkeep handoff names the player with the
+/// highest life total, not a fixed opponent or the ability controller. The
+/// subject must lower through the shared max-life PlayerFilter and the existing
+/// GainControl-to-GiveControl rewrite.
+#[test]
+fn most_life_player_subject_rewrites_to_dynamic_give_control() {
+    let def = parse_effect_chain(
+        "the player with the most life gains control of ~",
+        AbilityKind::Spell,
+    );
+    let Effect::GiveControl { target, recipient } = def.effect.as_ref() else {
+        panic!("expected GiveControl, got {:?}", def.effect);
+    };
+    assert_eq!(*target, TargetFilter::SelfRef);
+    let TargetFilter::PlayerMatching { player } = recipient else {
+        panic!("expected PlayerMatching recipient, got {recipient:?}");
+    };
+    assert!(matches!(
+        player.as_ref(),
+        PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::All,
+            attr,
+            comparator: Comparator::GE,
+            value,
+        } if matches!(
+            attr.as_ref(),
+            QuantityRef::LifeTotal { player: PlayerScope::ScopedPlayer }
+        ) && matches!(
+            value.as_ref(),
+            QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::AllPlayers {
+                        aggregate: AggregateFunction::Max,
+                        exclude: None,
+                    }
+                }
+            }
+        )
+    ));
+}
+
+/// CR 603.2 + CR 119.1: the complete Wild Dogs oracle text must retain the
+/// intervening-if trigger and lower its control handoff without a subject gap.
+#[test]
+fn wild_dogs_full_oracle_text_has_dynamic_control_handoff() {
+    let parsed = parse_oracle_text(
+        "At the beginning of your upkeep, if a player has more life than each other player, the player with the most life gains control of this creature.\nCycling {2}.",
+        "Wild Dogs",
+        &[],
+        &["Creature".to_string()],
+        &["Dog".to_string()],
+    );
+    let execute = parsed
+        .triggers
+        .first()
+        .and_then(|trigger| trigger.execute.as_deref())
+        .expect("Wild Dogs must have an upkeep trigger body");
+
+    fn find_give_control<'a>(ability: &'a AbilityDefinition) -> Option<&'a Effect> {
+        if matches!(ability.effect.as_ref(), Effect::GiveControl { .. }) {
+            return Some(ability.effect.as_ref());
+        }
+        ability
+            .sub_ability
+            .as_deref()
+            .and_then(find_give_control)
+            .or_else(|| ability.else_ability.as_deref().and_then(find_give_control))
+    }
+
+    let Effect::GiveControl { recipient, .. } = find_give_control(execute)
+        .expect("upkeep trigger must contain GiveControl")
+    else {
+        unreachable!();
+    };
+    assert!(matches!(recipient, TargetFilter::PlayerMatching { .. }));
+}
+
 fn nested_batch_aggregate() -> PropertyAggregate {
     PropertyAggregate::new(
         AggregateFunction::Sum,
@@ -8044,6 +8226,68 @@ fn effect_unless_pays_colored_mana_preserves_shards_after_lowercase() {
         "colored unless mana must preserve the red shard, got {cost:?}"
     );
 }
+/// CR 608.2b: Goblin Welder's "If both targets are still legal as this
+/// ability resolves" is the target pipeline's represented legality rider,
+/// not a swallowed game-state condition. The AST must retain both announced
+/// target slots and the full sacrifice/return chain, while the audit must not
+/// report a spurious Condition_If warning.
+#[test]
+fn goblin_welder_target_legality_rider_is_represented() {
+    let parsed = parse_oracle_text(
+        "{T}: Choose target artifact a player controls and target artifact card in that player's graveyard. If both targets are still legal as this ability resolves, that player simultaneously sacrifices the artifact and returns the artifact card to the battlefield.",
+        "Goblin Welder",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    assert_eq!(parsed.abilities.len(), 1);
+    assert!(
+        !parsed.parse_warnings.iter().any(|warning| matches!(
+            warning,
+            crate::parser::oracle_ir::diagnostic::OracleDiagnostic::SwallowedClause {
+                detector,
+                ..
+            } if detector == "Condition_If"
+        )),
+        "target-legality rider must not be reported as swallowed: {:?}",
+        parsed.parse_warnings
+    );
+
+    fn collect<'a>(ability: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+        out.push(&ability.effect);
+        if let Some(sub) = ability.sub_ability.as_deref() {
+            collect(sub, out);
+        }
+        if let Some(else_ability) = ability.else_ability.as_deref() {
+            collect(else_ability, out);
+        }
+    }
+    let mut effects = Vec::new();
+    collect(&parsed.abilities[0], &mut effects);
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::TargetOnly { .. }))
+            .count(),
+        2,
+        "both target slots must remain represented: {effects:#?}"
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Sacrifice {
+            target: TargetFilter::ParentTargetSlot { index: 0 },
+            ..
+        }
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::ChangeZone {
+            target: TargetFilter::ParentTargetSlot { index: 1 },
+            destination: Zone::Battlefield,
+            ..
+        }
+    )));
+}
 
 // Issue #3308 GAP A — full-card swallow/parse-warning check. Spell Stutter
 // and Concerted Defense are single-clause counterspells; once the dynamic
@@ -10848,6 +11092,35 @@ fn effect_it_explores_x_times_sets_repeat_for() {
         def.repeat_for,
         Some(QuantityExpr::Ref {
             qty: QuantityRef::Variable { .. }
+        })
+    ));
+}
+
+#[test]
+fn tangle_wire_taps_once_per_fade_counter() {
+    // CR 122.1 + CR 608.2c: the trailing counter phrase is an instruction
+    // multiplier, not an amount on Tap. Each iteration must therefore ask for
+    // one eligible permanent and tap it, with the count read from this source.
+    let def = parse_effect_chain(
+        "That player taps an untapped artifact, creature, or land they control for each fade counter on this artifact.",
+        AbilityKind::Activated,
+    );
+
+    assert!(matches!(
+        &*def.effect,
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            state: TapStateChange::Tap,
+            ..
+        }
+    ));
+    assert!(matches!(
+        def.repeat_for,
+        Some(QuantityExpr::Ref {
+            qty: QuantityRef::CountersOn {
+                scope: ObjectScope::Source,
+                counter_type: Some(CounterType::Fade),
+            }
         })
     ));
 }
@@ -19471,6 +19744,77 @@ fn temporal_prefix_in_effect_chain() {
     }
 }
 
+/// CR 603.7a + CR 502.2: an activated ability may defer its effect to the
+/// controller's next untap step.  Undiscovered Paradise uses the canonical
+/// "during your next untap step, as you untap your permanents" wording; this
+/// must lower through the shared delayed-trigger mechanism rather than the
+/// continuous-duration parser.
+#[test]
+fn during_next_untap_step_installs_controller_scoped_delayed_trigger() {
+    use crate::types::ability::TurnGate;
+
+    let def = parse_effect_chain(
+        "During your next untap step, as you untap your permanents, return this land to its owner's hand.",
+        AbilityKind::Activated,
+    );
+    let Effect::CreateDelayedTrigger {
+        condition, effect, ..
+    } = &*def.effect
+    else {
+        panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
+    };
+    assert_eq!(
+        *condition,
+        DelayedTriggerCondition::AtNextPhaseForPlayer {
+            phase: Phase::Untap,
+            player: crate::types::player::PlayerId(0),
+            gate: TurnGate::None,
+        }
+    );
+    assert!(
+        matches!(*effect.effect, Effect::Bounce { .. }),
+        "delayed body should return the source land, got {:?}",
+        effect.effect
+    );
+}
+
+/// CR 603.7a + CR 502.2: the full Undiscovered Paradise activated ability
+/// must retain its delayed return after the mana head is parsed. This catches
+/// the sequence splitter seam that a standalone temporal-clause test cannot.
+#[test]
+fn undiscovered_paradise_keeps_delayed_return_after_mana_head() {
+    let parsed = parse_oracle_text(
+        "{T}: Add one mana of any color. During your next untap step, as you untap your permanents, return this land to its owner's hand.",
+        "Undiscovered Paradise",
+        &[],
+        &["Land".to_string()],
+        &[],
+    );
+    assert_eq!(parsed.abilities.len(), 1, "expected one activated ability");
+    let def = &parsed.abilities[0];
+    assert_eq!(def.kind, AbilityKind::Activated);
+    let delayed = def
+        .sub_ability
+        .as_deref()
+        .expect("mana head must retain the delayed return");
+    let Effect::CreateDelayedTrigger { condition, effect, .. } = &*delayed.effect else {
+        panic!("expected delayed return, got {:?}", delayed.effect);
+    };
+    assert_eq!(
+        *condition,
+        DelayedTriggerCondition::AtNextPhaseForPlayer {
+            phase: Phase::Untap,
+            player: crate::types::player::PlayerId(0),
+            gate: TurnGate::None,
+        }
+    );
+    assert!(
+        matches!(*effect.effect, Effect::Bounce { .. }),
+        "delayed body should bounce the source land, got {:?}",
+        effect.effect
+    );
+}
+
 #[test]
 fn temporal_prefix_preserves_full_delayed_effect_chain() {
     let def = parse_effect_chain(
@@ -19537,6 +19881,75 @@ fn non_targeted_multi_untap_chooses_at_resolution() {
     assert_eq!(
         untap.multi_target,
         Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 3 }))
+    );
+}
+
+/// CR 609.3 + CR 701.26a: Tangle Wire's upkeep trigger taps one untapped
+/// permanent for each fade counter.  This is a dynamic count over an
+/// at-resolution object choice, not a mass tap of every eligible permanent.
+/// Keep it on the shared for-each path so other counted tap/untap cards inherit
+/// the same picker and replacement handling.
+#[test]
+fn tangle_wire_dynamic_for_each_tap_chooses_at_resolution() {
+    let mut ctx = ParseContext::default();
+    let clause = try_parse_for_each_effect(
+        "that player taps an untapped artifact, creature, or land they control for each fade counter on this artifact",
+        &mut ctx,
+    )
+    .expect("Tangle Wire's dynamic tap clause must parse");
+
+    assert!(matches!(
+        clause.effect,
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            state: TapStateChange::Tap,
+            ..
+        }
+    ));
+    assert_eq!(
+        clause.multi_target,
+        Some(MultiTargetSpec::exact(QuantityExpr::Ref {
+            qty: QuantityRef::CountersOn {
+                scope: ObjectScope::Source,
+                counter_type: Some(CounterType::Fade),
+            },
+        }))
+    );
+}
+
+#[test]
+fn tangle_wire_dynamic_tap_chain_is_resolution_time_and_typed() {
+    let def = parse_effect_chain(
+        "That player taps an untapped artifact, creature, or land they control for each fade counter on this artifact",
+        AbilityKind::Spell,
+    );
+    assert!(
+        matches!(
+            def.effect.as_ref(),
+            Effect::SetTapState {
+                target: TargetFilter::Or { .. },
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
+            }
+        ),
+        "unexpected Tangle Wire chain: {def:?}"
+    );
+    let Effect::SetTapState { target, .. } = def.effect.as_ref() else {
+        unreachable!("the shape was asserted above");
+    };
+    let TargetFilter::Or { filters } = target else {
+        unreachable!("the shape was asserted above");
+    };
+    assert_eq!(filters.len(), 3);
+    assert_eq!(def.target_choice_timing, TargetChoiceTiming::Resolution);
+    assert_eq!(
+        def.multi_target,
+        Some(MultiTargetSpec::exact(QuantityExpr::Ref {
+            qty: QuantityRef::CountersOn {
+                scope: ObjectScope::Source,
+                counter_type: Some(CounterType::Fade),
+            },
+        }))
     );
 }
 
@@ -20579,6 +20992,8 @@ fn effect_emblem_tamiyo_field_researcher_hand_free_cast() {
                     StaticMode::CastFromHandFree {
                         frequency: CastFrequency::Unlimited,
                         origin: CastFreeOrigin::Hand,
+                        all_players: false,
+                        grants_flash: false,
                     }
                 ),
                 "expected CastFromHandFree static, got {:?}",
@@ -26158,6 +26573,70 @@ fn parse_reveal_a_card_from_target_opponents_hand_preserves_hand_owner() {
             if tf.controller == Some(crate::types::ability::ControllerRef::Opponent)
     ));
     assert_eq!(*card_filter, TargetFilter::Any);
+}
+
+#[test]
+fn parse_random_hand_reveal_binds_chosen_name_condition() {
+    // Cursed Scroll: the game selects the revealed card; the damage rider only
+    // resolves when that result object matches the source's chosen name.
+    let def = parse_effect_chain(
+        "Reveal a card at random from your hand. If that card has the chosen name, this artifact deals 2 damage to any target.",
+        AbilityKind::Activated,
+    );
+
+    let Effect::RevealHand {
+        target,
+        card_filter,
+        count,
+        selection,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("Expected RevealHand, got {:?}", def.effect);
+    };
+    assert_eq!(*target, TargetFilter::Controller);
+    assert_eq!(*card_filter, TargetFilter::None);
+    assert_eq!(*count, Some(QuantityExpr::Fixed { value: 1 }));
+    assert!(selection.is_random());
+
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("expected conditional damage rider");
+    assert!(matches!(
+        rider.condition.as_ref(),
+        Some(AbilityCondition::TargetMatchesFilter {
+            filter: TargetFilter::HasChosenName,
+            use_lki: false,
+            subject_slot: None,
+        })
+    ));
+}
+
+#[test]
+fn parse_random_hand_reveal_preserves_target_opponent_axis() {
+    let def = parse_effect_chain(
+        "Reveal one card at random from target opponent's hand.",
+        AbilityKind::Spell,
+    );
+    let Effect::RevealHand {
+        target,
+        count,
+        selection,
+        card_filter,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("Expected RevealHand, got {:?}", def.effect);
+    };
+    assert!(matches!(
+        target,
+        TargetFilter::Typed(tf)
+            if tf.controller == Some(crate::types::ability::ControllerRef::Opponent)
+    ));
+    assert_eq!(*count, Some(QuantityExpr::Fixed { value: 1 }));
+    assert!(selection.is_random());
+    assert_eq!(*card_filter, TargetFilter::None);
 }
 
 #[test]
@@ -41220,6 +41699,64 @@ fn strip_target_supertype_conditional_suffix_nonbasic_land_uses_lki() {
                 p,
                 FilterProp::NotSupertype {
                     value: Supertype::Basic
+                }
+            )));
+        }
+        other => panic!("expected TargetMatchesFilter, got: {other:?}"),
+    }
+}
+
+#[test]
+fn strip_target_supertype_conditional_leading_snow_land_uses_lki() {
+    let (cond, text) =
+        strip_target_supertype_conditional("If that land was a snow land, you gain 1 life.");
+    assert!(cond.is_some(), "should extract snow land condition");
+    assert_eq!(text, "you gain 1 life.");
+    match cond.unwrap() {
+        AbilityCondition::TargetMatchesFilter {
+            filter, use_lki, ..
+        } => {
+            assert!(use_lki);
+            let TargetFilter::Typed(tf) = filter else {
+                panic!("expected Typed filter");
+            };
+            assert!(tf
+                .type_filters
+                .iter()
+                .any(|f| matches!(f, TypeFilter::Land)));
+            assert!(tf.properties.iter().any(|p| matches!(
+                p,
+                FilterProp::HasSupertype {
+                    value: Supertype::Snow
+                }
+            )));
+        }
+        other => panic!("expected TargetMatchesFilter, got: {other:?}"),
+    }
+}
+
+#[test]
+fn strip_target_supertype_conditional_suffix_snow_land_uses_lki() {
+    let (cond, text) =
+        strip_target_supertype_conditional("You gain 1 life if that land was a snow land.");
+    assert!(cond.is_some(), "should extract snow land condition");
+    assert_eq!(text, "You gain 1 life");
+    match cond.unwrap() {
+        AbilityCondition::TargetMatchesFilter {
+            filter, use_lki, ..
+        } => {
+            assert!(use_lki);
+            let TargetFilter::Typed(tf) = filter else {
+                panic!("expected Typed filter");
+            };
+            assert!(tf
+                .type_filters
+                .iter()
+                .any(|f| matches!(f, TypeFilter::Land)));
+            assert!(tf.properties.iter().any(|p| matches!(
+                p,
+                FilterProp::HasSupertype {
+                    value: Supertype::Snow
                 }
             )));
         }

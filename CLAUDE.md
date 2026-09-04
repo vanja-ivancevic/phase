@@ -179,6 +179,25 @@ If you cannot find the rule number in `docs/MagicCompRules.txt`, do NOT write th
 
 Use `cargo-release` via the workspace alias (`cargo release-local <version>`) — **never tag manually with `git tag`**. Full release + CI steps are in the **`project-reference`** skill; the **`ship-commits`** skill handles landing commits through the merge queue.
 
+## Patina old-border verification boundary
+
+- `crates/patina-old-border-smoke` is Patina's fast, database-free mechanism
+  suite. It depends on `phase-engine` as a normal library, intentionally
+  avoiding Phase's own `#[cfg(test)]` corpus and monolithic integration binary.
+- Add one deterministic scenario per reusable old-border mechanism batch. The
+  compact suite is a fast gate, not a substitute for card-data regeneration,
+  Phase integration, or Forge differential testing at milestones.
+- Use the M4 wrapper for routine compact checks. Beluga's detached runner is
+  an explicitly user-approved fallback only: start it with
+  `FORGE_PATINA_SMOKE_ALLOW_BELUGA=1 scripts/patina-old-border-smoke.sh start`.
+  It has a persistent local target cache plus 8 GiB soft / 9 GiB hard RAM and
+  2 GiB swap caps, and it refuses insufficient available memory or concurrent
+  Rust builds. Inspect it with `status` or `logs`; never attach a cold Phase
+  compile to an interactive agent process.
+- Do not run a full Phase Cargo gate on Beluga. Use the M4 wrapper for full
+  Phase, card-data, WASM, and playable-app gates once its load/memory guard
+  permits it.
+
 ## Planning
 
 Project planning docs live in `.planning/` with phase-based organization (phases 01-09+). Each phase has CONTEXT, RESEARCH, PLAN, SUMMARY, and VERIFICATION docs. `PROJECT.md` contains the project manifest with requirements and key decisions.

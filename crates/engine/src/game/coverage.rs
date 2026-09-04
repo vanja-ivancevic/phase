@@ -886,6 +886,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 parts.push(format!("{value}").to_lowercase());
             }
             FilterProp::IsChosenCreatureType => parts.push("chosen creature type".into()),
+            FilterProp::IsChosenLandType => parts.push("chosen land type".into()),
             FilterProp::MostPrevalentCreatureTypeIn { zone, scope } => {
                 let scope_str = match scope {
                     ControllerRef::You => "your",
@@ -1388,6 +1389,10 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 None => format!("counters on {scope_str} (any type)"),
             }
         }
+        QuantityRef::TokenSourceCounters { counter_type } => match counter_type {
+            Some(ct) => format!("{} counters on token creator", ct.as_str()),
+            None => "counters on token creator (any type)".to_string(),
+        },
         QuantityRef::CountersOnObjects {
             counter_type,
             filter,
@@ -4386,6 +4391,7 @@ fn fmt_trigger_condition(cond: &crate::types::ability::TriggerCondition) -> Stri
         TC::CastVariantPaid { .. } => "cast variant was paid".into(),
         TC::CastVariantPaidPersistent { .. } => "cast variant was paid (persistent)".into(),
         TC::ActivatedAbilityIsNonMana => "activated ability is not a mana ability".into(),
+        TC::SourceAbilityAddedManaThisTurn => "source ability added mana this turn".into(),
         TC::DealtDamageBySourceThisTurn => "dealt damage by source this turn".into(),
         TC::DealtDamageThisTurnBySource { source } => {
             format!("dealt damage this turn by {}", fmt_target(source))
@@ -4439,6 +4445,13 @@ fn fmt_trigger_condition(cond: &crate::types::ability::TriggerCondition) -> Stri
         TC::SourceIsFaceUp => "source is face-up".into(),
         TC::SourceIsFaceDown => "source is face-down".into(),
         TC::SourceInZone { zone } => format!("source is in {}", fmt_zone(zone)),
+        TC::SourceInZoneWithAdjacentFilter { zone, adjacent } => {
+            format!(
+                "source is in {} with adjacent {}",
+                fmt_zone(zone),
+                fmt_target(adjacent)
+            )
+        }
         TC::CounterAddedThisTurn => "added a counter this turn".into(),
         TC::LostLifeLastTurn => "lost life last turn".into(),
         TC::DefendingPlayerControlsNone { filter } => {
@@ -8337,6 +8350,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::PlayerCount { .. } => ("PlayerCount", Handled),
         QuantityRef::EventContextPlayerCount { .. } => ("EventContextPlayerCount", Handled),
         QuantityRef::CountersOn { .. } => ("CountersOn", Handled),
+        QuantityRef::TokenSourceCounters { .. } => ("TokenSourceCounters", Handled),
         QuantityRef::Intensity { .. } => ("Intensity", Handled),
         QuantityRef::CountersOnObjects { .. } => ("CountersOnObjects", Handled),
         QuantityRef::Variable { .. } => ("Variable", Handled),

@@ -1148,6 +1148,38 @@ fn static_condition_to_trigger_condition_source_in_battlefield() {
 }
 
 #[test]
+fn krovikan_horror_graveyard_adjacency_is_typed() {
+    // CR 404.1 + CR 603.4: the source-zone condition must preserve the
+    // immediately-above-card rider rather than swallowing the whole `if`
+    // clause after parsing only "in your graveyard".
+    let parsed = parse_oracle_text(
+        "At the beginning of the end step, if this card is in your graveyard with a creature card directly above it, you may return this card to your hand.\n{1}, Sacrifice a creature: This creature deals 1 damage to any target.",
+        "Krovikan Horror",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let trigger = parsed.triggers.first().expect("Krovikan Horror trigger");
+    assert_eq!(trigger.mode, TriggerMode::Phase);
+    assert_eq!(trigger.trigger_zones, vec![Zone::Graveyard]);
+    assert!(matches!(
+        trigger.condition.as_ref(),
+        Some(TriggerCondition::SourceInZoneWithAdjacentFilter {
+            zone: Zone::Graveyard,
+            adjacent: TargetFilter::Typed(TypedFilter {
+                type_filters,
+                controller: None,
+                properties,
+            }),
+        }) if type_filters == &vec![TypeFilter::Creature] && properties.is_empty()
+    ));
+    assert!(parsed.parse_warnings.iter().all(|warning| !matches!(
+        warning,
+        OracleDiagnostic::SwallowedClause { detector, .. } if detector == "Condition_If"
+    )));
+}
+
+#[test]
 fn intervening_if_source_attacked_this_turn_populates_condition() {
     // CR 508.1 + CR 603.4: a source-scoped "if ~ attacked this turn"
     // intervening-if must gate the trigger on the ability's own source creature
@@ -20222,6 +20254,20 @@ fn trigger_each_of_your_main_phases_uses_main_phase_constraint() {
         Some(TriggerConstraint::OnlyDuringYourMainPhase)
     );
     assert!(def.optional, "trigger should be optional ('you may')");
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::Not {
+            condition: Box::new(TriggerCondition::SourceAbilityAddedManaThisTurn),
+        }),
+        "Carpet's 'with this ability' gate must remain tied to the exact printed ability"
+    );
+    assert!(
+        matches!(
+            def.execute.as_deref().map(|ability| ability.effect.as_ref()),
+            Some(Effect::Mana { .. })
+        ),
+        "Carpet's payload must remain a mana effect"
+    );
 }
 
 /// Coalition Relic, third ability — Future Sight artifact, issue #130.
@@ -23852,6 +23898,100 @@ fn state_trigger_control_no_islands() {
         matches!(*execute.effect, Effect::Sacrifice { .. }),
         "expected Sacrifice, got {:?}",
         execute.effect,
+    );
+}
+
+#[test]
+fn phyrexian_devourer_power_state_trigger_is_typed() {
+    let def = parse_trigger_line(
+        "When ~'s power is 7 or greater, sacrifice it.",
+        "Phyrexian Devourer",
+    );
+    assert_eq!(def.mode, TriggerMode::StateCondition);
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::Power {
+                    scope: ObjectScope::Source,
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 7 },
+        })
+    );
+    assert!(matches!(
+        def.execute.as_deref().map(|a| a.effect.as_ref()),
+        Some(Effect::Sacrifice { .. })
+    ));
+}
+
+/// CR 603.8 + CR 208.1: Phyrexian Devourer's state trigger must observe its
+/// live power and sacrifice the source once it reaches seven or more.
+#[test]
+fn phyrexian_devourer_power_state_trigger_fires_and_sacrifices_self() {
+    use crate::game::scenario::GameRunner;
+    use crate::game::triggers::check_state_triggers;
+    use crate::game::zones::create_object;
+    use crate::types::card_type::CoreType;
+    use crate::types::game_state::GameState;
+    use crate::types::identifiers::CardId;
+    use crate::types::phase::Phase;
+    use crate::types::zones::Zone;
+    use crate::types::PlayerId;
+    use std::sync::Arc;
+
+    let parsed = parse_oracle_text(
+        "When ~'s power is 7 or greater, sacrifice it.",
+        "Phyrexian Devourer",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::StateCondition)
+        .expect("Phyrexian Devourer state trigger");
+    assert!(matches!(
+        trigger.condition,
+        Some(TriggerCondition::QuantityComparison { .. })
+    ));
+
+    let mut state = GameState::new_two_player(71);
+    state.phase = Phase::PreCombatMain;
+    state.turn_number = 2;
+    state.active_player = PlayerId(0);
+    state.priority_player = PlayerId(0);
+    let devourer_id = create_object(
+        &mut state,
+        CardId(71),
+        PlayerId(0),
+        "Phyrexian Devourer".to_string(),
+        Zone::Battlefield,
+    );
+    {
+        let obj = state.objects.get_mut(&devourer_id).unwrap();
+        obj.controller = PlayerId(0);
+        obj.power = Some(7);
+        obj.toughness = Some(7);
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.base_card_types.core_types.push(CoreType::Creature);
+        obj.base_trigger_definitions = Arc::new(parsed.triggers.clone());
+        obj.trigger_definitions = parsed.triggers.clone().into();
+    }
+
+    check_state_triggers(&mut state);
+    assert!(
+        state.pending_trigger.is_some() || !state.stack.is_empty(),
+        "power threshold should enqueue the state trigger",
+    );
+
+    let mut runner = GameRunner::from_state(state);
+    runner.advance_until_stack_empty();
+    assert!(
+        !runner.state().battlefield.iter().any(|id| *id == devourer_id),
+        "Phyrexian Devourer should sacrifice itself at seven power",
     );
 }
 

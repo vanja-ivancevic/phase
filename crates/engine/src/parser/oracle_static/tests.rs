@@ -3763,11 +3763,11 @@ fn alt_cost_jodah_mv_qualifier_behavior() {
     }
 }
 
-/// Strict-fail: non-mana payment shapes must NOT misparse into the static.
-/// Bolas's Citadel ("pay life equal to ...") and Dream Halls ("discard a
-/// card ...") defer to None rather than producing a wrong CastWithAlternativeCost.
+/// Strict-fail: unsupported non-mana payment shapes must NOT misparse into the
+/// generic "you may pay" static. Dream Halls has a separately typed global
+/// pitch-cost lowering below.
 #[test]
-fn alt_cost_non_mana_payment_defers_to_none() {
+fn alt_cost_unsupported_non_mana_payment_defers_to_none() {
     // Bolas's Citadel-style life payment.
     assert!(
             parse_spells_alternative_cost(
@@ -3776,21 +3776,48 @@ fn alt_cost_non_mana_payment_defers_to_none() {
             .is_none(),
             "life payment must defer to None"
         );
-    // Dream Halls-style discard payment.
-    assert!(
-            parse_spells_alternative_cost(
-                "You may discard a card that shares a color with that spell rather than pay the mana cost for spells you cast.",
-            )
-            .is_none(),
-            "discard payment must defer to None"
-        );
+}
+
+/// CR 118.9 + CR 601.2b: Dream Halls is a global alternative-cost permission;
+/// its discard filter must remain bound to the spell being announced, rather
+/// than to the enchantment that granted it.
+#[test]
+fn dream_halls_lowers_to_a_global_matching_color_discard_alternative() {
+    use crate::parser::oracle_static::cost_mod::parse_discard_matching_color_alternative_cost;
+    use crate::types::ability::{CardSelectionMode, DiscardSelfScope, SharedQuality};
+
+    let def = parse_discard_matching_color_alternative_cost(
+        "Rather than pay the mana cost for a spell, its controller may discard a card that shares a color with that spell.",
+    )
+    .expect("Dream Halls must lower to a cast alternative");
+
+    assert_eq!(def.affected, Some(TargetFilter::Typed(TypedFilter::card())));
+    assert_eq!(
+        def.mode,
+        StaticMode::CastWithAlternativeCost {
+            cost: AbilityCost::Discard {
+                count: QuantityExpr::Fixed { value: 1 },
+                filter: Some(TargetFilter::Typed(TypedFilter::card().properties(vec![
+                    FilterProp::SharesQuality {
+                        quality: SharedQuality::Color,
+                        reference: Some(Box::new(TargetFilter::SelfRef)),
+                        relation: Default::default(),
+                    },
+                ]))),
+                selection: CardSelectionMode::Chosen,
+                self_scope: DiscardSelfScope::FromHand,
+            },
+            timing_permission: None,
+            frequency: CastFrequency::Unlimited,
+        }
+    );
 }
 
 /// CR 118.9: full-dispatcher regression — Fist of Suns must route through
 /// the new Priority 6c-altcost branch into a CastWithAlternativeCost static
 /// with NO free-floating Effect::PayCost ability (the prior misparse), and
-/// the deferred non-mana classes (Bolas's Citadel, Dream Halls, As Foretold,
-/// Conspiracy Unraveler) must NOT be newly misparsed into this static.
+/// Bolas's Citadel must remain deferred while Dream Halls uses its dedicated
+/// global pitch-cost lowering.
 #[test]
 fn full_dispatch_alt_cost_routing_and_deferrals() {
     use crate::parser::oracle::parse_oracle_text;
@@ -3821,17 +3848,11 @@ fn full_dispatch_alt_cost_routing_and_deferrals() {
         parsed.abilities
     );
 
-    // Deferred non-mana payment classes: must NOT produce the new static.
-    let deferred = [
-            (
-                "Bolas's Citadel",
-                "You may pay life equal to a spell's mana value rather than pay its mana cost.",
-            ),
-            (
-                "Dream Halls",
-                "Rather than pay the mana cost for a spell, its controller may discard a card that shares a color with that spell.",
-            ),
-        ];
+    // Unsupported non-mana payment class: must NOT produce the new static.
+    let deferred = [(
+        "Bolas's Citadel",
+        "You may pay life equal to a spell's mana value rather than pay its mana cost.",
+    )];
     for (name, text) in deferred {
         let parsed = parse_oracle_text(text, name, &[], &["Enchantment".to_string()], &[]);
         assert!(
@@ -3843,6 +3864,22 @@ fn full_dispatch_alt_cost_routing_and_deferrals() {
             parsed.statics
         );
     }
+
+    let dream_halls = parse_oracle_text(
+        "Rather than pay the mana cost for a spell, its controller may discard a card that shares a color with that spell.",
+        "Dream Halls",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+    assert!(
+        dream_halls
+            .statics
+            .iter()
+            .any(|d| matches!(d.mode, StaticMode::CastWithAlternativeCost { .. })),
+        "Dream Halls must route through its dedicated alternative-cost lowering, got {:?}",
+        dream_halls.statics
+    );
 }
 
 /// CR 202.3 + CR 208.2a + CR 604.3: Dragon Man, Reformed Robot's CDA —
@@ -15624,6 +15661,8 @@ fn hand_cast_free_omniscience() {
         StaticMode::CastFromHandFree {
             frequency: CastFrequency::Unlimited,
             origin: CastFreeOrigin::Hand,
+            all_players: false,
+            grants_flash: false,
         }
     );
     assert_eq!(def.affected, Some(TargetFilter::Any));
@@ -15648,6 +15687,8 @@ fn hand_cast_free_zaffai_once_per_turn() {
             StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
                 origin: CastFreeOrigin::Hand,
+                all_players: false,
+                grants_flash: false,
             }
         ),
         "expected CastFromHandFree {{ OncePerTurn }}, got: {:?}",
@@ -15689,6 +15730,8 @@ fn cast_free_dracogenesis_no_zone_qualifier() {
         StaticMode::CastFromHandFree {
             frequency: CastFrequency::Unlimited,
             origin: CastFreeOrigin::DefaultCastPermission,
+            all_players: false,
+            grants_flash: false,
         }
     );
     // Dragon subtype filter must survive.
@@ -15738,6 +15781,41 @@ fn cast_free_unqualified_accepts_dynamic_mv_filter() {
         "expected CmcLE with dynamic ObjectCount RHS, got {:?}",
         tf.properties
     );
+}
+
+/// CR 601.2b + CR 601.3b + CR 702.8a: Aluren is a global, typed free-cast
+/// permission.  Its flash rider is deliberately carried by the same static so
+/// neither half can accidentally apply outside the other half's player/spell
+/// scope.
+#[test]
+fn aluren_global_free_cast_permission_carries_flash() {
+    use crate::types::ability::{Comparator, FilterProp, QuantityExpr, TargetFilter, TypeFilter};
+
+    let text = "Any player may cast creature spells with mana value 3 or less without paying their mana costs and as though they had flash.";
+    let def = parse_static_line(text).expect("Aluren must parse as a free-cast permission");
+    assert!(matches!(
+        def.mode,
+        StaticMode::CastFromHandFree {
+            frequency: CastFrequency::Unlimited,
+            origin: CastFreeOrigin::DefaultCastPermission,
+            all_players: true,
+            grants_flash: true,
+        }
+    ));
+    let TargetFilter::Typed(filter) = def.affected.expect("Aluren filter") else {
+        panic!("Aluren must retain a typed creature/MV filter");
+    };
+    assert!(filter
+        .type_filters
+        .iter()
+        .any(|kind| matches!(kind, TypeFilter::Creature)));
+    assert!(filter.properties.iter().any(|property| matches!(
+        property,
+        FilterProp::Cmc {
+            comparator: Comparator::LE,
+            value: QuantityExpr::Fixed { value: 3 },
+        }
+    )));
 }
 
 // Negative test: text without "without paying" must not match the

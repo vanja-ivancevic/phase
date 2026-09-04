@@ -13,6 +13,48 @@ use crate::types::ability::{
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::triggers::AttackTargetFilter;
 
+/// Quicksilver Dragon's condition belongs to the resolving ability, not the
+/// announced target. Keep the chain entry point honest before the full-card
+/// smoke test exercises the activated-ability router.
+#[test]
+fn quicksilver_dragon_condition_survives_effect_chain_lowering() {
+    let parsed = parse_effect_chain(
+        "If target spell has only one target and that target is this creature, change that spell's target to another creature.",
+        AbilityKind::Activated,
+    );
+
+    assert!(
+        matches!(
+            parsed.condition.as_ref(),
+            Some(AbilityCondition::TargetMatchesFilter { .. })
+        ),
+        "chain condition={:#?}",
+        parsed.condition
+    );
+}
+
+#[test]
+fn quicksilver_dragon_condition_survives_activated_ability_routing() {
+    let (ir, _) = parse_activated_ability_ir(
+        "{U}",
+        "If target spell has only one target and that target is this creature, change that spell's target to another creature.",
+        "{U}: If target spell has only one target and that target is this creature, change that spell's target to another creature.",
+        "Quicksilver Dragon",
+        Some(PrintedAbilityIndex::placeholder()),
+        &mut ParseContext::default(),
+    );
+    let parsed = lower_ability_ir(&ir);
+
+    assert!(
+        matches!(
+            parsed.condition.as_ref(),
+            Some(AbilityCondition::TargetMatchesFilter { .. })
+        ),
+        "activated ability condition={:#?}",
+        parsed.condition
+    );
+}
+
 #[test]
 fn unsupported_ability_ir_lowering_preserves_generic_and_structural_payloads() {
     let generic = lower_unsupported_node(&UnsupportedAbilityIr::unknown("unknown line"), 1);
@@ -1707,6 +1749,32 @@ fn parse(
     let types: Vec<String> = types.iter().map(|s| s.to_string()).collect();
     let subtypes: Vec<String> = subtypes.iter().map(|s| s.to_string()).collect();
     parse_oracle_text(text, name, &keyword_names, &types, &subtypes)
+}
+
+/// CR 614.1a: Urza's three-mana land cycle expresses its replacement branch
+/// as a conditional mana sub-ability.  The runtime already resolves this
+/// shape (and the tests in `game::mana_abilities` pin the one- vs three-mana
+/// outcomes); keep the parser audit from reporting it as swallowed merely
+/// because it is not a top-level `ReplacementDefinition`.
+#[test]
+fn urza_conditional_mana_replacement_is_not_reported_as_swallowed() {
+    let parsed = parse(
+        "{T}: Add {C}. If you control an Urza's Mine and an Urza's Power-Plant, add {C}{C}{C} instead.",
+        "Urza's Tower",
+        &[],
+        &["Land"],
+        &["Urza's", "Tower"],
+    );
+
+    assert!(
+        parsed.parse_warnings.iter().all(|warning| !matches!(
+            warning,
+            OracleDiagnostic::SwallowedClause { detector, .. }
+                if detector == "Replacement_Instead"
+        )),
+        "Urza's Tower's represented conditional mana replacement must not be flagged: {:?}",
+        parsed.parse_warnings
+    );
 }
 
 /// CR 506.3 + CR 508.1d + CR 611.2c + CR 615: Gideon Jura (verbatim MTGJSON

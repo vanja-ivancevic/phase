@@ -3268,8 +3268,9 @@ fn try_parse_disjunctive_top_of_library_cast_permission(
 }
 
 /// CR 601.2b + CR 118.9a: Parse Omniscience-class restricted free-cast static
-/// abilities — "you may cast [filter] [from your hand]? without paying [its|their]
-/// mana cost[s]?" — covering Omniscience and the Tamiyo, Field Researcher emblem
+/// abilities — "[you|any player] may cast [filter] [from your hand]? without paying
+/// [its|their] mana cost[s] [and as though they had flash]?" — covering Omniscience
+/// and the Tamiyo, Field Researcher emblem
 /// (no filter, hand qualifier), Zaffai-and-the-Tempests (typed filter, hand
 /// qualifier, once-per-turn frequency), and Dracogenesis (subtype filter, no
 /// zone qualifier, so it can replace the mana cost from built-in cast zones like
@@ -3277,18 +3278,30 @@ fn try_parse_disjunctive_top_of_library_cast_permission(
 pub(crate) fn try_parse_cast_free_permission(text: &str, lower: &str) -> Option<StaticDefinition> {
     // CR 601.2b: Prefix determines frequency. `OncePerTurn` (Zaffai) is the
     // explicit-choice path; `Unlimited` (Omniscience, Dracogenesis) runs silently.
-    let (rest, frequency) = if let Some(r) = nom_tag_lower(
+    let (rest, frequency, all_players) = if let Some(r) = nom_tag_lower(
         lower,
         lower,
         "once during each of your turns, you may cast ",
     ) {
-        (r, CastFrequency::OncePerTurn)
+        (r, CastFrequency::OncePerTurn, false)
+    } else if let Some(r) = nom_tag_lower(lower, lower, "any player may cast ") {
+        (r, CastFrequency::Unlimited, true)
     } else {
         (
             nom_tag_lower(lower, lower, "you may cast ")?,
             CastFrequency::Unlimited,
+            false,
         )
     };
+
+    // CR 601.3b + CR 702.8a: Aluren's trailing rider is inseparable from its
+    // free-cast permission: the same player may cast the same admitted spell
+    // for free at instant speed.  Keep it in the typed permission instead of
+    // emitting an independent generic Flash static that could widen either
+    // axis.  The rest of this parser still validates the free-cast anchor.
+    let grants_flash = lower
+        .trim_end_matches('.')
+        .ends_with("and as though they had flash");
 
     // The zone qualifier "from your hand" is optional. When omitted, the static
     // only replaces the mana cost for spells in the controller's built-in cast
@@ -3319,9 +3332,14 @@ pub(crate) fn try_parse_cast_free_permission(text: &str, lower: &str) -> Option<
     // Intentional: "spells" with no qualifier → Any filter (Omniscience) — no warning needed.
     if filter_text == "spells" {
         return Some(
-            StaticDefinition::new(StaticMode::CastFromHandFree { frequency, origin })
-                .affected(TargetFilter::Any)
-                .description(text.to_string()),
+            StaticDefinition::new(StaticMode::CastFromHandFree {
+                frequency,
+                origin,
+                all_players,
+                grants_flash,
+            })
+            .affected(TargetFilter::Any)
+            .description(text.to_string()),
         );
     }
 
@@ -3348,9 +3366,14 @@ pub(crate) fn try_parse_cast_free_permission(text: &str, lower: &str) -> Option<
     }
 
     Some(
-        StaticDefinition::new(StaticMode::CastFromHandFree { frequency, origin })
-            .affected(filter)
-            .description(text.to_string()),
+        StaticDefinition::new(StaticMode::CastFromHandFree {
+            frequency,
+            origin,
+            all_players,
+            grants_flash,
+        })
+        .affected(filter)
+        .description(text.to_string()),
     )
 }
 

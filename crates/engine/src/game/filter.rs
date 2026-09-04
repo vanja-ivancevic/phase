@@ -316,6 +316,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::PowerGTSource
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
@@ -593,7 +594,9 @@ fn filter_prop_characteristic_reads_at(prop: &FilterProp, depth: u32) -> Charact
         | FilterProp::EquippedBy => CharacteristicKinds::CARD_TYPES,
         // CR 205.3m + CR 702.73a: creature-type reads see through Changeling, so
         // they read layer 6 as well as layer 4.
-        FilterProp::IsChosenCreatureType | FilterProp::SharesCreatureTypeWithCommander => {
+        FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
+        | FilterProp::SharesCreatureTypeWithCommander => {
             CharacteristicKinds::CARD_TYPES.union(CharacteristicKinds::ABILITIES)
         }
         // CR 205.3m + CR 701.23a: whole-zone creature-type tally, scoped to a
@@ -983,6 +986,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::PowerGTSource
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
@@ -1718,6 +1722,7 @@ pub(crate) fn filter_prop_contains(
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::MostPrevalentCreatureTypeIn { .. }
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
@@ -3663,11 +3668,7 @@ fn filter_inner_for_object(
                 trigger_source,
                 recipient_id,
             );
-            let chosen_name = source_ctx.chosen_attributes.iter().find_map(|a| match a {
-                ChosenAttribute::CardName(n) => Some(n.as_str()),
-                _ => None,
-            });
-            chosen_name.is_some_and(|name| obj.name.eq_ignore_ascii_case(name))
+            chosen_name_matches(state, &source_ctx, &obj.name)
         }
         // CR 609.7a: "the chosen source" — match the ObjectId selected by
         // the prior damage-source choice while its continuation resolves.
@@ -3931,11 +3932,7 @@ fn zone_change_filter_inner(
                 trigger_source,
                 None,
             );
-            let chosen_name = source_ctx.chosen_attributes.iter().find_map(|a| match a {
-                    ChosenAttribute::CardName(n) => Some(n.as_str()),
-                    _ => None,
-            });
-            chosen_name.is_some_and(|name| record.name.eq_ignore_ascii_case(name))
+            chosen_name_matches(state, &source_ctx, &record.name)
         }
         TargetFilter::ChosenDamageSource { .. } => false,
         TargetFilter::Named { name } => record.name == *name,
@@ -4958,6 +4955,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::PtComparison { .. }
         | FilterProp::PowerGTSource
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::MostPrevalentCreatureTypeIn { .. }
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
@@ -5251,6 +5249,41 @@ fn source_chosen_player(source: &SourceContext<'_>) -> Option<PlayerId> {
             ChosenAttribute::Player(player) => Some(*player),
             _ => None,
         })
+}
+
+/// CR 201.2 + CR 608.2c: Resolve the name used by a `HasChosenName` filter.
+///
+/// A persisted choice (for example Pithing Needle's as-entered name) lives on
+/// the source object/LKI and remains the authority outside a resolving ability.
+/// Some effects instead say "choose a card name" and immediately test that
+/// answer (Cursed Scroll). Those choices are deliberately not persisted on
+/// the source; while their continuation is draining, the shared resolution
+/// ledger is the only authority. Read that ledger only when an ability is in
+/// scope, so a stale answer from an earlier resolution can never affect a
+/// passive filter or an unrelated history scan.
+fn chosen_name_matches(
+    state: &GameState,
+    source: &SourceContext<'_>,
+    candidate_name: &str,
+) -> bool {
+    if source.ability.is_some()
+        && matches!(
+            state.last_named_choice.as_ref(),
+            Some(ChoiceValue::CardName(name))
+                if candidate_name.eq_ignore_ascii_case(name)
+        )
+    {
+        return true;
+    }
+
+    source
+        .chosen_attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            ChosenAttribute::CardName(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .is_some_and(|name| candidate_name.eq_ignore_ascii_case(name))
 }
 
 /// CR 201.2 + CR 400.7: Resolve the printed name of the first
@@ -6058,6 +6091,20 @@ fn matches_filter_prop(
             ),
             None => false,
         },
+        // CR 205.3i + CR 608.2d: Match a land subtype against the source's
+        // persisted general land-type choice (Vision Charm). Unlike creature
+        // types, land types do not use Changeling semantics.
+        FilterProp::IsChosenLandType => source
+            .chosen_attributes
+            .iter()
+            .rev()
+            .find_map(|attribute| match attribute {
+                crate::types::ability::ChosenAttribute::LandType(land_type) => {
+                    Some(land_type.as_str())
+                }
+                _ => None,
+            })
+            .is_some_and(|chosen| obj.card_types.subtypes.iter().any(|subtype| subtype.eq_ignore_ascii_case(chosen))),
         // CR 205.3m: Object's creature type ties for highest count
         // among creature cards in the named player's named zone. Scope picks
         // the player whose zone is inspected; `Opponent` falls back to the
@@ -6289,9 +6336,23 @@ fn matches_filter_prop(
                 .fold(0, |sum: u32, record| sum.saturating_add(record.count));
             comparator.evaluate(i32::try_from(total).unwrap_or(i32::MAX), *count as i32)
         }
-        // CR 115.7: Stack entry has exactly one target — permissive at filter level,
-        // validated by retarget effects at resolution time.
-        FilterProp::HasSingleTarget => true,
+        // CR 115.9a: A stack spell or ability "with/has only one target" has
+        // exactly one declared target instance. This used to be permissive here
+        // because the announce-time retarget path performs its own check, but a
+        // resolution-time conditional (Quicksilver Dragon) evaluates this
+        // filter directly and must see the live stack entry too.
+        FilterProp::HasSingleTarget => state
+            .stack
+            .iter()
+            .find(|entry| entry.id == object_id)
+            .or_else(|| {
+                state
+                    .resolving_stack_entry
+                    .as_ref()
+                    .filter(|entry| entry.id == object_id)
+            })
+            .and_then(|entry| entry.ability())
+            .is_some_and(|ability| ability.targets.len() == 1),
         // CR 700.2: The object is modal iff its printed modality is present. Read
         // from the static printed characteristic populated at object creation,
         // available at SpellCast-trigger match time (Riku, of Many Paths).
@@ -6607,6 +6668,21 @@ fn zone_change_record_matches_property(
                 &state.all_creature_types,
             )
         }),
+        // CR 205.3i + CR 608.2d: The spell snapshot analogue of the live
+        // chosen-land-type predicate. The comparison is case-insensitive
+        // because Oracle subtype labels are canonicalized at different ingress
+        // points (card data versus player choice).
+        FilterProp::IsChosenLandType => source
+            .chosen_attributes
+            .iter()
+            .rev()
+            .find_map(|attribute| match attribute {
+                crate::types::ability::ChosenAttribute::LandType(land_type) => {
+                    Some(land_type.as_str())
+                }
+                _ => None,
+            })
+            .is_some_and(|chosen| record.subtypes.iter().any(|subtype| subtype.eq_ignore_ascii_case(chosen))),
         FilterProp::MostPrevalentCreatureTypeIn { .. } => false,
         FilterProp::MatchesLastChosenCardPredicate => matches_last_chosen_card_predicate(
             &state.last_named_choice,
@@ -7586,6 +7662,30 @@ pub fn player_matches_target_filter_in_state(
     source_controller: Option<PlayerId>,
     source_id: Option<ObjectId>,
 ) -> bool {
+    player_matches_target_filter_in_state_with_scope(
+        state,
+        filter,
+        player_id,
+        source_controller,
+        source_id,
+        None,
+    )
+}
+
+/// Check a player target with an explicit anchor for relative `PlayerFilter`
+/// predicates. Most filters are still evaluated relative to `source_controller`;
+/// only `TargetFilter::PlayerMatching` uses `scope_controller`. Triggered
+/// "each player's upkeep" abilities pass their `ResolvedAbility::scoped_player`
+/// here so phrases such as "more creatures than they do" compare against the
+/// upkeep player rather than the permanent's controller.
+pub fn player_matches_target_filter_in_state_with_scope(
+    state: &GameState,
+    filter: &TargetFilter,
+    player_id: PlayerId,
+    source_controller: Option<PlayerId>,
+    source_id: Option<ObjectId>,
+    scope_controller: Option<PlayerId>,
+) -> bool {
     player_matches_target_filter_with(
         filter,
         player_id,
@@ -7606,7 +7706,7 @@ pub fn player_matches_target_filter_in_state(
         // re-implementing any predicate here. `source_controller` is CR 109.5
         // "you": with no controller the payload's `relation` axis is unanswerable,
         // so fail closed — likewise with no source object.
-        &|player, candidate| match (source_controller, source_id) {
+        &|player, candidate| match (scope_controller.or(source_controller), source_id) {
             (Some(controller), Some(source)) => crate::game::effects::matches_player_scope(
                 state, candidate, player, controller, source,
             ),
@@ -11796,6 +11896,59 @@ mod tests {
         ));
     }
 
+    /// CR 608.2c: a non-persisting "choose a card name" must still feed a
+    /// dependent `HasChosenName` condition while the same ability continues.
+    /// The answer belongs to the resolution ledger, not to the source object.
+    #[test]
+    fn has_chosen_name_reads_resolution_local_card_name() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Cursed Scroll");
+        let bolt = add_creature(&mut state, PlayerId(0), "Lightning Bolt");
+        let growth = add_creature(&mut state, PlayerId(0), "Giant Growth");
+        state.last_named_choice = Some(ChoiceValue::CardName("lightning bolt".to_string()));
+
+        let ability = ResolvedAbility::new(
+            Effect::Unimplemented {
+                name: "dependent condition".to_string(),
+                description: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let context = FilterContext::from_ability(&ability);
+
+        assert!(super::matches_target_filter(
+            &state,
+            bolt,
+            &TargetFilter::HasChosenName,
+            &context,
+        ));
+        assert!(!super::matches_target_filter(
+            &state,
+            growth,
+            &TargetFilter::HasChosenName,
+            &context,
+        ));
+    }
+
+    /// A resolution-local answer must not leak into a passive/source-only
+    /// filter evaluation after the resolving ability is gone.
+    #[test]
+    fn has_chosen_name_ignores_resolution_local_card_name_without_ability() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Cursed Scroll");
+        let bolt = add_creature(&mut state, PlayerId(0), "Lightning Bolt");
+        state.last_named_choice = Some(ChoiceValue::CardName("Lightning Bolt".to_string()));
+
+        assert!(!matches_target_filter(
+            &state,
+            bolt,
+            &TargetFilter::HasChosenName,
+            source,
+        ));
+    }
+
     #[test]
     fn has_chosen_name_returns_false_when_no_card_name_chosen() {
         let mut state = setup();
@@ -15142,6 +15295,7 @@ mod characteristic_read_classification_tests {
             | FilterProp::ManaSymbolCount { .. }
             | FilterProp::HasSupertype { .. }
             | FilterProp::IsChosenCreatureType
+            | FilterProp::IsChosenLandType
             | FilterProp::IsChosenColor
             | FilterProp::IsChosenCardType
             | FilterProp::MatchesLastChosenCardPredicate

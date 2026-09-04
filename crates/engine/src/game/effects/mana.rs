@@ -316,6 +316,17 @@ pub fn resolve(
             events,
         );
     }
+    // CR 106.3 + CR 603.4: record successful mana production against the
+    // exact printed ability occurrence. This is deliberately after recipient
+    // validation and pool insertion, so an illegal target or zero-count
+    // effect does not consume a "with this ability" window.
+    if produced_mana {
+        if let Some(ability_index) = ability.ability_index {
+            state
+                .mana_added_by_abilities_this_turn
+                .insert((ability.source_id, ability_index));
+        }
+    }
     record_firebending_if_marked(state, ability, produced_mana, events);
 
     events.push(GameEvent::EffectResolved {
@@ -387,6 +398,15 @@ pub fn handle_choose_mana_effect(
                 *expiry,
                 events,
             );
+        }
+    }
+    // CR 106.3 + CR 603.4: the color-choice continuation has the same
+    // successful-production boundary as the synchronous resolver above.
+    if produced_mana {
+        if let Some(ability_index) = ability.ability_index {
+            state
+                .mana_added_by_abilities_this_turn
+                .insert((ability.source_id, ability_index));
         }
     }
     record_firebending_if_marked(state, ability, produced_mana, events);
@@ -1237,19 +1257,24 @@ mod tests {
     fn produce_single_red_mana() {
         let mut state = GameState::new_two_player(42);
         let mut events = Vec::new();
+        let mut ability = make_mana_ability(ManaProduction::Fixed {
+            colors: vec![ManaColor::Red],
+            contribution: ManaContribution::Base,
+        });
+        ability.ability_index = Some(3);
 
         resolve(
             &mut state,
-            &make_mana_ability(ManaProduction::Fixed {
-                colors: vec![ManaColor::Red],
-                contribution: ManaContribution::Base,
-            }),
+            &ability,
             &mut events,
         )
         .unwrap();
 
         assert_eq!(state.players[0].mana_pool.count_color(ManaType::Red), 1);
         assert_eq!(state.players[0].mana_pool.total(), 1);
+        assert!(state
+            .mana_added_by_abilities_this_turn
+            .contains(&(ObjectId(100), 3)));
     }
 
     /// CR 106.4: for "Choose a player. That player adds one mana of any color

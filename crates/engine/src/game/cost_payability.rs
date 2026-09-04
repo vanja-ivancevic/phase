@@ -22,7 +22,7 @@
 use crate::types::ability::{
     is_variable_remove_counter_cost_count, AbilityCost, Comparator, CounterCostSelection,
     FilterProp, PlayerFilter, QuantityExpr, QuantityRef, TapCreaturesAggregateStat,
-    TapCreaturesRequirement, TargetFilter, TypedFilter, EXILE_COST_X,
+    TapCreaturesRequirement, TargetFilter, TypedFilter, EXILE_COST_ANY_NUMBER, EXILE_COST_X,
 };
 use crate::types::card_type::CoreType;
 use crate::types::identifiers::ObjectId;
@@ -516,6 +516,12 @@ impl AbilityCost {
                 zone,
                 filter,
             } => {
+                // CR 107.1c: an "any number" choice includes zero, so the
+                // resource pre-gate is always satisfiable. The concrete
+                // selection is surfaced when the replacement resolves.
+                if *count == EXILE_COST_ANY_NUMBER {
+                    return true;
+                }
                 // CR 107.3a + CR 601.2b: X in this cost is chosen during
                 // announcement. X=0 is legal, so the pre-announcement
                 // affordability gate must not treat its compact sentinel as a

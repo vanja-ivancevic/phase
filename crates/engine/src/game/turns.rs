@@ -1291,6 +1291,7 @@ pub fn start_next_turn(state: &mut GameState, events: &mut Vec<GameEvent>) {
     // boundary alongside other "this turn" trackers (mirrors the cleanup of
     // `trigger_fire_counts_this_turn`).
     state.ability_resolutions_this_turn.clear();
+    state.mana_added_by_abilities_this_turn.clear();
     state.graveyard_cast_permissions_used.clear();
     // CR 110.4 + CR 601.2a: Reset per-turn-per-permanent-type tracking (Muldrotha).
     state.graveyard_cast_permissions_used_per_type.clear();

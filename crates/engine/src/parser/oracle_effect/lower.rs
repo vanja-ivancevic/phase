@@ -1855,7 +1855,7 @@ pub(super) fn target_choice_timing_for_clause(clause_ir: &ClauseIr) -> TargetCho
             scope: EffectScope::Single,
             ..
         }
-    ) && clause_ir.multi_target.is_some()
+    ) && (clause_ir.multi_target.is_some() || clause_ir.parsed.multi_target.is_some())
     {
         let lower = clause_ir
             .source
@@ -4419,35 +4419,51 @@ fn split_for_each_suffix(text: &str) -> Option<(usize, String)> {
     Some((base.len(), tail.to_string()))
 }
 
-pub(super) fn strip_for_each_repeat_suffix(text: &str) -> (Option<QuantityExpr>, String) {
+/// Parse a trailing `for each <set>` multiplier without deciding which effect
+/// is allowed to consume it.  Most callers should use
+/// [`strip_for_each_repeat_suffix`], whose deliberately narrow allow-list
+/// protects effect families with their own quantity semantics.  The effect
+/// chain parser uses this lower-level form for keyword actions whose runtime
+/// representation is an ordinary repeatable `AbilityDefinition` (for example
+/// Tangle Wire's `tap ... for each fade counter`).
+pub(super) fn parse_for_each_repeat_suffix(text: &str) -> Option<(QuantityExpr, String)> {
     let (_, text) = strip_each_copy_targets_distinct_member_suffix(text);
-    if let Some((base_len, tail)) = split_for_each_suffix(&text) {
-        if let Ok((_, qty)) = all_consuming(terminated(
-            nom_quantity::parse_for_each_clause_ref,
-            opt(tag::<_, _, OracleError<'_>>(".")),
-        ))
-        .parse(tail.as_str())
-        {
-            // The repeat-suffix lift is restricted to quantities whose consumer
-            // is `CopySpell`: commander casts, trigger-bound spell history, and
-            // Zada's distinct-copy object count. A player-set `PlayerCount` is
-            // deliberately NOT admitted here — that class routes through the
-            // fieldless-Investigate seam via `for_each_repeatable_repeat_for`.
-            if matches!(
-                &qty,
-                QuantityRef::CommanderCastFromCommandZoneCount
+    let (base_len, tail) = split_for_each_suffix(&text)?;
+    let nom_qty = all_consuming(terminated(
+        nom_quantity::parse_for_each_clause_ref,
+        opt(tag::<_, _, OracleError<'_>>(".")),
+    ))
+    .parse(tail.as_str())
+    .ok()
+    .map(|(_, qty)| QuantityExpr::Ref { qty });
+    // The context-free quantity wrapper also recognizes typed counter phrases
+    // such as `fade counter on this artifact`, which are intentionally outside
+    // the smaller nom reference grammar used by CopySpell's legacy suffix gate.
+    let qty =
+        nom_qty.or_else(|| parse_for_each_clause(&tail).map(|qty| QuantityExpr::Ref { qty }))?;
+    Some((qty, text[..base_len].trim_end().to_string()))
+}
+
+pub(super) fn strip_for_each_repeat_suffix(text: &str) -> (Option<QuantityExpr>, String) {
+    let (_, stripped_text) = strip_each_copy_targets_distinct_member_suffix(text);
+    if let Some((qty, base)) = parse_for_each_repeat_suffix(text) {
+        // The repeat-suffix lift is restricted to quantities whose consumer
+        // is `CopySpell`: commander casts, trigger-bound spell history, and
+        // Zada's distinct-copy object count. A player-set `PlayerCount` is
+        // deliberately NOT admitted here — that class routes through the
+        // fieldless-Investigate seam via `for_each_repeatable_repeat_for`.
+        if matches!(
+            &qty,
+            QuantityExpr::Ref {
+                qty: QuantityRef::CommanderCastFromCommandZoneCount
                     | QuantityRef::SpellsCastBeforeTriggeringSpell { .. }
-            ) || zada_repeat_for_implies_distinct_copy_targets(&QuantityExpr::Ref {
-                qty: qty.clone(),
-            }) {
-                return (
-                    Some(QuantityExpr::Ref { qty }),
-                    text[..base_len].trim_end().to_string(),
-                );
             }
+        ) || zada_repeat_for_implies_distinct_copy_targets(&qty)
+        {
+            return (Some(qty), base);
         }
     }
-    (None, text)
+    (None, stripped_text)
 }
 
 /// CR 701.16a + CR 608.2c: Lift a trailing "[once] for each ⟨set⟩" multiplier off a
@@ -5154,12 +5170,11 @@ pub(super) fn rebind_subject_only_body_recipient(effect: &mut Effect) {
 /// `(Comparator, QuantityExpr)` pair:
 /// - "controls"/"control" → `(GE, Fixed(1))` (at least one matching permanent).
 /// - "doesn't/does not/don't/do not control" → `(EQ, Fixed(0))` (none).
-/// - "controls/control more <type> than you" → `(GT, Ref(ObjectCount {
-///   filter: <type>.controller(You) }))` — strictly more than the effect
-///   controller's own count of the same type (CR 109.5 — "you" is the controller
-///   of the object the ability is on). The carried `filter` is the BARE type
-///   (no controller axis); the per-candidate control relationship is enforced at
-///   runtime by `player_control_count_compares`.
+/// - "controls/control more <type> than you/they do" → `(GT, Ref(ObjectCount {
+///   filter: <type>.controller(You|ScopedPlayer) }))` — strictly more than the
+///   effect controller's or scoped player's own count of the same type (CR 109.5).
+///   The carried `filter` is the BARE type (no controller axis); the per-candidate
+///   control relationship is enforced at runtime by `player_control_count_compares`.
 ///
 /// The object sub-phrase ("an Elf", "a creature with power 4 or greater")
 /// delegates to the shared `parse_type_phrase_with_ctx` combinator — no bespoke
@@ -5171,7 +5186,12 @@ pub(crate) fn parse_controls_permanent_object<'a>(
     ctx: &mut ParseContext,
 ) -> Option<(Comparator, QuantityExpr, TargetFilter, &'a str)> {
     let lower = rest.to_lowercase();
-    // Comparative form tried FIRST: "who controls more <type> than you".
+    // Comparative form tried FIRST: "who controls more <type> than you" or
+    // "who controls more <type> than they do". The latter is used by Oath of
+    // Druids-style target clauses inside an "each player's upkeep" trigger:
+    // the comparison anchor is the player whose upkeep it is, not the source
+    // controller. Both forms share this parser and the same ControlsCount
+    // runtime predicate; only the anchor on the inner count differs.
     // Mirrors `oracle_nom::condition::parse_that_player_controls_more_comparison`:
     // consume the verb prefix, then split the original-case remainder on
     // " than you" so the isolated type text and the trailing remainder both stay
@@ -5183,18 +5203,29 @@ pub(crate) fn parse_controls_permanent_object<'a>(
         Ok((i, ()))
     }) {
         let after_verb_lower = after_verb.to_lowercase();
-        if let Some((type_text, comparative_remainder)) =
-            split_once_on_lower(after_verb, &after_verb_lower, " than you")
-        {
+        let comparative = [
+            (" than they do", ControllerRef::ScopedPlayer),
+            (" than you do", ControllerRef::You),
+            (" than you", ControllerRef::You),
+        ]
+        .iter()
+        .find_map(|(suffix, controller)| {
+            split_once_on_lower(after_verb, &after_verb_lower, suffix)
+                .map(|(type_text, remainder)| (type_text, remainder, controller.clone()))
+        });
+        if let Some((type_text, comparative_remainder, count_controller)) = comparative {
             let (bare_filter, _) = parse_type_phrase_with_ctx(type_text, ctx);
             if matches!(bare_filter, TargetFilter::Any) {
                 return None;
             }
-            // CR 109.5: the controller's own count uses a `You`-controlled filter.
+            // CR 109.5: the comparison anchor is either the effect controller
+            // ("you") or the scoped player ("they"). The runtime's existing
+            // ControllerRef::ScopedPlayer fallback uses the supplied player
+            // scope when this predicate is evaluated as a target filter.
             let you_count = match &bare_filter {
                 TargetFilter::Typed(tf) => QuantityExpr::Ref {
                     qty: QuantityRef::ObjectCount {
-                        filter: TargetFilter::Typed(tf.clone().controller(ControllerRef::You)),
+                        filter: TargetFilter::Typed(tf.clone().controller(count_controller)),
                     },
                 },
                 // Non-typed filters cannot carry a controller axis; reject rather
@@ -6143,6 +6174,18 @@ pub(crate) fn strip_temporal_prefix(text: &str) -> (&str, Option<DelayedTriggerC
     let lower = text.to_lowercase();
     if let Some((condition, rest)) = nom_on_lower(text, &lower, |i| {
         alt((
+            // CR 603.7a + CR 502.2: "during your next untap step, as you
+            // untap your permanents" is a one-shot delayed trigger, not a
+            // continuous duration.  PlayerId(0) is the parse-time controller
+            // placeholder rewritten by delayed-trigger resolution.
+            value(
+                DelayedTriggerCondition::AtNextPhaseForPlayer {
+                    phase: Phase::Untap,
+                    player: crate::types::player::PlayerId(0),
+                    gate: crate::types::ability::TurnGate::None,
+                },
+                tag("during your next untap step, as you untap your permanents, "),
+            ),
             value(
                 DelayedTriggerCondition::AtNextPhase { phase: Phase::End },
                 tag("at the beginning of the next end step, "),

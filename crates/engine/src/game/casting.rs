@@ -5762,20 +5762,39 @@ fn iter_cast_free_permission_source_ids(state: &GameState) -> impl Iterator<Item
         .copied()
 }
 
+/// One admitted `CastFromHandFree` permission.  Keep the recipient decision and
+/// its flash rider together so callers cannot authorize a free cast for one
+/// player while accidentally applying the rider for another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandCastFreePermission {
+    frequency: CastFrequency,
+    grants_flash: bool,
+}
+
 fn cast_free_permission_from_source(
     state: &GameState,
     player: PlayerId,
     obj: &crate::game::game_object::GameObject,
     source_id: ObjectId,
-) -> Option<CastFrequency> {
+) -> Option<HandCastFreePermission> {
     let src_obj = state.objects.get(&source_id)?;
-    if src_obj.controller != player {
-        return None;
-    }
     active_static_definitions(state, src_obj).find_map(|s| {
-        let StaticMode::CastFromHandFree { frequency, origin } = s.mode else {
+        let StaticMode::CastFromHandFree {
+            frequency,
+            origin,
+            all_players,
+            grants_flash,
+        } = s.mode
+        else {
             return None;
         };
+        // CR 109.5 + CR 601.2b: ordinary free-cast permissions are controlled
+        // by the source's controller; Aluren's explicit "any player" wording
+        // is the narrow opt-out.  Do not infer this from the spell filter — a
+        // type-only Omniscience filter is still controller-only.
+        if !all_players && src_obj.controller != player {
+            return None;
+        }
         // CR 601.2b: Skip if this source's once-per-turn slot was already used.
         if frequency == CastFrequency::OncePerTurn
             && state.hand_cast_free_permissions_used.contains(&source_id)
@@ -5790,9 +5809,15 @@ fn cast_free_permission_from_source(
             state,
             obj.id,
             filter,
-            &super::filter::FilterContext::from_source_with_controller(source_id, player),
+            &super::filter::FilterContext::from_source_with_controller(
+                source_id,
+                src_obj.controller,
+            ),
         ) {
-            Some(frequency)
+            Some(HandCastFreePermission {
+                frequency,
+                grants_flash,
+            })
         } else {
             None
         }
@@ -5811,7 +5836,7 @@ pub(crate) fn hand_cast_free_permission_source(
 ) -> Option<(ObjectId, CastFrequency)> {
     iter_cast_free_permission_source_ids(state).find_map(|src_id| {
         cast_free_permission_from_source(state, player, obj, src_id)
-            .map(|frequency| (src_id, frequency))
+            .map(|permission| (src_id, permission.frequency))
     })
 }
 
@@ -5828,7 +5853,22 @@ fn unlimited_hand_cast_free_source(
 ) -> Option<ObjectId> {
     iter_cast_free_permission_source_ids(state).find(|&src_id| {
         cast_free_permission_from_source(state, player, obj, src_id)
-            == Some(CastFrequency::Unlimited)
+            .is_some_and(|permission| permission.frequency == CastFrequency::Unlimited)
+    })
+}
+
+/// CR 601.3b + CR 702.8a: whether an applicable free-cast permission also
+/// grants flash to this particular cast.  The check shares the admission
+/// authority with the no-cost path, so Aluren cannot accidentally grant flash
+/// to a spell/player it did not permit to be cast for free.
+fn hand_cast_free_permission_grants_flash(
+    state: &GameState,
+    player: PlayerId,
+    obj: &crate::game::game_object::GameObject,
+) -> bool {
+    iter_cast_free_permission_source_ids(state).any(|src_id| {
+        cast_free_permission_from_source(state, player, obj, src_id)
+            .is_some_and(|permission| permission.grants_flash)
     })
 }
 
@@ -7705,7 +7745,8 @@ fn prepare_spell_cast_with_variant_override_inner(
     let has_granted_flash =
         effective_spell_keyword_kinds_for(state, player, object_id, is_fuse_variant)
             .contains(&KeywordKind::Flash)
-            || exile_static_permission_grants_flash(state, player, object_id);
+            || exile_static_permission_grants_flash(state, player, object_id)
+            || hand_cast_free_permission_grants_flash(state, player, obj);
     let cast_outside_sorcery_timing = !restrictions::is_sorcery_speed_window(state, player);
     // CR 304.1: Instants can be cast any time a player has priority.
     // CR 301.1 / CR 306.1: Artifacts and planeswalkers are cast at sorcery speed.
@@ -11717,7 +11758,7 @@ pub fn handle_cast_spell_for_free_with_payment_mode(
     // active and filter-matched. Source-specific validation avoids accepting a
     // stale legal action for one source only because an earlier battlefield
     // source also matches the spell.
-    let frequency =
+    let permission =
         cast_free_permission_from_source(state, player, obj, source_id).ok_or_else(|| {
             EngineError::ActionNotAllowed(
                 "Named CastFromHandFree permission source does not admit this spell".to_string(),
@@ -11725,7 +11766,7 @@ pub fn handle_cast_spell_for_free_with_payment_mode(
         })?;
     let variant = CastingVariant::HandPermission {
         source: source_id,
-        frequency,
+        frequency: permission.frequency,
     };
     let mut prepared =
         prepare_spell_cast_with_variant_override(state, player, object_id, Some(variant))?;
@@ -14688,31 +14729,41 @@ pub fn hand_cast_free_candidates_with_probe(
 ) -> Vec<(ObjectId, ObjectId, CastFrequency)> {
     // CR 601.2b + CR 400.7: Collect active (source_id, frequency, filter)
     // triples for OncePerTurn permissions that haven't been consumed this turn.
-    let sources: Vec<(ObjectId, TargetFilter, CastFrequency, CastFreeOrigin)> =
-        iter_cast_free_permission_source_ids(state)
-            .filter_map(|src_id| {
-                let src_obj = state.objects.get(&src_id)?;
-                if src_obj.controller != player {
-                    return None;
-                }
-                active_static_definitions(state, src_obj).find_map(|s| match s.mode {
-                    StaticMode::CastFromHandFree { frequency, origin } => {
-                        if frequency == CastFrequency::OncePerTurn
-                            && state.hand_cast_free_permissions_used.contains(&src_id)
-                        {
-                            None
-                        } else if frequency == CastFrequency::OncePerTurn {
-                            s.affected
-                                .as_ref()
-                                .map(|f| (src_id, f.clone(), frequency, origin))
-                        } else {
-                            None
-                        }
+    let sources: Vec<(
+        ObjectId,
+        PlayerId,
+        TargetFilter,
+        CastFrequency,
+        CastFreeOrigin,
+    )> = iter_cast_free_permission_source_ids(state)
+        .filter_map(|src_id| {
+            let src_obj = state.objects.get(&src_id)?;
+            active_static_definitions(state, src_obj).find_map(|s| match s.mode {
+                StaticMode::CastFromHandFree {
+                    frequency,
+                    origin,
+                    all_players,
+                    ..
+                } => {
+                    if !all_players && src_obj.controller != player {
+                        return None;
                     }
-                    _ => None,
-                })
+                    if frequency == CastFrequency::OncePerTurn
+                        && state.hand_cast_free_permissions_used.contains(&src_id)
+                    {
+                        None
+                    } else if frequency == CastFrequency::OncePerTurn {
+                        s.affected
+                            .as_ref()
+                            .map(|f| (src_id, src_obj.controller, f.clone(), frequency, origin))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
             })
-            .collect();
+        })
+        .collect();
 
     if sources.is_empty() {
         return Vec::new();
@@ -14723,14 +14774,17 @@ pub fn hand_cast_free_candidates_with_probe(
         return out;
     };
     for &hand_id in &player_data.hand {
-        for (src_id, filter, frequency, origin) in &sources {
+        for (src_id, source_controller, filter, frequency, origin) in &sources {
             let Some(obj) = state.objects.get(&hand_id) else {
                 continue;
             };
             if !cast_free_origin_admits_object(state, player, obj, *origin) {
                 continue;
             }
-            let ctx = super::filter::FilterContext::from_source_with_controller(*src_id, player);
+            let ctx = super::filter::FilterContext::from_source_with_controller(
+                *src_id,
+                *source_controller,
+            );
             if !super::filter::matches_target_filter(state, hand_id, filter, &ctx) {
                 continue;
             }

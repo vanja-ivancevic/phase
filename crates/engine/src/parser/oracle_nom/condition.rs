@@ -2591,6 +2591,11 @@ fn parse_pt_ref_scoped(input: &str, scope: ObjectScope) -> OracleResult<'_, Quan
 fn parse_possessive_property(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = alt((
         tag("its "),
+        // CR 201.5 + CR 208.1: the parser normalizes a card's own name to
+        // `~`, but Oracle state triggers may retain the possessive form
+        // (`~'s power is 7 or greater`, Phyrexian Devourer). Treat it as the
+        // same source-relative pronoun used by the named-card form.
+        tag("~'s "),
         // CR 201.5: a possessive pronoun in a self-referential ability refers to
         // the object that has the ability (the source). Legendary creatures with
         // she/he pronouns use the gendered possessive instead of "its" (e.g. "if
@@ -10228,6 +10233,15 @@ pub(crate) fn parse_affirmative_reflexive_connector(
         value(
             AbilityCondition::effect_performed(),
             tag("if the player does, "),
+        ),
+        // CR 608.2c: Oath of Druids/Oath of Lieges name the player who made
+        // the preceding optional choice as "the first player".  This is the
+        // same reflexive OptionalEffectPerformed gate as "that player" and
+        // must stay in the shared connector grammar so the sequence splitter
+        // and effect-condition parser consume it identically.
+        value(
+            AbilityCondition::effect_performed(),
+            tag("if the first player does, "),
         ),
         value(AbilityCondition::effect_performed(), tag("if you do, ")),
         parse_discard_this_way_affirmative_connector,

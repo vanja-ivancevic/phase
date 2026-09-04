@@ -209,6 +209,36 @@ fn find_legal_targets_with_context(
         return targets;
     }
 
+    // CR 102.1 + CR 109.5: `PlayerMatching` is a player-only target filter
+    // whose predicate must be evaluated against the ability's scoped player
+    // when present (for example, Oath of Druids during the non-controller's
+    // upkeep). Keep the source controller for targeting restrictions such as
+    // hexproof, but bind the PlayerFilter relation/count anchor to the scoped
+    // player. This is the same matcher used during target re-validation.
+    if matches!(filter, TargetFilter::PlayerMatching { .. }) {
+        let scope_controller = target_ctx
+            .ability
+            .and_then(|ability| ability.scoped_player)
+            .or(target_ctx.scoped_iteration_player)
+            .unwrap_or(source_controller);
+        for player in &state.players {
+            if !player_is_legal_target(state, player.id, source_id, source_controller) {
+                continue;
+            }
+            if super::filter::player_matches_target_filter_in_state_with_scope(
+                state,
+                filter,
+                player.id,
+                Some(source_controller),
+                Some(source_id),
+                Some(scope_controller),
+            ) {
+                targets.push(TargetRef::Player(player.id));
+            }
+        }
+        return targets;
+    }
+
     // Typed filter with no type_filters AND no properties targets players, not
     // permanents. e.g. "target opponent" → Typed { type_filters: [], controller:
     // Opponent }. A non-empty `properties` list (e.g. `FilterProp::Token` for
@@ -1051,13 +1081,20 @@ fn target_ref_matches_resolved_filter_with_context(
             ),
             None => false,
         },
-        TargetRef::Player(player) => super::filter::player_matches_target_filter_in_state(
-            state,
-            target_filter,
-            *player,
-            ctx.source_controller,
-            Some(ctx.source_id),
-        ),
+        TargetRef::Player(player) => {
+            let scope_controller = ctx
+                .ability
+                .and_then(|ability| ability.scoped_player)
+                .or(ctx.scoped_iteration_player);
+            super::filter::player_matches_target_filter_in_state_with_scope(
+                state,
+                target_filter,
+                *player,
+                ctx.source_controller,
+                Some(ctx.source_id),
+                scope_controller,
+            )
+        }
     }
 }
 

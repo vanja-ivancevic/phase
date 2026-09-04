@@ -2963,6 +2963,7 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
         | QuantityRef::EnteredThisTurn { .. }
         | QuantityRef::CommanderManaValue { .. }
         | QuantityRef::CountersOn { .. }
+        | QuantityRef::TokenSourceCounters { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::TargetControllerCounter { .. }
         | QuantityRef::Variable { .. }
@@ -3293,6 +3294,7 @@ fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
         | QuantityRef::TriggeringScryLookCount
         | QuantityRef::TriggeringScryBottomCount
         | QuantityRef::CountersOn { .. }
+        | QuantityRef::TokenSourceCounters { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::TargetControllerCounter { .. }
         | QuantityRef::Variable { .. }
@@ -3480,6 +3482,7 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::MostPrevalentCreatureTypeIn { .. }
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType

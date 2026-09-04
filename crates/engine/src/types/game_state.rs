@@ -18032,6 +18032,15 @@ declare_game_state! {
         with = "tuple_key_map"
     )]
     pub ability_resolutions_this_turn: HashMap<(ObjectId, usize), u32>,
+    /// CR 106.3 + CR 603.4: Exact printed abilities that actually added one
+    /// or more mana during this turn. Keyed by `(source_id, ability_index)` so
+    /// a condition such as Carpet of Flowers' "with this ability" does not
+    /// accidentally observe another mana ability on the same permanent.
+    /// Object ids change on zone changes (CR 400.7), naturally resetting the
+    /// marker for a new incarnation; the whole set is cleared at turn start.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+    pub mana_added_by_abilities_this_turn: HashSet<(ObjectId, usize)>,
     /// CR 601.2a: Tracks which graveyard-cast permission sources have been
     /// used this turn. Keyed by the granting permanent's ObjectId.
     /// CR 400.7: Zone change creates new ObjectId, naturally resetting.
@@ -23235,6 +23244,7 @@ impl GameState {
             object_counter_placement_count_this_turn: std::collections::HashMap::new(),
             pending_attack_trigger_events: Vec::new(),
             ability_resolutions_this_turn: HashMap::new(),
+            mana_added_by_abilities_this_turn: HashSet::new(),
             graveyard_cast_permissions_used: HashSet::new(),
             graveyard_cast_permissions_used_per_type: HashSet::new(),
             pending_permanent_type_slot: None,
@@ -25266,6 +25276,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         object_counter_placement_count_this_turn: _,
         pending_attack_trigger_events: _,
         ability_resolutions_this_turn: _,
+        mana_added_by_abilities_this_turn: _,
         graveyard_cast_permissions_used: _,
         graveyard_cast_permissions_used_per_type: _,
         pending_permanent_type_slot: _,
@@ -25594,6 +25605,7 @@ impl PartialEq for GameState {
                 == other.loyalty_abilities_activated_this_turn
             && self.extra_loyalty_activations_this_turn == other.extra_loyalty_activations_this_turn
             && self.ability_resolutions_this_turn == other.ability_resolutions_this_turn
+            && self.mana_added_by_abilities_this_turn == other.mana_added_by_abilities_this_turn
             && self.graveyard_cast_permissions_used == other.graveyard_cast_permissions_used
             && self.graveyard_cast_permissions_used_per_type
                 == other.graveyard_cast_permissions_used_per_type

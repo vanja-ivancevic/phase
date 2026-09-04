@@ -1613,7 +1613,15 @@ fn effect_is_replacement_carrier(effect: &Effect) -> bool {
         // name IS the replacement, with or without the `on_exile` rider (the
         // Feather return / Lilah plot parameterization is a second consequence
         // folded into the same carrier, so it stays exempt either way).
-        | Effect::ExileResolvingSpellInsteadOfGraveyard { .. } => true,
+        | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
+        // CR 701.6a + CR 614.1a: a countered spell's non-graveyard
+        // destination is the replacement itself, carried on Counter rather
+        // than in the top-level replacement collection (Memory Lapse,
+        // Remand, Spell Crumple).
+        | Effect::Counter {
+            countered_spell_zone: Some(_),
+            ..
+        } => true,
         _ => false,
     }
 }
@@ -1641,8 +1649,28 @@ fn def_is_represented_instead_branch(def: &AbilityDefinition) -> bool {
     def.condition.is_some() && def.else_ability.is_some()
 }
 
+/// CR 614.1a + CR 605.1a: activated mana abilities may carry their
+/// replacement branch as a conditional mana `sub_ability` rather than an
+/// `else_ability`.  This is the canonical shape for the Urza lands (and for
+/// other conditional-mana lands): the parent adds its base production, while
+/// the conditional mana child replaces that production when its gate holds.
+///
+/// Keep this predicate structural and deliberately narrow.  A conditional
+/// non-mana sequel remains a sequel and must not silence the detector; only a
+/// mana effect whose conditional child is itself a mana effect can represent
+/// the replacement of mana production.
+fn def_is_conditional_mana_instead_branch(def: &AbilityDefinition) -> bool {
+    matches!(&*def.effect, Effect::Mana { .. })
+        && def.sub_ability.as_deref().is_some_and(|sub| {
+            sub.condition.is_some() && matches!(&*sub.effect, Effect::Mana { .. })
+        })
+}
+
 fn def_tree_has_replacement_carrier(def: &AbilityDefinition) -> bool {
-    if effect_is_replacement_carrier(&def.effect) || def_is_represented_instead_branch(def) {
+    if effect_is_replacement_carrier(&def.effect)
+        || def_is_represented_instead_branch(def)
+        || def_is_conditional_mana_instead_branch(def)
+    {
         return true;
     }
     if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
@@ -3147,6 +3175,70 @@ fn any_optional_ability_has_dig(parsed: &ParsedAbilities) -> bool {
         })
 }
 
+/// CR 701.20a + CR 608.2c: An optional RevealUntil instruction already
+/// carries the "if the first player does" gate when the following clause is
+/// absorbed as its kept/rest continuation.  The optional `AbilityDefinition`
+/// stops the chain when the player declines; accepting it routes the hit card
+/// and revealed remainder through the typed destination fields.  This is the
+/// same structural linkage as the Dig/look family above, but it needs its own
+/// probe because RevealUntil uses destination slots rather than a separate
+/// tracked-set effect.
+fn def_tree_has_reveal_until(def: &AbilityDefinition) -> bool {
+    if matches!(&*def.effect, Effect::RevealUntil { .. }) {
+        return true;
+    }
+    if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
+        if def_tree_has_reveal_until(effect) {
+            return true;
+        }
+    }
+    if let Some(ref sub) = def.sub_ability {
+        if def_tree_has_reveal_until(sub) {
+            return true;
+        }
+    }
+    if let Some(ref else_ab) = def.else_ability {
+        if def_tree_has_reveal_until(else_ab) {
+            return true;
+        }
+    }
+    def.mode_abilities.iter().any(def_tree_has_reveal_until)
+}
+
+fn any_optional_ability_has_reveal_until(parsed: &ParsedAbilities) -> bool {
+    parsed
+        .abilities
+        .iter()
+        .any(|def| def_tree_has_optional(def) && def_tree_has_reveal_until(def))
+        || parsed.triggers.iter().any(|trigger| {
+            trigger_tree_has_optional(trigger)
+                && trigger
+                    .execute
+                    .as_deref()
+                    .is_some_and(def_tree_has_reveal_until)
+        })
+}
+
+/// The Oath cycle's "If the first player does" sentence is the affirmative
+/// continuation of an optional reveal-until instruction, not an independent
+/// game-state condition.  Keep this exemption narrow and text-scoped: any
+/// second, unrelated `if` marker must remain visible to the detector.
+fn optional_reveal_until_first_player_if_is_only_if_marker(
+    stripped: &str,
+    parsed: &ParsedAbilities,
+) -> bool {
+    if !stripped.contains("if the first player does")
+        || !any_optional_ability_has_reveal_until(parsed)
+    {
+        return false;
+    }
+    let without_link = stripped.replace("if the first player does", "");
+    let has_if_marker = without_link.contains(" if ");
+    let has_as_if_marker = without_link.contains(" as if ");
+    let has_even_if_marker = without_link.contains(" even if ");
+    !(has_if_marker && !has_as_if_marker && !has_even_if_marker)
+}
+
 fn dig_if_you_do_is_only_if_marker(stripped: &str) -> bool {
     // allow-noncombinator: swallow detector marker scan on classified text
     if !stripped.contains("if you do") {
@@ -3630,6 +3722,46 @@ fn cast_this_way_alt_cost_is_only_if_marker(stripped: &str, evidence: &UnitEvide
     !has_other_if
 }
 
+/// CR 608.2b: a multi-target spell or ability may state that its announced
+/// targets must all still be legal as it resolves. The target-selection
+/// pipeline owns that legality check; it is not an independent game-state
+/// condition. Require a matching pair of target slots before discharging the
+/// rider so a partial parse cannot hide a real swallowed clause.
+///
+/// This is deliberately phrased in terms of the reusable target-legality
+/// mechanism, not a card name. The wording varies between "both"/"all" and
+/// "spell"/"ability", but the semantic carrier is the same.
+fn target_legality_rider_is_only_if_marker(
+    stripped: &str,
+    evidence: &UnitEvidence,
+) -> bool {
+    let mut residual = stripped.to_owned();
+    let mut matched = false;
+    for target_count in ["both", "all"] {
+        for object_kind in ["spell", "ability"] {
+            for still in [" still", ""] {
+                let marker = format!(
+                    "if {target_count} targets are{still} legal as this {object_kind} resolves"
+                );
+                if residual.contains(&marker) {
+                    matched = true;
+                    residual = residual.replace(&marker, "");
+                }
+            }
+        }
+    }
+    if !matched
+        || evidence.count_effect(|effect| matches!(effect, Effect::TargetOnly { .. })) < 2
+    {
+        return false;
+    }
+
+    let has_other_if = residual.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
+        && !residual.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
+        && !residual.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
+    !has_other_if
+}
+
 // ── Detector G: Condition_If ────────────────────────────────────────────
 
 /// CR 608.2c: "if [condition], [effect]" — conditional gate. Must be
@@ -3700,6 +3832,13 @@ fn detect_condition_if(
     let stripped = strip_represented_replacement_instead_sentences(&stripped, parsed);
     let stripped =
         strip_represented_tiered_enters_with_additional_counter_if_pairs(&stripped, parsed);
+    // CR 608.2b: "If both/all targets are still legal as this spell/ability
+    // resolves" is the target pipeline's represented legality gate. It is
+    // suppressed only when this unit contains the corresponding pair of
+    // parsed target slots and no other bare conditional remains.
+    if target_legality_rider_is_only_if_marker(&stripped, evidence) {
+        return;
+    }
     // CR 608.2c: "if a player is dealt damage this way, they discard" — the ParentTarget
     // discard rider is structurally represented (Effect::Discard{target:ParentTarget}); the
     // leading "if" is the CR 608.2c back-reference, not a swallowed game-state condition.
@@ -3721,6 +3860,13 @@ fn detect_condition_if(
     // same `Dig`; the "if you do" linkage IS represented by the optional `Dig`
     // (declining the look stops the whole chain), not swallowed.
     if any_optional_ability_has_dig(parsed) && dig_if_you_do_is_only_if_marker(&stripped) {
+        return;
+    }
+    // CR 701.20a + CR 608.2c: Oath of Druids / Oath of Lieges phrase the
+    // affirmative continuation as "If the first player does".  The optional
+    // RevealUntil head is the typed gate; accepting it applies its kept/rest
+    // destinations, while declining it resolves no continuation at all.
+    if optional_reveal_until_first_player_if_is_only_if_marker(&stripped, parsed) {
         return;
     }
     // CR 603.7a + CR 608.2c + CR 702.170c: "exile that {card,spell} instead of
@@ -4631,6 +4777,7 @@ fn detect_duration_this_turn(
                 | TriggerCondition::FirstTimeObjectTappedThisTurn
                 | TriggerCondition::FirstTimeObjectCountersAddedThisTurn
                 | TriggerCondition::AttackedThisTurn
+                | TriggerCondition::SourceAbilityAddedManaThisTurn
                 | TriggerCondition::CastSpellThisTurn { .. }
                 | TriggerCondition::SpellCastWithVariantThisTurn { .. }
                 | TriggerCondition::CounterAddedThisTurn
@@ -6657,6 +6804,19 @@ mod tests {
         assert!(!has_swallowed_detector(&parsed, "Replacement_Instead"));
     }
 
+    /// CR 701.6a + CR 614.1a: a countered-spell destination rider is a
+    /// replacement carrier on the Counter effect, not a top-level definition.
+    #[test]
+    fn replacement_instead_accepts_countered_spell_zone_redirect() {
+        let parsed = parse_named(
+            "Counter target spell. If that spell is countered this way, put it on top of its owner's library instead of into that player's graveyard.",
+            "Memory Lapse",
+            &["Instant"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Replacement_Instead"));
+    }
+
     #[test]
     fn replacement_instead_accepts_power_pack_delayed_payload_rider() {
         let parsed = parse_named(
@@ -7146,6 +7306,17 @@ mod tests {
     }
 
     #[test]
+    fn duration_this_turn_accepts_source_ability_mana_history_condition() {
+        let parsed = parse_named(
+            "At the beginning of each of your main phases, if you haven't added mana with this ability this turn, you may add X mana of any one color, where X is the number of Islands target opponent controls.",
+            "Carpet of Flowers",
+            &["Enchantment"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Duration_ThisTurn"));
+    }
+
+    #[test]
     fn duration_this_turn_accepts_life_loss_turn_history_condition() {
         let parsed = parse(
             "{1}{R}, Discard a card, Sacrifice a Vampire: Draw two cards. \
@@ -7355,6 +7526,20 @@ mod tests {
         );
         assert!(!has_swallowed_detector(&songbirds, "Optional_YouMay"));
         assert!(!has_swallowed_detector(&songbirds, "Condition_If"));
+    }
+
+    #[test]
+    fn oath_of_druids_optional_reveal_until_does_not_swallow_if_you_do() {
+        let parsed = parse_named(
+            "At the beginning of each player's upkeep, that player chooses target player who controls more creatures than they do and is their opponent. The first player may reveal cards from the top of their library until they reveal a creature card. If the first player does, that player puts that card onto the battlefield and all other cards revealed this way into their graveyard.",
+            "Oath of Druids",
+            &["Enchantment"],
+        );
+        assert!(
+            !has_swallowed_detector(&parsed, "Condition_If"),
+            "optional reveal-until consequence is represented, warnings: {:?}",
+            parsed.parse_warnings
+        );
     }
 
     /// CR 701.6 + CR 608.2c: The "If a permanent's ability is countered this

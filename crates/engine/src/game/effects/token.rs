@@ -1280,6 +1280,10 @@ pub(crate) fn materialize_token_spec_body(
     let ch = &spec.characteristics;
     // CR 111.1: Mark as token for SBA cleanup (CR 704.5d)
     object.is_token = true;
+    // CR 111.3: retain the creating permanent so token characteristic-
+    // defining abilities can resolve references such as "the number of fade
+    // counters on Saproling Burst" continuously while the token exists.
+    object.entered_via_ability_source = Some(spec.source_id);
     // True token from a TokenSpec — image lives in the generic-token
     // database (Treasure, Spirit, Saproling, Soldier, etc.).
     object.display_source = DisplaySource::Token;

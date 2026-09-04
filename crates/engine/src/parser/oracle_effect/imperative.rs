@@ -3690,6 +3690,23 @@ pub(super) fn parse_hand_reveal_ast(
         return Some(HandRevealImperativeAst::RevealBackRef);
     }
 
+    // CR 701.9a + CR 701.20a: the game selects one card uniformly at random
+    // from a hand. Keep this separate from the ordinary singular reveal path:
+    // `RevealHand { selection: Chosen }` would incorrectly open a controller
+    // choice prompt for cards such as Cursed Scroll.
+    if let Some((target, _)) = nom_on_lower(after_reveal_lower, after_reveal_lower, |input| {
+        let (rest, _) = alt((
+            tag::<_, _, OracleError<'_>>("a card at random from "),
+            tag("one card at random from "),
+            tag("a card at random in "),
+            tag("one card at random in "),
+        ))
+        .parse(input)?;
+        parse_hand_possessive_target(rest)
+    }) {
+        return Some(HandRevealImperativeAst::RevealRandom { target });
+    }
+
     // CR 701.20a: the definite-article forms ("the card" / "the cards") are the
     // same back-reference, but far more collision-prone than the pronoun forms:
     // "reveal the cards you want to splice onto it" and "reveal the cards in your
@@ -3748,11 +3765,35 @@ pub(super) fn parse_hand_reveal_ast(
     // This function only handles hand-related reveals.
 
     if nom_primitives::scan_contains(lower, "hand") {
+        // CR 701.20a: "reveal a card at random from your hand" selects the
+        // card as part of the effect, so it must not become a second interactive
+        // hand-card choice. Preserve the possessive player axis and lower the
+        // card filter to `None` (the random selection is the result object).
+        let random_prefixes = [
+            "a card at random from ",
+            "one card at random from ",
+        ];
+        for prefix in random_prefixes {
+            if let Some(hand_phrase) = after_reveal_lower.strip_prefix(prefix) {
+                let hand_phrase = hand_phrase.trim_end_matches('.').trim();
+                if let Ok((rest, target)) = parse_hand_possessive_target(hand_phrase) {
+                    if rest.trim().is_empty() {
+                        return Some(HandRevealImperativeAst::RevealAll {
+                            target,
+                            card_filter: TargetFilter::None,
+                            random: true,
+                        });
+                    }
+                }
+            }
+        }
+
         let (target, card_filter) =
             parse_hand_reveal_target_and_card_filter(after_reveal_lower, ctx);
         return Some(HandRevealImperativeAst::RevealAll {
             target,
             card_filter,
+            random: false,
         });
     }
 
@@ -3864,11 +3905,24 @@ pub(super) fn lower_hand_reveal_ast(ast: HandRevealImperativeAst) -> Effect {
         HandRevealImperativeAst::RevealAll {
             target,
             card_filter,
+            random,
         } => Effect::RevealHand {
             target,
             card_filter,
             count: None,
-            selection: crate::types::ability::CardSelectionMode::Chosen,
+            selection: if random {
+                crate::types::ability::CardSelectionMode::Random
+            } else {
+                crate::types::ability::CardSelectionMode::Chosen
+            },
+            choice_optional: false,
+            reveal: true,
+        },
+        HandRevealImperativeAst::RevealRandom { target } => Effect::RevealHand {
+            target,
+            card_filter: TargetFilter::None,
+            count: Some(QuantityExpr::Fixed { value: 1 }),
+            selection: crate::types::ability::CardSelectionMode::Random,
             choice_optional: false,
             reveal: true,
         },

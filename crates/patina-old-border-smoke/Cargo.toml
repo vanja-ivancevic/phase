@@ -1,0 +1,13 @@
+[package]
+name = "patina-old-border-smoke"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Compact Patina old-border rules smoke suite."
+
+[dependencies]
+# `test-support` exposes the small, public GameScenario harness.  It does not
+# enable Phase's own #[cfg(test)] integration corpus, so Patina's compact suite
+# still compiles the engine as one normal dependency.
+engine = { package = "phase-engine", path = "../engine", features = ["test-support"] }
