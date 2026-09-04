@@ -683,6 +683,7 @@ impl EventObjectSnapshot {
             | FilterProp::NameMatchesAnyPermanent { .. }
             | FilterProp::SharesQuality { .. }
             | FilterProp::IsChosenCreatureType
+            | FilterProp::IsChosenLandType
             | FilterProp::IsChosenCardType => Supported,
 
             // ---- composites ----

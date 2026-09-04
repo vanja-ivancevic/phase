@@ -886,6 +886,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 parts.push(format!("{value}").to_lowercase());
             }
             FilterProp::IsChosenCreatureType => parts.push("chosen creature type".into()),
+            FilterProp::IsChosenLandType => parts.push("chosen land type".into()),
             FilterProp::MostPrevalentCreatureTypeIn { zone, scope } => {
                 let scope_str = match scope {
                     ControllerRef::You => "your",

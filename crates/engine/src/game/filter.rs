@@ -316,6 +316,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::PowerGTSource
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
@@ -593,7 +594,9 @@ fn filter_prop_characteristic_reads_at(prop: &FilterProp, depth: u32) -> Charact
         | FilterProp::EquippedBy => CharacteristicKinds::CARD_TYPES,
         // CR 205.3m + CR 702.73a: creature-type reads see through Changeling, so
         // they read layer 6 as well as layer 4.
-        FilterProp::IsChosenCreatureType | FilterProp::SharesCreatureTypeWithCommander => {
+        FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
+        | FilterProp::SharesCreatureTypeWithCommander => {
             CharacteristicKinds::CARD_TYPES.union(CharacteristicKinds::ABILITIES)
         }
         // CR 205.3m + CR 701.23a: whole-zone creature-type tally, scoped to a
@@ -983,6 +986,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::PowerGTSource
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
@@ -1718,6 +1722,7 @@ pub(crate) fn filter_prop_contains(
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::MostPrevalentCreatureTypeIn { .. }
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
@@ -4950,6 +4955,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::PtComparison { .. }
         | FilterProp::PowerGTSource
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::MostPrevalentCreatureTypeIn { .. }
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
