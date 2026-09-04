@@ -60,6 +60,15 @@ fn scan_source_zone_filter(text: &str) -> Option<Zone> {
 /// `RequiresCondition { condition: None }`.
 pub fn parse_restriction_condition(text: &str) -> Option<ParsedCondition> {
     let lower = text.trim().trim_end_matches('.').to_lowercase();
+    // Preserve the restriction-only source-power vocabulary for the named
+    // self form. The shared grammar also accepts `~'s power`, which is the
+    // correct normalized shape for state triggers, but activation restrictions
+    // historically expose `SourcePowerAtLeast` to the restriction evaluator.
+    // Keep the two consumers' public AST contracts distinct while retaining
+    // the trigger parser's normalized `QuantityComparison` representation.
+    if let Some(power) = parse_source_power_threshold(&lower) {
+        return Some(ParsedCondition::SourcePowerAtLeast { minimum: power });
+    }
     match parse_shared_restriction_condition(&lower) {
         // The shared grammar recognized the phrase and `ParsedCondition` can hold it.
         SharedRestrictionParse::Converted(condition) => Some(condition),

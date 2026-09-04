@@ -3661,6 +3661,7 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::CommanderCastFromCommandZoneCount
         | QuantityRef::CommanderManaValue { .. }
         | QuantityRef::VoteCount { .. } => false,
+        QuantityRef::TokenSourceCounters { .. } => false,
     }
 }
 

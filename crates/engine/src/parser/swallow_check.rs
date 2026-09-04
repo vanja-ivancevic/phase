@@ -1613,7 +1613,15 @@ fn effect_is_replacement_carrier(effect: &Effect) -> bool {
         // name IS the replacement, with or without the `on_exile` rider (the
         // Feather return / Lilah plot parameterization is a second consequence
         // folded into the same carrier, so it stays exempt either way).
-        | Effect::ExileResolvingSpellInsteadOfGraveyard { .. } => true,
+        | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
+        // CR 701.6a + CR 614.1a: a countered spell's non-graveyard
+        // destination is the replacement itself, carried on Counter rather
+        // than in the top-level replacement collection (Memory Lapse,
+        // Remand, Spell Crumple).
+        | Effect::Counter {
+            countered_spell_zone: Some(_),
+            ..
+        } => true,
         _ => false,
     }
 }
@@ -3694,6 +3702,46 @@ fn cast_this_way_alt_cost_is_only_if_marker(stripped: &str, evidence: &UnitEvide
     !has_other_if
 }
 
+/// CR 608.2b: a multi-target spell or ability may state that its announced
+/// targets must all still be legal as it resolves. The target-selection
+/// pipeline owns that legality check; it is not an independent game-state
+/// condition. Require a matching pair of target slots before discharging the
+/// rider so a partial parse cannot hide a real swallowed clause.
+///
+/// This is deliberately phrased in terms of the reusable target-legality
+/// mechanism, not a card name. The wording varies between "both"/"all" and
+/// "spell"/"ability", but the semantic carrier is the same.
+fn target_legality_rider_is_only_if_marker(
+    stripped: &str,
+    evidence: &UnitEvidence,
+) -> bool {
+    let mut residual = stripped.to_owned();
+    let mut matched = false;
+    for target_count in ["both", "all"] {
+        for object_kind in ["spell", "ability"] {
+            for still in [" still", ""] {
+                let marker = format!(
+                    "if {target_count} targets are{still} legal as this {object_kind} resolves"
+                );
+                if residual.contains(&marker) {
+                    matched = true;
+                    residual = residual.replace(&marker, "");
+                }
+            }
+        }
+    }
+    if !matched
+        || evidence.count_effect(|effect| matches!(effect, Effect::TargetOnly { .. })) < 2
+    {
+        return false;
+    }
+
+    let has_other_if = residual.contains(" if ") // allow-noncombinator: swallow detector marker scan on classified text
+        && !residual.contains(" as if ") // allow-noncombinator: swallow detector marker scan on classified text
+        && !residual.contains(" even if "); // allow-noncombinator: swallow detector marker scan on classified text
+    !has_other_if
+}
+
 // ── Detector G: Condition_If ────────────────────────────────────────────
 
 /// CR 608.2c: "if [condition], [effect]" — conditional gate. Must be
@@ -3764,6 +3812,13 @@ fn detect_condition_if(
     let stripped = strip_represented_replacement_instead_sentences(&stripped, parsed);
     let stripped =
         strip_represented_tiered_enters_with_additional_counter_if_pairs(&stripped, parsed);
+    // CR 608.2b: "If both/all targets are still legal as this spell/ability
+    // resolves" is the target pipeline's represented legality gate. It is
+    // suppressed only when this unit contains the corresponding pair of
+    // parsed target slots and no other bare conditional remains.
+    if target_legality_rider_is_only_if_marker(&stripped, evidence) {
+        return;
+    }
     // CR 608.2c: "if a player is dealt damage this way, they discard" — the ParentTarget
     // discard rider is structurally represented (Effect::Discard{target:ParentTarget}); the
     // leading "if" is the CR 608.2c back-reference, not a swallowed game-state condition.
@@ -4702,6 +4757,7 @@ fn detect_duration_this_turn(
                 | TriggerCondition::FirstTimeObjectTappedThisTurn
                 | TriggerCondition::FirstTimeObjectCountersAddedThisTurn
                 | TriggerCondition::AttackedThisTurn
+                | TriggerCondition::SourceAbilityAddedManaThisTurn
                 | TriggerCondition::CastSpellThisTurn { .. }
                 | TriggerCondition::SpellCastWithVariantThisTurn { .. }
                 | TriggerCondition::CounterAddedThisTurn
@@ -6728,6 +6784,19 @@ mod tests {
         assert!(!has_swallowed_detector(&parsed, "Replacement_Instead"));
     }
 
+    /// CR 701.6a + CR 614.1a: a countered-spell destination rider is a
+    /// replacement carrier on the Counter effect, not a top-level definition.
+    #[test]
+    fn replacement_instead_accepts_countered_spell_zone_redirect() {
+        let parsed = parse_named(
+            "Counter target spell. If that spell is countered this way, put it on top of its owner's library instead of into that player's graveyard.",
+            "Memory Lapse",
+            &["Instant"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Replacement_Instead"));
+    }
+
     #[test]
     fn replacement_instead_accepts_power_pack_delayed_payload_rider() {
         let parsed = parse_named(
@@ -7214,6 +7283,17 @@ mod tests {
              not dropped: {:?}",
             parsed.replacements
         );
+    }
+
+    #[test]
+    fn duration_this_turn_accepts_source_ability_mana_history_condition() {
+        let parsed = parse_named(
+            "At the beginning of each of your main phases, if you haven't added mana with this ability this turn, you may add X mana of any one color, where X is the number of Islands target opponent controls.",
+            "Carpet of Flowers",
+            &["Enchantment"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Duration_ThisTurn"));
     }
 
     #[test]

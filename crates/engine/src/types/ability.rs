@@ -7509,6 +7509,17 @@ pub enum QuantityRef {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         counter_type: Option<CounterType>,
     },
+    /// CR 208.2 + CR 111.3: a token's characteristic-defining power or
+    /// toughness may count counters on the object that created it (for
+    /// example, Saproling Burst's token). This is deliberately distinct from
+    /// `CountersOn { scope: Source }`: in a token's static ability the source
+    /// object is the token itself, while the printed reference names the
+    /// creating permanent. The token creation path records that provenance on
+    /// `GameObject::entered_via_ability_source` for the token's lifetime.
+    TokenSourceCounters {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        counter_type: Option<CounterType>,
+    },
     /// CR 122.1: Total counters across all objects matching a filter.
     /// Used for phrases like "the number of +1/+1 counters on lands you control"
     /// (`counter_type: Some("P1P1")`) and "counters among artifacts and creatures
@@ -8386,6 +8397,7 @@ impl QuantityRef {
             | QuantityRef::DistinctColorsAmong { .. }
             | QuantityRef::DistinctCounterKindsAmong { .. }
             | QuantityRef::VoteCount { .. } => None,
+            QuantityRef::TokenSourceCounters { .. } => None,
         }
     }
 }
@@ -10952,6 +10964,10 @@ pub const REMOVE_COUNTER_COST_ALL: u32 = u32::MAX - 1;
 pub const REMOVE_COUNTER_COST_ANY_NUMBER: u32 = u32::MAX - 2;
 /// Sentinel for literal `X` in exile costs that use the compact numeric count.
 pub const EXILE_COST_X: u32 = u32::MAX;
+/// Sentinel for an unbounded "exile any number of" card choice. This is used
+/// by as-enters replacements whose accept branch lets the player choose zero
+/// or more matching cards before the permanent enters (CR 107.1c).
+pub const EXILE_COST_ANY_NUMBER: u32 = u32::MAX - 1;
 
 pub fn is_x_remove_counter_cost_count(count: u32) -> bool {
     count == REMOVE_COUNTER_COST_X
@@ -24070,6 +24086,14 @@ pub enum TriggerCondition {
     /// on activated-ability trigger events.
     ActivatedAbilityIsNonMana,
 
+    /// CR 106.3 + CR 603.4: True after this exact printed ability has added
+    /// one or more mana during the current turn. The evaluator receives the
+    /// printed ability index from trigger collection/resolution and keys the
+    /// per-turn ledger by the source's exact object id plus that index. This
+    /// models Carpet of Flowers' "with this ability" wording without widening
+    /// the condition to every mana ability on the permanent.
+    SourceAbilityAddedManaThisTurn,
+
     /// CR 700.4 + CR 120.1: "a creature dealt damage by ~ this turn dies" — death trigger
     /// gated on the dying creature having been dealt damage by the trigger source this turn.
     DealtDamageBySourceThisTurn,
@@ -24204,6 +24228,16 @@ pub enum TriggerCondition {
     SourceIsFaceDown,
     /// CR 113.6b: "if this card is in [zone]" — true when the trigger source is in the given zone.
     SourceInZone { zone: crate::types::zones::Zone },
+    /// CR 404.1 + CR 603.4: "if this card is in [zone] with a [filter] card
+    /// directly above it" — true when the exact live source is in the given
+    /// owner-scoped zone and the immediately newer card in that zone matches
+    /// the printed adjacent filter. The filter is retained rather than reduced
+    /// to a core type so subtype and future card-type phrases use the same
+    /// matching authority.
+    SourceInZoneWithAdjacentFilter {
+        zone: crate::types::zones::Zone,
+        adjacent: TargetFilter,
+    },
     /// CR 122.1: "if you put a counter on a permanent this turn" — true when the controller
     /// added any counter to any permanent this turn.
     CounterAddedThisTurn,
@@ -24446,6 +24480,7 @@ impl TriggerCondition {
             | TriggerCondition::CastVariantPaid { .. }
             | TriggerCondition::CastVariantPaidPersistent { .. }
             | TriggerCondition::ActivatedAbilityIsNonMana
+            | TriggerCondition::SourceAbilityAddedManaThisTurn
             | TriggerCondition::DealtDamageBySourceThisTurn
             | TriggerCondition::DealtDamageThisTurnBySource { .. }
             | TriggerCondition::FirstTimeObjectTappedThisTurn
@@ -24471,6 +24506,7 @@ impl TriggerCondition {
             | TriggerCondition::SourceIsFaceUp
             | TriggerCondition::SourceIsFaceDown
             | TriggerCondition::SourceInZone { .. }
+            | TriggerCondition::SourceInZoneWithAdjacentFilter { .. }
             | TriggerCondition::CounterAddedThisTurn
             | TriggerCondition::LostLifeLastTurn
             | TriggerCondition::DefendingPlayerControlsNone { .. }

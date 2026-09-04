@@ -43,7 +43,7 @@ use crate::types::ability::{
     PermissionGrantee, PlayerFilter, PreventionAmount, QuantityExpr, QuantityModification,
     QuantityRef, RedirectionLifetime, ReplacementCondition, ReplacementDefinition, ReplacementMode,
     ReplacementPlayerScope, SourceExclusion, StaticCondition, StaticDefinition, TapStateChange,
-    TargetFilter, TriggerDefinition, TypeFilter, TypedFilter,
+    TargetFilter, TriggerDefinition, TypeFilter, TypedFilter, EXILE_COST_ANY_NUMBER,
 };
 use crate::types::ability::{CardPlayMode, CastingPermission};
 use crate::types::card_type::Supertype;
@@ -145,6 +145,17 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     }
 
     // --- The Mimeoplasm: "As ~ enters, you may exile N cards from graveyards. If you do, ..." ---
+    // --- Sutured Ghoul: "As ~ enters, exile any number of creature cards from
+    //     your graveyard." ---
+    // The choice is made before the permanent enters, so use the existing
+    // replacement MayCost payment seam with an unbounded, zero-inclusive exile
+    // choice rather than treating the ChangeZone text as a post-entry effect.
+    if let Some(def) =
+        parse_as_enters_exile_any_number_from_graveyard(&norm_lower, &normalized, &text)
+    {
+        return Some(def);
+    }
+
     // Check before other "as enters" patterns to ensure it matches correctly
     if let Some(def) = parse_as_enters_exile_from_graveyards(&norm_lower, &normalized, &text) {
         return Some(def);
@@ -1338,6 +1349,62 @@ fn parse_self_enters_pay_cost_replacement(
 /// the parsed `AbilityCost::Exile` from graveyards; the "If you do" continuation
 /// is the copy + counter placement effect chain. No decline branch — the permanent
 /// enters normally (no exile, no copy, no counters) if declined.
+/// CR 614.1c + CR 614.12: Sutured Ghoul — "As ~ enters, exile any number of
+/// creature cards from your graveyard."
+///
+/// This is a zero-inclusive, unbounded choice made before the permanent enters.
+/// It is represented by the existing replacement `MayCost` seam, with a typed
+/// sentinel count so the payment resolver can surface the card choice before
+/// the entry event completes. Unlike the Mimeoplasm form below, there is no
+/// follow-up copy/counter continuation and declining simply leaves the entry
+/// unchanged.
+fn parse_as_enters_exile_any_number_from_graveyard(
+    norm_lower: &str,
+    normalized: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    let ((), after_prefix) = nom_on_lower(normalized, norm_lower, |i| {
+        value(
+            (),
+            preceded(
+                tag("as "),
+                alt((
+                    tag("~ enters, exile any number of "),
+                    tag("~ enters the battlefield, exile any number of "),
+                )),
+            ),
+        )
+        .parse(i)
+    })?;
+
+    let after_prefix_lower = after_prefix.to_lowercase();
+    let (filter_text, tail) =
+        split_once_on_lower(after_prefix, &after_prefix_lower, " from your graveyard")?;
+    if !tail.trim().trim_end_matches('.').trim().is_empty() {
+        return None;
+    }
+    let (filter, remainder) = parse_type_phrase(filter_text.trim());
+    if !remainder.trim().is_empty() {
+        return None;
+    }
+
+    let cost = AbilityCost::Exile {
+        count: EXILE_COST_ANY_NUMBER,
+        zone: Some(Zone::Graveyard),
+        filter: Some(filter),
+    };
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::Moved)
+            .mode(ReplacementMode::MayCost {
+                cost,
+                decline: None,
+            })
+            .valid_card(TargetFilter::SelfRef)
+            .destination_zone(Zone::Battlefield)
+            .description(original_text.to_string()),
+    )
+}
 fn parse_as_enters_exile_from_graveyards(
     norm_lower: &str,
     normalized: &str,
@@ -16011,6 +16078,33 @@ mod tests {
         assert_eq!(def.event, ReplacementEvent::LoseLife);
         assert_eq!(def.quantity_modification, None);
         assert_eq!(def.valid_player, None);
+    }
+
+    #[test]
+    fn sutured_ghoul_any_number_graveyard_exile_is_replacement_cost() {
+        let def = parse_replacement_line(
+            "As Sutured Ghoul enters, exile any number of creature cards from your graveyard.",
+            "Sutured Ghoul",
+        )
+        .expect("Sutured Ghoul's as-enters exile must parse");
+
+        assert_eq!(def.event, ReplacementEvent::Moved);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        assert_eq!(def.destination_zone, Some(Zone::Battlefield));
+        match def.mode {
+            ReplacementMode::MayCost { cost, decline } => {
+                assert!(decline.is_none());
+                assert!(matches!(
+                    cost,
+                    AbilityCost::Exile {
+                        count: EXILE_COST_ANY_NUMBER,
+                        zone: Some(Zone::Graveyard),
+                        filter: Some(TargetFilter::Typed(_)),
+                    }
+                ));
+            }
+            other => panic!("expected MayCost replacement, got {other:?}"),
+        }
     }
 
     #[test]

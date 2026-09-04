@@ -1043,6 +1043,7 @@ pub(crate) fn bind_resolution_scope(
             trigger_event: trigger_event.as_ref(),
             subject_match_count: *subject_match_count,
             die_result: *die_result,
+            ability_index: entry.ability().and_then(|ability| ability.ability_index),
         }),
         _ => None,
     };
@@ -1066,6 +1067,9 @@ pub(crate) struct TriggeredResolutionScope<'a> {
     pub trigger_event: Option<&'a GameEvent>,
     pub subject_match_count: Option<u32>,
     pub die_result: Option<i32>,
+    /// Exact printed ability index for source-ability-relative intervening-if
+    /// conditions (for example Carpet of Flowers).
+    pub ability_index: Option<usize>,
 }
 
 /// The decision-and-binding half of [`bind_resolution_scope`], with no stack
@@ -1084,12 +1088,13 @@ pub(crate) fn bind_triggered_resolution_scope(
     // CR 603.4: Intervening-if condition rechecked at resolution time.
     if let Some(scope) = &triggered {
         if let Some(condition) = scope.condition {
-            if !super::triggers::check_trigger_condition_with_source(
+            if !super::triggers::check_trigger_condition_with_source_and_ability_index(
                 state,
                 condition,
                 scope.controller,
                 scope.trigger_source,
                 scope.trigger_event,
+                scope.ability_index,
             ) {
                 return false;
             }
@@ -14312,6 +14317,7 @@ mod tests {
                     trigger_event: Some(&event_a),
                     subject_match_count: Some(4),
                     die_result: Some(6),
+                    ability_index: None,
                 }),
                 None,
             ));
@@ -14337,6 +14343,7 @@ mod tests {
                     trigger_event: Some(&event_a),
                     subject_match_count: None,
                     die_result: None,
+                    ability_index: None,
                 }),
                 Some(vec![event_a.clone(), event_b.clone()]),
             ));
@@ -14363,6 +14370,7 @@ mod tests {
                     trigger_event: None,
                     subject_match_count: Some(2),
                     die_result: None,
+                    ability_index: None,
                 }),
                 Some(vec![event_b.clone(), event_a.clone()]),
             ));
@@ -14412,6 +14420,7 @@ mod tests {
                     trigger_event: Some(&event_a),
                     subject_match_count: Some(4),
                     die_result: Some(6),
+                    ability_index: None,
                 }),
                 Some(vec![event_a.clone(), event_b.clone()]),
             ));
@@ -14442,6 +14451,7 @@ mod tests {
                     trigger_event: Some(&event_a),
                     subject_match_count: Some(4),
                     die_result: Some(6),
+                    ability_index: None,
                 }),
                 None,
             ));
@@ -14490,6 +14500,7 @@ mod tests {
                     trigger_event: Some(&event_a),
                     subject_match_count: Some(3),
                     die_result: Some(20),
+                    ability_index: None,
                 }),
                 Some(vec![event_a.clone(), event_b.clone()]),
             ));

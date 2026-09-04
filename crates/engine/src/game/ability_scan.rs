@@ -2110,6 +2110,11 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
             acc = acc.or(scan_player_filter(filter, mode));
             acc
         }
+        QuantityRef::TokenSourceCounters { .. } => Axes {
+            event: false,
+            sibling: true,
+            projected: false,
+        },
         QuantityRef::CountersOn { scope, .. } => {
             let mut acc = Axes {
                 event: false,
@@ -3659,7 +3664,8 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
         TriggerCondition::SourceIsAttacking => Axes::NONE,
         TriggerCondition::CastVariantPaid { variant: _ } => Axes::NONE,
         TriggerCondition::CastVariantPaidPersistent { variant: _ } => Axes::NONE,
-        TriggerCondition::ActivatedAbilityIsNonMana => Axes::NONE,
+        TriggerCondition::ActivatedAbilityIsNonMana
+        | TriggerCondition::SourceAbilityAddedManaThisTurn => Axes::NONE,
         TriggerCondition::DealtDamageBySourceThisTurn => Axes {
             event: false,
             sibling: false,
@@ -3777,7 +3783,8 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
         TriggerCondition::SourceIsTransformed => Axes::NONE,
         TriggerCondition::SourceIsFaceUp => Axes::NONE,
         TriggerCondition::SourceIsFaceDown => Axes::NONE,
-        TriggerCondition::SourceInZone { zone: _ } => Axes::NONE,
+        TriggerCondition::SourceInZone { zone: _ }
+        | TriggerCondition::SourceInZoneWithAdjacentFilter { .. } => Axes::NONE,
         TriggerCondition::CounterAddedThisTurn => Axes {
             event: false,
             sibling: false,

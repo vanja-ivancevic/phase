@@ -17,9 +17,9 @@ use super::{resolve_it_pronoun, ParseContext};
 use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
     AbilityDefinition, AbilityKind, ChosenSubtypeKind, ColorChangeMode, ContinuousModification,
-    ControllerRef, Duration, EachDamageRecipient, Effect, EffectScope, FilterProp, MultiTargetSpec,
-    ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef, StaticCondition,
-    StaticDefinition, TargetFilter, TypedFilter,
+    AggregateFunction, ControllerRef, Duration, EachDamageRecipient, Effect, EffectScope,
+    FilterProp, MultiTargetSpec, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PtValue,
+    QuantityExpr, QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -2874,6 +2874,31 @@ pub(super) fn parse_subject_application(
         if rest.trim().is_empty() && matches!(neighbor_filter, TargetFilter::Neighbor { .. }) {
             return subject_filter_application(neighbor_filter, false);
         }
+    }
+    // CR 119.1 + CR 603.2: Wild Dogs/Ghazban Ogre — the intervening-if
+    // condition establishes a unique maximum, then the player with that life
+    // total receives control of the source. Keep the recipient as a dynamic
+    // PlayerMatching filter so GiveControl resolves the current maximum at
+    // resolution rather than collapsing it to the controller or an opponent.
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "the player with the most life",
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        let player = super::player_with_most_life_filter(
+            PlayerRelation::All,
+            PlayerScope::AllPlayers {
+                aggregate: AggregateFunction::Max,
+                exclude: None,
+            },
+        );
+        return subject_filter_application(
+            TargetFilter::PlayerMatching {
+                player: Box::new(player),
+            },
+            false,
+        );
     }
     // CR 608.2c + CR 117.3a: "that player" / "the player" as subject,
     // optionally carrying a "may" modal ("that player may pay {2}").
@@ -6965,6 +6990,7 @@ pub(crate) fn starts_with_subject_prefix(lower: &str) -> bool {
             // controller of the creature that dealt combat damage. Longest-match
             // before the bare "the player " arm.
             value((), tag("the attacking player ")),
+            value((), tag("the player with the most life ")),
             value((), tag("the player ")),
             // CR 609.7 + CR 615.5: "the source's controller" / "the source's
             // owner" as a subject in a damage-prevention follow-up (Swans of

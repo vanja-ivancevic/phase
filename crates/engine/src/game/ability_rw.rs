@@ -1911,6 +1911,7 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
         | TriggerCondition::SourceIsFaceUp
         | TriggerCondition::SourceIsFaceDown
         | TriggerCondition::SourceInZone { .. }
+        | TriggerCondition::SourceInZoneWithAdjacentFilter { .. }
         | TriggerCondition::IsRenowned { .. }
         | TriggerCondition::WasStartingPlayer { .. }
         | TriggerCondition::ZoneChangeObjectMatchesFilter { .. }
@@ -1937,6 +1938,7 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
         | TriggerCondition::CastVariantPaid { .. }
         | TriggerCondition::CastVariantPaidPersistent { .. }
         | TriggerCondition::ActivatedAbilityIsNonMana
+        | TriggerCondition::SourceAbilityAddedManaThisTurn
         | TriggerCondition::FirstTimeObjectTappedThisTurn
         // Both first-time siblings are terminal here: neither carries a legacy
         // player-filter/quantity ref, so the D5 legacy-batch-prompt flag is
@@ -2152,6 +2154,7 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         QuantityRef::EventContextAmount
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::ManaSpentToCast { .. } => true,
+        QuantityRef::TokenSourceCounters { .. } => false,
         // Object-scope carriers: `ObjectScope::CostPaidObject` is a 12th tag.
         QuantityRef::CountersOn { scope, .. }
         | QuantityRef::Intensity { scope, .. }
@@ -6249,6 +6252,7 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
         }
         QuantityRef::PlayerCount { filter: _ } => RwProfile::empty(),
         QuantityRef::EventContextPlayerCount { filter: _ } => reads_event_live(),
+        QuantityRef::TokenSourceCounters { .. } => read_object_scope(&ObjectScope::Source, StateKind::ObjectCounters),
         QuantityRef::CountersOn { scope, .. } | QuantityRef::Intensity { scope, .. } => {
             read_object_scope(scope, StateKind::ObjectCounters)
         }
@@ -6673,6 +6677,7 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         | TriggerCondition::SourceIsFaceUp
         | TriggerCondition::SourceIsFaceDown
         | TriggerCondition::SourceInZone { .. }
+        | TriggerCondition::SourceInZoneWithAdjacentFilter { .. }
         | TriggerCondition::IsRenowned { .. }
         | TriggerCondition::WasStartingPlayer { .. } => frozen_source_read(),
         TriggerCondition::ZoneChangeObjectMatchesFilter { .. }
@@ -6688,6 +6693,13 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         | TriggerCondition::TriggeringSpellMatchesFilter { .. } => reads_event_live(),
         TriggerCondition::ManaColorSpent { .. } | TriggerCondition::ManaSpentCondition { .. } => {
             reads_player_of(StateKind::JournalCast)
+        }
+        // CR 106.3 + CR 603.4: the exact-ability mana ledger is mutable
+        // per-turn state with no narrower existing StateKind. Conservatively
+        // classify it as `Other` so sibling-order analysis never assumes that
+        // a mana-producing ability commutes with a trigger that reads this gate.
+        TriggerCondition::SourceAbilityAddedManaThisTurn => {
+            reads_board_of(StateKind::Other)
         }
         TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
             let mut p = RwProfile::empty();

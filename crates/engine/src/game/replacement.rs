@@ -8,7 +8,7 @@ use crate::types::ability::{
     Duration, Effect, EffectScope, ManaSpendPermission, PermissionGrantee,
     PostReplacementContinuation, PreventionAmount, QuantityExpr, QuantityModification,
     RedirectionLifetime, ReplacementCondition, ReplacementDefinition, ReplacementMode,
-    ResolvedAbility, ShieldKind, TapStateChange, TargetFilter, TargetRef,
+    ResolvedAbility, ShieldKind, TapStateChange, TargetFilter, TargetRef, EXILE_COST_ANY_NUMBER,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
@@ -1168,6 +1168,9 @@ fn replacement_cost_description(cost: &AbilityCost) -> String {
                 Some(Zone::Battlefield) => "from the battlefield",
                 _ => "",
             };
+            if *count == EXILE_COST_ANY_NUMBER {
+                return format!("Exile any number of cards {zone_str}");
+            }
             if *count == 1 {
                 format!("Exile a card {zone_str}")
             } else {
@@ -11654,6 +11657,69 @@ mod tests {
         assert_eq!(state.players[0].life, 18);
     }
 
+    #[test]
+    fn sutured_ghoul_any_number_replacement_surfaces_zone_choice() {
+        let repl = crate::parser::oracle_replacement::parse_replacement_line(
+            "As Sutured Ghoul enters, exile any number of creature cards from your graveyard.",
+            "Sutured Ghoul",
+        )
+        .expect("Sutured Ghoul replacement should parse");
+
+        assert_eq!(repl.event, ReplacementEvent::Moved);
+        assert_eq!(repl.valid_card, Some(TargetFilter::SelfRef));
+        assert_eq!(repl.destination_zone, Some(Zone::Battlefield));
+        assert!(matches!(
+            repl.mode,
+            ReplacementMode::MayCost {
+                cost: AbilityCost::Exile {
+                    count: EXILE_COST_ANY_NUMBER,
+                    zone: Some(Zone::Graveyard),
+                    filter: Some(TargetFilter::Typed(_)),
+                },
+                decline: None,
+            }
+        ));
+
+        let mut state = test_state_with_object(ObjectId(10), Zone::Hand, vec![repl]);
+        let mut creature = GameObject::new(
+            ObjectId(20),
+            CardId(2),
+            PlayerId(0),
+            "Graveyard Creature".to_string(),
+            Zone::Graveyard,
+        );
+        creature.card_types.core_types.push(CoreType::Creature);
+        creature.base_card_types.core_types.push(CoreType::Creature);
+        state.objects.insert(ObjectId(20), creature);
+        state.players[0].graveyard.push_back(ObjectId(20));
+
+        let mut events = Vec::new();
+        let proposed =
+            ProposedEvent::zone_change(ObjectId(10), Zone::Hand, Zone::Battlefield, None);
+        let result = replace_event(&mut state, proposed, &mut events);
+        assert!(matches!(
+            result,
+            ReplacementResult::NeedsChoice(PlayerId(0))
+        ));
+
+        let result = continue_replacement(&mut state, 0, &mut events);
+        assert!(matches!(result, ReplacementResult::Execute(_)));
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::EffectZoneChoice {
+                count: 1,
+                min_count: 0,
+                up_to: true,
+                is_cost_payment: true,
+                ..
+            }
+        ));
+        assert_eq!(state.objects.get(&ObjectId(10)).unwrap().zone, Zone::Hand);
+        assert_eq!(
+            state.objects.get(&ObjectId(20)).unwrap().zone,
+            Zone::Graveyard
+        );
+    }
     #[test]
     fn may_cost_replacement_decline_applies_decline_branch() {
         let repl = may_cost_tapped_replacement(2);
