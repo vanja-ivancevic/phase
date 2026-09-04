@@ -2985,6 +2985,20 @@ pub(super) fn strip_target_supertype_conditional(text: &str) -> (Option<AbilityC
         );
     }
 
+    // CR 205.4 + CR 400.7: Thermokarst's "If that land was a snow land"
+    // rider is an LKI test on the land destroyed by the preceding instruction.
+    // Keep the land type in the filter: "snow" is a supertype adjective, not a
+    // standalone type, and the anaphor explicitly names a land.
+    if let Ok((rest, _)) =
+        tag::<_, _, OracleError<'_>>("if that land was a snow land, ").parse(lower.as_str())
+    {
+        let body_start = text.len() - rest.len();
+        return (
+            Some(snow_land_lki_condition()),
+            text[body_start..].to_string(),
+        );
+    }
+
     if let Some((before, after)) = tp.rsplit_around(" if that land was ") {
         if all_consuming(alt((
             tag::<_, _, OracleError<'_>>("nonbasic."),
@@ -2995,6 +3009,21 @@ pub(super) fn strip_target_supertype_conditional(text: &str) -> (Option<AbilityC
         {
             return (
                 Some(nonbasic_land_lki_condition()),
+                before.original.trim_end_matches('.').trim().to_string(),
+            );
+        }
+    }
+
+    if let Some((before, after)) = tp.rsplit_around(" if that land was ") {
+        if all_consuming(alt((
+            tag::<_, _, OracleError<'_>>("a snow land."),
+            tag("a snow land"),
+        )))
+        .parse(after.lower.trim())
+        .is_ok()
+        {
+            return (
+                Some(snow_land_lki_condition()),
                 before.original.trim_end_matches('.').trim().to_string(),
             );
         }
@@ -3040,6 +3069,18 @@ fn nonbasic_land_lki_condition() -> AbilityCondition {
         filter: TargetFilter::Typed(TypedFilter::land().properties(vec![
             FilterProp::NotSupertype {
                 value: Supertype::Basic,
+            },
+        ])),
+        use_lki: true,
+        subject_slot: None,
+    }
+}
+
+fn snow_land_lki_condition() -> AbilityCondition {
+    AbilityCondition::TargetMatchesFilter {
+        filter: TargetFilter::Typed(TypedFilter::land().properties(vec![
+            FilterProp::HasSupertype {
+                value: Supertype::Snow,
             },
         ])),
         use_lki: true,
@@ -5478,6 +5519,28 @@ fn keyword_presence_kind(keyword: &Keyword) -> Option<crate::types::keywords::Ke
     keyword.kind_identifies_ability().then(|| keyword.kind())
 }
 
+/// CR 201.2 + CR 608.2c: A reveal/hand-choice continuation may ask whether
+/// the selected card has the source's chosen name (Cursed Scroll: "If that
+/// card has the chosen name, ...").  This is a result-object predicate, not a
+/// static battlefield condition: the selected card is injected into the
+/// continuation target by the resolution driver. Reuse the shared
+/// `HasChosenName` filter so the source-relative chosen-name lookup stays
+/// identical to Pithing Needle and other chosen-name effects.
+fn parse_revealed_card_chosen_name_condition(text: &str) -> Option<AbilityCondition> {
+    let text = text.trim().trim_end_matches('.').trim();
+    all_consuming(alt((
+        tag::<_, _, OracleError<'_>>("that card has the chosen name"),
+        tag("the revealed card has the chosen name"),
+    )))
+    .parse(text)
+    .ok()?;
+    Some(AbilityCondition::TargetMatchesFilter {
+        filter: TargetFilter::HasChosenName,
+        use_lki: false,
+        subject_slot: None,
+    })
+}
+
 pub(super) fn try_nom_condition_as_ability_condition(
     text: &str,
     ctx: &mut ParseContext,
@@ -5485,6 +5548,10 @@ pub(super) fn try_nom_condition_as_ability_condition(
     use crate::parser::oracle_nom::condition::parse_inner_condition;
 
     let lower = text.to_lowercase();
+
+    if let Some(condition) = parse_revealed_card_chosen_name_condition(&lower) {
+        return Some(condition);
+    }
 
     // CR 508.4 + CR 608.2c + CR 701.42: attacking meld-pair conditions are
     // resolution-time leading conditions. Keep them in the shared condition
@@ -8606,6 +8673,10 @@ mod tests {
             ("if that player does, draw a card", Some(effect.clone())),
             ("if the player does, draw a card", Some(effect.clone())),
             (
+                "if the first player does, draw a card",
+                Some(effect.clone()),
+            ),
+            (
                 "if that player doesn't, draw a card",
                 Some(not_effect.clone()),
             ),
@@ -10426,6 +10497,84 @@ mod tests {
             })
         );
         assert!(subtype_filter.is_none());
+    }
+
+    /// CR 201.2 + CR 608.2c: Cursed Scroll's chosen-name rider is a
+    /// result-object condition, not a swallowed conditional.
+    #[test]
+    fn that_card_has_the_chosen_name_is_a_result_object_condition() {
+        let condition = try_nom_condition_as_ability_condition(
+            "that card has the chosen name",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(
+            condition,
+            Some(AbilityCondition::TargetMatchesFilter {
+                filter: TargetFilter::HasChosenName,
+                use_lki: false,
+                subject_slot: None,
+            })
+        );
+    }
+
+    /// The leading-if router must preserve the body while lowering the same
+    /// chosen-name condition used by Cursed Scroll's activated ability.
+    #[test]
+    fn cursed_scroll_chosen_name_leading_condition_preserves_damage_body() {
+        let (condition, body) = strip_leading_general_conditional(
+            "If that card has the chosen name, this artifact deals 2 damage to any target.",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(body, "this artifact deals 2 damage to any target.");
+        assert_eq!(
+            condition,
+            Some(AbilityCondition::TargetMatchesFilter {
+                filter: TargetFilter::HasChosenName,
+                use_lki: false,
+                subject_slot: None,
+            })
+        );
+    }
+
+    /// The complete Cursed Scroll chain must retain both the random reveal and
+    /// the chosen-name gate on its damage continuation, not merely parse the
+    /// leading conditional in isolation.
+    #[test]
+    fn cursed_scroll_full_chain_keeps_chosen_name_damage_gate() {
+        fn has_gated_damage(def: &AbilityDefinition) -> bool {
+            let gated_damage = matches!(
+                (&*def.effect, &def.condition),
+                (
+                    Effect::DealDamage { .. },
+                    Some(AbilityCondition::TargetMatchesFilter {
+                        filter: TargetFilter::HasChosenName,
+                        use_lki: false,
+                        subject_slot: None,
+                    })
+                )
+            );
+            gated_damage
+                || def.sub_ability.as_deref().is_some_and(has_gated_damage)
+                || def.else_ability.as_deref().is_some_and(has_gated_damage)
+        }
+
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            "{3}, {T}: Choose a card name, then reveal a card at random from your hand. If that card has the chosen name, this artifact deals 2 damage to any target.",
+            "Cursed Scroll",
+            &[],
+            &["Artifact".to_string()],
+            &[],
+        );
+        assert!(
+            parsed.parse_warnings.is_empty(),
+            "Cursed Scroll should not emit parser warnings: {:?}",
+            parsed.parse_warnings
+        );
+        assert!(
+            parsed.abilities.iter().any(has_gated_damage),
+            "full Cursed Scroll chain must contain a HasChosenName-gated DealDamage: {:?}",
+            parsed.abilities
+        );
     }
 
     /// CR 608.2c: Suffix-if peel (`strip_suffix_conditional`) must stay in lockstep

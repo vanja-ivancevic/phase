@@ -3748,11 +3748,35 @@ pub(super) fn parse_hand_reveal_ast(
     // This function only handles hand-related reveals.
 
     if nom_primitives::scan_contains(lower, "hand") {
+        // CR 701.20a: "reveal a card at random from your hand" selects the
+        // card as part of the effect, so it must not become a second interactive
+        // hand-card choice. Preserve the possessive player axis and lower the
+        // card filter to `None` (the random selection is the result object).
+        let random_prefixes = [
+            "a card at random from ",
+            "one card at random from ",
+        ];
+        for prefix in random_prefixes {
+            if let Some(hand_phrase) = after_reveal_lower.strip_prefix(prefix) {
+                let hand_phrase = hand_phrase.trim_end_matches('.').trim();
+                if let Ok((rest, target)) = parse_hand_possessive_target(hand_phrase) {
+                    if rest.trim().is_empty() {
+                        return Some(HandRevealImperativeAst::RevealAll {
+                            target,
+                            card_filter: TargetFilter::None,
+                            random: true,
+                        });
+                    }
+                }
+            }
+        }
+
         let (target, card_filter) =
             parse_hand_reveal_target_and_card_filter(after_reveal_lower, ctx);
         return Some(HandRevealImperativeAst::RevealAll {
             target,
             card_filter,
+            random: false,
         });
     }
 
@@ -3864,11 +3888,16 @@ pub(super) fn lower_hand_reveal_ast(ast: HandRevealImperativeAst) -> Effect {
         HandRevealImperativeAst::RevealAll {
             target,
             card_filter,
+            random,
         } => Effect::RevealHand {
             target,
             card_filter,
             count: None,
-            selection: crate::types::ability::CardSelectionMode::Chosen,
+            selection: if random {
+                crate::types::ability::CardSelectionMode::Random
+            } else {
+                crate::types::ability::CardSelectionMode::Chosen
+            },
             choice_optional: false,
             reveal: true,
         },

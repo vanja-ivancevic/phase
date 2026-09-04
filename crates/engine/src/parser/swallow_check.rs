@@ -3147,6 +3147,70 @@ fn any_optional_ability_has_dig(parsed: &ParsedAbilities) -> bool {
         })
 }
 
+/// CR 701.20a + CR 608.2c: An optional RevealUntil instruction already
+/// carries the "if the first player does" gate when the following clause is
+/// absorbed as its kept/rest continuation.  The optional `AbilityDefinition`
+/// stops the chain when the player declines; accepting it routes the hit card
+/// and revealed remainder through the typed destination fields.  This is the
+/// same structural linkage as the Dig/look family above, but it needs its own
+/// probe because RevealUntil uses destination slots rather than a separate
+/// tracked-set effect.
+fn def_tree_has_reveal_until(def: &AbilityDefinition) -> bool {
+    if matches!(&*def.effect, Effect::RevealUntil { .. }) {
+        return true;
+    }
+    if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
+        if def_tree_has_reveal_until(effect) {
+            return true;
+        }
+    }
+    if let Some(ref sub) = def.sub_ability {
+        if def_tree_has_reveal_until(sub) {
+            return true;
+        }
+    }
+    if let Some(ref else_ab) = def.else_ability {
+        if def_tree_has_reveal_until(else_ab) {
+            return true;
+        }
+    }
+    def.mode_abilities.iter().any(def_tree_has_reveal_until)
+}
+
+fn any_optional_ability_has_reveal_until(parsed: &ParsedAbilities) -> bool {
+    parsed
+        .abilities
+        .iter()
+        .any(|def| def_tree_has_optional(def) && def_tree_has_reveal_until(def))
+        || parsed.triggers.iter().any(|trigger| {
+            trigger_tree_has_optional(trigger)
+                && trigger
+                    .execute
+                    .as_deref()
+                    .is_some_and(def_tree_has_reveal_until)
+        })
+}
+
+/// The Oath cycle's "If the first player does" sentence is the affirmative
+/// continuation of an optional reveal-until instruction, not an independent
+/// game-state condition.  Keep this exemption narrow and text-scoped: any
+/// second, unrelated `if` marker must remain visible to the detector.
+fn optional_reveal_until_first_player_if_is_only_if_marker(
+    stripped: &str,
+    parsed: &ParsedAbilities,
+) -> bool {
+    if !stripped.contains("if the first player does")
+        || !any_optional_ability_has_reveal_until(parsed)
+    {
+        return false;
+    }
+    let without_link = stripped.replace("if the first player does", "");
+    let has_if_marker = without_link.contains(" if ");
+    let has_as_if_marker = without_link.contains(" as if ");
+    let has_even_if_marker = without_link.contains(" even if ");
+    !(has_if_marker && !has_as_if_marker && !has_even_if_marker)
+}
+
 fn dig_if_you_do_is_only_if_marker(stripped: &str) -> bool {
     // allow-noncombinator: swallow detector marker scan on classified text
     if !stripped.contains("if you do") {
@@ -3721,6 +3785,13 @@ fn detect_condition_if(
     // same `Dig`; the "if you do" linkage IS represented by the optional `Dig`
     // (declining the look stops the whole chain), not swallowed.
     if any_optional_ability_has_dig(parsed) && dig_if_you_do_is_only_if_marker(&stripped) {
+        return;
+    }
+    // CR 701.20a + CR 608.2c: Oath of Druids / Oath of Lieges phrase the
+    // affirmative continuation as "If the first player does".  The optional
+    // RevealUntil head is the typed gate; accepting it applies its kept/rest
+    // destinations, while declining it resolves no continuation at all.
+    if optional_reveal_until_first_player_if_is_only_if_marker(&stripped, parsed) {
         return;
     }
     // CR 603.7a + CR 608.2c + CR 702.170c: "exile that {card,spell} instead of
@@ -7355,6 +7426,20 @@ mod tests {
         );
         assert!(!has_swallowed_detector(&songbirds, "Optional_YouMay"));
         assert!(!has_swallowed_detector(&songbirds, "Condition_If"));
+    }
+
+    #[test]
+    fn oath_of_druids_optional_reveal_until_does_not_swallow_if_you_do() {
+        let parsed = parse_named(
+            "At the beginning of each player's upkeep, that player chooses target player who controls more creatures than they do and is their opponent. The first player may reveal cards from the top of their library until they reveal a creature card. If the first player does, that player puts that card onto the battlefield and all other cards revealed this way into their graveyard.",
+            "Oath of Druids",
+            &["Enchantment"],
+        );
+        assert!(
+            !has_swallowed_detector(&parsed, "Condition_If"),
+            "optional reveal-until consequence is represented, warnings: {:?}",
+            parsed.parse_warnings
+        );
     }
 
     /// CR 701.6 + CR 608.2c: The "If a permanent's ability is countered this

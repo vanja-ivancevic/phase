@@ -4303,6 +4303,7 @@ fn scan_filter_prop(x: &FilterProp, mode: ScanMode) -> Axes {
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate

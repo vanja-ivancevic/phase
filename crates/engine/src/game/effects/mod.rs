@@ -2960,6 +2960,21 @@ fn apply_parent_chain_context(
     state: &mut GameState,
 ) {
     child.context = parent.context.clone();
+    // Result-object conditions consume the producer's result for one immediate
+    // child. Do not let a later grandchild inherit it accidentally; the producer
+    // branch below stamps it back onto the direct condition consumer.
+    child.context.resolution_result_context = None;
+    if effect_writes_last_revealed_ids(&parent.effect)
+        && !state.last_revealed_ids.is_empty()
+        && child
+            .condition
+            .as_ref()
+            .is_some_and(condition_depends_on_result_object)
+    {
+        child.context.resolution_result_context = Some(Box::new(
+            ForwardedResultContext::from_object_ids(state, &state.last_revealed_ids),
+        ));
+    }
     // CR 120.1 + CR 608.2b: The damage-subject binding names the object THIS
     // hand-off supplies (or fails to supply) to the immediate child's damage
     // clause. It is one-hop by construction — a grandchild's subject slot is a
@@ -3847,7 +3862,8 @@ fn condition_reads_filter_population(
 
 /// CR 608.2c + CR 400.7j: Whether a condition reads the parent's *suspended-
 /// selection result object* — the found/revealed card that a `SearchLibrary`
-/// injects as the continuation target only after the player responds
+/// injects as the continuation target (or a prompted `RevealHand` supplies it
+/// only after the player responds)
 /// (`engine_resolution_choices.rs`, `cont.chain.targets = continuation_targets`).
 /// A `TargetMatchesFilter` or `RevealedHasCardType` gate on "that card" ("the
 /// revealed card is the chosen type" / "if it's a land card") cannot be evaluated
@@ -3966,6 +3982,14 @@ fn effect_writes_last_revealed_ids(effect: &Effect) -> bool {
             // a chained "If it's a creature card, …" rider and an anaphoric
             // "turn it face up" follow-up read it (Hauntwoods Shrieker).
             | Effect::Reveal { .. }
+            // CR 701.20a: a random card selected from a hand is a concrete
+            // result object for a chained condition (Cursed Scroll), while a
+            // non-random whole-hand reveal intentionally remains outside this
+            // ledger because it has no singular result object.
+            | Effect::RevealHand {
+                selection: crate::types::ability::CardSelectionMode::Random,
+                ..
+            }
     )
 }
 
@@ -13231,6 +13255,9 @@ fn resolve_chain_body(
                         && condition_depends_on_graveyard_size(condition))
                     || condition_depends_on_last_created(condition)
                     || matches!(condition, AbilityCondition::WhenYouDo)
+                    || (matches!(ability.effect, Effect::RevealHand { .. })
+                        && matches!(state.waiting_for, WaitingFor::RevealChoice { .. })
+                        && condition_depends_on_result_object(condition))
                     || (matches!(state.waiting_for, WaitingFor::SearchChoice { .. })
                         && condition_depends_on_result_object(condition))
                     || condition_awaits_resolution_only_referent(condition, state, ability))
@@ -14841,7 +14868,19 @@ pub(crate) fn evaluate_condition(
             // Mirror the `ParentTargetController` fallback (targeting.rs): when
             // `targets` has no object, resolve the anaphor against
             // `TriggeringSource` from the current trigger event.
-            let target_id = if let Some(index) = subject_slot {
+            let result_target_id = ability
+                .context
+                .resolution_result_context
+                .as_ref()
+                .and_then(|context| {
+                    context.targets.iter().find_map(|target| match target {
+                        TargetRef::Object(id) if context.object_pin_is_current(*id, state) => {
+                            Some(*id)
+                        }
+                        _ => None,
+                    })
+                });
+            let target_id = result_target_id.or_else(|| if let Some(index) = subject_slot {
                 match crate::game::targeting::resolve_parent_slot_from_root(state, ability, *index)
                 {
                     Some(TargetRef::Object(id)) => Some(id),
@@ -14866,7 +14905,7 @@ pub(crate) fn evaluate_condition(
                             TargetRef::Player(_) => None,
                         })
                     })
-            };
+            });
             let matched = if let Some(id) = target_id {
                 if *use_lki {
                     if let Some(GameEvent::ZoneChanged { record, .. }) =

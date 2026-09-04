@@ -11513,6 +11513,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         // read live from the same place on both legs — the prop-level
         // counterpart of `TargetFilter::HasChosenName`.
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::ControllerChoseLabel { .. }

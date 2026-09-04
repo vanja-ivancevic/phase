@@ -2504,8 +2504,26 @@ fn try_parse_at_next_phase_delayed_trigger(
     let (effect_text, condition) = strip_temporal_prefix(text);
     let condition = condition?;
     let mut ctx = ParseContext::default();
-    let inner = parse_effect_chain_with_context(effect_text, kind, &mut ctx);
-    Some(ParsedEffectClause {
+    Some(build_at_next_phase_delayed_trigger(
+        effect_text,
+        condition,
+        kind,
+        &mut ctx,
+    ))
+}
+
+/// CR 603.7a: Shared lowering for temporal prefixes reached from both the
+/// top-level spell parser and an activated-ability effect clause.  Keeping the
+/// body parse in the caller's context matters for source-relative pronouns in
+/// activated abilities (for example, "return it" on a land's ability).
+fn build_at_next_phase_delayed_trigger(
+    effect_text: &str,
+    condition: DelayedTriggerCondition,
+    kind: AbilityKind,
+    ctx: &mut ParseContext,
+) -> ParsedEffectClause {
+    let inner = parse_effect_chain_with_context(effect_text, kind, ctx);
+    ParsedEffectClause {
         effect: Effect::CreateDelayedTrigger {
             condition,
             effect: Box::new(inner),
@@ -2518,7 +2536,7 @@ fn try_parse_at_next_phase_delayed_trigger(
         condition: None,
         optional: false,
         unless_pay: None,
-    })
+    }
 }
 
 /// CR 603.7a + CR 603.7c + CR 400.7: Is this delayed trigger's inner chain an impulse-cleanup
@@ -9150,8 +9168,49 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
             description: None,
         });
     }
+    // CR 608.2b: "This ability still resolves if its target becomes illegal" is
+    // a declarative targeting rider, not a second game instruction. The engine's
+    // normal resolution path already checks each target independently and keeps
+    // the remaining legal instructions alive, so preserve the rider as an
+    // explicit no-op rather than reporting an unbound subject and marking the
+    // whole card unsupported. Keep this exact and end-anchored: a future rider
+    // with different legality semantics must earn its own parser/runtime proof.
+    let lower = text.to_lowercase();
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "this ability still resolves if its target becomes illegal",
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        return parsed_clause(Effect::NoOp);
+    }
+    // CR 608.2d + CR 608.2c: A single instruction may announce multiple named
+    // choices ("choose a land type and a basic land type") before a following
+    // sentence consumes both values.  The ordinary named-choice parser is
+    // intentionally prefix-based, so without this complete-conjunction arm it
+    // would accept only the first choice and silently drop the second.  Build
+    // the choices as an ordered sub-ability chain; each value is persisted on
+    // the exact source so later clauses can read both attributes independently.
+    if let Some(clause) = try_parse_named_choice_conjunction_clause(text) {
+        return clause;
+    }
     if counter_unless_payment_is_unsupported(text) {
         return parsed_unless_payment_unsupported_clause(text);
+    }
+    // CR 603.7a: Activated abilities can install delayed effects too.  The
+    // top-level spell parser already owns this temporal recognizer, but effect
+    // clauses reached through an activated ability (notably Undiscovered
+    // Paradise) arrive here instead.  Keep the prefix grammar in `lower.rs`
+    // and reuse the same delayed-trigger lowering so this remains a mechanism,
+    // not a card-specific exception.
+    let (temporal_body, temporal_condition) = strip_temporal_prefix(text);
+    if let Some(condition) = temporal_condition {
+        return build_at_next_phase_delayed_trigger(
+            temporal_body,
+            condition,
+            AbilityKind::Activated,
+            ctx,
+        );
     }
     // CR 608.2c: Self-ref continuation adverb. "also" after a self-ref subject
     // is a natural-language additive connector with no semantic weight — it
@@ -27371,6 +27430,45 @@ pub(crate) fn try_parse_named_choice_conjunction(choose_text: &str) -> Option<Ve
     (choices.len() >= 2).then_some(choices)
 }
 
+/// CR 608.2d + CR 608.2c: Lower a complete conjunction of named choices into
+/// an ordered `Choose` → `Choose` sub-ability chain.  This is deliberately
+/// independent of any particular pair: the same mechanism handles card-name +
+/// creature-type (Psychic Paper), land-type + basic-land-type (Vision Charm),
+/// and future N-way named-choice conjunctions.
+fn try_parse_named_choice_conjunction_clause(text: &str) -> Option<ParsedEffectClause> {
+    let lower = text.trim().trim_end_matches('.').trim().to_lowercase();
+    let choice_types = try_parse_named_choice_conjunction(&lower)?;
+    let mut iter = choice_types.into_iter();
+    let first = iter.next()?;
+
+    let mut continuation: Option<Box<AbilityDefinition>> = None;
+    for choice_type in iter.rev() {
+        let mut definition = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Choose {
+                choice_type,
+                persist: true,
+                selection: TargetSelectionMode::Chosen,
+            },
+        );
+        definition.description = Some("choose named value".to_string());
+        definition.sub_ability = continuation.take();
+        continuation = Some(Box::new(definition));
+    }
+
+    let mut clause = parsed_clause(Effect::Choose {
+        choice_type: first,
+        // A conjunction is a multi-value declaration whose later instructions
+        // may read any of the values, so retain every selected attribute on the
+        // source object (CR 607.2d), rather than leaving it only in the transient
+        // single-value `last_named_choice` slot.
+        persist: true,
+        selection: TargetSelectionMode::Chosen,
+    });
+    clause.sub_ability = continuation;
+    Some(clause)
+}
+
 /// CR 608.2d + CR 113.3: Parse a typed keyword enumeration following "choose "
 /// ("first strike, vigilance, or lifelink", "hexproof or indestructible") into
 /// its `Keyword` option list.
@@ -32124,6 +32222,23 @@ fn unimplemented_clause(
     .push();
 }
 
+/// Effects whose printed grammar uses a trailing `for each` as a true
+/// repeat-count rather than as an amount/filter modifier. Keep this allow-list
+/// narrow: quantity-bearing effects must consume their own suffix so the
+/// resolver does not accidentally turn an amount into repeated instructions.
+/// `SetTapState::Single` is the choice-per-iteration shape used by Tangle Wire
+/// (and the corresponding untap wording); each iteration asks for one eligible
+/// permanent and then applies the tap state to that choice.
+fn trailing_for_each_repeat_is_supported(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            ..
+        }
+    )
+}
+
 pub(crate) fn parse_effect_chain_ir(
     text: &str,
     kind: AbilityKind,
@@ -34696,9 +34811,34 @@ pub(crate) fn parse_effect_chain_ir(
         } else if let Some(lose) = difference_lose {
             (lose, repeat_for)
         } else {
-            let (suffix_repeat_for, stripped_text_no_qty) =
+            let (suffix_repeat_for, restricted_text_no_qty) =
                 strip_for_each_repeat_suffix(&text_no_qty);
-            let mut stripped_clause = parse_effect_clause(&stripped_text_no_qty, ctx);
+            // Most trailing `for each` clauses are intentionally handled by
+            // effect-specific quantity slots.  A few keyword actions instead
+            // have a normal, repeatable effect body: Tangle Wire's
+            // "tap ... for each fade counter" is one such shape.  Probe the
+            // stripped body in an isolated context so an unsupported generic
+            // suffix cannot mutate the real chain context before we decide
+            // whether this effect is safe to drive through `repeat_for`.
+            let (mut stripped_clause, suffix_repeat_for) = if suffix_repeat_for.is_some() {
+                (
+                    parse_effect_clause(&restricted_text_no_qty, ctx),
+                    suffix_repeat_for,
+                )
+            } else if let Some((candidate_repeat_for, candidate_text)) =
+                lower::parse_for_each_repeat_suffix(&text_no_qty)
+            {
+                let mut candidate_ctx = ctx.clone();
+                let candidate_clause = parse_effect_clause(&candidate_text, &mut candidate_ctx);
+                if trailing_for_each_repeat_is_supported(&candidate_clause.effect) {
+                    *ctx = candidate_ctx;
+                    (candidate_clause, Some(candidate_repeat_for))
+                } else {
+                    (parse_effect_clause(&restricted_text_no_qty, ctx), None)
+                }
+            } else {
+                (parse_effect_clause(&restricted_text_no_qty, ctx), None)
+            };
             // CR 701.16a + CR 608.2c: a fieldless Investigate (no count slot) drops a
             // trailing "[once] for each <set>" multiplier. Precompute the lift,
             // gated to Investigate + no prior repeat_for, so ONLY the repeatable-for-each
@@ -34731,6 +34871,14 @@ pub(crate) fn parse_effect_chain_ir(
                         *target = TargetFilter::TriggeringSource;
                     }
                 }
+                (stripped_clause, repeat_for.or(suffix_repeat_for))
+            } else if suffix_repeat_for.is_some()
+                && trailing_for_each_repeat_is_supported(&stripped_clause.effect)
+            {
+                // CR 608.2c: keyword-action bodies such as Tangle Wire's Tap
+                // are complete once the suffix is removed, so attach the
+                // parsed quantity to this definition and let the common
+                // resolver repeat the one-choice action.
                 (stripped_clause, repeat_for.or(suffix_repeat_for))
             } else if let Some((fanout_clause, fanout_spec, fanout_ctx)) =
                 parse_for_each_opponent_target_fanout_clause(

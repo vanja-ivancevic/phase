@@ -36,6 +36,111 @@ fn assert_tracked_mana_value_source(def: &AbilityDefinition, expected: TrackedAn
     ));
 }
 
+/// Vision Charm's land-type mode is a paired named choice: the first value
+/// selects the lands to affect, while the second value supplies the replacement
+/// basic land type.  Keep this parser shape explicit so a future conjunction
+/// refactor cannot silently drop the second choice or its source persistence.
+#[test]
+fn paired_land_type_choices_feed_second_chosen_type_modification() {
+    let def = parse_effect_chain(
+        "Choose a land type and a basic land type. Each land of the first chosen type becomes the second chosen type until end of turn.",
+        AbilityKind::Spell,
+    );
+
+    let Effect::Choose {
+        choice_type: ChoiceType::LandType,
+        persist: true,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected persistent land-type choice, got {:?}", def.effect);
+    };
+    let second = def
+        .sub_ability
+        .as_deref()
+        .expect("paired choice must retain its second choice");
+    assert!(matches!(
+        second.effect.as_ref(),
+        Effect::Choose {
+            choice_type: ChoiceType::BasicLandType,
+            persist: true,
+            ..
+        }
+    ));
+
+    let replacement = second
+        .sub_ability
+        .as_deref()
+        .expect("paired choices must chain into the replacement effect");
+    let Effect::GenericEffect {
+        static_abilities,
+        duration: Some(Duration::UntilEndOfTurn),
+        ..
+    } = replacement.effect.as_ref()
+    else {
+        panic!("expected end-of-turn replacement effect, got {:?}", replacement.effect);
+    };
+    assert_eq!(static_abilities.len(), 1);
+    assert!(static_abilities[0]
+        .modifications
+        .contains(&ContinuousModification::SetChosenBasicLandType));
+    let affected = static_abilities[0]
+        .affected
+        .as_ref()
+        .expect("replacement must carry its affected filter");
+    let TargetFilter::Typed(typed) = affected else {
+        panic!("expected typed land filter, got {affected:?}");
+    };
+    assert!(typed.type_filters.contains(&TypeFilter::Land));
+    assert!(typed
+        .properties
+        .contains(&FilterProp::IsChosenLandType));
+}
+
+/// CR 608.2b: Gilded Drake's final sentence is a declarative targeting rider.
+/// It must not become an `unbound_subject` effect after the already-supported
+/// exchange/sacrifice chain; the ordinary target-resolution machinery supplies
+/// the stated “still resolves” behavior.
+#[test]
+fn gilded_drake_illegal_target_rider_is_absorbed_without_gap() {
+    let def = parse_effect_chain(
+        "When this creature enters, exchange control of this creature and up to one target creature an opponent controls. If you don't or can't make an exchange, sacrifice this creature. This ability still resolves if its target becomes illegal.",
+        AbilityKind::Spell,
+    );
+
+    fn collect<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+        out.push(&def.effect);
+        if let Effect::CreateDelayedTrigger { effect, .. } = &*def.effect {
+            collect(effect, out);
+        }
+        if let Some(sub) = &def.sub_ability {
+            collect(sub, out);
+        }
+        if let Some(else_ability) = &def.else_ability {
+            collect(else_ability, out);
+        }
+    }
+    let mut effects = Vec::new();
+    collect(&def, &mut effects);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Unimplemented { .. })),
+        "Gilded Drake's targeting rider must not leave a parser gap: {effects:#?}"
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::ExchangeControl { .. }
+        )),
+        "the supported exchange instruction must remain in the chain: {effects:#?}"
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(effect, Effect::NoOp)),
+        "the declarative rider should be represented explicitly as NoOp: {effects:#?}"
+    );
+}
+
 fn nested_batch_aggregate() -> PropertyAggregate {
     PropertyAggregate::new(
         AggregateFunction::Sum,
@@ -10853,6 +10958,35 @@ fn effect_it_explores_x_times_sets_repeat_for() {
 }
 
 #[test]
+fn tangle_wire_taps_once_per_fade_counter() {
+    // CR 122.1 + CR 608.2c: the trailing counter phrase is an instruction
+    // multiplier, not an amount on Tap. Each iteration must therefore ask for
+    // one eligible permanent and tap it, with the count read from this source.
+    let def = parse_effect_chain(
+        "That player taps an untapped artifact, creature, or land they control for each fade counter on this artifact.",
+        AbilityKind::Activated,
+    );
+
+    assert!(matches!(
+        &*def.effect,
+        Effect::SetTapState {
+            scope: EffectScope::Single,
+            state: TapStateChange::Tap,
+            ..
+        }
+    ));
+    assert!(matches!(
+        def.repeat_for,
+        Some(QuantityExpr::Ref {
+            qty: QuantityRef::CountersOn {
+                scope: ObjectScope::Source,
+                counter_type: Some(CounterType::Fade),
+            }
+        })
+    ));
+}
+
+#[test]
 fn effect_proliferate_target_single_target() {
     // CR 701.34a + CR 122.1: Skyship Plunderer / Maulfist Revolutionary —
     // forced single-target proliferate. Must target a permanent-or-player
@@ -19469,6 +19603,77 @@ fn temporal_prefix_in_effect_chain() {
             effect.effect
         );
     }
+}
+
+/// CR 603.7a + CR 502.2: an activated ability may defer its effect to the
+/// controller's next untap step.  Undiscovered Paradise uses the canonical
+/// "during your next untap step, as you untap your permanents" wording; this
+/// must lower through the shared delayed-trigger mechanism rather than the
+/// continuous-duration parser.
+#[test]
+fn during_next_untap_step_installs_controller_scoped_delayed_trigger() {
+    use crate::types::ability::TurnGate;
+
+    let def = parse_effect_chain(
+        "During your next untap step, as you untap your permanents, return this land to its owner's hand.",
+        AbilityKind::Activated,
+    );
+    let Effect::CreateDelayedTrigger {
+        condition, effect, ..
+    } = &*def.effect
+    else {
+        panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
+    };
+    assert_eq!(
+        *condition,
+        DelayedTriggerCondition::AtNextPhaseForPlayer {
+            phase: Phase::Untap,
+            player: crate::types::player::PlayerId(0),
+            gate: TurnGate::None,
+        }
+    );
+    assert!(
+        matches!(*effect.effect, Effect::Bounce { .. }),
+        "delayed body should return the source land, got {:?}",
+        effect.effect
+    );
+}
+
+/// CR 603.7a + CR 502.2: the full Undiscovered Paradise activated ability
+/// must retain its delayed return after the mana head is parsed. This catches
+/// the sequence splitter seam that a standalone temporal-clause test cannot.
+#[test]
+fn undiscovered_paradise_keeps_delayed_return_after_mana_head() {
+    let parsed = parse_oracle_text(
+        "{T}: Add one mana of any color. During your next untap step, as you untap your permanents, return this land to its owner's hand.",
+        "Undiscovered Paradise",
+        &[],
+        &["Land".to_string()],
+        &[],
+    );
+    assert_eq!(parsed.abilities.len(), 1, "expected one activated ability");
+    let def = &parsed.abilities[0];
+    assert_eq!(def.kind, AbilityKind::Activated);
+    let delayed = def
+        .sub_ability
+        .as_deref()
+        .expect("mana head must retain the delayed return");
+    let Effect::CreateDelayedTrigger { condition, effect, .. } = &*delayed.effect else {
+        panic!("expected delayed return, got {:?}", delayed.effect);
+    };
+    assert_eq!(
+        *condition,
+        DelayedTriggerCondition::AtNextPhaseForPlayer {
+            phase: Phase::Untap,
+            player: crate::types::player::PlayerId(0),
+            gate: TurnGate::None,
+        }
+    );
+    assert!(
+        matches!(*effect.effect, Effect::Bounce { .. }),
+        "delayed body should bounce the source land, got {:?}",
+        effect.effect
+    );
 }
 
 #[test]
@@ -41220,6 +41425,64 @@ fn strip_target_supertype_conditional_suffix_nonbasic_land_uses_lki() {
                 p,
                 FilterProp::NotSupertype {
                     value: Supertype::Basic
+                }
+            )));
+        }
+        other => panic!("expected TargetMatchesFilter, got: {other:?}"),
+    }
+}
+
+#[test]
+fn strip_target_supertype_conditional_leading_snow_land_uses_lki() {
+    let (cond, text) =
+        strip_target_supertype_conditional("If that land was a snow land, you gain 1 life.");
+    assert!(cond.is_some(), "should extract snow land condition");
+    assert_eq!(text, "you gain 1 life.");
+    match cond.unwrap() {
+        AbilityCondition::TargetMatchesFilter {
+            filter, use_lki, ..
+        } => {
+            assert!(use_lki);
+            let TargetFilter::Typed(tf) = filter else {
+                panic!("expected Typed filter");
+            };
+            assert!(tf
+                .type_filters
+                .iter()
+                .any(|f| matches!(f, TypeFilter::Land)));
+            assert!(tf.properties.iter().any(|p| matches!(
+                p,
+                FilterProp::HasSupertype {
+                    value: Supertype::Snow
+                }
+            )));
+        }
+        other => panic!("expected TargetMatchesFilter, got: {other:?}"),
+    }
+}
+
+#[test]
+fn strip_target_supertype_conditional_suffix_snow_land_uses_lki() {
+    let (cond, text) =
+        strip_target_supertype_conditional("You gain 1 life if that land was a snow land.");
+    assert!(cond.is_some(), "should extract snow land condition");
+    assert_eq!(text, "You gain 1 life");
+    match cond.unwrap() {
+        AbilityCondition::TargetMatchesFilter {
+            filter, use_lki, ..
+        } => {
+            assert!(use_lki);
+            let TargetFilter::Typed(tf) = filter else {
+                panic!("expected Typed filter");
+            };
+            assert!(tf
+                .type_filters
+                .iter()
+                .any(|f| matches!(f, TypeFilter::Land)));
+            assert!(tf.properties.iter().any(|p| matches!(
+                p,
+                FilterProp::HasSupertype {
+                    value: Supertype::Snow
                 }
             )));
         }

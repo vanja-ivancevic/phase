@@ -103,6 +103,7 @@ type SharedPlayerCount = Arc<AtomicU32>;
 type SharedGameDb = Arc<persistence::GameDb>;
 type SharedDraftState = Arc<Mutex<DraftSessionManager>>;
 const SPECTATOR_PLAYER_ID: PlayerId = PlayerId(u8::MAX);
+const DEFAULT_AI_RESULT_DELAY_MS: u64 = 100;
 /// Stack size for every thread that can run the engine: the runtime *owner*
 /// thread spawned in `main`, plus Tokio's worker and blocking threads.
 ///
@@ -878,6 +879,18 @@ enum CardDataSource {
 
 fn dev_fixture_enabled() -> bool {
     matches!(std::env::var("PHASE_DEV_FIXTURE"), Ok(value) if value == "1")
+}
+
+fn ai_result_broadcast_delay_from(value: Option<&str>) -> Duration {
+    let milliseconds = value
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_AI_RESULT_DELAY_MS)
+        .min(1_000);
+    Duration::from_millis(milliseconds)
+}
+
+fn ai_result_broadcast_delay() -> Duration {
+    ai_result_broadcast_delay_from(std::env::var("PHASE_AI_RESULT_DELAY_MS").ok().as_deref())
 }
 
 fn select_card_data_source(data_dir: &Path, dev_fixture: bool) -> Result<CardDataSource, String> {
@@ -2450,6 +2463,7 @@ async fn health() -> &'static str {
 mod lifecycle_tests {
     use std::collections::HashMap;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use axum::http::{header::ORIGIN, HeaderMap, HeaderValue};
     use clap::Parser;
@@ -2458,9 +2472,30 @@ mod lifecycle_tests {
     use url::Url;
 
     use super::{
-        bootstrap_required, origin_is_allowed, prune_game_connections, select_card_data_source,
-        validate_public_url, CardDataSource, Cli, SharedConnections,
+        ai_result_broadcast_delay_from, bootstrap_required, origin_is_allowed,
+        prune_game_connections, select_card_data_source, validate_public_url, CardDataSource, Cli,
+        SharedConnections,
     };
+
+    #[test]
+    fn ai_result_delay_uses_safe_default_and_bounded_override() {
+        assert_eq!(
+            ai_result_broadcast_delay_from(None),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            ai_result_broadcast_delay_from(Some("16")),
+            Duration::from_millis(16)
+        );
+        assert_eq!(
+            ai_result_broadcast_delay_from(Some("not-a-number")),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            ai_result_broadcast_delay_from(Some("5000")),
+            Duration::from_millis(1000)
+        );
+    }
 
     #[test]
     fn bind_flag_defaults_to_lan_and_accepts_loopback() {
@@ -4532,9 +4567,14 @@ async fn broadcast_ai_results(
     ai_results: &[RevisionedActionResult],
     rewind_targets: &[RewindOption],
 ) {
-    // Broadcast AI follow-up results with delays
+    // Keep the default pacing for existing clients, while allowing a native
+    // client to choose a frame-sized delay or disable pacing entirely. The
+    // delay is presentation policy, not game authority.
+    let ai_result_delay = ai_result_broadcast_delay();
     for (i, (ai_revision, result)) in ai_results.iter().enumerate() {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if !ai_result_delay.is_zero() {
+            tokio::time::sleep(ai_result_delay).await;
+        }
         let (
             ai_raw_state,
             ai_events,

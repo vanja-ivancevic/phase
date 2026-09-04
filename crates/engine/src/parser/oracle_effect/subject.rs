@@ -362,7 +362,14 @@ fn extract_subject_text(text: &str) -> Option<String> {
     // by `subject_predicate_ast_from_clause` matches the one parsed inside
     // `try_parse_subject_continuous_clause`. Without this the AST subject falls
     // back to `TargetFilter::Any` (broadcasting the grant to every permanent).
-    let subject = strip_trailing_additive_adverb(text[..verb_start].trim());
+    // CR 608.2c + CR 608.2f: manner adverbs such as "simultaneously" sit
+    // between an anaphoric subject and its predicate (Goblin Welder: "that
+    // player simultaneously sacrifices the artifact"). They modify how the
+    // instruction is performed, not which player is affected. Keep them out of
+    // the subject phrase so the ordinary player-anaphor resolver can bind it;
+    // the imperative parser still receives the full predicate and therefore
+    // retains the simultaneous-action semantics where supported.
+    let subject = strip_trailing_subject_adverb(text[..verb_start].trim());
     if subject.is_empty() {
         None
     } else {
@@ -2720,6 +2727,23 @@ pub(super) fn parse_subject_application(
     {
         return subject_filter_application(TargetFilter::AllPlayers, false);
     }
+    // CR 205.3i + CR 608.2d: Vision Charm's paired land-type mode applies to
+    // every land whose subtype matches the first selected land type. Keep this
+    // as a typed subject predicate so the existing continuous-effect lowering
+    // can reuse its normal layer-4 and duration machinery.
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "each land of the first chosen type",
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        return subject_filter_application(
+            TargetFilter::Typed(
+                TypedFilter::land().properties(vec![FilterProp::IsChosenLandType]),
+            ),
+            false,
+        );
+    }
     if let Ok((rest_lower, _)) =
         alt((tag::<_, _, OracleError<'_>>("all "), tag("each "))).parse(lower.as_str())
     {
@@ -4706,6 +4730,34 @@ fn build_become_clause(
     // Must intercept before parse_animation_spec which produces AddSubtype("Night"/"Day").
     if let Some(clause) = try_parse_set_day_night(become_text) {
         return Some(clause);
+    }
+
+    // CR 205.3i + CR 305.7 + CR 608.2d: "becomes the second chosen type"
+    // consumes the second value from a preceding paired land-type choice.  The
+    // source's `ChosenAttribute::BasicLandType` is read by the existing
+    // `SetChosenBasicLandType` layer-4 modification, so this adds no new runtime
+    // effect or card-specific resolver path.
+    if become_text.eq_ignore_ascii_case("the second chosen type") {
+        let affected = static_affected_for_application(&application);
+        let effect = Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(affected)
+                .modifications(vec![ContinuousModification::SetChosenBasicLandType])
+                .description(become_text.to_string())],
+            duration: duration.clone(),
+            target: application.target.clone(),
+            end_cost: None,
+        };
+        return Some(ParsedEffectClause {
+            effect,
+            duration,
+            sub_ability: None,
+            distribute: None,
+            multi_target: None,
+            condition: None,
+            optional: false,
+            unless_pay: None,
+        });
     }
 
     // CR 205.3 / CR 305.7: "become the [type] of your choice" — player chooses a subtype.
@@ -7060,6 +7112,25 @@ fn strip_trailing_additive_adverb(subject: &str) -> &str {
     }
 }
 
+/// CR 608.2c + CR 608.2f: remove a manner adverb that is interposed between a
+/// subject and its predicate. Oracle text occasionally places "simultaneously"
+/// there ("that player simultaneously sacrifices …"). It is not part of the
+/// subject's identity, so retaining it makes an otherwise bindable anaphor look
+/// like an unknown subject. This helper is deliberately an end-anchored
+/// allowlist; unrelated words remain untouched and fail closed.
+fn strip_trailing_subject_adverb(subject: &str) -> &str {
+    let lower = subject.to_lowercase();
+    let subject = match lower
+        .strip_suffix(" simultaneously")
+        .map(str::len)
+        .filter(|len| !subject[..*len].trim_end().is_empty())
+    {
+        Some(head_len) => subject[..head_len].trim_end(),
+        None => subject,
+    };
+    strip_trailing_additive_adverb(subject)
+}
+
 fn is_restriction_predicate_verb(token: &str) -> bool {
     // CR 613.1d: "isn't"/"aren't" head a layer-4 type-removal predicate ("~ isn't
     // a creature until end of turn", Blink's Alien Angel token). Recognizing the
@@ -8202,6 +8273,58 @@ mod tests {
         );
         // Bare "also" has no filter to grant against → not stripped to empty.
         assert_eq!(strip_trailing_additive_adverb("also"), "also");
+    }
+
+    /// CR 608.2c + CR 608.2f: an interposed manner adverb belongs to the
+    /// instruction, not to the subject. Goblin Welder's "that player
+    /// simultaneously sacrifices the artifact" must therefore bind the player
+    /// anaphor exactly as the same sentence without "simultaneously" would.
+    #[test]
+    fn interposed_simultaneously_does_not_break_player_anaphor() {
+        assert_eq!(
+            extract_subject_text("that player simultaneously sacrifices the artifact"),
+            Some("that player".to_string())
+        );
+        assert_eq!(
+            strip_trailing_subject_adverb("that player SIMULTANEOUSLY"),
+            "that player"
+        );
+        assert_eq!(
+            strip_trailing_subject_adverb("that player"),
+            "that player"
+        );
+
+        let def = super::super::parse_effect_chain(
+            "Choose target artifact a player controls and target artifact card in that player's graveyard. If both targets are still legal as this ability resolves, that player simultaneously sacrifices the artifact and returns the artifact card to the battlefield.",
+            AbilityKind::Activated,
+        );
+        fn collect<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+            out.push(&def.effect);
+            if let Some(sub) = &def.sub_ability {
+                collect(sub, out);
+            }
+            if let Some(else_ability) = &def.else_ability {
+                collect(else_ability, out);
+            }
+        }
+        let mut effects = Vec::new();
+        collect(&def, &mut effects);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Unimplemented { .. })),
+            "Goblin Welder's simultaneous sacrifice must be parsed, got {effects:#?}"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Sacrifice {
+                    target: TargetFilter::ParentTargetSlot { index: 0 },
+                    ..
+                }
+            )),
+            "the sacrifice must use the first declared target slot, got {effects:#?}"
+        );
     }
 
     /// CR 509.1c (issue #4233): "Each creature your opponents control blocks this

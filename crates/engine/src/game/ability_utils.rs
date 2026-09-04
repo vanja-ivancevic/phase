@@ -3435,7 +3435,16 @@ fn quantity_expr_contains_amassed_army_ref(expr: &QuantityExpr) -> bool {
 }
 
 fn target_filter_needs_ability_context(filter: &TargetFilter) -> bool {
-    target_filter_contains_chosen_x_ref(filter)
+    let player_matching = match filter {
+        TargetFilter::PlayerMatching { .. } => true,
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(target_filter_needs_ability_context)
+        }
+        TargetFilter::Not { filter } => target_filter_needs_ability_context(filter),
+        _ => false,
+    };
+    player_matching
+        || target_filter_contains_chosen_x_ref(filter)
         || target_filter_contains_amassed_army_ref(filter)
         || target_filter_contains_scoped_player_ref(filter)
         || filter_needs_trigger_source(filter)

@@ -2510,6 +2510,7 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
@@ -2792,6 +2793,7 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
