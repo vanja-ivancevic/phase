@@ -8226,6 +8226,68 @@ fn effect_unless_pays_colored_mana_preserves_shards_after_lowercase() {
         "colored unless mana must preserve the red shard, got {cost:?}"
     );
 }
+/// CR 608.2b: Goblin Welder's "If both targets are still legal as this
+/// ability resolves" is the target pipeline's represented legality rider,
+/// not a swallowed game-state condition. The AST must retain both announced
+/// target slots and the full sacrifice/return chain, while the audit must not
+/// report a spurious Condition_If warning.
+#[test]
+fn goblin_welder_target_legality_rider_is_represented() {
+    let parsed = parse_oracle_text(
+        "{T}: Choose target artifact a player controls and target artifact card in that player's graveyard. If both targets are still legal as this ability resolves, that player simultaneously sacrifices the artifact and returns the artifact card to the battlefield.",
+        "Goblin Welder",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    assert_eq!(parsed.abilities.len(), 1);
+    assert!(
+        !parsed.parse_warnings.iter().any(|warning| matches!(
+            warning,
+            crate::parser::oracle_ir::diagnostic::OracleDiagnostic::SwallowedClause {
+                detector,
+                ..
+            } if detector == "Condition_If"
+        )),
+        "target-legality rider must not be reported as swallowed: {:?}",
+        parsed.parse_warnings
+    );
+
+    fn collect<'a>(ability: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+        out.push(&ability.effect);
+        if let Some(sub) = ability.sub_ability.as_deref() {
+            collect(sub, out);
+        }
+        if let Some(else_ability) = ability.else_ability.as_deref() {
+            collect(else_ability, out);
+        }
+    }
+    let mut effects = Vec::new();
+    collect(&parsed.abilities[0], &mut effects);
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::TargetOnly { .. }))
+            .count(),
+        2,
+        "both target slots must remain represented: {effects:#?}"
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Sacrifice {
+            target: TargetFilter::ParentTargetSlot { index: 0 },
+            ..
+        }
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::ChangeZone {
+            target: TargetFilter::ParentTargetSlot { index: 1 },
+            destination: Zone::Battlefield,
+            ..
+        }
+    )));
+}
 
 // Issue #3308 GAP A — full-card swallow/parse-warning check. Spell Stutter
 // and Concerted Defense are single-clause counterspells; once the dynamic
