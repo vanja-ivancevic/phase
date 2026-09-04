@@ -10229,6 +10229,15 @@ pub(crate) fn parse_affirmative_reflexive_connector(
             AbilityCondition::effect_performed(),
             tag("if the player does, "),
         ),
+        // CR 608.2c: Oath of Druids/Oath of Lieges name the player who made
+        // the preceding optional choice as "the first player".  This is the
+        // same reflexive OptionalEffectPerformed gate as "that player" and
+        // must stay in the shared connector grammar so the sequence splitter
+        // and effect-condition parser consume it identically.
+        value(
+            AbilityCondition::effect_performed(),
+            tag("if the first player does, "),
+        ),
         value(AbilityCondition::effect_performed(), tag("if you do, ")),
         parse_discard_this_way_affirmative_connector,
     ))

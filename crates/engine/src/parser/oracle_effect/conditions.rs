@@ -8673,6 +8673,10 @@ mod tests {
             ("if that player does, draw a card", Some(effect.clone())),
             ("if the player does, draw a card", Some(effect.clone())),
             (
+                "if the first player does, draw a card",
+                Some(effect.clone()),
+            ),
+            (
                 "if that player doesn't, draw a card",
                 Some(not_effect.clone()),
             ),
