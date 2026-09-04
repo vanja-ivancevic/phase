@@ -4749,6 +4749,7 @@ fn detect_duration_this_turn(
                 | TriggerCondition::FirstTimeObjectTappedThisTurn
                 | TriggerCondition::FirstTimeObjectCountersAddedThisTurn
                 | TriggerCondition::AttackedThisTurn
+                | TriggerCondition::SourceAbilityAddedManaThisTurn
                 | TriggerCondition::CastSpellThisTurn { .. }
                 | TriggerCondition::SpellCastWithVariantThisTurn { .. }
                 | TriggerCondition::CounterAddedThisTurn
@@ -7261,6 +7262,17 @@ mod tests {
              not dropped: {:?}",
             parsed.replacements
         );
+    }
+
+    #[test]
+    fn duration_this_turn_accepts_source_ability_mana_history_condition() {
+        let parsed = parse_named(
+            "At the beginning of each of your main phases, if you haven't added mana with this ability this turn, you may add X mana of any one color, where X is the number of Islands target opponent controls.",
+            "Carpet of Flowers",
+            &["Enchantment"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Duration_ThisTurn"));
     }
 
     #[test]
