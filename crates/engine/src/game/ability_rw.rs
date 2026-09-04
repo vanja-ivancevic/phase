@@ -1911,6 +1911,7 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
         | TriggerCondition::SourceIsFaceUp
         | TriggerCondition::SourceIsFaceDown
         | TriggerCondition::SourceInZone { .. }
+        | TriggerCondition::SourceInZoneWithAdjacentFilter { .. }
         | TriggerCondition::IsRenowned { .. }
         | TriggerCondition::WasStartingPlayer { .. }
         | TriggerCondition::ZoneChangeObjectMatchesFilter { .. }
@@ -6673,6 +6674,7 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         | TriggerCondition::SourceIsFaceUp
         | TriggerCondition::SourceIsFaceDown
         | TriggerCondition::SourceInZone { .. }
+        | TriggerCondition::SourceInZoneWithAdjacentFilter { .. }
         | TriggerCondition::IsRenowned { .. }
         | TriggerCondition::WasStartingPlayer { .. } => frozen_source_read(),
         TriggerCondition::ZoneChangeObjectMatchesFilter { .. }

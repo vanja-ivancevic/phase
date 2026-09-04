@@ -4440,6 +4440,13 @@ fn fmt_trigger_condition(cond: &crate::types::ability::TriggerCondition) -> Stri
         TC::SourceIsFaceUp => "source is face-up".into(),
         TC::SourceIsFaceDown => "source is face-down".into(),
         TC::SourceInZone { zone } => format!("source is in {}", fmt_zone(zone)),
+        TC::SourceInZoneWithAdjacentFilter { zone, adjacent } => {
+            format!(
+                "source is in {} with adjacent {}",
+                fmt_zone(zone),
+                fmt_target(adjacent)
+            )
+        }
         TC::CounterAddedThisTurn => "added a counter this turn".into(),
         TC::LostLifeLastTurn => "lost life last turn".into(),
         TC::DefendingPlayerControlsNone { filter } => {

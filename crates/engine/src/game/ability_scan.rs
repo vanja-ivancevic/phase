@@ -3777,7 +3777,8 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
         TriggerCondition::SourceIsTransformed => Axes::NONE,
         TriggerCondition::SourceIsFaceUp => Axes::NONE,
         TriggerCondition::SourceIsFaceDown => Axes::NONE,
-        TriggerCondition::SourceInZone { zone: _ } => Axes::NONE,
+        TriggerCondition::SourceInZone { zone: _ }
+        | TriggerCondition::SourceInZoneWithAdjacentFilter { .. } => Axes::NONE,
         TriggerCondition::CounterAddedThisTurn => Axes {
             event: false,
             sibling: false,

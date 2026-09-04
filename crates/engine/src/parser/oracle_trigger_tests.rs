@@ -1148,6 +1148,38 @@ fn static_condition_to_trigger_condition_source_in_battlefield() {
 }
 
 #[test]
+fn krovikan_horror_graveyard_adjacency_is_typed() {
+    // CR 404.1 + CR 603.4: the source-zone condition must preserve the
+    // immediately-above-card rider rather than swallowing the whole `if`
+    // clause after parsing only "in your graveyard".
+    let parsed = parse_oracle_text(
+        "At the beginning of the end step, if this card is in your graveyard with a creature card directly above it, you may return this card to your hand.\n{1}, Sacrifice a creature: This creature deals 1 damage to any target.",
+        "Krovikan Horror",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let trigger = parsed.triggers.first().expect("Krovikan Horror trigger");
+    assert_eq!(trigger.mode, TriggerMode::Phase);
+    assert_eq!(trigger.trigger_zones, vec![Zone::Graveyard]);
+    assert!(matches!(
+        trigger.condition.as_ref(),
+        Some(TriggerCondition::SourceInZoneWithAdjacentFilter {
+            zone: Zone::Graveyard,
+            adjacent: TargetFilter::Typed(TypedFilter {
+                type_filters,
+                controller: None,
+                properties,
+            }),
+        }) if type_filters == &vec![TypeFilter::Creature] && properties.is_empty()
+    ));
+    assert!(parsed.parse_warnings.iter().all(|warning| !matches!(
+        warning,
+        OracleDiagnostic::SwallowedClause { detector, .. } if detector == "Condition_If"
+    )));
+}
+
+#[test]
 fn intervening_if_source_attacked_this_turn_populates_condition() {
     // CR 508.1 + CR 603.4: a source-scoped "if ~ attacked this turn"
     // intervening-if must gate the trigger on the ability's own source creature

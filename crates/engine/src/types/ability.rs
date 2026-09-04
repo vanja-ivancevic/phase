@@ -24204,6 +24204,16 @@ pub enum TriggerCondition {
     SourceIsFaceDown,
     /// CR 113.6b: "if this card is in [zone]" — true when the trigger source is in the given zone.
     SourceInZone { zone: crate::types::zones::Zone },
+    /// CR 404.1 + CR 603.4: "if this card is in [zone] with a [filter] card
+    /// directly above it" — true when the exact live source is in the given
+    /// owner-scoped zone and the immediately newer card in that zone matches
+    /// the printed adjacent filter. The filter is retained rather than reduced
+    /// to a core type so subtype and future card-type phrases use the same
+    /// matching authority.
+    SourceInZoneWithAdjacentFilter {
+        zone: crate::types::zones::Zone,
+        adjacent: TargetFilter,
+    },
     /// CR 122.1: "if you put a counter on a permanent this turn" — true when the controller
     /// added any counter to any permanent this turn.
     CounterAddedThisTurn,
@@ -24471,6 +24481,7 @@ impl TriggerCondition {
             | TriggerCondition::SourceIsFaceUp
             | TriggerCondition::SourceIsFaceDown
             | TriggerCondition::SourceInZone { .. }
+            | TriggerCondition::SourceInZoneWithAdjacentFilter { .. }
             | TriggerCondition::CounterAddedThisTurn
             | TriggerCondition::LostLifeLastTurn
             | TriggerCondition::DefendingPlayerControlsNone { .. }

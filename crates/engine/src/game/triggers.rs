@@ -14179,6 +14179,41 @@ fn evaluate_trigger_condition_with_source(
                     if object.zone == *zone
             )
         }),
+        // CR 404.1 + CR 603.4: the source must remain the exact live object in
+        // the required owner-scoped zone, and the next card in that owner's
+        // graveyard vector (the card immediately above it) must match the
+        // printed filter. Fail closed when either object or adjacency is absent.
+        TriggerCondition::SourceInZoneWithAdjacentFilter { zone, adjacent } => source_context
+            .is_some_and(|source| {
+                let TriggerSourceRead::ExactLive(object) = source.source_read(state) else {
+                    return false;
+                };
+                if object.zone != *zone {
+                    return false;
+                }
+                if *zone != Zone::Graveyard {
+                    return false;
+                }
+                let owner = object.owner;
+                let Some(graveyard) = state.players.get(owner.0 as usize).map(|p| &p.graveyard)
+                else {
+                    return false;
+                };
+                let Some(position) = graveyard.iter().position(|id| *id == object.id) else {
+                    return false;
+                };
+                let Some(adjacent_id) = graveyard.get(position + 1).copied() else {
+                    return false;
+                };
+                let context = FilterContext::from_trigger_source(source);
+                crate::game::filter::matches_target_filter_for_zone(
+                    state,
+                    adjacent_id,
+                    Zone::Graveyard,
+                    adjacent,
+                    &context,
+                )
+            }),
         // CR 702.104b: True when the Tribute ETB replacement resolved without the
         // chosen opponent placing the +1/+1 counters. Read from the creature's
         // persisted `ChosenAttribute::TributeOutcome` — explicit `Declined` or no
@@ -15658,6 +15693,130 @@ pub mod tests {
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
+    }
+
+    #[test]
+    fn source_zone_adjacent_filter_checks_graveyard_order_and_type() {
+        // CR 404.1 + CR 603.4: the source itself and the card immediately
+        // above it are independent live objects; both facts must be true at
+        // trigger time and at the resolution re-check.
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(0x100),
+            PlayerId(0),
+            "Krovikan Horror".to_string(),
+            Zone::Graveyard,
+        );
+        let adjacent = create_object(
+            &mut state,
+            CardId(0x101),
+            PlayerId(0),
+            "Graveyard Creature".to_string(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&adjacent)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        state.players[0].graveyard.push_back(source);
+        state.players[0].graveyard.push_back(adjacent);
+
+        let condition = TriggerCondition::SourceInZoneWithAdjacentFilter {
+            zone: Zone::Graveyard,
+            adjacent: TargetFilter::Typed(TypedFilter::creature()),
+        };
+        assert!(check_trigger_condition(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(source),
+            None,
+        ));
+
+        // A non-creature directly above the source does not satisfy the rider.
+        state
+            .objects
+            .get_mut(&adjacent)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Land];
+        assert!(!check_trigger_condition(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(source),
+            None,
+        ));
+
+        // With no newer card, the adjacency predicate fails closed.
+        state.players[0].graveyard.pop_back();
+        assert!(!check_trigger_condition(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(source),
+            None,
+        ));
+    }
+
+    #[test]
+    fn graveyard_phase_trigger_with_adjacent_filter_fires() {
+        // CR 603.2 + CR 603.4: a Krovikan-style source in the graveyard is
+        // found by its declared trigger zone and then gated by the live
+        // adjacency condition during phase-trigger collection.
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        state.phase = Phase::End;
+        let source = create_object(
+            &mut state,
+            CardId(0x110),
+            PlayerId(0),
+            "Krovikan Horror".to_string(),
+            Zone::Graveyard,
+        );
+        let adjacent = create_object(
+            &mut state,
+            CardId(0x111),
+            PlayerId(0),
+            "Graveyard Creature".to_string(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&adjacent)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        state.players[0].graveyard.push_back(source);
+        state.players[0].graveyard.push_back(adjacent);
+
+        let trigger = TriggerDefinition::new(TriggerMode::Phase)
+            .phase(Phase::End)
+            .valid_target(TargetFilter::Controller)
+            .trigger_zones(vec![Zone::Graveyard])
+            .condition(TriggerCondition::SourceInZoneWithAdjacentFilter {
+                zone: Zone::Graveyard,
+                adjacent: TargetFilter::Typed(TypedFilter::creature()),
+            })
+            .execute(AbilityDefinition::new(
+                AbilityKind::Database,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+            ));
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .trigger_definitions
+            .push(trigger);
+
+        process_triggers(&mut state, &[GameEvent::PhaseChanged { phase: Phase::End }]);
+        assert_eq!(state.stack.len(), 1);
     }
 
     #[test]

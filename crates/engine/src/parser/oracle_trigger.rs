@@ -346,7 +346,10 @@ fn trigger_condition_source_zones(condition: &TriggerCondition) -> Vec<Zone> {
 
 fn collect_trigger_condition_source_zones(condition: &TriggerCondition, out: &mut Vec<Zone>) {
     match condition {
-        TriggerCondition::SourceInZone { zone } if !out.contains(zone) => {
+        TriggerCondition::SourceInZone { zone }
+        | TriggerCondition::SourceInZoneWithAdjacentFilter { zone, .. }
+            if !out.contains(zone) =>
+        {
             out.push(*zone);
         }
         TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
@@ -5738,6 +5741,41 @@ fn parse_source_suspected_intervening_if(input: &str) -> OracleResult<'_, Trigge
     Ok((rest, condition))
 }
 
+/// CR 404.1 + CR 603.4: Parse a source-zone adjacency rider such as
+/// "if this card is in your graveyard with a creature card directly above it".
+///
+/// The source remains the exact live object; the adjacent card is a typed
+/// TargetFilter so the runtime can reuse owner-zone filter semantics for core
+/// types, subtypes, and future filter properties. The parser intentionally
+/// consumes only a single adjacent card phrase and its fixed positional rider;
+/// any trailing comma/effect remains for the trigger-body parser.
+fn parse_source_zone_adjacent_filter_intervening_if(
+    input: &str,
+) -> OracleResult<'_, TriggerCondition> {
+    let (rest, _) = tag("if ").parse(input)?;
+    let (rest, _) = alt((
+        tag("this card"),
+        tag("this creature"),
+        tag("this permanent"),
+        tag("~"),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag(" is in your graveyard with ").parse(rest)?;
+    let (rest, _) = alt((tag("a "), tag("an "))).parse(rest)?;
+    let (rest, adjacent) = parse_type_phrase_nom(rest)?;
+    if matches!(adjacent, TargetFilter::Any) {
+        return Err(oracle_err(input));
+    }
+    let (rest, _) = tag(" card directly above it").parse(rest)?;
+    Ok((
+        rest,
+        TriggerCondition::SourceInZoneWithAdjacentFilter {
+            zone: Zone::Graveyard,
+            adjacent,
+        },
+    ))
+}
+
 /// CR 603.4 + CR 601.2: Parse "if you didn't cast it from your hand/exile" or
 /// "if you didn't cast it from your graveyard" — negated zone-specific cast
 /// provenance intervening-if (Chainer, Nightmare Adept; Phage the Untouchable;
@@ -6655,6 +6693,24 @@ fn extract_if_condition_with_card_name(
     // parsed predicate in `Not`. Cost-form `unless` ("unless you pay {2}",
     // "unless you sacrifice a creature") is already stripped upstream by
     // `extract_unless_pay_modifier`.
+    // CR 404.1 + CR 603.4: Krovikan Horror and the reusable graveyard-stack
+    // shape "if this card is in your graveyard with a [type] card directly
+    // above it". This is source-relative (not an event-object it), so it
+    // must be recognized before the generic static-condition bridge, which
+    // can parse only the leading source-zone prefix and would leave the
+    // adjacency rider as an honest swallowed clause.
+    if let Some((before, condition, rest)) =
+        scan_preceded(&lower, parse_source_zone_adjacent_filter_intervening_if)
+            .filter(|(before, _, _)| before.trim_start().is_empty())
+    {
+        let pos = before.len();
+        let clause_len = lower.len() - before.len() - rest.len();
+        return (
+            strip_condition_clause(text, pos, clause_len),
+            Some(condition),
+        );
+    }
+
     if let Some(result) = try_extract_spell_targets_intervening_if(&tp, &lower, text) {
         return result;
     }
@@ -10559,6 +10615,9 @@ fn trigger_object_pronoun_ref_for_intervening_if(
     fn pins_source_off_battlefield(condition: &TriggerCondition) -> bool {
         match condition {
             TriggerCondition::SourceInZone { zone } => *zone != Zone::Battlefield,
+            TriggerCondition::SourceInZoneWithAdjacentFilter { zone, .. } => {
+                *zone != Zone::Battlefield
+            }
             TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
                 conditions.iter().any(pins_source_off_battlefield)
             }
