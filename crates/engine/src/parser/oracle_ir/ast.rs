@@ -1441,6 +1441,9 @@ pub(crate) enum HandRevealImperativeAst {
     RevealAll {
         target: TargetFilter,
         card_filter: TargetFilter,
+        /// CR 701.20a: true when the hand reveal itself chooses the card at
+        /// random, rather than revealing the whole hand or opening a chooser.
+        random: bool,
     },
     /// "reveals a number of cards from their hand equal to X" (CR 701.20a).
     RevealPartial {

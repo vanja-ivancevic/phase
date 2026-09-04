@@ -23628,6 +23628,13 @@ pub struct SpellContext {
     /// inherited-target fallback.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forwarded_result_context: Option<Box<ForwardedResultContext>>,
+    /// CR 608.2c: A result-object condition on the immediate child of a
+    /// reveal/look effect may need the produced object while the child also
+    /// carries an independent declared target (Cursed Scroll's revealed card
+    /// versus its damage recipient). Keep that condition subject separate from
+    /// the effect's ordinary targets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolution_result_context: Option<Box<ForwardedResultContext>>,
     /// CR 610.3b: specified duration events observed after a triggered ability
     /// triggered but before this initial zone-change effect occurred.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

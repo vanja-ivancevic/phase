@@ -3663,11 +3663,7 @@ fn filter_inner_for_object(
                 trigger_source,
                 recipient_id,
             );
-            let chosen_name = source_ctx.chosen_attributes.iter().find_map(|a| match a {
-                ChosenAttribute::CardName(n) => Some(n.as_str()),
-                _ => None,
-            });
-            chosen_name.is_some_and(|name| obj.name.eq_ignore_ascii_case(name))
+            chosen_name_matches(state, &source_ctx, &obj.name)
         }
         // CR 609.7a: "the chosen source" — match the ObjectId selected by
         // the prior damage-source choice while its continuation resolves.
@@ -3931,11 +3927,7 @@ fn zone_change_filter_inner(
                 trigger_source,
                 None,
             );
-            let chosen_name = source_ctx.chosen_attributes.iter().find_map(|a| match a {
-                    ChosenAttribute::CardName(n) => Some(n.as_str()),
-                    _ => None,
-            });
-            chosen_name.is_some_and(|name| record.name.eq_ignore_ascii_case(name))
+            chosen_name_matches(state, &source_ctx, &record.name)
         }
         TargetFilter::ChosenDamageSource { .. } => false,
         TargetFilter::Named { name } => record.name == *name,
@@ -5251,6 +5243,41 @@ fn source_chosen_player(source: &SourceContext<'_>) -> Option<PlayerId> {
             ChosenAttribute::Player(player) => Some(*player),
             _ => None,
         })
+}
+
+/// CR 201.2 + CR 608.2c: Resolve the name used by a `HasChosenName` filter.
+///
+/// A persisted choice (for example Pithing Needle's as-entered name) lives on
+/// the source object/LKI and remains the authority outside a resolving ability.
+/// Some effects instead say "choose a card name" and immediately test that
+/// answer (Cursed Scroll). Those choices are deliberately not persisted on
+/// the source; while their continuation is draining, the shared resolution
+/// ledger is the only authority. Read that ledger only when an ability is in
+/// scope, so a stale answer from an earlier resolution can never affect a
+/// passive filter or an unrelated history scan.
+fn chosen_name_matches(
+    state: &GameState,
+    source: &SourceContext<'_>,
+    candidate_name: &str,
+) -> bool {
+    if source.ability.is_some()
+        && matches!(
+            state.last_named_choice.as_ref(),
+            Some(ChoiceValue::CardName(name))
+                if candidate_name.eq_ignore_ascii_case(name)
+        )
+    {
+        return true;
+    }
+
+    source
+        .chosen_attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            ChosenAttribute::CardName(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .is_some_and(|name| candidate_name.eq_ignore_ascii_case(name))
 }
 
 /// CR 201.2 + CR 400.7: Resolve the printed name of the first
@@ -11813,6 +11840,59 @@ mod tests {
             .push(ChosenAttribute::CardName("lightning bolt".to_string()));
 
         assert!(matches_target_filter(
+            &state,
+            bolt,
+            &TargetFilter::HasChosenName,
+            source,
+        ));
+    }
+
+    /// CR 608.2c: a non-persisting "choose a card name" must still feed a
+    /// dependent `HasChosenName` condition while the same ability continues.
+    /// The answer belongs to the resolution ledger, not to the source object.
+    #[test]
+    fn has_chosen_name_reads_resolution_local_card_name() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Cursed Scroll");
+        let bolt = add_creature(&mut state, PlayerId(0), "Lightning Bolt");
+        let growth = add_creature(&mut state, PlayerId(0), "Giant Growth");
+        state.last_named_choice = Some(ChoiceValue::CardName("lightning bolt".to_string()));
+
+        let ability = ResolvedAbility::new(
+            Effect::Unimplemented {
+                name: "dependent condition".to_string(),
+                description: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let context = FilterContext::from_ability(&ability);
+
+        assert!(super::matches_target_filter(
+            &state,
+            bolt,
+            &TargetFilter::HasChosenName,
+            &context,
+        ));
+        assert!(!super::matches_target_filter(
+            &state,
+            growth,
+            &TargetFilter::HasChosenName,
+            &context,
+        ));
+    }
+
+    /// A resolution-local answer must not leak into a passive/source-only
+    /// filter evaluation after the resolving ability is gone.
+    #[test]
+    fn has_chosen_name_ignores_resolution_local_card_name_without_ability() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Cursed Scroll");
+        let bolt = add_creature(&mut state, PlayerId(0), "Lightning Bolt");
+        state.last_named_choice = Some(ChoiceValue::CardName("Lightning Bolt".to_string()));
+
+        assert!(!matches_target_filter(
             &state,
             bolt,
             &TargetFilter::HasChosenName,
