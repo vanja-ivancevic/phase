@@ -37966,6 +37966,22 @@ fn starts_with_you_may_choose_new_targets(text: &str) -> bool {
 fn try_parse_change_targets(lower: &str) -> Option<Effect> {
     type E<'a> = OracleError<'a>;
 
+    // CR 115.1 + CR 115.7a: "If target spell …, change that spell's target to
+    // another creature" names the stack spell in the conditional head, then
+    // refers to that announced target in the imperative body (Quicksilver
+    // Dragon). The target is any spell when announced; the head's
+    // resolution-time rider supplies the one-target/self-target predicate.
+    if let Ok((rest, _)) = tag::<_, _, E>("change that spell's target to ").parse(lower) {
+        let (forced_to, trailing) = parse_target(rest);
+        if trailing.trim().trim_matches('.').is_empty() {
+            return Some(Effect::ChangeTargets {
+                target: TargetFilter::StackSpell,
+                scope: RetargetScope::Single,
+                forced_to: Some(forced_to),
+            });
+        }
+    }
+
     let (rest, scope) = alt((
         value(
             RetargetScope::Single,
@@ -38807,6 +38823,31 @@ mod change_targets_stack_object_tests {
             }
             _ => None,
         }
+    }
+
+    /// Quicksilver Dragon's imperative body carries forward the `target spell`
+    /// announced by its conditional head. The conditional itself is parsed by
+    /// `oracle_effect::conditions`; this seam must retain the target declaration
+    /// and the forced "another creature" destination (CR 115.1 + CR 115.7a).
+    #[test]
+    fn conditional_that_spell_retarget_keeps_stack_spell_and_another_creature() {
+        let effect = try_parse_change_targets("change that spell's target to another creature.")
+            .expect("Quicksilver Dragon retarget body must parse");
+        let Effect::ChangeTargets {
+            target,
+            scope,
+            forced_to: Some(forced_to),
+        } = effect
+        else {
+            panic!("expected forced ChangeTargets effect, got {effect:?}");
+        };
+        assert_eq!(target, TargetFilter::StackSpell);
+        assert_eq!(scope, super::RetargetScope::Single);
+        let TargetFilter::Typed(typed) = forced_to else {
+            panic!("expected another-creature filter, got {forced_to:?}");
+        };
+        assert!(typed.type_filters.contains(&TypeFilter::Creature));
+        assert!(typed.properties.contains(&FilterProp::Another));
     }
 
     /// Reroute: "Change the target of target activated ability with a single

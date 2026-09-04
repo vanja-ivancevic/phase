@@ -5541,6 +5541,59 @@ fn parse_revealed_card_chosen_name_condition(text: &str) -> Option<AbilityCondit
     })
 }
 
+/// CR 115.1 + CR 115.9a/c + CR 608.2c: a targeted spell has exactly one
+/// target, and that target is this ability's source. The target spell remains
+/// a normal announced target; this is deliberately a resolution-time rider so
+/// a response may make the condition true or false after the ability is
+/// activated (Quicksilver Dragon).
+///
+/// The target-side constraints reuse the generic stack-entry filter machinery:
+/// `HasSingleTarget` counts declared target instances, while `TargetsOnly`
+/// evaluates every one against `SelfRef` in the resolving ability's context.
+fn parse_target_spell_single_targeting_source_condition(
+    input: &str,
+) -> OracleResult<'_, AbilityCondition> {
+    let (input, _) = tag("target spell has only one target and that target is ").parse(input)?;
+    // `parse_oracle_ir` canonicalizes source references before activated-ability
+    // routing, while this parser is also used directly by unnormalized callers.
+    // Both spellings name the same source object; accept either at this shared
+    // condition boundary rather than forcing individual callers to special-case
+    // Quicksilver Dragon's resolution-time guard.
+    let (input, _) = alt((tag("this creature"), tag("~"))).parse(input)?;
+    Ok((
+        input,
+        AbilityCondition::TargetMatchesFilter {
+            filter: TargetFilter::And {
+                filters: vec![
+                    TargetFilter::StackSpell,
+                    TargetFilter::Typed(TypedFilter {
+                        properties: vec![
+                            FilterProp::HasSingleTarget,
+                            FilterProp::TargetsOnly {
+                                filter: Box::new(TargetFilter::SelfRef),
+                            },
+                        ],
+                        ..Default::default()
+                    }),
+                ],
+            },
+            use_lki: false,
+            subject_slot: None,
+        },
+    ))
+}
+
+fn parse_target_spell_single_targeting_source_condition_text(
+    text: &str,
+) -> Option<AbilityCondition> {
+    let lower = text.trim().trim_end_matches('.').to_ascii_lowercase();
+    let parsed = all_consuming(parse_target_spell_single_targeting_source_condition)
+        .parse(lower.as_str())
+        .ok()
+        .map(|(_, condition)| condition);
+    parsed
+}
+
 pub(super) fn try_nom_condition_as_ability_condition(
     text: &str,
     ctx: &mut ParseContext,
@@ -5550,6 +5603,12 @@ pub(super) fn try_nom_condition_as_ability_condition(
     let lower = text.to_lowercase();
 
     if let Some(condition) = parse_revealed_card_chosen_name_condition(&lower) {
+        return Some(condition);
+    }
+
+    if let Some(condition) =
+        parse_target_spell_single_targeting_source_condition_text(lower.as_str())
+    {
         return Some(condition);
     }
 
@@ -7659,6 +7718,45 @@ mod tests {
         AggregateFunction, CardTypeSetSource, CommanderOwnership, PlayerFilter, SharedQuality,
     };
     use crate::types::counter::{CounterMatch, CounterType};
+
+    /// Quicksilver Dragon: the spell is announced as the ability target, but
+    /// both its target count and its target identity are rechecked as the
+    /// ability resolves (CR 115.1 + CR 115.9a/c + CR 608.2c).
+    #[test]
+    fn target_spell_single_targeting_source_condition_is_typed() {
+        for source_reference in ["this creature", "~"] {
+            let condition = try_nom_condition_as_ability_condition(
+                &format!("target spell has only one target and that target is {source_reference}"),
+                &mut ParseContext::default(),
+            )
+            .expect("Quicksilver Dragon condition must parse");
+
+            let AbilityCondition::TargetMatchesFilter {
+                filter: TargetFilter::And { filters },
+                use_lki: false,
+                subject_slot: None,
+            } = condition
+            else {
+                panic!("expected live target-spell condition, got {condition:?}");
+            };
+            assert_eq!(filters.len(), 2);
+            assert_eq!(filters[0], TargetFilter::StackSpell);
+            let TargetFilter::Typed(typed) = &filters[1] else {
+                panic!(
+                    "expected typed stack-target constraints, got {:?}",
+                    filters[1]
+                );
+            };
+            assert!(typed.properties.contains(&FilterProp::HasSingleTarget));
+            assert!(typed.properties.iter().any(|property| {
+                matches!(
+                    property,
+                    FilterProp::TargetsOnly { filter }
+                        if **filter == TargetFilter::SelfRef
+                )
+            }));
+        }
+    }
 
     /// CR 903.3d + CR 603.4: the `StaticCondition` -> `AbilityCondition` bridge
     /// must lower a commander-control gate, and must keep the two `ownership`

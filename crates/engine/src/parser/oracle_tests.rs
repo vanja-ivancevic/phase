@@ -13,6 +13,48 @@ use crate::types::ability::{
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::triggers::AttackTargetFilter;
 
+/// Quicksilver Dragon's condition belongs to the resolving ability, not the
+/// announced target. Keep the chain entry point honest before the full-card
+/// smoke test exercises the activated-ability router.
+#[test]
+fn quicksilver_dragon_condition_survives_effect_chain_lowering() {
+    let parsed = parse_effect_chain(
+        "If target spell has only one target and that target is this creature, change that spell's target to another creature.",
+        AbilityKind::Activated,
+    );
+
+    assert!(
+        matches!(
+            parsed.condition.as_ref(),
+            Some(AbilityCondition::TargetMatchesFilter { .. })
+        ),
+        "chain condition={:#?}",
+        parsed.condition
+    );
+}
+
+#[test]
+fn quicksilver_dragon_condition_survives_activated_ability_routing() {
+    let (ir, _) = parse_activated_ability_ir(
+        "{U}",
+        "If target spell has only one target and that target is this creature, change that spell's target to another creature.",
+        "{U}: If target spell has only one target and that target is this creature, change that spell's target to another creature.",
+        "Quicksilver Dragon",
+        Some(PrintedAbilityIndex::placeholder()),
+        &mut ParseContext::default(),
+    );
+    let parsed = lower_ability_ir(&ir);
+
+    assert!(
+        matches!(
+            parsed.condition.as_ref(),
+            Some(AbilityCondition::TargetMatchesFilter { .. })
+        ),
+        "activated ability condition={:#?}",
+        parsed.condition
+    );
+}
+
 #[test]
 fn unsupported_ability_ir_lowering_preserves_generic_and_structural_payloads() {
     let generic = lower_unsupported_node(&UnsupportedAbilityIr::unknown("unknown line"), 1);

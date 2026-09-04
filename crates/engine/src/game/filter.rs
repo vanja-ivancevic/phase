@@ -6336,9 +6336,23 @@ fn matches_filter_prop(
                 .fold(0, |sum: u32, record| sum.saturating_add(record.count));
             comparator.evaluate(i32::try_from(total).unwrap_or(i32::MAX), *count as i32)
         }
-        // CR 115.7: Stack entry has exactly one target — permissive at filter level,
-        // validated by retarget effects at resolution time.
-        FilterProp::HasSingleTarget => true,
+        // CR 115.9a: A stack spell or ability "with/has only one target" has
+        // exactly one declared target instance. This used to be permissive here
+        // because the announce-time retarget path performs its own check, but a
+        // resolution-time conditional (Quicksilver Dragon) evaluates this
+        // filter directly and must see the live stack entry too.
+        FilterProp::HasSingleTarget => state
+            .stack
+            .iter()
+            .find(|entry| entry.id == object_id)
+            .or_else(|| {
+                state
+                    .resolving_stack_entry
+                    .as_ref()
+                    .filter(|entry| entry.id == object_id)
+            })
+            .and_then(|entry| entry.ability())
+            .is_some_and(|ability| ability.targets.len() == 1),
         // CR 700.2: The object is modal iff its printed modality is present. Read
         // from the static printed characteristic populated at object creation,
         // available at SpellCast-trigger match time (Riku, of Many Paths).

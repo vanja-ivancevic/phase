@@ -110,6 +110,7 @@ use super::oracle_special::{
 use super::oracle_static::{
     is_speed_unlock_sentence, lower_static_ir, parse_alternative_keyword_cost,
     parse_cast_spells_alternative_cost_multi, parse_collect_evidence_alt_cost,
+    parse_discard_matching_color_alternative_cost,
     parse_flashback_trailing_self_spell_cost_reduction, parse_spells_alternative_cost,
     parse_static_line, parse_static_line_multi, try_parse_graveyard_keyword_grant_clause,
     try_parse_graveyard_keyword_grant_static, try_parse_top_of_library_cast_permission,
@@ -5519,6 +5520,18 @@ pub(crate) fn parse_oracle_ir(
                 i += 1;
                 continue;
             }
+        }
+
+        // Priority 6c-altcost-a: CR 118.9 — a global pitch-cost alternative:
+        // "Rather than pay the mana cost for a spell, its controller may discard
+        // a card that shares a color with that spell." (Dream Halls). This has a
+        // different grammatical subject from the "you may pay" class above, so
+        // route it through its strict lowering before Priority 7 can treat it as
+        // an effect sentence.
+        if let Some(static_def) = parse_discard_matching_color_alternative_cost(&line) {
+            emitter.static_ir_at(item_line, StaticIr::from_definition(&line, static_def));
+            i += 1;
+            continue;
         }
 
         // Priority 6c-altcost-b: CR 118.9 — "You may cast [filter] by paying {X}

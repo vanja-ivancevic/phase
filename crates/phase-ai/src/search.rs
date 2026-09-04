@@ -7615,6 +7615,8 @@ mod tests {
                     StaticDefinition::new(engine::types::statics::StaticMode::CastFromHandFree {
                         frequency: engine::types::statics::CastFrequency::Unlimited,
                         origin: engine::types::statics::CastFreeOrigin::Hand,
+                        all_players: false,
+                        grants_flash: false,
                     })
                     .affected(TargetFilter::Any),
                 );

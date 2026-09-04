@@ -6071,6 +6071,8 @@ mod tests {
                 mode: StaticMode::CastFromHandFree {
                     frequency: CastFrequency::Unlimited,
                     origin: CastFreeOrigin::Hand,
+                    all_players: false,
+                    grants_flash: false,
                 },
                 affected: Some(TargetFilter::Any),
                 modifications: vec![],

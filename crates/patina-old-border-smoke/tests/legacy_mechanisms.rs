@@ -8,7 +8,7 @@ use engine::ai_support::legal_actions;
 use engine::game::casting::can_activate_ability_now;
 use engine::game::scenario::{GameScenario, P0};
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::AbilityTag;
+use engine::types::ability::{AbilityCondition, AbilityTag, Effect, FilterProp, TargetFilter};
 use engine::types::actions::GameAction;
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -17,6 +17,12 @@ use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
 const LEGACY_CYCLING_ORACLE: &str = "Cycling {2}";
+const QUICKSILVER_DRAGON_ORACLE: &str = concat!(
+    "Flying\n",
+    "{U}: If target spell has only one target and that target is this creature, ",
+    "change that spell's target to another creature.\n",
+    "Morph {4}{U}"
+);
 
 fn cycling_index(state: &engine::types::game_state::GameState, card: ObjectId) -> usize {
     state.objects[&card]
@@ -88,5 +94,55 @@ fn cycling_parses_and_is_legal_only_from_hand() {
                 if *source_id == card && *index == ability_index
         )),
         "Cycling must not remain an offered action outside hand"
+    );
+}
+
+/// CR 115.1 + CR 115.9a/c + CR 115.7a: Quicksilver Dragon uses an announced
+/// spell target, a resolution-time self-target/single-target guard, and a
+/// forced legal retarget destination. This keeps the complete old-border
+/// sentence together at the public parser boundary.
+#[test]
+fn quicksilver_dragon_parses_as_a_guarded_forced_retarget() {
+    let parsed = parse_oracle_text(
+        QUICKSILVER_DRAGON_ORACLE,
+        "Quicksilver Dragon",
+        &[],
+        &["Creature".to_string()],
+        &["Dragon".to_string()],
+    );
+    let ability = parsed
+        .abilities
+        .iter()
+        .find(|ability| matches!(ability.effect.as_ref(), Effect::ChangeTargets { .. }))
+        .expect("Quicksilver Dragon must retain its activated retarget ability");
+
+    assert!(matches!(
+        ability.effect.as_ref(),
+        Effect::ChangeTargets {
+            target: TargetFilter::StackSpell,
+            forced_to: Some(TargetFilter::Typed(typed)),
+            ..
+        } if typed.properties.contains(&FilterProp::Another)
+    ));
+    assert!(
+        matches!(
+            ability.condition.as_ref(),
+            Some(AbilityCondition::TargetMatchesFilter {
+                filter: TargetFilter::And { filters },
+                use_lki: false,
+                subject_slot: None,
+            }) if filters.iter().any(|filter| filter == &TargetFilter::StackSpell)
+                && filters.iter().any(|filter| matches!(
+                    filter,
+                    TargetFilter::Typed(typed)
+                        if typed.properties.contains(&FilterProp::HasSingleTarget)
+                            && typed.properties.iter().any(|property| matches!(
+                                property,
+                                FilterProp::TargetsOnly { filter }
+                                    if **filter == TargetFilter::SelfRef
+                            ))
+                ))
+        ),
+        "Quicksilver Dragon ability={ability:#?}"
     );
 }

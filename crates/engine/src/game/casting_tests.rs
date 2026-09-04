@@ -3,7 +3,9 @@ use super::*;
 use crate::game::zones;
 use crate::game::zones::create_object;
 use crate::parser::oracle_effect::parse_effect_chain;
-use crate::parser::oracle_static::parse_static_line;
+use crate::parser::oracle_static::{
+    parse_discard_matching_color_alternative_cost, parse_static_line,
+};
 use crate::types::ability::{
     AbilityCost, AbilityTag, ActivationRestriction, AdditionalCost, AggregateFunction,
     BasicLandType, CastPermissionConstraint, CastVariantPaid, CastingPermission, ChosenAttribute,
@@ -41,6 +43,152 @@ fn setup_game_at_main_phase() -> GameState {
         player: PlayerId(0),
     };
     state
+}
+
+/// CR 601.2b + CR 601.3b + CR 702.8a: Aluren's permission belongs to every
+/// player, not merely its controller, and its free-cast and flash halves must
+/// be admitted together.  P1 is casting during P0's main phase with no mana;
+/// either missing half makes this discriminating scenario fail.
+#[test]
+fn aluren_allows_an_opponent_to_free_cast_an_eligible_creature_at_instant_speed() {
+    let mut state = setup_game_at_main_phase();
+    state.priority_player = PlayerId(1);
+    state.waiting_for = WaitingFor::Priority {
+        player: PlayerId(1),
+    };
+
+    let aluren = create_object(
+        &mut state,
+        CardId(9_900_001),
+        PlayerId(0),
+        "Aluren".to_string(),
+        Zone::Battlefield,
+    );
+    state.objects.get_mut(&aluren).unwrap().static_definitions.push(
+        parse_static_line(
+            "Any player may cast creature spells with mana value 3 or less without paying their mana costs and as though they had flash.",
+        )
+        .expect("Aluren must parse"),
+    );
+
+    let creature = create_object(
+        &mut state,
+        CardId(9_900_002),
+        PlayerId(1),
+        "Opponent's three-drop".to_string(),
+        Zone::Hand,
+    );
+    let creature_obj = state.objects.get_mut(&creature).unwrap();
+    creature_obj.card_types.core_types.push(CoreType::Creature);
+    creature_obj.mana_cost = ManaCost::generic(3);
+    creature_obj.base_mana_cost = creature_obj.mana_cost.clone();
+
+    assert_eq!(
+        effective_spell_cost(&state, PlayerId(1), creature),
+        Some(ManaCost::NoCost),
+        "the opponent must receive Aluren's no-cost permission"
+    );
+    assert!(
+        can_cast_object_now(&state, PlayerId(1), creature),
+        "the same permission must grant flash during the other player's main phase"
+    );
+
+    let mut events = Vec::new();
+    handle_cast_spell(
+        &mut state,
+        PlayerId(1),
+        creature,
+        CardId(9_900_002),
+        &mut events,
+    )
+    .expect("the admitted opponent cast must traverse the normal cast pipeline");
+    assert_eq!(
+        state.objects[&creature].zone,
+        Zone::Stack,
+        "Aluren must carry the opponent's free instant-speed cast through payment into the stack"
+    );
+}
+
+/// CR 118.9 + CR 601.2b: Dream Halls' pitch payment must be offered to either
+/// player only when another hand card shares a color with the pending spell.
+/// The filter source is the pending spell, not Dream Halls, which is the crucial
+/// distinction for both legality and the eventual discard chooser.
+#[test]
+fn dream_halls_offers_only_matching_color_pitch_costs_to_any_player() {
+    let mut state = setup_game_at_main_phase();
+    let dream_halls = create_object(
+        &mut state,
+        CardId(9_900_010),
+        PlayerId(0),
+        "Dream Halls".to_string(),
+        Zone::Battlefield,
+    );
+    state.objects.get_mut(&dream_halls).unwrap().static_definitions.push(
+        parse_discard_matching_color_alternative_cost(
+            "Rather than pay the mana cost for a spell, its controller may discard a card that shares a color with that spell.",
+        )
+        .expect("Dream Halls must parse"),
+    );
+
+    let spell = create_object(
+        &mut state,
+        CardId(9_900_011),
+        PlayerId(1),
+        "Opponent's blue spell".to_string(),
+        Zone::Hand,
+    );
+    {
+        let spell_obj = state.objects.get_mut(&spell).unwrap();
+        spell_obj.color = vec![ManaColor::Blue];
+        spell_obj.mana_cost = ManaCost::generic(5);
+        spell_obj.base_mana_cost = spell_obj.mana_cost.clone();
+    }
+    let matching_discard = create_object(
+        &mut state,
+        CardId(9_900_012),
+        PlayerId(1),
+        "Blue pitch card".to_string(),
+        Zone::Hand,
+    );
+    state.objects.get_mut(&matching_discard).unwrap().color = vec![ManaColor::Blue];
+    let nonmatching_discard = create_object(
+        &mut state,
+        CardId(9_900_013),
+        PlayerId(1),
+        "Red pitch card".to_string(),
+        Zone::Hand,
+    );
+    state.objects.get_mut(&nonmatching_discard).unwrap().color = vec![ManaColor::Red];
+
+    let cost =
+        super::casting_costs::payable_spell_alternative_cost_details(&state, PlayerId(1), spell)
+            .expect("a matching hand card must make Dream Halls payable");
+    assert!(matches!(cost.cost, AbilityCost::Discard { .. }));
+    assert_eq!(
+        super::find_eligible_discard_targets(
+            &state,
+            PlayerId(1),
+            spell,
+            match &cost.cost {
+                AbilityCost::Discard { filter, .. } => filter.as_ref(),
+                _ => unreachable!("Dream Halls costs discard a card"),
+            },
+        ),
+        vec![matching_discard],
+        "only the same-color card may pay the pitch cost"
+    );
+
+    state.players[PlayerId(1).0 as usize]
+        .hand
+        .retain(|id| *id != matching_discard);
+    assert!(
+        super::casting_costs::payable_spell_alternative_cost_details(&state, PlayerId(1), spell)
+            .is_none(),
+        "a mismatched hand card must not make the pitch cost payable"
+    );
+    assert!(state.players[PlayerId(1).0 as usize]
+        .hand
+        .contains(&nonmatching_discard));
 }
 
 fn ability_graph_has_cast_occurrence(
@@ -15941,6 +16089,8 @@ mod omniscience_alt_cost_2432 {
                 StaticDefinition::new(StaticMode::CastFromHandFree {
                     frequency: CastFrequency::OncePerTurn,
                     origin: CastFreeOrigin::Hand,
+                    all_players: false,
+                    grants_flash: false,
                 })
                 .affected(TargetFilter::Any),
             );
