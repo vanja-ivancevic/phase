@@ -331,7 +331,33 @@ fn prompt_resolution_tap_untap_choice(
                 });
                 return true;
             }
-            return false;
+            // CR 609.3: a counted, non-targeted tap/untap says to perform the
+            // action once for each counted object, but cannot require more
+            // permanents than are available. These effects are represented by
+            // an exact resolution-time MultiTargetSpec (Tangle Wire is the
+            // canonical old-border case). Clamp the required selection to the
+            // live eligible pool and keep it mandatory; using `up_to` here
+            // would incorrectly let the player choose fewer than the available
+            // count.
+            let exact_count = spec.max.as_ref().is_some_and(|max| max == &spec.min)
+                && !crate::game::ability_utils::multi_target_needs_quantity_choice(
+                    state, ability, spec,
+                );
+            if exact_count {
+                let required =
+                    crate::game::quantity::resolve_quantity_with_targets(state, &spec.min, ability)
+                        .max(0) as usize;
+                if eligible.len() < required {
+                    crate::game::ability_utils::MultiTargetBounds {
+                        min: eligible.len(),
+                        max: eligible.len(),
+                    }
+                } else {
+                    return false;
+                }
+            } else {
+                return false;
+            }
         }
     };
 

@@ -3690,6 +3690,23 @@ pub(super) fn parse_hand_reveal_ast(
         return Some(HandRevealImperativeAst::RevealBackRef);
     }
 
+    // CR 701.9a + CR 701.20a: the game selects one card uniformly at random
+    // from a hand. Keep this separate from the ordinary singular reveal path:
+    // `RevealHand { selection: Chosen }` would incorrectly open a controller
+    // choice prompt for cards such as Cursed Scroll.
+    if let Some((target, _)) = nom_on_lower(after_reveal_lower, after_reveal_lower, |input| {
+        let (rest, _) = alt((
+            tag::<_, _, OracleError<'_>>("a card at random from "),
+            tag("one card at random from "),
+            tag("a card at random in "),
+            tag("one card at random in "),
+        ))
+        .parse(input)?;
+        parse_hand_possessive_target(rest)
+    }) {
+        return Some(HandRevealImperativeAst::RevealRandom { target });
+    }
+
     // CR 701.20a: the definite-article forms ("the card" / "the cards") are the
     // same back-reference, but far more collision-prone than the pronoun forms:
     // "reveal the cards you want to splice onto it" and "reveal the cards in your
@@ -3898,6 +3915,14 @@ pub(super) fn lower_hand_reveal_ast(ast: HandRevealImperativeAst) -> Effect {
             } else {
                 crate::types::ability::CardSelectionMode::Chosen
             },
+            choice_optional: false,
+            reveal: true,
+        },
+        HandRevealImperativeAst::RevealRandom { target } => Effect::RevealHand {
+            target,
+            card_filter: TargetFilter::None,
+            count: Some(QuantityExpr::Fixed { value: 1 }),
+            selection: crate::types::ability::CardSelectionMode::Random,
             choice_optional: false,
             reveal: true,
         },

@@ -1452,6 +1452,10 @@ pub(crate) enum HandRevealImperativeAst {
         /// random, rather than revealing the whole hand or opening a chooser.
         random: bool,
     },
+    /// CR 701.9a + CR 701.20a: "reveal a card at random from/in ... hand".
+    /// The game, not the controller, selects the card; this lowers to a
+    /// one-card random `Effect::RevealHand` with no choice prompt.
+    RevealRandom { target: TargetFilter },
     /// "reveals a number of cards from their hand equal to X" (CR 701.20a).
     RevealPartial {
         count: crate::types::ability::QuantityExpr,
