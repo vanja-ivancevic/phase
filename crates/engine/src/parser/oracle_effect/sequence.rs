@@ -2067,6 +2067,8 @@ fn starts_prefix_clause(current_lower: &str) -> bool {
         // reaches `strip_temporal_prefix` instead of splitting at the comma
         // (Fortune, Loyal Steed: "at end of combat, exile it and …").
         tag("at end of combat"),
+        // CR 603.7a + CR 502.2: this temporal prefix also owns its comma.
+        tag("during your next untap step"),
         tag("for as long as "),
         // CR 508.6: "During any turn [you attacked with X], [effect]" — temporal
         // attack-history gate (Neyali, Neriv, Boros Strike-Captain). Keep the
@@ -2451,6 +2453,9 @@ fn is_inside_temporal_prefix(lower: &str) -> bool {
         tag::<_, _, OracleError<'_>>("at the beginning of the next "),
         tag("at the beginning of your next "),
         tag("at the end of "),
+        // CR 603.7a + CR 502.2: keep Undiscovered Paradise's delayed-return
+        // prefix intact through its internal comma.
+        tag("during your next untap step"),
     ))
     .parse(trimmed)
     .is_ok()
@@ -12499,6 +12504,22 @@ mod tests {
         assert_eq!(
             chunks,
             vec!["at the beginning of the next end step, return it and lose 2 life"]
+        );
+    }
+
+    #[test]
+    fn temporal_prefix_next_untap_keeps_its_internal_commas() {
+        // CR 603.7a + CR 502.2: the "as you untap your permanents" wording is
+        // part of the delayed-trigger condition, not a standalone `during`
+        // effect. The full clause must reach the shared temporal lowerer.
+        let chunks = clause_texts(
+            "during your next untap step, as you untap your permanents, return this land to its owner's hand",
+        );
+        assert_eq!(
+            chunks,
+            vec![
+                "during your next untap step, as you untap your permanents, return this land to its owner's hand"
+            ]
         );
     }
 
