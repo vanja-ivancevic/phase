@@ -10952,6 +10952,10 @@ pub const REMOVE_COUNTER_COST_ALL: u32 = u32::MAX - 1;
 pub const REMOVE_COUNTER_COST_ANY_NUMBER: u32 = u32::MAX - 2;
 /// Sentinel for literal `X` in exile costs that use the compact numeric count.
 pub const EXILE_COST_X: u32 = u32::MAX;
+/// Sentinel for an unbounded "exile any number of" card choice. This is used
+/// by as-enters replacements whose accept branch lets the player choose zero
+/// or more matching cards before the permanent enters (CR 107.1c).
+pub const EXILE_COST_ANY_NUMBER: u32 = u32::MAX - 1;
 
 pub fn is_x_remove_counter_cost_count(count: u32) -> bool {
     count == REMOVE_COUNTER_COST_X
