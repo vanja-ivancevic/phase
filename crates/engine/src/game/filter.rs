@@ -6085,6 +6085,20 @@ fn matches_filter_prop(
             ),
             None => false,
         },
+        // CR 205.3i + CR 608.2d: Match a land subtype against the source's
+        // persisted general land-type choice (Vision Charm). Unlike creature
+        // types, land types do not use Changeling semantics.
+        FilterProp::IsChosenLandType => source
+            .chosen_attributes
+            .iter()
+            .rev()
+            .find_map(|attribute| match attribute {
+                crate::types::ability::ChosenAttribute::LandType(land_type) => {
+                    Some(land_type.as_str())
+                }
+                _ => None,
+            })
+            .is_some_and(|chosen| obj.card_types.subtypes.iter().any(|subtype| subtype.eq_ignore_ascii_case(chosen))),
         // CR 205.3m: Object's creature type ties for highest count
         // among creature cards in the named player's named zone. Scope picks
         // the player whose zone is inspected; `Opponent` falls back to the
@@ -6634,6 +6648,21 @@ fn zone_change_record_matches_property(
                 &state.all_creature_types,
             )
         }),
+        // CR 205.3i + CR 608.2d: The spell snapshot analogue of the live
+        // chosen-land-type predicate. The comparison is case-insensitive
+        // because Oracle subtype labels are canonicalized at different ingress
+        // points (card data versus player choice).
+        FilterProp::IsChosenLandType => source
+            .chosen_attributes
+            .iter()
+            .rev()
+            .find_map(|attribute| match attribute {
+                crate::types::ability::ChosenAttribute::LandType(land_type) => {
+                    Some(land_type.as_str())
+                }
+                _ => None,
+            })
+            .is_some_and(|chosen| record.subtypes.iter().any(|subtype| subtype.eq_ignore_ascii_case(chosen))),
         FilterProp::MostPrevalentCreatureTypeIn { .. } => false,
         FilterProp::MatchesLastChosenCardPredicate => matches_last_chosen_card_predicate(
             &state.last_named_choice,

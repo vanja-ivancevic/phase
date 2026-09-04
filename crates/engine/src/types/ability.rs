@@ -1994,6 +1994,10 @@ pub enum ChosenAttribute {
     Color(ManaColor),
     CreatureType(String),
     BasicLandType(BasicLandType),
+    /// CR 205.3i + CR 608.2d: a chosen land subtype (including nonbasic land
+    /// types), as in Vision Charm's "first chosen type".  Kept distinct from
+    /// `BasicLandType` because the first choice may be Cave, Desert, Gate, etc.
+    LandType(String),
     CardType(CoreType),
     OddOrEven(Parity),
     CardName(String),
@@ -2094,6 +2098,7 @@ impl ChosenAttribute {
             Self::Color(_) => ChoiceType::color(),
             Self::CreatureType(_) => ChoiceType::creature_type(),
             Self::BasicLandType(_) => ChoiceType::BasicLandType,
+            Self::LandType(_) => ChoiceType::LandType,
             Self::CardType(_) => ChoiceType::card_type(),
             Self::OddOrEven(_) => ChoiceType::OddOrEven,
             Self::CardName(_) => ChoiceType::CardName,
@@ -2175,6 +2180,7 @@ impl ChosenAttribute {
             ChoiceValue::Color(color) => Some(Self::Color(color)),
             ChoiceValue::CreatureType(creature_type) => Some(Self::CreatureType(creature_type)),
             ChoiceValue::BasicLandType(land_type) => Some(Self::BasicLandType(land_type)),
+            ChoiceValue::LandType(land_type) => Some(Self::LandType(land_type)),
             ChoiceValue::CardType(card_type) => Some(Self::CardType(card_type)),
             ChoiceValue::OddOrEven(parity) => Some(Self::OddOrEven(parity)),
             ChoiceValue::CardName(card_name) => Some(Self::CardName(card_name)),
@@ -2190,7 +2196,6 @@ impl ChosenAttribute {
             // `Effect::PutChosenCounter` can read it.
             ChoiceValue::Counter(counter_type) => Some(Self::Counter(counter_type)),
             ChoiceValue::CardPredicate(_) => None,
-            ChoiceValue::LandType(_) => None,
         }
     }
 }
@@ -5371,6 +5376,10 @@ pub enum FilterProp {
     /// Matches objects whose subtypes include the source object's chosen creature type.
     /// Used for "of the chosen type" patterns (Cavern of Souls, Metallic Mimic).
     IsChosenCreatureType,
+    /// CR 205.3i + CR 608.2d: Matches lands whose land subtype is the source
+    /// object's chosen land type (including nonbasic subtypes).  Used by
+    /// paired choices such as Vision Charm's "first chosen type" clause.
+    IsChosenLandType,
     /// CR 205.3m + CR 701.23a: Matches creature cards whose creature type is
     /// tied for the highest count among creature cards in the named player's
     /// named zone. CR 205.3m defines the creature subtype set being counted;

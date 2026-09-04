@@ -2720,6 +2720,23 @@ pub(super) fn parse_subject_application(
     {
         return subject_filter_application(TargetFilter::AllPlayers, false);
     }
+    // CR 205.3i + CR 608.2d: Vision Charm's paired land-type mode applies to
+    // every land whose subtype matches the first selected land type. Keep this
+    // as a typed subject predicate so the existing continuous-effect lowering
+    // can reuse its normal layer-4 and duration machinery.
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "each land of the first chosen type",
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        return subject_filter_application(
+            TargetFilter::Typed(
+                TypedFilter::land().properties(vec![FilterProp::IsChosenLandType]),
+            ),
+            false,
+        );
+    }
     if let Ok((rest_lower, _)) =
         alt((tag::<_, _, OracleError<'_>>("all "), tag("each "))).parse(lower.as_str())
     {
@@ -4706,6 +4723,34 @@ fn build_become_clause(
     // Must intercept before parse_animation_spec which produces AddSubtype("Night"/"Day").
     if let Some(clause) = try_parse_set_day_night(become_text) {
         return Some(clause);
+    }
+
+    // CR 205.3i + CR 305.7 + CR 608.2d: "becomes the second chosen type"
+    // consumes the second value from a preceding paired land-type choice.  The
+    // source's `ChosenAttribute::BasicLandType` is read by the existing
+    // `SetChosenBasicLandType` layer-4 modification, so this adds no new runtime
+    // effect or card-specific resolver path.
+    if become_text.eq_ignore_ascii_case("the second chosen type") {
+        let affected = static_affected_for_application(&application);
+        let effect = Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(affected)
+                .modifications(vec![ContinuousModification::SetChosenBasicLandType])
+                .description(become_text.to_string())],
+            duration: duration.clone(),
+            target: application.target.clone(),
+            end_cost: None,
+        };
+        return Some(ParsedEffectClause {
+            effect,
+            duration,
+            sub_ability: None,
+            distribute: None,
+            multi_target: None,
+            condition: None,
+            optional: false,
+            unless_pay: None,
+        });
     }
 
     // CR 205.3 / CR 305.7: "become the [type] of your choice" — player chooses a subtype.

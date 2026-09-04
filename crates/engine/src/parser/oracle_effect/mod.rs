@@ -9168,6 +9168,16 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
             description: None,
         });
     }
+    // CR 608.2d + CR 608.2c: A single instruction may announce multiple named
+    // choices ("choose a land type and a basic land type") before a following
+    // sentence consumes both values.  The ordinary named-choice parser is
+    // intentionally prefix-based, so without this complete-conjunction arm it
+    // would accept only the first choice and silently drop the second.  Build
+    // the choices as an ordered sub-ability chain; each value is persisted on
+    // the exact source so later clauses can read both attributes independently.
+    if let Some(clause) = try_parse_named_choice_conjunction_clause(text) {
+        return clause;
+    }
     if counter_unless_payment_is_unsupported(text) {
         return parsed_unless_payment_unsupported_clause(text);
     }
@@ -27402,6 +27412,45 @@ pub(crate) fn try_parse_named_choice_conjunction(choose_text: &str) -> Option<Ve
         .parse(trimmed)
         .ok()?;
     (choices.len() >= 2).then_some(choices)
+}
+
+/// CR 608.2d + CR 608.2c: Lower a complete conjunction of named choices into
+/// an ordered `Choose` → `Choose` sub-ability chain.  This is deliberately
+/// independent of any particular pair: the same mechanism handles card-name +
+/// creature-type (Psychic Paper), land-type + basic-land-type (Vision Charm),
+/// and future N-way named-choice conjunctions.
+fn try_parse_named_choice_conjunction_clause(text: &str) -> Option<ParsedEffectClause> {
+    let lower = text.trim().trim_end_matches('.').trim().to_lowercase();
+    let choice_types = try_parse_named_choice_conjunction(&lower)?;
+    let mut iter = choice_types.into_iter();
+    let first = iter.next()?;
+
+    let mut continuation: Option<Box<AbilityDefinition>> = None;
+    for choice_type in iter.rev() {
+        let mut definition = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Choose {
+                choice_type,
+                persist: true,
+                selection: TargetSelectionMode::Chosen,
+            },
+        );
+        definition.description = Some("choose named value".to_string());
+        definition.sub_ability = continuation.take();
+        continuation = Some(Box::new(definition));
+    }
+
+    let mut clause = parsed_clause(Effect::Choose {
+        choice_type: first,
+        // A conjunction is a multi-value declaration whose later instructions
+        // may read any of the values, so retain every selected attribute on the
+        // source object (CR 607.2d), rather than leaving it only in the transient
+        // single-value `last_named_choice` slot.
+        persist: true,
+        selection: TargetSelectionMode::Chosen,
+    });
+    clause.sub_ability = continuation;
+    Some(clause)
 }
 
 /// CR 608.2d + CR 113.3: Parse a typed keyword enumeration following "choose "

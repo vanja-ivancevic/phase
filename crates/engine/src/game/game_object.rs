@@ -3008,6 +3008,17 @@ impl GameObject {
         })
     }
 
+    /// CR 205.3i + CR 608.2d: Look up the most recently chosen land subtype,
+    /// including nonbasic land types.  This is separate from
+    /// `chosen_basic_land_type` because effects may remember both a general
+    /// land type and a basic land type in the same resolution (Vision Charm).
+    pub fn chosen_land_type(&self) -> Option<&str> {
+        self.chosen_attributes.iter().rev().find_map(|a| match a {
+            ChosenAttribute::LandType(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
     /// Look up a stored creature type choice.
     ///
     /// CR 613.7: Reads the LAST `ChosenAttribute::CreatureType`, so that a
