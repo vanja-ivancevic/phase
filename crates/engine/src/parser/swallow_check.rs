@@ -1613,7 +1613,15 @@ fn effect_is_replacement_carrier(effect: &Effect) -> bool {
         // name IS the replacement, with or without the `on_exile` rider (the
         // Feather return / Lilah plot parameterization is a second consequence
         // folded into the same carrier, so it stays exempt either way).
-        | Effect::ExileResolvingSpellInsteadOfGraveyard { .. } => true,
+        | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
+        // CR 701.6a + CR 614.1a: a countered spell's non-graveyard
+        // destination is the replacement itself, carried on Counter rather
+        // than in the top-level replacement collection (Memory Lapse,
+        // Remand, Spell Crumple).
+        | Effect::Counter {
+            countered_spell_zone: Some(_),
+            ..
+        } => true,
         _ => false,
     }
 }
@@ -6770,6 +6778,19 @@ mod tests {
              Prevent the next 3 damage that would be dealt this turn to any number of targets, divided as you choose. \
              If this spell was kicked, prevent the next 6 damage this way instead.",
             "Pollen Remedy",
+            &["Instant"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Replacement_Instead"));
+    }
+
+    /// CR 701.6a + CR 614.1a: a countered-spell destination rider is a
+    /// replacement carrier on the Counter effect, not a top-level definition.
+    #[test]
+    fn replacement_instead_accepts_countered_spell_zone_redirect() {
+        let parsed = parse_named(
+            "Counter target spell. If that spell is countered this way, put it on top of its owner's library instead of into that player's graveyard.",
+            "Memory Lapse",
             &["Instant"],
         );
 
