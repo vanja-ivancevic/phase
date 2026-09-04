@@ -9175,10 +9175,11 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     // explicit no-op rather than reporting an unbound subject and marking the
     // whole card unsupported. Keep this exact and end-anchored: a future rider
     // with different legality semantics must earn its own parser/runtime proof.
+    let lower = text.to_lowercase();
     if all_consuming(tag::<_, _, OracleError<'_>>(
         "this ability still resolves if its target becomes illegal",
     ))
-    .parse(text.to_lowercase().as_str())
+    .parse(lower.as_str())
     .is_ok()
     {
         return parsed_clause(Effect::NoOp);
