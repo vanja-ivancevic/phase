@@ -489,6 +489,13 @@ pub(crate) enum ContinuationAst {
     /// creation clause — source-defined token P/T printed as a separate
     /// sentence.
     TokenSourcePowerToughness { power: PtValue, toughness: PtValue },
+    /// CR 111.3 + CR 208.2: an `It has "…"` sentence immediately after a
+    /// token creation grants a static ability to that token. Absorb the
+    /// definition into the preceding `Effect::Token` instead of leaving an
+    /// unimplemented sibling in the chain.
+    TokenStaticAbilities {
+        static_abilities: Vec<StaticDefinition>,
+    },
     /// "After that turn, that player takes an extra turn." after a controlled-turn effect.
     GrantExtraTurnAfterControlledTurn,
     /// CR 701.20a: "Put that card [onto the battlefield / into your hand]" after RevealUntil —

@@ -2110,6 +2110,11 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
             acc = acc.or(scan_player_filter(filter, mode));
             acc
         }
+        QuantityRef::TokenSourceCounters { .. } => Axes {
+            event: false,
+            sibling: true,
+            projected: false,
+        },
         QuantityRef::CountersOn { scope, .. } => {
             let mut acc = Axes {
                 event: false,

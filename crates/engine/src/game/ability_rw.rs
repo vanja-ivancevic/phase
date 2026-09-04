@@ -2154,6 +2154,7 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         QuantityRef::EventContextAmount
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::ManaSpentToCast { .. } => true,
+        QuantityRef::TokenSourceCounters { .. } => false,
         // Object-scope carriers: `ObjectScope::CostPaidObject` is a 12th tag.
         QuantityRef::CountersOn { scope, .. }
         | QuantityRef::Intensity { scope, .. }
@@ -6251,6 +6252,7 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
         }
         QuantityRef::PlayerCount { filter: _ } => RwProfile::empty(),
         QuantityRef::EventContextPlayerCount { filter: _ } => reads_event_live(),
+        QuantityRef::TokenSourceCounters { .. } => read_object_scope(&ObjectScope::Source, StateKind::ObjectCounters),
         QuantityRef::CountersOn { scope, .. } | QuantityRef::Intensity { scope, .. } => {
             read_object_scope(scope, StateKind::ObjectCounters)
         }

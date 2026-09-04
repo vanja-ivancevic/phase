@@ -34381,7 +34381,17 @@ pub(crate) fn parse_effect_chain_ir(
                 let next_text = strip_leading_sequence_connector(&next.text).trim();
                 sequence::parse_token_source_power_toughness_followup(next_text)
             })
-            .map(|(power, toughness)| TokenPtFollowup::PowerToughness { power, toughness });
+            .map(|(power, toughness)| TokenPtFollowup::PowerToughness { power, toughness })
+            .or_else(|| {
+                chunks
+                    .get(chunk_idx + 1)
+                    .filter(|_| token_source_pt_followup_can_apply_to_chunk(normalized_text))
+                    .and_then(|next| {
+                        let next_text = strip_leading_sequence_connector(&next.text).trim();
+                        token::parse_token_static_ability_followup(next_text)
+                    })
+                    .map(|_| TokenPtFollowup::StaticAbility)
+            });
         let nearest_bare_card_publisher = builder
             .clauses()
             .iter()

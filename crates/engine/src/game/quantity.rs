@@ -1094,6 +1094,7 @@ fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
         | QuantityRef::PlayerCount { .. }
         | QuantityRef::EventContextPlayerCount { .. }
         | QuantityRef::CountersOn { .. }
+        | QuantityRef::TokenSourceCounters { .. }
         | QuantityRef::CountersOnObjects { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::TargetControllerCounter { .. }
@@ -1433,6 +1434,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::PlayerCount { .. }
         | QuantityRef::EventContextPlayerCount { .. }
         | QuantityRef::CountersOn { .. }
+        | QuantityRef::TokenSourceCounters { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::TargetControllerCounter { .. }
         | QuantityRef::Variable { .. }
@@ -1744,6 +1746,7 @@ fn quantity_ref_characteristic_reads(qty: &QuantityRef, depth: u32) -> Character
         | QuantityRef::PlayerCount { .. }
         | QuantityRef::EventContextPlayerCount { .. }
         | QuantityRef::CountersOn { .. }
+        | QuantityRef::TokenSourceCounters { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::Variable { .. }
         // Digital-only Alchemy counter-like value; no layer writes it.
@@ -1998,6 +2001,7 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::PlayerCount { .. }
         | QuantityRef::EventContextPlayerCount { .. }
         | QuantityRef::CountersOn { .. }
+        | QuantityRef::TokenSourceCounters { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::TargetControllerCounter { .. }
         | QuantityRef::Variable { .. }
@@ -3693,6 +3697,9 @@ fn resolve_ref(
             scope,
             counter_type,
         } => resolve_counters_on_scope(state, *scope, ctx, targets, ability, counter_type.as_ref()),
+        QuantityRef::TokenSourceCounters { counter_type } => {
+            resolve_token_source_counters(state, source_id, counter_type.as_ref())
+        }
         // CR 107.3a + CR 601.2b + CR 107.3i: "X" resolves to the value chosen at
         // cast time, carried on the resolving ability's `chosen_x`
         // (CR 601.2b announcement; CR 107.3i makes all instances share the value).
@@ -6041,6 +6048,36 @@ fn resolve_counters_on_live_or_lki_scope(
         }
     }
     live.map(|obj| counter_count_from_map(&obj.counters, counter_type))
+        .unwrap_or(0)
+}
+
+/// CR 111.3 + CR 208.2: resolve a token CDA that refers to the permanent
+/// which created that token. The creator id is carried by the token's
+/// `entered_via_ability_source` provenance while the token is on the
+/// battlefield; unlike an ordinary `Source` quantity this must hop through
+/// that relation before reading the creator's counters.
+fn resolve_token_source_counters(
+    state: &GameState,
+    token_id: ObjectId,
+    counter_type: Option<&CounterType>,
+) -> i32 {
+    let Some(creator_id) = state
+        .objects
+        .get(&token_id)
+        .and_then(|token| token.entered_via_ability_source)
+    else {
+        return 0;
+    };
+    state
+        .objects
+        .get(&creator_id)
+        .map(|object| counter_count_from_map(&object.counters, counter_type))
+        .or_else(|| {
+            state
+                .lki_cache
+                .get(&creator_id)
+                .map(|snapshot| counter_count_from_map(&snapshot.counters, counter_type))
+        })
         .unwrap_or(0)
 }
 

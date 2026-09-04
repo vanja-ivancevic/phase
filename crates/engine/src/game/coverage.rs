@@ -1389,6 +1389,10 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 None => format!("counters on {scope_str} (any type)"),
             }
         }
+        QuantityRef::TokenSourceCounters { counter_type } => match counter_type {
+            Some(ct) => format!("{} counters on token creator", ct.as_str()),
+            None => "counters on token creator (any type)".to_string(),
+        },
         QuantityRef::CountersOnObjects {
             counter_type,
             filter,
@@ -8346,6 +8350,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::PlayerCount { .. } => ("PlayerCount", Handled),
         QuantityRef::EventContextPlayerCount { .. } => ("EventContextPlayerCount", Handled),
         QuantityRef::CountersOn { .. } => ("CountersOn", Handled),
+        QuantityRef::TokenSourceCounters { .. } => ("TokenSourceCounters", Handled),
         QuantityRef::Intensity { .. } => ("Intensity", Handled),
         QuantityRef::CountersOnObjects { .. } => ("CountersOnObjects", Handled),
         QuantityRef::Variable { .. } => ("Variable", Handled),

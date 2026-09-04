@@ -925,6 +925,11 @@ fn parse_token_description_with_context(
         {
             power = Some(followup_power.clone());
             toughness = Some(followup_toughness.clone());
+        } else if matches!(ctx.token_pt_followup, Some(TokenPtFollowup::StaticAbility)) {
+            // The following sentence supplies a characteristic-defining
+            // ability which will set the token's P/T in layer 7. Leave the
+            // printed values absent; the continuation grafts the live static
+            // definition onto this token effect.
         } else {
             return None;
         }
@@ -1204,6 +1209,88 @@ fn parse_token_name_clause(text: &str) -> (Option<String>, &str) {
 /// `, `) and the closing `'` is the last `'` in the text. This pairing rule
 /// guarantees that any `'` inside the span (apostrophes from "can't" /
 /// possessives) is never mistaken for the close quote.
+/// Parse the sentence-form token static ability that follows a create clause.
+///
+/// Oracle uses the sentence "It has \"This token's power and toughness are each equal to …\""
+/// for characteristic-defining abilities whose reference is the token's
+/// creator. Keep this separate from the ordinary source/P/T continuation:
+/// the ability must remain a live Layer-7a static, not be resolved once at
+/// token creation.
+pub(super) fn parse_token_static_ability_followup(
+    text: &str,
+) -> Option<Vec<StaticDefinition>> {
+    let lower = text.trim().to_ascii_lowercase();
+    let prefix = ["it has ", "this token has ", "the token has "]
+        .into_iter()
+        .find(|prefix| lower.starts_with(prefix))?;
+    let quoted = lower.strip_prefix(prefix)?.trim();
+    let quoted = quoted.strip_prefix('"')?.strip_suffix('"')?;
+    let body = quoted.trim_end_matches('.').trim();
+    let marker = "this token's power and toughness are each equal to ";
+    let quantity_text = body.strip_prefix(marker)?;
+    let quantity = crate::parser::oracle_quantity::parse_cda_quantity(quantity_text)?;
+    let mut definitions = parse_static_line_multi(body);
+    if definitions.is_empty() {
+        return None;
+    }
+    // The wrapper's exact subject ("This token's … on the creator") proves
+    // that source-scoped counter reads in this one static refer to the token's
+    // creator, not to the token that carries the granted ability.
+    let mut rewrote = false;
+    for definition in &mut definitions {
+        for modification in &mut definition.modifications {
+            if let ContinuousModification::SetDynamicPower { value }
+            | ContinuousModification::SetDynamicToughness { value } = modification
+            {
+                rewrote |= rewrite_token_creator_counter_refs(value);
+            }
+        }
+    }
+    rewrote.then_some(definitions).filter(|_| {
+        // Keep the quantity parse as an explicit guard: parse_static_line_multi
+        // may accept a superficially similar sentence through another grammar,
+        // but only the counter quantity is supported by this token-origin seam.
+        matches!(
+            quantity,
+            QuantityExpr::Ref {
+                qty: QuantityRef::CountersOn { .. }
+            }
+        )
+    })
+}
+
+fn rewrite_token_creator_counter_refs(expr: &mut QuantityExpr) -> bool {
+    match expr {
+        QuantityExpr::Ref { qty } => {
+            if let QuantityRef::CountersOn {
+                scope: ObjectScope::Source,
+                counter_type,
+            } = qty
+            {
+                let counter_type = counter_type.take();
+                *qty = QuantityRef::TokenSourceCounters { counter_type };
+                true
+            } else {
+                false
+            }
+        }
+        QuantityExpr::Fixed { .. } => false,
+        QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
+        | QuantityExpr::Multiply { inner, .. }
+        | QuantityExpr::UpTo { max: inner } => rewrite_token_creator_counter_refs(inner),
+        QuantityExpr::Power { exponent, .. } => rewrite_token_creator_counter_refs(exponent),
+        QuantityExpr::Difference { left, right } => {
+            rewrite_token_creator_counter_refs(left)
+                || rewrite_token_creator_counter_refs(right)
+        }
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => exprs
+            .iter_mut()
+            .any(rewrite_token_creator_counter_refs),
+    }
+}
+
 fn extract_token_static_abilities(text: &str, token_name: &str) -> Vec<StaticDefinition> {
     let mut statics = Vec::new();
 
@@ -3687,5 +3774,24 @@ mod token_attachment_connector_tests {
                 "{text:?} host binding mismatch, got {attach_to:?}"
             );
         }
+    }
+
+    #[test]
+    fn token_static_ability_followup_rewrites_creator_counters() {
+        let statics = parse_token_static_ability_followup(
+            r#"It has "This token's power and toughness are each equal to the number of fade counters on ~.""#,
+        )
+        .expect("sentence-form token CDA must parse");
+        assert_eq!(statics.len(), 1, "expected one token CDA: {statics:#?}");
+        let debug = format!("{statics:?}");
+        assert!(
+            debug.contains("TokenSourceCounters"),
+            "token P/T must read creator counters: {statics:#?}"
+        );
+        assert!(parse_token_static_ability_followup(
+            r#"It has "This token's power and toughness are each equal to the number of fade counters on ~.""#
+        )
+        .is_some());
+        assert!(parse_token_static_ability_followup(r#"It has "This token can't block.""#).is_none());
     }
 }

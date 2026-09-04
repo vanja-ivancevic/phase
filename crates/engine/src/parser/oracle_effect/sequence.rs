@@ -5088,6 +5088,18 @@ pub(super) fn apply_clause_continuation(
                 enter_with_counters.push((counter_type, count));
             }
         }
+        ContinuationAst::TokenStaticAbilities { static_abilities } => {
+            let Some(previous) = defs.last_mut() else {
+                return;
+            };
+            if let Effect::Token {
+                static_abilities: existing,
+                ..
+            } = &mut *previous.effect
+            {
+                existing.extend(static_abilities);
+            }
+        }
         ContinuationAst::TokenSourcePowerToughness {
             power: followup_power,
             toughness: followup_toughness,
@@ -5567,6 +5579,7 @@ pub(super) fn continuation_absorbs_current(
         ContinuationAst::EntersTappedAttacking { .. } => true,
         ContinuationAst::TokenEntersWithCounters { .. } => true,
         ContinuationAst::TokenSourcePowerToughness { .. } => true,
+        ContinuationAst::TokenStaticAbilities { .. } => true,
         ContinuationAst::DigFromAmong { .. } => true,
         ContinuationAst::FaceDownProfileSpec { .. } => true,
         ContinuationAst::GrantExtraTurnAfterControlledTurn => true,
@@ -7806,6 +7819,10 @@ pub(super) fn parse_followup_continuation_ast(
             .map(|(power, toughness)| ContinuationAst::TokenSourcePowerToughness {
                 power,
                 toughness,
+            })
+            .or_else(|| {
+                super::token::parse_token_static_ability_followup(&lower)
+                    .map(|static_abilities| ContinuationAst::TokenStaticAbilities { static_abilities })
             })
             .or_else(|| try_parse_token_enters_with_counters(&lower))
             .or_else(|| try_parse_put_counters_on_token_followup(&lower)),
@@ -14059,6 +14076,31 @@ mod tests {
         assert!(
             result.is_none(),
             "reflexive attach gate must not re-patch the Dig, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn token_static_source_cda_followup_is_absorbed() {
+        let text = r#"create a green Saproling creature token. It has "This token's power and toughness are each equal to the number of fade counters on ~.""#;
+        let def = super::super::parse_effect_chain(text, AbilityKind::Spell);
+        let Effect::Token {
+            static_abilities, ..
+        } = &*def.effect
+        else {
+            panic!("expected token effect, got {def:?}");
+        };
+        assert_eq!(
+            static_abilities.len(),
+            1,
+            "token CDA must be absorbed into the token effect: {def:?}"
+        );
+        assert!(
+            format!("{static_abilities:?}").contains("TokenSourceCounters"),
+            "token CDA must read the creating permanent's counters: {def:?}"
+        );
+        assert!(
+            def.sub_ability.is_none(),
+            "the sentence-form token CDA must not remain as an unimplemented sibling: {def:?}"
         );
     }
 }

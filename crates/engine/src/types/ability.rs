@@ -7509,6 +7509,17 @@ pub enum QuantityRef {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         counter_type: Option<CounterType>,
     },
+    /// CR 208.2 + CR 111.3: a token's characteristic-defining power or
+    /// toughness may count counters on the object that created it (for
+    /// example, Saproling Burst's token). This is deliberately distinct from
+    /// `CountersOn { scope: Source }`: in a token's static ability the source
+    /// object is the token itself, while the printed reference names the
+    /// creating permanent. The token creation path records that provenance on
+    /// `GameObject::entered_via_ability_source` for the token's lifetime.
+    TokenSourceCounters {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        counter_type: Option<CounterType>,
+    },
     /// CR 122.1: Total counters across all objects matching a filter.
     /// Used for phrases like "the number of +1/+1 counters on lands you control"
     /// (`counter_type: Some("P1P1")`) and "counters among artifacts and creatures
@@ -8386,6 +8397,7 @@ impl QuantityRef {
             | QuantityRef::DistinctColorsAmong { .. }
             | QuantityRef::DistinctCounterKindsAmong { .. }
             | QuantityRef::VoteCount { .. } => None,
+            QuantityRef::TokenSourceCounters { .. } => None,
         }
     }
 }
