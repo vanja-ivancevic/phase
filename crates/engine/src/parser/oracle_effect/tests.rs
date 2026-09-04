@@ -19534,6 +19534,43 @@ fn during_next_untap_step_installs_controller_scoped_delayed_trigger() {
     );
 }
 
+/// CR 603.7a + CR 502.2: the full Undiscovered Paradise activated ability
+/// must retain its delayed return after the mana head is parsed. This catches
+/// the sequence splitter seam that a standalone temporal-clause test cannot.
+#[test]
+fn undiscovered_paradise_keeps_delayed_return_after_mana_head() {
+    let parsed = parse_oracle_text(
+        "{T}: Add one mana of any color. During your next untap step, as you untap your permanents, return this land to its owner's hand.",
+        "Undiscovered Paradise",
+        &[],
+        &["Land".to_string()],
+        &[],
+    );
+    assert_eq!(parsed.abilities.len(), 1, "expected one activated ability");
+    let def = &parsed.abilities[0];
+    assert_eq!(def.kind, AbilityKind::Activated);
+    let delayed = def
+        .sub_ability
+        .as_deref()
+        .expect("mana head must retain the delayed return");
+    let Effect::CreateDelayedTrigger { condition, effect, .. } = &*delayed.effect else {
+        panic!("expected delayed return, got {:?}", delayed.effect);
+    };
+    assert_eq!(
+        *condition,
+        DelayedTriggerCondition::AtNextPhaseForPlayer {
+            phase: Phase::Untap,
+            player: crate::types::player::PlayerId(0),
+            gate: TurnGate::None,
+        }
+    );
+    assert!(
+        matches!(*effect.effect, Effect::Bounce { .. }),
+        "delayed body should bounce the source land, got {:?}",
+        effect.effect
+    );
+}
+
 #[test]
 fn temporal_prefix_preserves_full_delayed_effect_chain() {
     let def = parse_effect_chain(
