@@ -6178,6 +6178,45 @@ pub(super) fn try_nom_condition_as_ability_condition(
         }
     }
 
+    // CR 201.2 + CR 608.2c: "that card/it has the chosen name" — the
+    // anaphoric result of a preceding random/selected reveal is compared with
+    // the name chosen on the resolving source (Cursed Scroll and the same
+    // choose-name/reveal-result family). Use the existing HasChosenName filter
+    // so the runtime reads the source's chosen-name attribute and remains
+    // case-insensitive. Keep both polarities typed; an unrecognized suffix
+    // falls through to the honest unsupported-condition path.
+    if let Ok((rest, negated)) = alt((
+        value(
+            true,
+            alt((
+                tag::<_, _, OracleError<'_>>("that card doesn't have "),
+                tag("that card does not have "),
+                tag("it doesn't have "),
+                tag("it does not have "),
+            )),
+        ),
+        value(
+            false,
+            alt((
+                tag::<_, _, OracleError<'_>>("that card has "),
+                tag("it has "),
+            )),
+        ),
+    ))
+    .parse(lower.as_str())
+    {
+        if rest.trim().trim_end_matches('.').trim() == "the chosen name" {
+            return Some(maybe_negate(
+                AbilityCondition::TargetMatchesFilter {
+                    filter: TargetFilter::HasChosenName,
+                    use_lki: false,
+                    subject_slot: None,
+                },
+                negated,
+            ));
+        }
+    }
+
     // CR 608.2c + CR 702.1: "it has [keyword]" — affirmative pronoun keyword check
     // (e.g. "If it has flying, ..."). Routed through TargetMatchesFilter, the
     // same abstraction the "it's a [type]" arm uses.
