@@ -15281,6 +15281,7 @@ mod characteristic_read_classification_tests {
             | FilterProp::ManaSymbolCount { .. }
             | FilterProp::HasSupertype { .. }
             | FilterProp::IsChosenCreatureType
+            | FilterProp::IsChosenLandType
             | FilterProp::IsChosenColor
             | FilterProp::IsChosenCardType
             | FilterProp::MatchesLastChosenCardPredicate
