@@ -1615,4 +1615,54 @@ then lose that much life.";
             }
         );
     }
+
+    /// CR 119.1 + CR 613.3: a dynamic PlayerMatching recipient resolves from
+    /// the current life totals at GiveControl resolution, including the source
+    /// controller as a possible highest-life player.
+    #[test]
+    fn give_control_resolves_most_life_player_matching_recipient() {
+        use crate::game::layers::evaluate_layers;
+        use crate::parser::oracle_effect::parse_effect_chain;
+        use crate::types::ability::AbilityKind;
+
+        let mut state = GameState::new(FormatConfig::standard(), 3, 0);
+        state.players[0].life = 10;
+        state.players[1].life = 21;
+        state.players[2].life = 15;
+        let source = create_object(
+            &mut state,
+            CardId(7),
+            PlayerId(0),
+            "Wild Dogs".to_string(),
+            Zone::Battlefield,
+        );
+        let def = parse_effect_chain(
+            "the player with the most life gains control of ~",
+            AbilityKind::Spell,
+        );
+        let resolved = ResolvedAbility::new(
+            def.effect.as_ref().clone(),
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve_give(&mut state, &resolved, &mut events).expect("handoff resolves");
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+
+        assert_eq!(
+            state.objects[&source].controller,
+            PlayerId(1),
+            "the unique highest-life player must receive control"
+        );
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::ControllerChanged {
+                object_id,
+                new_controller: PlayerId(1),
+                ..
+            } if *object_id == source
+        )));
+    }
 }

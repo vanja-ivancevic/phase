@@ -8213,21 +8213,34 @@ pub(crate) fn parse_opponent_most_life_restriction(input: &str) -> OracleResult<
     .parse(input)?;
     Ok((
         input,
-        PlayerFilter::PlayerAttribute {
-            relation: PlayerRelation::Opponent,
-            attr: Box::new(QuantityRef::LifeTotal {
-                player: PlayerScope::ScopedPlayer,
-            }),
-            comparator: Comparator::GE,
-            value: Box::new(QuantityExpr::Ref {
-                qty: QuantityRef::LifeTotal {
-                    player: PlayerScope::Opponent {
-                        aggregate: AggregateFunction::Max,
-                    },
-                },
-            }),
-        },
+        player_with_most_life_filter(
+            PlayerRelation::Opponent,
+            PlayerScope::Opponent {
+                aggregate: AggregateFunction::Max,
+            },
+        ),
     ))
+}
+
+/// CR 119.1 + CR 102.1/102.2: Build the reusable player predicate for
+/// "the player(s) with the most life". The candidate's life is read from the
+/// scoped player, while the threshold is the maximum over the supplied
+/// population. Keeping this as one typed builder lets choice restrictions and
+/// subject recipients share exactly the same semantics.
+pub(crate) fn player_with_most_life_filter(
+    relation: PlayerRelation,
+    population: PlayerScope,
+) -> PlayerFilter {
+    PlayerFilter::PlayerAttribute {
+        relation,
+        attr: Box::new(QuantityRef::LifeTotal {
+            player: PlayerScope::ScopedPlayer,
+        }),
+        comparator: Comparator::GE,
+        value: Box::new(QuantityExpr::Ref {
+            qty: QuantityRef::LifeTotal { player: population },
+        }),
+    }
 }
 
 /// CR 119.1 + CR 109.5 + CR 810.9a: "who has more life than you" as a

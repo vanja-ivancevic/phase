@@ -141,6 +141,83 @@ fn gilded_drake_illegal_target_rider_is_absorbed_without_gap() {
     );
 }
 
+/// CR 119.1 + CR 603.2: Wild Dogs' upkeep handoff names the player with the
+/// highest life total, not a fixed opponent or the ability controller. The
+/// subject must lower through the shared max-life PlayerFilter and the existing
+/// GainControl-to-GiveControl rewrite.
+#[test]
+fn most_life_player_subject_rewrites_to_dynamic_give_control() {
+    let def = parse_effect_chain(
+        "the player with the most life gains control of ~",
+        AbilityKind::Spell,
+    );
+    let Effect::GiveControl { target, recipient } = def.effect.as_ref() else {
+        panic!("expected GiveControl, got {:?}", def.effect);
+    };
+    assert_eq!(*target, TargetFilter::SelfRef);
+    let TargetFilter::PlayerMatching { player } = recipient else {
+        panic!("expected PlayerMatching recipient, got {recipient:?}");
+    };
+    assert!(matches!(
+        player.as_ref(),
+        PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::All,
+            attr,
+            comparator: Comparator::GE,
+            value,
+        } if matches!(
+            attr.as_ref(),
+            QuantityRef::LifeTotal { player: PlayerScope::ScopedPlayer }
+        ) && matches!(
+            value.as_ref(),
+            QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::AllPlayers {
+                        aggregate: AggregateFunction::Max,
+                        exclude: None,
+                    }
+                }
+            }
+        )
+    ));
+}
+
+/// CR 603.2 + CR 119.1: the complete Wild Dogs oracle text must retain the
+/// intervening-if trigger and lower its control handoff without a subject gap.
+#[test]
+fn wild_dogs_full_oracle_text_has_dynamic_control_handoff() {
+    let parsed = parse_oracle_text(
+        "At the beginning of your upkeep, if a player has more life than each other player, the player with the most life gains control of this creature.\nCycling {2}.",
+        "Wild Dogs",
+        &[],
+        &["Creature".to_string()],
+        &["Dog".to_string()],
+    );
+    let execute = parsed
+        .triggers
+        .first()
+        .and_then(|trigger| trigger.execute.as_deref())
+        .expect("Wild Dogs must have an upkeep trigger body");
+
+    fn find_give_control<'a>(ability: &'a AbilityDefinition) -> Option<&'a Effect> {
+        if matches!(ability.effect.as_ref(), Effect::GiveControl { .. }) {
+            return Some(ability.effect.as_ref());
+        }
+        ability
+            .sub_ability
+            .as_deref()
+            .and_then(find_give_control)
+            .or_else(|| ability.else_ability.as_deref().and_then(find_give_control))
+    }
+
+    let Effect::GiveControl { recipient, .. } = find_give_control(execute)
+        .expect("upkeep trigger must contain GiveControl")
+    else {
+        unreachable!();
+    };
+    assert!(matches!(recipient, TargetFilter::PlayerMatching { .. }));
+}
+
 fn nested_batch_aggregate() -> PropertyAggregate {
     PropertyAggregate::new(
         AggregateFunction::Sum,
