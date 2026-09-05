@@ -19325,6 +19325,29 @@ fn try_parse_discard_trigger(
     }
 
     // CR 109.5 + CR 603.2: "a spell or ability an opponent controls causes you to
+    // discard a card" — a battlefield trigger for an opponent-caused discard
+    // (Spiritual Focus). The `EventSourceControlledBy { Opponent }` constraint
+    // gates on the discard event's cause; mirrors the replacement form in
+    // `oracle_replacement.rs`.
+    if tag::<_, _, OracleError<'_>>(
+        "a spell or ability an opponent controls causes you to discard a card",
+    )
+    .parse(event)
+    .is_ok()
+    {
+        let mut def = make_base();
+        def.mode = TriggerMode::Discarded;
+        def.valid_card = Some(TargetFilter::Typed(TypedFilter::card()));
+        def.valid_target = Some(TargetFilter::Controller);
+        def.constraint = Some(
+            crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+                controller: ControllerRef::Opponent,
+            },
+        );
+        return Some((TriggerMode::Discarded, def));
+    }
+
+    // CR 109.5 + CR 603.2: "a spell or ability an opponent controls causes you to
     // discard this card" — the self-discard caused by an opponent's spell/ability
     // (Guerrilla Tactics, Sand Golem, Quagnoth, Mangara's Blessing). The
     // `EventSourceControlledBy { Opponent }` constraint gates on the discard
