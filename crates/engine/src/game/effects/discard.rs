@@ -253,32 +253,36 @@ pub fn resolve(
     // the upper-bound expression and the may-pick-fewer flag. Plain
     // `QuantityExpr` means a mandatory count; wrapped in `UpTo` means the
     // player may discard 0..=count.
-    let (num_cards, up_to, unless_filter, target_filter, random) = match &ability.effect {
-        Effect::DiscardCard { count, target } => (*count, false, None, target.clone(), false),
-        Effect::Discard {
-            count,
-            unless_filter,
-            target,
-            selection,
-            ..
-        } => {
-            let (inner, up_to) = count.peel_up_to();
-            (
-                // CR 107.1b: a calculation that would yield a negative number
-                // uses zero instead. Clamp before the `as u32` cast — a
-                // subtractive count ("discard cards equal to A minus B" when
-                // B > A) would otherwise wrap to ~4 billion and let the player
-                // discard their whole hand. Ability context also resolves X
-                // against the caster's chosen value. Mirrors `draw.rs`.
-                resolve_quantity_with_targets(state, inner, ability).max(0) as u32,
-                up_to,
-                unless_filter.clone(),
-                target.clone(),
-                selection.is_random(),
-            )
-        }
-        _ => (1, false, None, TargetFilter::Any, false),
-    };
+    let (num_cards, up_to, unless_filter, eligibility_filter, target_filter, random) =
+        match &ability.effect {
+            Effect::DiscardCard { count, target } => {
+                (*count, false, None, None, target.clone(), false)
+            }
+            Effect::Discard {
+                count,
+                unless_filter,
+                filter,
+                target,
+                selection,
+            } => {
+                let (inner, up_to) = count.peel_up_to();
+                (
+                    // CR 107.1b: a calculation that would yield a negative number
+                    // uses zero instead. Clamp before the `as u32` cast — a
+                    // subtractive count ("discard cards equal to A minus B" when
+                    // B > A) would otherwise wrap to ~4 billion and let the player
+                    // discard their whole hand. Ability context also resolves X
+                    // against the caster's chosen value. Mirrors `draw.rs`.
+                    resolve_quantity_with_targets(state, inner, ability).max(0) as u32,
+                    up_to,
+                    unless_filter.clone(),
+                    filter.clone(),
+                    target.clone(),
+                    selection.is_random(),
+                )
+            }
+            _ => (1, false, None, None, TargetFilter::Any, false),
+        };
 
     // CR 400.7 + CR 603.7c + CR 603.7b: a delayed discard whose pinned referent
     // became a new object discards nothing, and the trigger still resolves.
@@ -536,6 +540,25 @@ pub fn resolve(
             .hand
             .iter()
             .copied()
+            .collect();
+        // CR 701.9b: qualifiers on a discard instruction constrain the set
+        // from which the player chooses.  Keep this at the resolver boundary
+        // so random, automatic, and interactive discards all observe the same
+        // eligible set.  The full ability context is necessary for filters
+        // such as `HasChosenName`, whose choice is resolution-local.
+        let filter_context = crate::game::filter::FilterContext::from_ability(ability);
+        let hand_cards: Vec<ObjectId> = hand_cards
+            .into_iter()
+            .filter(|object_id| {
+                eligibility_filter.as_ref().is_none_or(|filter| {
+                    crate::game::filter::matches_target_filter(
+                        state,
+                        *object_id,
+                        filter,
+                        &filter_context,
+                    )
+                })
+            })
             .collect();
 
         // CR 701.9b: For "up to N" discards, present the full N to the player.
@@ -1486,10 +1509,10 @@ mod tests {
     use crate::game::engine::apply_as_current;
     use crate::game::zones::create_object;
     use crate::types::ability::{
-        AbilityCondition, AbilityDefinition, AbilityKind, ControllerRef, DiscardedCardResult,
-        EffectOutcomeSignal, LibraryPosition, QuantityExpr, ReplacementCondition,
-        ReplacementDefinition, ReplacementMode, ResolvedAbility, SubAbilityLink, TargetFilter,
-        TypedFilter,
+        AbilityCondition, AbilityDefinition, AbilityKind, ChoiceValue, ControllerRef,
+        DiscardedCardResult, EffectOutcomeSignal, LibraryPosition, QuantityExpr,
+        ReplacementCondition, ReplacementDefinition, ReplacementMode, ResolvedAbility,
+        SubAbilityLink, TargetFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::counter::CounterType;
@@ -2287,6 +2310,46 @@ mod tests {
         );
         assert!(!state.players[0].hand.contains(&c1));
         assert!(!state.players[0].hand.contains(&c2));
+    }
+
+    #[test]
+    fn filtered_discard_only_offers_cards_matching_resolution_local_name() {
+        let mut state = GameState::new_two_player(42);
+        let named = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Lightning Bolt".into(),
+            Zone::Hand,
+        );
+        let other = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Giant Growth".into(),
+            Zone::Hand,
+        );
+        // A non-persisting named choice is carried by the active resolution,
+        // as it is for Cabal Therapy's "cards with that name" instruction.
+        state.last_named_choice = Some(ChoiceValue::CardName("lightning bolt".into()));
+        let ability = ResolvedAbility::new(
+            Effect::Discard {
+                count: QuantityExpr::Fixed { value: 7 },
+                target: TargetFilter::Any,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                unless_filter: None,
+                filter: Some(TargetFilter::HasChosenName),
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(state.players[0].graveyard.contains(&named));
+        assert!(state.players[0].hand.contains(&other));
     }
 
     #[test]
