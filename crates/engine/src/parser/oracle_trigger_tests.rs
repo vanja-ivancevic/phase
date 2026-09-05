@@ -16302,6 +16302,53 @@ fn trigger_opponent_causes_you_to_discard_this_card() {
     assert_eq!(def.trigger_zones, vec![Zone::Graveyard, Zone::Exile]);
 }
 
+/// CR 109.5 + CR 603.2: opponent-caused discard is not restricted to a
+/// self-discard trigger. Spiritual Focus remains on the battlefield and watches
+/// every card its controller discards to an opponent-controlled spell or ability.
+#[test]
+fn trigger_opponent_causes_you_to_discard_a_card() {
+    let def = parse_trigger_line(
+        "Whenever a spell or ability an opponent controls causes you to discard a card, \
+         you gain 2 life and you may draw a card.",
+        "Spiritual Focus",
+    );
+    assert_eq!(def.mode, TriggerMode::Discarded);
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::Typed(TypedFilter::card()))
+    );
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+    assert_eq!(
+        def.constraint,
+        Some(
+            crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+                controller: ControllerRef::Opponent
+            }
+        )
+    );
+    assert_eq!(def.trigger_zones, vec![Zone::Battlefield]);
+
+    let execute = def.execute.expect("Spiritual Focus must retain its life gain");
+    assert!(matches!(
+        execute.effect.as_ref(),
+        Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 2 },
+            player: TargetFilter::Controller,
+        }
+    ));
+    let draw = execute
+        .sub_ability
+        .expect("Spiritual Focus must retain its optional draw");
+    assert!(draw.optional);
+    assert!(matches!(
+        draw.effect.as_ref(),
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        }
+    ));
+}
+
 /// CR 701.9 + CR 608.2k + CR 406.1: Necropotence's on-discard trigger
 /// exiles the just-discarded card from the graveyard. The "that card"
 /// anaphor must lift from `ParentTarget` to `TriggeringSource` so the
