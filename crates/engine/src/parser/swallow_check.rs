@@ -8258,6 +8258,37 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         );
     }
 
+    /// CR 106.4 + CR 115.1: Mana Short's player target is shared by its mana
+    /// loss and land-tapping instructions. Its mana-loss clause must not be
+    /// silently swallowed or represented as a generic mana payment.
+    #[test]
+    fn mana_short_has_targeted_unspent_mana_loss_without_unimplemented_text() {
+        let parsed = parse_named(
+            "Target player loses all unspent mana and taps all lands they control.",
+            "Mana Short",
+            &["Instant"],
+        );
+
+        assert!(
+            parsed.parse_warnings.is_empty(),
+            "Mana Short must parse without warnings: {:?}",
+            parsed.parse_warnings
+        );
+        let mana_loss = parsed
+            .abilities
+            .iter()
+            .find_map(|definition| match definition.effect.as_ref() {
+                Effect::LoseAllUnspentMana { player } => Some(player),
+                _ => None,
+            })
+            .expect("Mana Short must retain its unspent-mana-loss instruction");
+        assert_eq!(*mana_loss, TargetFilter::Player);
+        assert!(
+            !any_ability_has_unimplemented(&parsed),
+            "Mana Short must retain its tap-all-lands follow-up"
+        );
+    }
+
     /// CR 601.2f: Awaken the Blood Avatar's `you may sacrifice any number of
     /// creatures` is an additional-cost optional, captured as
     /// `AdditionalCost::Optional(_)` at the top level — `any_ability_is_optional`

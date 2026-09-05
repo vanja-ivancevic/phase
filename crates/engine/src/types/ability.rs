@@ -13623,6 +13623,17 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         target: Option<TargetFilter>,
     },
+    /// CR 106.4: Cause a player to lose every currently unspent mana unit.
+    ///
+    /// This is an instruction-driven mana loss (Mana Short), distinct from the
+    /// automatic step/phase-end emptying process. Step-end retention effects
+    /// therefore remain scoped to the rule text that creates them.
+    LoseAllUnspentMana {
+        /// The affected player. `Player` is a declared target; context filters
+        /// resolve through the normal player-context authority.
+        #[serde(default = "default_target_filter_controller")]
+        player: TargetFilter,
+    },
     /// CR 701.26a (tap) / CR 701.26b (untap): Set the tap state of one or more
     /// permanents. Collapses the legacy `Tap` / `Untap` / `TapAll` / `UntapAll`
     /// variants into a single parameterized form:
@@ -18488,6 +18499,10 @@ impl Effect {
             | Effect::LoseTheGame { target, .. }
             | Effect::WinTheGame { target, .. } => target.as_ref(),
 
+            // CR 106.4 + CR 115.1: Mana Short's affected player is a genuine
+            // spell target, even though mana loss has no numeric magnitude.
+            Effect::LoseAllUnspentMana { player } => Some(player),
+
             // CR 601.2c + CR 115.1: A mana sentence declares its recipient and
             // count-source player targets as independent role slots
             // (`ManaTargetRole`). This accessor answers the generic targeting
@@ -19414,6 +19429,7 @@ impl Effect {
             | Effect::Intensify { .. }
             | Effect::LoseAllPlayerCounters { .. }
             | Effect::LoseLife { .. }
+            | Effect::LoseAllUnspentMana { .. }
             | Effect::LoseTheGame { .. }
             | Effect::Monstrosity { .. }
             | Effect::MoveCounters { .. }
@@ -19592,6 +19608,7 @@ impl Effect {
             Effect::LoseLife { amount, .. } => {
                 f(amount);
             }
+            Effect::LoseAllUnspentMana { .. } => {}
             Effect::RemoveCounter { count, .. } => {
                 f(count);
             }
@@ -20372,6 +20389,7 @@ impl Effect {
             | Effect::RedistributeLifeTotals
             | Effect::ReverseTurnOrder
             | Effect::Unimplemented { .. }
+            | Effect::LoseAllUnspentMana { .. }
             | Effect::VentureInto { .. }
             | Effect::VentureIntoDungeon
             | Effect::CombineHost { .. }
@@ -20635,6 +20653,7 @@ impl Effect {
             | Effect::RedistributeLifeTotals
             | Effect::ReverseTurnOrder
             | Effect::Unimplemented { .. }
+            | Effect::LoseAllUnspentMana { .. }
             | Effect::VentureInto { .. }
             | Effect::VentureIntoDungeon
             | Effect::CombineHost { .. }
@@ -20668,6 +20687,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::Token { .. } => "Token",
         Effect::GainLife { .. } => "GainLife",
         Effect::LoseLife { .. } => "LoseLife",
+        Effect::LoseAllUnspentMana { .. } => "LoseAllUnspentMana",
         // CR 701.26a/b: preserve the four legacy variant labels so diagnostic
         // and coverage tooling that keys on the name keeps reading the same set.
         Effect::SetTapState { scope, state, .. } => match (scope, state) {
@@ -20922,6 +20942,7 @@ pub enum EffectKind {
     Token,
     GainLife,
     LoseLife,
+    LoseAllUnspentMana,
     Tap,
     Untap,
     RemoveCounter,
@@ -21179,6 +21200,7 @@ impl From<&Effect> for EffectKind {
             Effect::Token { .. } => EffectKind::Token,
             Effect::GainLife { .. } => EffectKind::GainLife,
             Effect::LoseLife { .. } => EffectKind::LoseLife,
+            Effect::LoseAllUnspentMana { .. } => EffectKind::LoseAllUnspentMana,
             // CR 701.26a/b: map the parameterized effect back to the four
             // legacy `EffectKind` discriminants (EffectKind stays unchanged).
             Effect::SetTapState { scope, state, .. } => match (scope, state) {

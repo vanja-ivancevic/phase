@@ -730,6 +730,9 @@ fn effect_projection(effect: &Effect) -> Projection {
             let (a, _) = count_seed(amount);
             b.add_life(target_player_opt(target), -a, AxisMagnitude::Fixed(0));
         }
+        // Mana loss changes a transient pool, not a modeled persistent resource
+        // axis. It is intentionally unmodeled for combo-resource projection.
+        Effect::LoseAllUnspentMana { .. } => {}
         // ----- TOKEN family (CR 111.1) — a token entry IS an ETB (CR 603.6a) -----
         Effect::Token { count, .. }
         | Effect::CopyTokenOf { count, .. }

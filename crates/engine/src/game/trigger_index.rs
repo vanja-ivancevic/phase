@@ -775,7 +775,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         EffectKind::Monstrosity => push(TriggerEventKey::BecomesMonstrous),
         EffectKind::ManifestDread => push(TriggerEventKey::ManifestDreadResolved),
         EffectKind::DayTimeChange => push(TriggerEventKey::DayNightChanged),
-        EffectKind::PutSticker | EffectKind::ApplySticker => {}
+        EffectKind::PutSticker | EffectKind::ApplySticker | EffectKind::LoseAllUnspentMana => {}
         // All other variants: not dispatched on by any production
         // EffectResolved matcher (verified against `trigger_matchers.rs` 1-3216).
         // Explicit `&[]`-equivalent arms — a future contributor who adds a

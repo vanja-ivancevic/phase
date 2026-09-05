@@ -3351,6 +3351,7 @@ fn legacy_effect(x: &Effect) -> bool {
         Effect::Mana { target, .. } => target
             .as_ref()
             .is_some_and(|role| role.declared_filters().any(|(_, f)| legacy_target_filter(f))),
+        Effect::LoseAllUnspentMana { player } => legacy_target_filter(player),
         Effect::LoseTheGame { target } | Effect::WinTheGame { target } => otf(target),
         Effect::ChooseFromZone { filter, .. } => otf(filter),
         Effect::ReduceNextSpellCost { spell_filter, .. }
@@ -5605,6 +5606,11 @@ fn rw_effect(
             expiry: _,
             target: _,
         } => (writes_pool_profile(), None),
+        Effect::LoseAllUnspentMana { player } => {
+            let mut p = writes_pool_profile();
+            flag_legacy_write_target(&mut p, player);
+            (p, None)
+        }
 
         // ---- Tap ----
         Effect::SetTapState {

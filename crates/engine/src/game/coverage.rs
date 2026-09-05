@@ -2927,6 +2927,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         Effect::LoseLife { amount, .. } => {
             d.push(("amount".into(), fmt_quantity(amount)));
         }
+        Effect::LoseAllUnspentMana { .. } => {}
         Effect::ExchangeLifeWithStat { player, stat } => {
             d.push(("player".into(), fmt_target(player)));
             d.push((
@@ -6867,6 +6868,7 @@ fn visit_direct_effect_ability_payloads<'a>(
         | Effect::Token { .. }
         | Effect::GainLife { .. }
         | Effect::LoseLife { .. }
+        | Effect::LoseAllUnspentMana { .. }
         | Effect::SetTapState { .. }
         | Effect::RemoveCounter { .. }
         | Effect::Sacrifice { .. }
