@@ -5286,6 +5286,37 @@ fn chosen_name_matches(
         .is_some_and(|name| candidate_name.eq_ignore_ascii_case(name))
 }
 
+/// CR 105.4 + CR 608.2d: Resolve a color used by an `IsChosenColor` filter.
+///
+/// Persistent choices (Hall of Triumph) live on the source, while a resolving
+/// spell's immediately-following instruction (Persecute) reads the active
+/// resolution ledger. As with `chosen_name_matches`, never consult that ledger
+/// without an active ability, so an answer from an earlier resolution cannot
+/// leak into a passive filter.
+fn chosen_color_matches(
+    state: &GameState,
+    source: &SourceContext<'_>,
+    candidate_colors: &[ManaColor],
+) -> bool {
+    if source.ability.is_some()
+        && matches!(
+            state.last_named_choice.as_ref(),
+            Some(ChoiceValue::Color(color)) if candidate_colors.contains(color)
+        )
+    {
+        return true;
+    }
+
+    source
+        .chosen_attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            ChosenAttribute::Color(color) => Some(color),
+            _ => None,
+        })
+        .is_some_and(|color| candidate_colors.contains(color))
+}
+
 /// CR 201.2 + CR 400.7: Resolve the printed name of the first
 /// `TargetRef::Object` in the resolving ability's targets, falling back to the
 /// LKI cache when the targeted object has already left its zone (e.g. exiled
@@ -6125,15 +6156,7 @@ fn matches_filter_prop(
         }
         // CR 105.4: Match objects whose colors include the source's chosen color.
         // Used for "of the chosen color" (Hall of Triumph, Prismatic Strands).
-        FilterProp::IsChosenColor => source
-            .chosen_attributes
-            .iter()
-            .find_map(|a| match a {
-                crate::types::ability::ChosenAttribute::Color(c) => Some(c),
-                _ => None,
-            })
-            // CR 709.4b: combined colors off the stack for a split card.
-            .is_some_and(|chosen| obj.effective_colors().contains(chosen)),
+        FilterProp::IsChosenColor => chosen_color_matches(state, source, &obj.effective_colors()),
         // CR 205 + CR 205.2a: Match objects whose core type includes the
         // source's chosen card type. Used for "spells of the chosen type"
         // (Archon of Valor's Reach) and "all cards of the chosen type revealed
