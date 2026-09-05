@@ -2326,6 +2326,7 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
             channel: _,
             aggregate: _,
         } => Axes::NONE,
+        QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue => Axes::NONE,
         QuantityRef::PreviousEffectCount => Axes::NONE,
         QuantityRef::LifeLostThisTurn { player } => {
             let mut acc = Axes {

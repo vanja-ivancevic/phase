@@ -613,21 +613,52 @@ pub(crate) fn apply_damage_after_replacement(
     // those counters (clamping at 0), which destroys the pre-hit value, so capture
     // it here before mutating. (Creatures mark — not clamp — damage, so their
     // excess is reconstructed from `damage_marked` below.)
-    let (is_creature, is_planeswalker, is_battle, loyalty_before, defense_before) = match t {
+    let (
+        is_creature,
+        is_planeswalker,
+        is_battle,
+        loyalty_before,
+        defense_before,
+        drain_life_cap_before,
+    ) = match t {
         TargetRef::Object(obj_id) => state
             .objects
             .get(obj_id)
             .map(|obj| {
+                // Drain Life's Oracle wording supplies a ceiling for each
+                // applicable target characteristic. A multi-typed permanent
+                // has to satisfy every printed ceiling, so use their minimum.
+                // (Old-border cards never target a planeswalker, but retaining
+                // the Oracle's modern wording here keeps the primitive general.)
+                let mut caps = Vec::new();
+                if obj.card_types.core_types.contains(&CoreType::Creature) {
+                    caps.push(obj.toughness.unwrap_or(0));
+                }
+                if obj.card_types.core_types.contains(&CoreType::Planeswalker) {
+                    caps.push(obj.loyalty.unwrap_or(0) as i32);
+                }
                 (
                     obj.card_types.core_types.contains(&CoreType::Creature),
                     obj.card_types.core_types.contains(&CoreType::Planeswalker),
                     obj.card_types.core_types.contains(&CoreType::Battle),
                     obj.loyalty,
                     obj.defense,
+                    caps.into_iter().min().map(|cap| cap.max(0)),
                 )
             })
-            .unwrap_or((false, false, false, None, None)),
-        TargetRef::Player(_) => (false, false, false, None, None),
+            .unwrap_or((false, false, false, None, None, None)),
+        TargetRef::Player(player_id) => (
+            false,
+            false,
+            false,
+            None,
+            None,
+            state
+                .players
+                .iter()
+                .find(|player| player.id == *player_id)
+                .map(|player| player.life.max(0)),
+        ),
     };
 
     match t {
@@ -845,6 +876,10 @@ pub(crate) fn apply_damage_after_replacement(
         is_combat,
         excess: primary_excess,
     });
+    // CR 608.2c + CR 120.3: publish the exact target ceiling beside the
+    // damage result so the immediately following Drain Life-class instruction
+    // sees the pre-damage value, never a post-damage live lookup.
+    state.last_damage_target_pre_damage_life_gain_cap = drain_life_cap_before;
 
     // CR 120.1: Record damage for "was dealt damage by" condition queries.
     if actual_amount > 0 {

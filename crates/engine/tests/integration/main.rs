@@ -221,6 +221,7 @@ mod draw_delivery_preview;
 mod draw_from_general_post_replacement;
 mod draw_preflight_matches_live_pipeline;
 mod dream_salvage_target_opponent_discards;
+mod drain_life_pre_damage_cap;
 mod dredgers_insight_mill_from_among;
 mod druid_of_purification_destroy_chosen_4780;
 mod duskmantle_seer_each_player_reveal;

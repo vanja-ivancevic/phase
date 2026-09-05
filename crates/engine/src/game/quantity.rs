@@ -1124,6 +1124,7 @@ fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
         | QuantityRef::FilteredTrackedSetSize { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::PartySize { .. }
@@ -1457,6 +1458,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::FilteredTrackedSetSize { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::Speed { .. }
@@ -1756,6 +1758,7 @@ fn quantity_ref_characteristic_reads(qty: &QuantityRef, depth: u32) -> Character
         | QuantityRef::TrackedSetSize
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::UnspentMana { .. }
@@ -2024,6 +2027,7 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::FilteredTrackedSetSize { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::Speed { .. }
@@ -4280,6 +4284,21 @@ fn resolve_ref(
                 DamageChannel::Excess => state.last_effect_excess_amount.unwrap_or(0),
             }
         }
+        // CR 608.2c + CR 120.3: Drain Life's second instruction reads the
+        // actual damage published by the immediately preceding instruction,
+        // but cannot gain more life than that target's pre-damage value. Both
+        // operands are resolution-local snapshots: replacement/prevention has
+        // already shaped `last_effect_amount`, and damage application captured
+        // the target value before it changed.
+        QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue => state
+            .last_effect_amount
+            .unwrap_or(0)
+            .min(
+                state
+                    .last_damage_target_pre_damage_life_gain_cap
+                    .unwrap_or(0),
+            )
+            .max(0),
         // Read the preceding continuation-local effect count directly.
         // An unavailable count resolves to zero.
         QuantityRef::PreviousEffectCount => state.last_effect_count.unwrap_or(0),

@@ -18666,6 +18666,15 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_effect_excess_amount: Option<i32>,
 
+    /// CR 608.2c + CR 120.3: Target-derived ceiling for the immediately
+    /// preceding damage instruction's Drain Life-class life gain. Captured
+    /// before damage mutates the target's life, toughness-relevant state, or
+    /// loyalty, and reset at the start of each top-level resolution. This is
+    /// transient resolution bookkeeping and follows `last_effect_amount`'s
+    /// PartialEq-omission convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_damage_target_pre_damage_life_gain_cap: Option<i32>,
+
     /// CR 706.2 + CR 706.4: The actual scalar result available to the current
     /// ability resolution. During a results-table roll, `roll_die::resolve`
     /// stamps each individual die result before resolving that die's branch
@@ -23336,6 +23345,7 @@ impl GameState {
             player_actions_this_way: HashSet::new(),
             last_effect_amount: None,
             last_effect_excess_amount: None,
+            last_damage_target_pre_damage_life_gain_cap: None,
             die_result_this_resolution: None,
             last_effect_count: None,
             last_effect_counts_by_player: HashMap::new(),
@@ -25360,6 +25370,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         player_actions_this_way: _,
         last_effect_amount: _,
         last_effect_excess_amount: _,
+        last_damage_target_pre_damage_life_gain_cap: _,
         die_result_this_resolution: _,
         last_effect_count: _,
         last_effect_counts_by_player: _,
