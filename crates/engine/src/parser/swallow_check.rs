@@ -8030,6 +8030,84 @@ mod tests {
         );
     }
 
+    /// CR 207.2c + CR 118.7a + CR 118.12a: Domain is an ability word, not a
+    /// keyword. Draco has both an ordinary spell-cost reduction and an upkeep
+    /// payment whose generic cost is reduced by the same Domain count. Parsing
+    /// only the first line is a false green: the second line must reach the
+    /// dynamic unless-payment representation as well.
+    #[test]
+    fn draco_domain_cost_reduction_parses_without_swallow() {
+        let parsed = parse_named(
+            "Domain — This spell costs {2} less to cast for each basic land type among lands you control.\nFlying\nDomain — At the beginning of your upkeep, sacrifice this creature unless you pay {10}. This cost is reduced by {2} for each basic land type among lands you control.",
+            "Draco",
+            &["Artifact", "Creature"],
+        );
+        assert_eq!(
+            parsed.statics.len(),
+            1,
+            "expected one self-spell cost static"
+        );
+        assert!(
+            matches!(
+                parsed.statics[0].mode,
+                StaticMode::ModifyCost {
+                    dynamic_count: Some(crate::types::ability::QuantityRef::BasicLandTypeCount {
+                        controller: crate::types::ability::ControllerRef::You,
+                    }),
+                    ..
+                }
+            ),
+            "expected Domain-bound ModifyCost, got {:?}",
+            parsed.statics[0].mode
+        );
+        let unless = parsed
+            .triggers
+            .first()
+            .and_then(|trigger| trigger.unless_pay.as_ref())
+            .expect("Draco upkeep must retain its unless-payment");
+        let crate::types::ability::AbilityCost::ManaDynamic {
+            quantity: crate::types::ability::QuantityExpr::Sum { exprs },
+        } = &unless.cost
+        else {
+            panic!(
+                "expected upkeep payment {{10}} minus {{2}} per Domain type, got {:?}",
+                unless.cost
+            );
+        };
+        assert_eq!(
+            exprs.len(),
+            2,
+            "expected base payment and one Domain reduction: {exprs:?}"
+        );
+        assert_eq!(
+            exprs[0],
+            crate::types::ability::QuantityExpr::Fixed { value: 10 }
+        );
+        assert!(
+            matches!(
+                &exprs[1],
+                crate::types::ability::QuantityExpr::Multiply {
+                    factor: -2,
+                    inner,
+                } if matches!(
+                    inner.as_ref(),
+                    crate::types::ability::QuantityExpr::Ref {
+                        qty: crate::types::ability::QuantityRef::BasicLandTypeCount {
+                            controller: crate::types::ability::ControllerRef::You,
+                        },
+                    }
+                )
+            ),
+            "expected {{2}} reduction per controlled basic land type: {:?}",
+            exprs[1]
+        );
+        assert!(
+            parsed.parse_warnings.is_empty(),
+            "Draco must not leave a parser warning: {:?}",
+            parsed.parse_warnings
+        );
+    }
+
     /// CR 608.2c: Wretched Banquet — least-power destroy gate must parse without
     /// swallowing the intervening-if clause.
     #[test]
@@ -8238,11 +8316,25 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         );
     }
 
-    /// Regression: issue #2277 — Tithe's "If target opponent controls more
-    /// lands than you, you may search …" has an unrecognized leading condition;
-    /// the structural fallback strips the head so the optional flag is preserved.
+    /// CR 115.1 + CR 608.2c: Tithe's "If target opponent controls more lands
+    /// than you, you may search …" declares a target through its condition and
+    /// gates the optional second search on that target.  Preserving only the
+    /// `you may` marker is a false green: both pieces must remain in the AST.
     #[test]
-    fn optional_you_may_accepts_tithe_optional_search() {
+    fn tithe_preserves_targeted_condition_and_optional_second_search() {
+        fn tree_has_conditioned_optional(def: &AbilityDefinition) -> bool {
+            (def.optional && def.condition.is_some())
+                || def
+                    .sub_ability
+                    .as_deref()
+                    .is_some_and(tree_has_conditioned_optional)
+                || def
+                    .else_ability
+                    .as_deref()
+                    .is_some_and(tree_has_conditioned_optional)
+                || def.mode_abilities.iter().any(tree_has_conditioned_optional)
+        }
+
         let parsed = parse_named(
             "Search your library for a Plains card. If target opponent controls \
              more lands than you, you may search your library for an additional \
@@ -8251,10 +8343,15 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
             &["Instant"],
         );
 
-        assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
         assert!(
-            parsed.abilities.iter().any(def_tree_has_optional),
-            "Tithe's optional second search must be marked optional"
+            !has_swallowed_detector(&parsed, "Condition_If"),
+            "Tithe's target-dependent gate must not be swallowed: {:?}",
+            parsed.parse_warnings
+        );
+        assert!(
+            parsed.abilities.iter().any(tree_has_conditioned_optional),
+            "Tithe's optional second search must retain its condition: {:?}",
+            parsed.abilities
         );
     }
 

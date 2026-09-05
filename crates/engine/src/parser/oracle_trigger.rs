@@ -3284,11 +3284,64 @@ fn parse_unless_mana_payment(cost_str: &str) -> Option<AbilityCost> {
     {
         return None;
     }
+    if let Some(cost) = parse_reduced_unless_mana_payment(after_cost, &mana_cost) {
+        return Some(cost);
+    }
     if let Some(cost) = super::oracle_effect::parse_unless_for_each_payment(after_cost, &mana_cost)
     {
         return Some(cost);
     }
     Some(AbilityCost::Mana { cost: mana_cost })
+}
+
+/// CR 118.7a + CR 118.12a: A triggered payment may modify its own generic
+/// cost in a following sentence: "unless you pay {10}. This cost is reduced by
+/// {2} for each basic land type among lands you control" (Draco).  Reuse the
+/// ordinary self-spell cost-reduction grammar rather than growing a second
+/// Domain parser here, then lower its reduction to the dynamic generic amount
+/// the resolution-time payment path already evaluates.
+fn parse_reduced_unless_mana_payment(
+    after_base_cost: &str,
+    base_cost: &crate::types::mana::ManaCost,
+) -> Option<AbilityCost> {
+    let crate::types::mana::ManaCost::Cost { shards, generic } = base_cost else {
+        return None;
+    };
+    // CR 118.7a: generic cost reducers cannot reduce colored components.  The
+    // dynamic-payment representation likewise carries a generic amount only,
+    // so decline any future colored shape rather than silently losing a pip.
+    if !shards.is_empty() {
+        return None;
+    }
+
+    let suffix = after_base_cost
+        .trim_start()
+        .trim_start_matches('.')
+        .trim_start();
+    let reduction_text = suffix.strip_prefix("this cost is reduced by ")?;
+    let (amount, counted_objects) = reduction_text.split_once(" for each ")?;
+    let reduction = super::oracle_cost::try_parse_cost_reduction(&format!(
+        "this spell costs {amount} less to cast for each {counted_objects}"
+    ))?;
+    if reduction.mode != crate::types::statics::CostModifyMode::Reduce
+        || reduction.condition.is_some()
+    {
+        return None;
+    }
+
+    Some(AbilityCost::ManaDynamic {
+        quantity: QuantityExpr::Sum {
+            exprs: vec![
+                QuantityExpr::Fixed {
+                    value: i32::try_from(*generic).ok()?,
+                },
+                QuantityExpr::Multiply {
+                    factor: -i32::try_from(reduction.amount_per).ok()?,
+                    inner: Box::new(reduction.count),
+                },
+            ],
+        },
+    })
 }
 
 /// CR 118.12: Detect "unless [player] pays {cost}" in trigger effect text.

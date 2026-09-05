@@ -2480,7 +2480,12 @@ fn companion_target_player_legal_targets(
             // opponents (self excluded; any one opponent in >2p). Reuses the
             // Typed{controller:Opponent} legality path bare "target opponent" uses
             // (targeting.rs → players::is_opponent). Plain "target player" → any player.
-            let slot_filter = if effect_references_target_opponent(&ability.effect) {
+            let slot_filter = if effect_references_target_opponent(&ability.effect)
+                || ability
+                    .condition
+                    .as_ref()
+                    .is_some_and(ability_condition_references_target_opponent)
+            {
                 TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
             } else {
                 TargetFilter::Player
@@ -3722,6 +3727,105 @@ fn effect_references_target_opponent(effect: &Effect) -> bool {
     effect_bound_filter_matches(effect, filter_references_target_opponent)
 }
 
+/// CR 115.1 + CR 608.2c: A conditional effect can itself declare a player
+/// target, even when its `Effect` has no target-bearing filter. Tithe's
+/// "If target opponent controls more lands than you" is the old-border
+/// exemplar: both count expressions are resolution conditions, but the target
+/// opponent is still chosen while the spell is announced and retained on that
+/// conditional link for the later recheck.
+fn ability_condition_references_target_player(condition: &AbilityCondition) -> bool {
+    match condition {
+        AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
+            quantity_expr_references_target_player(lhs)
+                || quantity_expr_references_target_player(rhs)
+        }
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => conditions
+            .iter()
+            .any(ability_condition_references_target_player),
+        AbilityCondition::Not { condition }
+        | AbilityCondition::ConditionInstead { inner: condition } => {
+            ability_condition_references_target_player(condition)
+        }
+        _ => false,
+    }
+}
+
+/// Opponent-only counterpart to `ability_condition_references_target_player`.
+/// Slot detection and legality are deliberately separate: the former sees any
+/// declared target player; this one narrows that slot to opponents when the
+/// condition's filter says `TargetOpponent`.
+fn ability_condition_references_target_opponent(condition: &AbilityCondition) -> bool {
+    match condition {
+        AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
+            quantity_expr_references_target_opponent(lhs)
+                || quantity_expr_references_target_opponent(rhs)
+        }
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => conditions
+            .iter()
+            .any(ability_condition_references_target_opponent),
+        AbilityCondition::Not { condition }
+        | AbilityCondition::ConditionInstead { inner: condition } => {
+            ability_condition_references_target_opponent(condition)
+        }
+        _ => false,
+    }
+}
+
+fn quantity_expr_references_target_player(expr: &QuantityExpr) -> bool {
+    quantity_expr_filter_matches(expr, filter_references_target_player)
+}
+
+fn quantity_expr_references_target_opponent(expr: &QuantityExpr) -> bool {
+    quantity_expr_filter_matches(expr, filter_references_target_opponent)
+}
+
+/// Walk the quantity forms which may carry an object-population filter. These
+/// are the same filter-bearing count family used by `quantity_ref_target_slot_spec`;
+/// the distinction is that this walker asks whether the population is scoped to
+/// a declared *player* rather than whether it embeds a target *object*.
+fn quantity_expr_filter_matches(expr: &QuantityExpr, pred: fn(&TargetFilter) -> bool) -> bool {
+    match expr {
+        QuantityExpr::Ref { qty } => quantity_ref_filter_matches(qty, pred),
+        QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
+        | QuantityExpr::Multiply { inner, .. }
+        | QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::UpTo { max: inner }
+        | QuantityExpr::Power {
+            exponent: inner, ..
+        } => quantity_expr_filter_matches(inner, pred),
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => exprs
+            .iter()
+            .any(|expr| quantity_expr_filter_matches(expr, pred)),
+        QuantityExpr::Difference { left, right } => {
+            quantity_expr_filter_matches(left, pred) || quantity_expr_filter_matches(right, pred)
+        }
+        QuantityExpr::Fixed { .. } => false,
+    }
+}
+
+fn quantity_ref_filter_matches(qty: &QuantityRef, pred: fn(&TargetFilter) -> bool) -> bool {
+    match qty {
+        QuantityRef::ObjectCount { filter }
+        | QuantityRef::ObjectCountDistinct { filter, .. }
+        | QuantityRef::ObjectCountBySharedQuality { filter, .. }
+        | QuantityRef::CountersOnObjects { filter, .. }
+        | QuantityRef::EnteredThisTurn { filter }
+        | QuantityRef::BattlefieldEntriesThisTurn { filter, .. }
+        | QuantityRef::SacrificedThisTurn { filter, .. }
+        | QuantityRef::ZoneChangeCountThisTurn { filter, .. }
+        | QuantityRef::ZoneChangeAggregateThisTurn { filter, .. }
+        | QuantityRef::CounterAddedThisTurn { target: filter, .. }
+        | QuantityRef::TokensCreatedThisTurn { filter, .. }
+        | QuantityRef::DistinctCounterKindsAmong { filter }
+        | QuantityRef::ControlledByEachPlayer { filter, .. } => pred(filter),
+        QuantityRef::SpellsCastThisTurn { filter, .. }
+        | QuantityRef::SpellsCastBeforeTriggeringSpell { filter, .. }
+        | QuantityRef::SpellsCastThisGame { filter, .. } => filter.as_ref().is_some_and(pred),
+        _ => false,
+    }
+}
+
 fn ability_needs_companion_target_player_slot(ability: &ResolvedAbility) -> bool {
     // Triggered abilities carry an exact trigger source. Hellkite-style
     // GainControlAll uses "that player" from the triggering event, not a
@@ -3730,6 +3834,10 @@ fn ability_needs_companion_target_player_slot(ability: &ResolvedAbility) -> bool
         return false;
     }
     effect_references_target_player(&ability.effect)
+        || ability
+            .condition
+            .as_ref()
+            .is_some_and(ability_condition_references_target_player)
         // CR 115.1 + CR 118.12a: a targeted unless-payer declared inside the unless
         // clause surfaces its own player target slot even when the primary effect
         // references no target player (e.g. Athreos, God of Passage).
@@ -9389,6 +9497,57 @@ mod tests {
         assert!(
             ability_needs_companion_target_player_slot(&ability),
             "a declared-target opponent unless-payer must surface a companion player slot"
+        );
+    }
+
+    /// CR 115.1 + CR 608.2c: a declared player target can live solely in an
+    /// `if` condition. Tithe's conditional second search has no target-bearing
+    /// effect of its own, so it must still expose exactly one opponent-only
+    /// announcement slot and keep the chosen player on the conditional link.
+    #[test]
+    fn quantity_condition_target_opponent_surfaces_companion_player_slot() {
+        let state = GameState::new_two_player(7);
+        let target_lands =
+            TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::TargetOpponent));
+        let your_lands = TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You));
+        let mut ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        ability.condition = Some(AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: target_lands,
+                },
+            },
+            comparator: crate::types::ability::Comparator::GT,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter: your_lands },
+            },
+        });
+
+        assert!(ability_needs_companion_target_player_slot(&ability));
+        let slots = build_target_slots(&state, &ability).expect("conditional target slot builds");
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].legal_targets, vec![TargetRef::Player(PlayerId(1))]);
+
+        let progress = build_target_selection_progress_for_ability(
+            &state,
+            &ability,
+            &slots,
+            &ability.target_constraints,
+            0,
+            vec![],
+        )
+        .expect("conditional target slot recomputes");
+        assert_eq!(
+            progress.current_legal_targets,
+            vec![TargetRef::Player(PlayerId(1))]
         );
     }
 
