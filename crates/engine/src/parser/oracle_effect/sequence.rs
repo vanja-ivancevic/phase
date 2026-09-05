@@ -2806,6 +2806,11 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
         // each clause reaches the effect dispatcher independently.
         value((), tag("transform ")),
     ))
+    // A player subject can govern a list of conjugated actions: "target player
+    // reveals their hand and discards ...". The continuation must be a separate
+    // chunk so the carried player subject is injected by the effect-chain
+    // lowerer instead of losing the discard instruction.
+    .or(value((), tag("discards ")))
     .or(value((), tag("cast ")))
     .or(value((), tag("cloak ")))
     .or(value((), tag("convert ")))

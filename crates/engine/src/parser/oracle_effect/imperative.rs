@@ -1361,6 +1361,25 @@ fn parse_discard_unless_filter<'a>(
 /// Dokuchi Silencer ("you may discard a creature card") preserves the same
 /// filter data as cost-form discards like "Discard a creature card:".
 pub(crate) fn parse_discard_card_filter(tail: &str) -> Option<TargetFilter> {
+    parse_discard_card_filter_inner(tail, None)
+}
+
+/// Context-aware form used by resolution effects.  A card filter can refer to
+/// a value chosen earlier in the same resolution (for example, "cards with
+/// mana value equal to that number"), so this path preserves the chain's
+/// quantity bindings while the cost and trigger callers retain their
+/// context-free contract.
+fn parse_discard_card_filter_with_ctx(
+    tail: &str,
+    ctx: &mut ParseContext,
+) -> Option<TargetFilter> {
+    parse_discard_card_filter_inner(tail, Some(ctx))
+}
+
+fn parse_discard_card_filter_inner(
+    tail: &str,
+    mut ctx: Option<&mut ParseContext>,
+) -> Option<TargetFilter> {
     let (filter, remainder) = parse_type_phrase(tail);
     let is_bare_card = matches!(
         &filter,
@@ -1374,6 +1393,17 @@ pub(crate) fn parse_discard_card_filter(tail: &str) -> Option<TargetFilter> {
         return Some(filter);
     }
 
+    // A qualified card phrase has text after its "card(s)" noun, such as
+    // "nonland cards with mana value equal to that number".  The type-only
+    // fast path above deliberately leaves that suffix untouched; let the full
+    // target grammar consume it when resolution context is available.
+    if let Some(ctx) = ctx.as_deref_mut() {
+        let (filter, remainder) = parse_target_with_ctx(tail, ctx);
+        if remainder.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
+            return Some(filter);
+        }
+    }
+
     // Find the " card" / " cards" suffix — the type phrase lies before it.
     // No suffix or empty before-suffix → no type qualifier.
     let type_phrase = tail
@@ -1383,7 +1413,11 @@ pub(crate) fn parse_discard_card_filter(tail: &str) -> Option<TargetFilter> {
     if type_phrase.is_empty() {
         return None;
     }
-    let (filter, remainder) = parse_target(type_phrase);
+    let (filter, remainder) = if let Some(ctx) = ctx {
+        parse_target_with_ctx(type_phrase, ctx)
+    } else {
+        parse_target(type_phrase)
+    };
     if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return None;
     }
@@ -1842,6 +1876,25 @@ pub(super) fn parse_targeted_action_ast(
                 up_to,
                 unless_filter: None,
                 filter: None,
+            });
+        }
+        // "Discard all <filter> cards" means every eligible card in the
+        // affected player's hand.  Model that as the hand size with the typed
+        // eligibility filter: the resolver already limits the actual choice to
+        // matching cards, and therefore naturally caps the count at their
+        // number.  Unlike "all cards in their hand", this retains the filter.
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("all ").parse(after_discard) {
+            let filter = parse_discard_card_filter_with_ctx(rest, ctx)?;
+            return Some(TargetedImperativeAst::Discard {
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: PlayerScope::Controller,
+                    },
+                },
+                random,
+                up_to: false,
+                unless_filter: None,
+                filter: Some(filter),
             });
         }
         // CR 701.8a: "discard any number of [filter] cards" — opt-choice

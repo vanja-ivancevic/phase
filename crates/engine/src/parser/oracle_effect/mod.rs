@@ -1059,6 +1059,11 @@ fn definition_reads_player_chosen_number(def: &AbilityDefinition) -> bool {
     if found {
         return true;
     }
+    if let Effect::DestroyAll { target, .. } = def.effect.as_ref() {
+        if target_filter_reads_player_chosen_number(target) {
+            return true;
+        }
+    }
     // CR 120.3: `DamageEachPlayer`'s recipient set is a `PlayerFilter` rather
     // than a quantity, so it is not reached by `for_each_quantity_expr`.
     if let Effect::DamageEachPlayer { player_filter, .. } = def.effect.as_ref() {
@@ -1104,6 +1109,37 @@ fn definition_reads_player_chosen_number(def: &AbilityDefinition) -> bool {
             .else_ability
             .as_deref()
             .is_some_and(definition_reads_player_chosen_number)
+}
+
+fn target_filter_reads_player_chosen_number(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(typed) => typed
+            .properties
+            .iter()
+            .any(filter_prop_reads_player_chosen_number),
+        TargetFilter::Not { filter } | TargetFilter::TrackedSetFiltered { filter, .. } => {
+            target_filter_reads_player_chosen_number(filter)
+        }
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => filters
+            .iter()
+            .any(target_filter_reads_player_chosen_number),
+        _ => false,
+    }
+}
+
+fn filter_prop_reads_player_chosen_number(prop: &FilterProp) -> bool {
+    match prop {
+        FilterProp::Counters { count, .. }
+        | FilterProp::Cmc { value: count, .. }
+        | FilterProp::PtComparison { value: count, .. } => {
+            quantity_expr_reads_player_chosen_number(count)
+        }
+        FilterProp::AnyOf { props } => props
+            .iter()
+            .any(filter_prop_reads_player_chosen_number),
+        FilterProp::Not { prop } => filter_prop_reads_player_chosen_number(prop),
+        _ => false,
+    }
 }
 
 /// CR 608.2c: Does this condition read a secretly-chosen number? Recurses
