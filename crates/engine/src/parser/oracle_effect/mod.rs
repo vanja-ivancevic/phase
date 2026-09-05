@@ -3097,6 +3097,86 @@ fn try_parse_global_damage_modification_replacement(text: &str) -> Option<Effect
     })
 }
 
+/// Lift the resolving-spell form of the controller-scoped graveyard redirect
+/// into the existing floating-replacement authority. This is deliberately a
+/// sentence-form parser: printed permanent replacements use the normal
+/// replacement path, while this effect expires at cleanup.
+fn graveyard_snapshot_play_permission_effect() -> Effect {
+    Effect::GrantCastingPermission {
+        permission: CastingPermission::PlayFromExile {
+            provenance: crate::types::ability::PlayFromExileProvenance::Impulse,
+            mode: CardPlayMode::Play,
+            duration: Duration::UntilEndOfTurn,
+            granted_to: crate::types::player::PlayerId(0),
+            frequency: CastFrequency::Unlimited,
+            source_id: None,
+            exiled_by_ability_controller: None,
+            mana_spend_permission: None,
+            card_filter: None,
+            single_use_group: None,
+            single_use: false,
+            cast_cost_raise: None,
+            alt_ability_cost: None,
+            land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            invalidation: None,
+        },
+        target: TargetFilter::Typed(TypedFilter::default().properties(vec![
+            FilterProp::InZone { zone: Zone::Graveyard },
+            FilterProp::Owned { controller: ControllerRef::You },
+            FilterProp::NonToken,
+        ])),
+        grantee: crate::types::ability::PermissionGrantee::AbilityController,
+    }
+}
+
+fn try_parse_temporary_own_graveyard_exile_replacement(text: &str) -> Option<Effect> {
+    if !text.trim().trim_end_matches('.').eq_ignore_ascii_case(
+        "if a card would be put into your graveyard from anywhere this turn, exile that card instead",
+    ) {
+        return None;
+    }
+
+    let exile_effect = AbilityDefinition::new(AbilityKind::Spell, Effect::ChangeZone {
+        origin: None,
+        destination: Zone::Exile,
+        target: TargetFilter::SelfRef,
+        owner_library: false,
+        enter_transformed: false,
+        enters_under: None,
+        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+        enters_attacking: false,
+        up_to: false,
+        enter_with_counters: vec![],
+        conditional_enter_with_counters: vec![],
+        face_down_profile: None,
+        enters_modified_if: None,
+    });
+    let mut replacement = ReplacementDefinition::new(ReplacementEvent::Moved)
+        .valid_card(TargetFilter::Typed(TypedFilter::default().properties(vec![
+            FilterProp::Owned { controller: ControllerRef::You },
+            FilterProp::NonToken,
+        ])))
+        .destination_zone(Zone::Graveyard)
+        .execute(exile_effect);
+    replacement.expiry = Some(RestrictionExpiry::EndOfTurn);
+    replacement.description = Some(text.to_string());
+
+    Some(Effect::AddTargetReplacement {
+        replacement: Box::new(replacement),
+        target: TargetFilter::None,
+    })
+}
+
+const GRAVEYARD_PLAY_AND_REDIRECT: &str = "Until end of turn, you may play lands and cast spells from your graveyard. If a card would be put into your graveyard from anywhere this turn, exile that card instead.";
+const GRAVEYARD_PLAY_CLAUSE: &str = "Until end of turn, you may play lands and cast spells from your graveyard.";
+const GRAVEYARD_REDIRECT_CLAUSE: &str = "If a card would be put into your graveyard from anywhere this turn, exile that card instead.";
+
+/// Dispatches the complete text form before the second sentence is classified
+/// as an object-hosted replacement ability.
+pub(crate) fn is_turn_bound_graveyard_play_and_redirect(text: &str) -> bool {
+    text.trim().eq_ignore_ascii_case(GRAVEYARD_PLAY_AND_REDIRECT)
+}
+
 /// CR 614.1a + CR 514.2 + CR 611.2c: Recognize the one-shot spell/trigger form
 /// of the life-floor damage replacement — "damage that would reduce your life
 /// total to less than N reduces it to N instead" (Angel's Grace, Angel of
@@ -32392,6 +32472,48 @@ pub(crate) fn parse_effect_chain_ir(
         .map_or(text, |(_, body)| *body);
     let full_text = text; // bind AFTER the strip so diagnostics track the parsed chunks
     ctx.effect_chain_full_lower = Some(full_text.to_ascii_lowercase());
+    // Keep this linked permission and redirect form together: generic sequence
+    // splitting would divide both clauses at grammar that is essential to their
+    // meaning. This is keyed to the complete rules text, not a card name.
+    if is_turn_bound_graveyard_play_and_redirect(full_text) {
+        let redirect = try_parse_temporary_own_graveyard_exile_replacement(
+            GRAVEYARD_REDIRECT_CLAUSE,
+        )
+        .expect("the canonical graveyard redirect clause must parse");
+        let mut graveyard_builder = ClauseIrBuilder::new(full_text);
+        graveyard_builder
+            .clause(
+                GRAVEYARD_PLAY_CLAUSE,
+                parsed_clause(graveyard_snapshot_play_permission_effect()),
+                Some(ClauseBoundary::Sentence),
+                ClauseDisposition::Emit {
+                    followup: None,
+                    intrinsic: None,
+                },
+            )
+            .push();
+        graveyard_builder
+            .clause(
+                GRAVEYARD_REDIRECT_CLAUSE,
+                parsed_clause(redirect),
+                None,
+                ClauseDisposition::Emit {
+                    followup: None,
+                    intrinsic: None,
+                },
+            )
+            .push();
+        return EffectChainIr {
+            clauses: graveyard_builder.finish(),
+            kind,
+            continuation_kind: None,
+            player_scope_rewrite: PlayerScopeRewrite::Apply,
+            chain_rounding,
+            actor: ctx.actor.clone(),
+            in_trigger: ctx.in_trigger,
+            repeat_until: None,
+        };
+    }
     // CR 608.2c: A tracked-set source-zone binding is scoped to the chain that
     // publishes it. The per-chunk `chunk_ctx` re-seeds `pending_tracked_set_origin`
     // from the `chain_pending_tracked_set_origin` loop-local (initialized to

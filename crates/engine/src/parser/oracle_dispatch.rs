@@ -5,7 +5,9 @@ use super::oracle_classifier::{
     has_trigger_prefix, is_damage_prevention_pattern, is_effect_sentence_candidate,
     is_replacement_pattern, is_static_pattern,
 };
-use super::oracle_effect::{lower_ability_ir, parse_ability_ir_with_context};
+use super::oracle_effect::{
+    is_turn_bound_graveyard_play_and_redirect, lower_ability_ir, parse_ability_ir_with_context,
+};
 use super::oracle_ir::context::ParseContext;
 use super::oracle_ir::doc::{UnsupportedAbilityCategory, UnsupportedAbilityIr};
 use super::oracle_ir::effect_chain::AbilityIr;
@@ -37,7 +39,10 @@ pub(super) fn dispatch_line_nom(
         ..Default::default()
     };
 
-    if is_effect_sentence_candidate(&lower) || is_damage_prevention_pattern(&lower) {
+    if is_effect_sentence_candidate(&lower)
+        || is_damage_prevention_pattern(&lower)
+        || is_turn_bound_graveyard_play_and_redirect(line)
+    {
         let ir = parse_ability_ir_with_context(line, AbilityKind::Spell, &mut ctx);
         if !has_unimplemented(&lower_ability_ir(&ir)) {
             return NomDispatchIr::Spell(ir);
