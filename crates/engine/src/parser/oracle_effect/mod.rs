@@ -9211,6 +9211,20 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
             player: TargetFilter::Player,
         });
     }
+    // CR 106.4 + CR 608.2c: the current Oracle wording of Mana Short puts the
+    // target-player land tap first, then refers back to that same player. Keep
+    // the loss as an inherited player target rather than silently dropping the
+    // anaphoric continuation (the historical wording used the reverse order).
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "that player loses all unspent mana",
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        return parsed_clause(Effect::LoseAllUnspentMana {
+            player: TargetFilter::ParentTarget,
+        });
+    }
     // CR 608.2d + CR 608.2c: A single instruction may announce multiple named
     // choices ("choose a land type and a basic land type") before a following
     // sentence consumes both values.  The ordinary named-choice parser is

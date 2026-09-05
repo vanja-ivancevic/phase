@@ -102,4 +102,35 @@ mod tests {
             }
         )));
     }
+
+    /// CR 608.2c: a sequential "that player loses all unspent mana" clause
+    /// inherits the preceding player target (Mana Short's current wording).
+    #[test]
+    fn inherited_player_target_loses_every_color_of_unspent_mana() {
+        let mut state = GameState::new_two_player(42);
+        state.players[1]
+            .mana_pool
+            .add(ManaUnit::new(ManaType::Blue, ObjectId(10), false, Vec::new()));
+        state.players[1]
+            .mana_pool
+            .add(ManaUnit::new(ManaType::Red, ObjectId(11), false, Vec::new()));
+        let ability = ResolvedAbility::new(
+            Effect::LoseAllUnspentMana {
+                player: TargetFilter::ParentTarget,
+            },
+            vec![TargetRef::Player(PlayerId(1))],
+            ObjectId(99),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(state.players[0].mana_pool.mana.is_empty());
+        assert!(state.players[1].mana_pool.mana.is_empty());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::ManaPoolEmptied { player_id: PlayerId(1), .. }
+        )));
+    }
 }
