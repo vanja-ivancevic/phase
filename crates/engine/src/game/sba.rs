@@ -1002,7 +1002,10 @@ fn perform_creature_deaths(
                     }
                 }
                 if destroyed {
-                    events.push(GameEvent::CreatureDestroyed { object_id });
+                    events.push(GameEvent::CreatureDestroyed {
+                        object_id,
+                        source_id: None,
+                    });
                 }
                 performed_ids.push(object_id);
             }
@@ -1132,7 +1135,10 @@ fn perform_creature_deaths(
                             return;
                         }
                     }
-                    events.push(GameEvent::CreatureDestroyed { object_id });
+                    events.push(GameEvent::CreatureDestroyed {
+                        object_id,
+                        source_id: None,
+                    });
                     performed_ids.push(object_id);
                 }
                 *any_performed = true;
@@ -6401,7 +6407,7 @@ mod tests {
 
         assert_eq!(zone_changed_for(&events, stale), 0);
         assert!(!events.iter().any(
-            |event| matches!(event, GameEvent::CreatureDestroyed { object_id } if *object_id == stale)
+            |event| matches!(event, GameEvent::CreatureDestroyed { object_id, .. } if *object_id == stale)
         ));
         assert!(zone_changed_for(&events, live) > 0);
         assert!(
@@ -6588,7 +6594,7 @@ mod tests {
 
         assert!(state.players[0].graveyard.contains(&creature));
         assert!(events.iter().any(
-            |event| matches!(event, GameEvent::CreatureDestroyed { object_id } if *object_id == creature)
+            |event| matches!(event, GameEvent::CreatureDestroyed { object_id, .. } if *object_id == creature)
         ));
     }
 
@@ -6628,7 +6634,7 @@ mod tests {
         assert!(state.battlefield.contains(&zero));
         assert!(state.battlefield.contains(&negative));
         assert!(!events.iter().any(
-            |event| matches!(event, GameEvent::CreatureDestroyed { object_id } if *object_id == zero || *object_id == negative)
+            |event| matches!(event, GameEvent::CreatureDestroyed { object_id, .. } if *object_id == zero || *object_id == negative)
         ));
     }
 
@@ -6650,7 +6656,7 @@ mod tests {
 
         assert_eq!(zone_changed_for(&events, stale), 0);
         assert!(!events.iter().any(
-            |event| matches!(event, GameEvent::CreatureDestroyed { object_id } if *object_id == stale)
+            |event| matches!(event, GameEvent::CreatureDestroyed { object_id, .. } if *object_id == stale)
         ));
         assert!(state.players[0].graveyard.contains(&live));
     }

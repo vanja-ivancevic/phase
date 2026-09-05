@@ -1186,6 +1186,14 @@ pub enum GameEvent {
     },
     CreatureDestroyed {
         object_id: ObjectId,
+        /// CR 701.8a + CR 603.2: the spell or ability source that performed
+        /// this destruction, if the destruction was effect-driven. State-based
+        /// destruction has no source. This is event provenance, so a trigger
+        /// such as Karmic Justice can distinguish an opponent's spell or
+        /// ability from a self-controlled one after the destroyed permanent
+        /// has changed zones.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<ObjectId>,
     },
     PermanentSacrificed {
         object_id: ObjectId,

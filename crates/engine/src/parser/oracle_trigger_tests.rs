@@ -16388,6 +16388,58 @@ fn trigger_opponent_causes_land_to_enter_your_graveyard() {
     ));
 }
 
+/// CR 701.8a + CR 603.2: Karmic Justice binds both the destroyed permanent
+/// and the opponent-controlled spell/ability that destroyed it. The active
+/// voice must not fall through to the passive "is destroyed" grammar, which
+/// has no event-source controller to retain.
+#[test]
+fn trigger_opponent_controlled_spell_destroys_noncreature_permanent() {
+    let condition = "a spell or ability an opponent controls destroys a noncreature permanent you control";
+    assert_eq!(
+        relative_player_scope_for_condition(condition),
+        Some(ControllerRef::TriggeringPlayer),
+        "the destruction source's controller must be available to the trailing that-opponent target"
+    );
+    let def = parse_trigger_line(
+        "Whenever a spell or ability an opponent controls destroys a noncreature permanent you control, \
+         you may destroy target permanent that opponent controls.",
+        "Karmic Justice",
+    );
+    assert_eq!(def.mode, TriggerMode::Destroyed);
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::Typed(
+            TypedFilter::permanent()
+                .with_type(TypeFilter::Non(Box::new(TypeFilter::Creature)))
+                .controller(ControllerRef::You)
+        ))
+    );
+    assert_eq!(
+        def.constraint,
+        Some(
+            crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+                controller: ControllerRef::Opponent
+            }
+        )
+    );
+    assert!(def.optional);
+    assert!(matches!(
+        def.execute
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::Destroy {
+            target: TargetFilter::Typed(TypedFilter {
+                // "That opponent" refers to the controller of the spell or
+                // ability recorded on the destruction event, not simply any
+                // opponent of Karmic Justice's controller.
+                controller: Some(ControllerRef::TriggeringPlayer),
+                ..
+            }),
+            ..
+        })
+    ));
+}
+
 /// CR 701.9 + CR 608.2k + CR 406.1: Necropotence's on-discard trigger
 /// exiles the just-discarded card from the graveyard. The "that card"
 /// anaphor must lift from `ParentTarget` to `TriggeringSource` so the

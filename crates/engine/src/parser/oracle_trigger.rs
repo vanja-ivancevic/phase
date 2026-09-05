@@ -1328,14 +1328,18 @@ pub(crate) fn relative_player_scope_for_condition(cond_lower: &str) -> Option<Co
         // player for "that player" anaphors in the effect body (Total War:
         // "...destroy all untapped non-Wall creatures that player controls...").
         Some(ControllerRef::TriggeringPlayer)
-    } else if condition_introduces_becomes_target_source_player(cond_lower) {
+    } else if condition_introduces_becomes_target_source_player(cond_lower)
+        || try_parse_opponent_controlled_destroy_trigger(cond_lower).is_some()
+    {
         // CR 115.1 + CR 603.2e + CR 608.2c: "Whenever ~ becomes the target of a
         // spell or ability an opponent controls, … that player controls" — reading
         // the English text (CR 608.2c), "that player" is the controller of the
         // targeting source, delivered by
         // `extract_player_from_event`'s BecomesTarget arm (game/targeting.rs).
-        // (Black Bolt Lethal Voice, Scalelord Reckoner.) Unlike `TargetPlayer`,
-        // `TriggeringPlayer` surfaces no phantom companion Player target slot.
+        // Karmic Justice uses the sibling destruction form: the destruction event
+        // retains the source object, and the same runtime extractor resolves its
+        // controller. Unlike `TargetPlayer`, `TriggeringPlayer` surfaces no
+        // phantom companion Player target slot.
         Some(ControllerRef::TriggeringPlayer)
     } else if condition_introduces_target_player(cond_lower) {
         Some(ControllerRef::TargetPlayer)
@@ -10406,6 +10410,15 @@ pub(crate) fn parse_trigger_condition(
         return result;
     }
 
+    // CR 701.8a + CR 603.2: "Whenever a spell or ability an opponent
+    // controls destroys [permanent-filter]" is an active-voice destruction
+    // trigger. It is distinct from the ordinary passive "[subject] is
+    // destroyed" grammar below: the trigger must retain both the destroyed
+    // subject and the controller of the spell/ability that caused it.
+    if let Some(result) = try_parse_opponent_controlled_destroy_trigger(&lower) {
+        return result;
+    }
+
     // Counter-related events: "a +1/+1 counter is put on ~" /
     // "one or more counters are put on ~" / "the twelfth hour counter is put
     // on ~". These are passive event subjects where the object after "on" is
@@ -18704,6 +18717,43 @@ fn parse_dies_verb_phrase(input: &str) -> OracleResult<'_, ()> {
         value((), tag("are put into a graveyard from the battlefield")),
     ))
     .parse(input)
+}
+
+/// CR 701.8a + CR 603.2: Parse the active-voice trigger family
+/// "a spell or ability an opponent controls destroys [permanent-filter]".
+///
+/// The passive destruction grammar maps directly to [`TriggerMode::Destroyed`]
+/// after subject decomposition. This family instead leads with the causing
+/// spell/ability, so it must construct the same trigger mode while retaining
+/// an event-source controller constraint. `parse_trigger_subject` owns the
+/// shared permanent-filter grammar, keeping forms such as "a noncreature
+/// permanent you control" aligned with other trigger heads.
+fn try_parse_opponent_controlled_destroy_trigger(
+    condition: &str,
+) -> Option<(TriggerMode, TriggerDefinition)> {
+    // `parse_trigger_condition` receives the clause after `split_trigger`,
+    // whereas direct parser callers and scope derivation may retain its leading
+    // trigger keyword. Accept both normalized forms.
+    let after_keyword = condition
+        .strip_prefix("whenever ")
+        .or_else(|| condition.strip_prefix("when "))
+        .unwrap_or(condition);
+    let subject_text =
+        after_keyword.strip_prefix("a spell or ability an opponent controls destroys ")?;
+    let (subject, tail) = parse_trigger_subject(subject_text, &mut ParseContext::default());
+    if !tail.trim().is_empty() {
+        return None;
+    }
+
+    let mut def = make_base();
+    def.mode = TriggerMode::Destroyed;
+    def.valid_card = Some(subject);
+    def.constraint = Some(
+        crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+            controller: ControllerRef::Opponent,
+        },
+    );
+    Some((TriggerMode::Destroyed, def))
 }
 
 /// CR 603.6 + CR 603.2: Parse one clause of a disjunctive zone-change trigger

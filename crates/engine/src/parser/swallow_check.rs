@@ -8376,9 +8376,9 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
             .iter()
             .find_map(|definition| {
                 let mut found = None;
-                super::visit_ability_def(definition, &mut |effect| {
+                let _ = super::visit_ability_def(definition, &mut |effect| {
                     if let Effect::LoseAllUnspentMana { player } = effect {
-                        found = Some(player);
+                        found = Some(player.clone());
                         std::ops::ControlFlow::Break(())
                     } else {
                         std::ops::ControlFlow::Continue(())
@@ -8387,7 +8387,7 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
                 found
             })
             .expect("Mana Short must retain its unspent-mana-loss instruction");
-        assert_eq!(*mana_loss, TargetFilter::ParentTarget);
+        assert_eq!(mana_loss, TargetFilter::ParentTarget);
         assert!(
             !any_ability_has_unimplemented(&parsed),
             "Mana Short must retain its tap-all-lands follow-up"

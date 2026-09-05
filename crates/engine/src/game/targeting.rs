@@ -1695,7 +1695,7 @@ pub(crate) fn extract_source_from_event(
         GameEvent::Evolved { object_id } => Some(*object_id),
         GameEvent::CounterRemoved { object_id, .. } => Some(*object_id),
         GameEvent::TokenCreated { object_id, .. } => Some(*object_id),
-        GameEvent::CreatureDestroyed { object_id } => Some(*object_id),
+        GameEvent::CreatureDestroyed { object_id, .. } => Some(*object_id),
         GameEvent::PermanentSacrificed { object_id, .. } => Some(*object_id),
         GameEvent::Unattached {
             old_target: TargetRef::Object(object_id),
@@ -2022,6 +2022,14 @@ pub(crate) fn extract_player_from_event(
         // TriggeringPlayer` fell back to the ability controller, hitting the
         // wrong player (Suture Priest #560, Bloodchief Ascension #546).
         GameEvent::ZoneChanged { record, .. } => Some(record.controller),
+        // CR 701.8a + CR 603.2 + CR 608.2c: an active-voice destruction trigger
+        // such as Karmic Justice binds "that opponent" to the controller of the
+        // spell or ability that destroyed the permanent, retained as event
+        // provenance even after that source has left the stack.
+        GameEvent::CreatureDestroyed {
+            source_id: Some(source_id),
+            ..
+        } => state.objects.get(source_id).map(|object| object.controller),
         // CR 122.1 + CR 603.7c: "that player" / `TriggeringPlayer` on a
         // counter-placement trigger is the player who put the counters.
         GameEvent::CounterAdded { actor, .. } => Some(*actor),

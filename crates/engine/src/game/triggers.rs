@@ -12863,6 +12863,10 @@ fn check_trigger_constraint_with_ref(
                     };
                     source_id
                 }
+                Some(GameEvent::CreatureDestroyed {
+                    source_id: Some(source_id),
+                    ..
+                }) => *source_id,
                 _ => return false,
             };
             let Some(event_source_controller) = state
@@ -13701,7 +13705,7 @@ fn evaluate_trigger_condition_with_source(
             // CreatureDestroyed and ZoneChanged (dies = battlefield→graveyard)
             // carry the dying creature — other event shapes are not valid here.
             let dying_creature = trigger_event.and_then(|e| match e {
-                GameEvent::CreatureDestroyed { object_id } => Some(*object_id),
+                GameEvent::CreatureDestroyed { object_id, .. } => Some(*object_id),
                 GameEvent::ZoneChanged { object_id, .. } => Some(*object_id),
                 _ => None,
             });
@@ -13724,7 +13728,7 @@ fn evaluate_trigger_condition_with_source(
         // whose source satisfies the filter (Spider you controlled, etc.).
         TriggerCondition::DealtDamageThisTurnBySource { source } => {
             let dying_creature = trigger_event.and_then(|e| match e {
-                GameEvent::CreatureDestroyed { object_id } => Some(*object_id),
+                GameEvent::CreatureDestroyed { object_id, .. } => Some(*object_id),
                 GameEvent::ZoneChanged { object_id, .. } => Some(*object_id),
                 _ => None,
             });
@@ -17443,6 +17447,69 @@ pub mod tests {
             !check_trigger_constraint(&state, &def, source, 0, PlayerId(0), &no_cause),
             "a discard with no recorded cause must NOT satisfy the constraint"
         );
+    }
+
+    /// CR 701.8a + CR 603.2: Karmic Justice-class destruction triggers reuse
+    /// the event-source controller constraint. The destroyed permanent is the
+    /// event subject; the spell/ability that caused the destruction is its
+    /// separate provenance field, so the two player scopes cannot be confused.
+    #[test]
+    fn event_source_controlled_by_opponent_gates_destroy_trigger() {
+        use crate::types::ability::{ControllerRef, TriggerConstraint};
+        let mut state = setup();
+        let karmic = make_creature(&mut state, PlayerId(0), "Karmic Justice", 0, 0);
+        let victim = make_creature(&mut state, PlayerId(0), "Owned Permanent", 0, 0);
+        let opponent_cause = make_creature(&mut state, PlayerId(1), "Opponent Spell", 0, 0);
+        let own_cause = make_creature(&mut state, PlayerId(0), "Own Spell", 0, 0);
+
+        let mut def = make_trigger(TriggerMode::Destroyed);
+        def.constraint = Some(TriggerConstraint::EventSourceControlledBy {
+            controller: ControllerRef::Opponent,
+        });
+
+        let opponent_destroyed = GameEvent::CreatureDestroyed {
+            object_id: victim,
+            source_id: Some(opponent_cause),
+        };
+        assert!(check_trigger_constraint(
+            &state,
+            &def,
+            karmic,
+            0,
+            PlayerId(0),
+            &opponent_destroyed,
+        ));
+        assert_eq!(
+            crate::game::targeting::extract_player_from_event(&opponent_destroyed, &state),
+            Some(PlayerId(1)),
+            "the destruction event must bind Karmic Justice's ‘that opponent’ to the causing source's controller",
+        );
+
+        let own_destroyed = GameEvent::CreatureDestroyed {
+            object_id: victim,
+            source_id: Some(own_cause),
+        };
+        assert!(!check_trigger_constraint(
+            &state,
+            &def,
+            karmic,
+            0,
+            PlayerId(0),
+            &own_destroyed,
+        ));
+
+        let source_less_destroyed = GameEvent::CreatureDestroyed {
+            object_id: victim,
+            source_id: None,
+        };
+        assert!(!check_trigger_constraint(
+            &state,
+            &def,
+            karmic,
+            0,
+            PlayerId(0),
+            &source_less_destroyed,
+        ));
     }
 
     /// CR 109.5 + CR 603.2: Zone-change causation is captured with the event,
@@ -27978,6 +28045,7 @@ pub mod tests {
         let condition = TriggerCondition::DealtDamageBySourceThisTurn;
         let event = GameEvent::CreatureDestroyed {
             object_id: dying_creature,
+            source_id: None,
         };
 
         // Matching source + matching dying creature → true
@@ -28002,6 +28070,7 @@ pub mod tests {
         // Non-matching dying creature → false
         let wrong_event = GameEvent::CreatureDestroyed {
             object_id: ObjectId(88),
+            source_id: None,
         };
         assert!(!check_trigger_condition(
             &state,
@@ -28057,6 +28126,7 @@ pub mod tests {
         });
         let other_only_event = GameEvent::CreatureDestroyed {
             object_id: other_only_victim,
+            source_id: None,
         };
         assert!(!check_trigger_condition(
             &state,
@@ -28108,6 +28178,7 @@ pub mod tests {
         let condition = TriggerCondition::DealtDamageBySourceThisTurn;
         let event = GameEvent::CreatureDestroyed {
             object_id: dying_creature,
+            source_id: None,
         };
 
         // Same incarnation still on the battlefield → the record is its own → true.
@@ -28202,7 +28273,10 @@ pub mod tests {
         ));
 
         // A non-tap event → false (only PermanentTapped carries the subject).
-        let non_tap = GameEvent::CreatureDestroyed { object_id: tapped };
+        let non_tap = GameEvent::CreatureDestroyed {
+            object_id: tapped,
+            source_id: None,
+        };
         assert!(!check_trigger_condition(
             &state,
             &condition,
@@ -28494,7 +28568,10 @@ pub mod tests {
                     .controller(ControllerRef::You),
             ),
         };
-        let event = GameEvent::CreatureDestroyed { object_id: victim };
+        let event = GameEvent::CreatureDestroyed {
+            object_id: victim,
+            source_id: None,
+        };
 
         assert!(check_trigger_condition(
             &state,
@@ -28506,6 +28583,7 @@ pub mod tests {
 
         let wrong_victim = GameEvent::CreatureDestroyed {
             object_id: ObjectId(99),
+            source_id: None,
         };
         assert!(!check_trigger_condition(
             &state,
