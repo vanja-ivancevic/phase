@@ -1263,12 +1263,7 @@ mod tests {
         });
         ability.ability_index = Some(3);
 
-        resolve(
-            &mut state,
-            &ability,
-            &mut events,
-        )
-        .unwrap();
+        resolve(&mut state, &ability, &mut events).unwrap();
 
         assert_eq!(state.players[0].mana_pool.count_color(ManaType::Red), 1);
         assert_eq!(state.players[0].mana_pool.total(), 1);

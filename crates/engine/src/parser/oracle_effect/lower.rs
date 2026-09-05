@@ -10642,7 +10642,7 @@ fn apply_where_x_to_ability_cost(
         // `apply_where_x_effect_expression` rewriter so a "where X is …" clause
         // flows into the nested effect's count exactly as it does for the
         // sub-ability's effects — never re-implement the per-effect quantity walk.
-        AbilityCost::EffectCost { effect } => {
+        AbilityCost::EffectCost { effect, .. } => {
             apply_where_x_effect_expression(effect, where_x_expression);
         }
         // (the nested effect reports its own unrepresentable where-X binding by

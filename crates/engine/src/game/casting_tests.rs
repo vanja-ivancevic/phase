@@ -6269,6 +6269,7 @@ fn legacy_equip_effect_cost_one_of_is_legal_without_mana_when_discard_available(
                 ),
             ],
         }),
+        player_scope: None,
     };
     let source = create_colorless_tap_activated_source(
         &mut state,
@@ -54791,7 +54792,7 @@ fn land_grant_alt_cost_offered_with_no_lands_in_hand() {
     assert!(
         matches!(
             land_grant_offered_cost(&state, PlayerId(0), land_grant),
-            Some(AbilityCost::EffectCost { ref effect })
+            Some(AbilityCost::EffectCost { ref effect, .. })
                 if matches!(**effect, Effect::RevealHand { .. })
         ),
         "no land cards in hand meets the gate; reveal-hand alt-cost must be offered"

@@ -189,8 +189,8 @@ mod tests {
             .filter_map(|event| match event {
                 GameEvent::CardsRevealed { card_ids, .. } => Some(card_ids.clone()),
                 _ => None,
-        })
-        .collect();
+            })
+            .collect();
         assert_eq!(revealed.len(), 2);
         let revealed_ids: Vec<ObjectId> = revealed.into_iter().flatten().collect();
         assert_eq!(revealed_ids.len(), selected.len());

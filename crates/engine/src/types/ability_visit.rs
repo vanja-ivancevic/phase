@@ -520,7 +520,7 @@ where
     F: FnMut(&Effect) -> ControlFlow<()>,
 {
     match cost {
-        AbilityCost::EffectCost { effect } => visit_effect_scoped(effect, scope, visit)?,
+        AbilityCost::EffectCost { effect, .. } => visit_effect_scoped(effect, scope, visit)?,
         AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
             for sub in costs {
                 visit_cost_scoped(sub, scope, visit)?;

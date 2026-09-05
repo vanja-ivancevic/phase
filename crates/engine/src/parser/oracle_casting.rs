@@ -360,6 +360,19 @@ fn parse_self_alternative_cost_option(
         return Some(option);
     }
 
+    // CR 118.9: A few older cards invert the otherwise-standard sentence
+    // order: "rather than pay this spell's mana cost, you may [action]".
+    // The caller has already peeled a leading `If ...` gate, so this routes the
+    // action through the same typed cost authority as the canonical wording.
+    if let Some(cost_text) = body_lower
+        .strip_prefix("rather than pay this spell's mana cost, you may ")
+        .map(|rest| body[body.len() - rest.len()..].trim())
+    {
+        return Some(SpellCastingOption::alternative_cost(parse_oracle_cost(
+            cost_text,
+        )));
+    }
+
     if let Some(self_ref) = self_spell_phrase(body_lower, card_name) {
         let without_cost = format!("you may cast {self_ref} without paying its mana cost");
         if body_lower == without_cost {
@@ -857,8 +870,8 @@ mod tests {
     use super::*;
     use crate::types::ability::{
         AdditionalCostRepeatability, AggregateFunction, BeholdCostAction, CardSelectionMode,
-        Comparator, ControllerRef, CountScope, FilterProp, ParsedCondition, PlayerScope,
-        QuantityExpr, QuantityRef, TargetFilter, TypeFilter,
+        Comparator, ControllerRef, CountScope, FilterProp, ParsedCondition, PlayerFilter,
+        PlayerScope, QuantityExpr, QuantityRef, TargetFilter, TypeFilter,
     };
     use crate::types::keywords::Keyword;
     use crate::types::mana::{ManaColor, ManaCost};
@@ -1872,6 +1885,40 @@ Trample";
                     .any(|t| matches!(t, TypeFilter::Subtype(s) if s == "Plains")) => {}
             other => panic!("expected TapCreatures + Plains-control condition, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn alt_cost_reversed_effect_cost_retains_player_scope_and_condition() {
+        // Reverent Silence: its action is a real alternative cost, not part of
+        // the spell's resolving effect. The unusual "rather than ... you may"
+        // order must retain both the Forest gate and the every-other-player
+        // scope emitted by the generic effect lowerer.
+        let option = parse_spell_casting_option_line(
+            "If you control a Forest, rather than pay this spell's mana cost, you may have each other player gain 6 life.",
+            "Reverent Silence",
+        )
+        .expect("conditional reversed alternative cost should parse");
+
+        assert!(
+            matches!(
+                option,
+                SpellCastingOption {
+                kind: crate::types::ability::SpellCastingOptionKind::AlternativeCost,
+                cost: Some(AbilityCost::EffectCost {
+                    ref effect,
+                        player_scope: Some(PlayerFilter::Opponent),
+                    }),
+                    condition: Some(ParsedCondition::QuantityComparison { .. }),
+                } if matches!(
+                    effect.as_ref(),
+                    crate::types::ability::Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 6 },
+                        ..
+                    }
+                )
+            ),
+            "got {option:?}"
+        );
     }
 
     #[test]

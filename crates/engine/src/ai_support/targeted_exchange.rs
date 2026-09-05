@@ -1086,6 +1086,7 @@ mod tests {
     fn fight_cost() -> AbilityCost {
         AbilityCost::EffectCost {
             effect: Box::new(fight_effect()),
+            player_scope: None,
         }
     }
 

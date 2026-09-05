@@ -41,7 +41,7 @@ fn braid_of_fire_cumulative_upkeep_adds_red_for_each_age_counter() {
     match &runner.state().waiting_for {
         WaitingFor::UnlessPayment { cost, .. } => assert!(matches!(
             cost,
-            AbilityCost::EffectCost { effect }
+            AbilityCost::EffectCost { effect, .. }
                 if matches!(
                     effect.as_ref(),
                     Effect::Mana {
@@ -102,6 +102,7 @@ fn fixed_mana_effect_cost_pays_into_the_unless_payers_mana_pool() {
                 expiry: None,
                 target: None,
             }),
+            player_scope: None,
         },
         pending_effect: Box::new(pending_effect),
         trigger_event: None,

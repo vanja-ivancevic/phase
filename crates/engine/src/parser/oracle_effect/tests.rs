@@ -78,7 +78,10 @@ fn paired_land_type_choices_feed_second_chosen_type_modification() {
         ..
     } = replacement.effect.as_ref()
     else {
-        panic!("expected end-of-turn replacement effect, got {:?}", replacement.effect);
+        panic!(
+            "expected end-of-turn replacement effect, got {:?}",
+            replacement.effect
+        );
     };
     assert_eq!(static_abilities.len(), 1);
     assert!(static_abilities[0]
@@ -92,9 +95,7 @@ fn paired_land_type_choices_feed_second_chosen_type_modification() {
         panic!("expected typed land filter, got {affected:?}");
     };
     assert!(typed.type_filters.contains(&TypeFilter::Land));
-    assert!(typed
-        .properties
-        .contains(&FilterProp::IsChosenLandType));
+    assert!(typed.properties.contains(&FilterProp::IsChosenLandType));
 }
 
 /// CR 608.2b: Gilded Drake's final sentence is a declarative targeting rider.
@@ -129,10 +130,9 @@ fn gilded_drake_illegal_target_rider_is_absorbed_without_gap() {
         "Gilded Drake's targeting rider must not leave a parser gap: {effects:#?}"
     );
     assert!(
-        effects.iter().any(|effect| matches!(
-            effect,
-            Effect::ExchangeControl { .. }
-        )),
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::ExchangeControl { .. })),
         "the supported exchange instruction must remain in the chain: {effects:#?}"
     );
     assert!(
@@ -210,8 +210,8 @@ fn wild_dogs_full_oracle_text_has_dynamic_control_handoff() {
             .or_else(|| ability.else_ability.as_deref().and_then(find_give_control))
     }
 
-    let Effect::GiveControl { recipient, .. } = find_give_control(execute)
-        .expect("upkeep trigger must contain GiveControl")
+    let Effect::GiveControl { recipient, .. } =
+        find_give_control(execute).expect("upkeep trigger must contain GiveControl")
     else {
         unreachable!();
     };
@@ -8768,7 +8768,7 @@ fn blazing_salvo_unless_have_deal_damage() {
         .expect("Blazing Salvo must attach unless_pay");
     assert_eq!(unless_pay.payer, TargetFilter::ParentTargetController);
     match &unless_pay.cost {
-        AbilityCost::EffectCost { effect } => match effect.as_ref() {
+        AbilityCost::EffectCost { effect, .. } => match effect.as_ref() {
             Effect::DealDamage {
                 amount: QuantityExpr::Fixed { value: 5 },
                 ..
@@ -8841,7 +8841,7 @@ fn lava_blister_its_controller_unless_have_deal_damage() {
         .expect("Lava Blister must attach unless_pay");
     assert_eq!(unless_pay.payer, TargetFilter::ParentTargetController);
     match &unless_pay.cost {
-        AbilityCost::EffectCost { effect } => match effect.as_ref() {
+        AbilityCost::EffectCost { effect, .. } => match effect.as_ref() {
             Effect::DealDamage {
                 amount: QuantityExpr::Fixed { value: 6 },
                 target: TargetFilter::Player,
@@ -8871,7 +8871,7 @@ fn decoy_gambit_unless_have_you_draw_a_card() {
         .expect("Decoy Gambit bounce line must attach unless_pay");
     assert_eq!(unless_pay.payer, TargetFilter::ParentTargetController);
     match &unless_pay.cost {
-        AbilityCost::EffectCost { effect } => match effect.as_ref() {
+        AbilityCost::EffectCost { effect, .. } => match effect.as_ref() {
             Effect::Draw {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::OriginalController,
@@ -8899,7 +8899,7 @@ fn molten_influence_unless_have_deal_damage() {
         .expect("Molten Influence must attach unless_pay");
     assert_eq!(unless_pay.payer, TargetFilter::ParentTargetController);
     match &unless_pay.cost {
-        AbilityCost::EffectCost { effect } => match effect.as_ref() {
+        AbilityCost::EffectCost { effect, .. } => match effect.as_ref() {
             Effect::DealDamage {
                 amount: QuantityExpr::Fixed { value: 4 },
                 target: TargetFilter::Player,
@@ -8928,7 +8928,7 @@ fn skullscorch_unless_that_player_have_deal_damage() {
         .expect("Skullscorch must attach unless_pay");
     assert_eq!(unless_pay.payer, TargetFilter::Player);
     match &unless_pay.cost {
-        AbilityCost::EffectCost { effect } => match effect.as_ref() {
+        AbilityCost::EffectCost { effect, .. } => match effect.as_ref() {
             Effect::DealDamage {
                 amount: QuantityExpr::Fixed { value: 4 },
                 target: TargetFilter::Player,
@@ -19797,7 +19797,10 @@ fn undiscovered_paradise_keeps_delayed_return_after_mana_head() {
         .sub_ability
         .as_deref()
         .expect("mana head must retain the delayed return");
-    let Effect::CreateDelayedTrigger { condition, effect, .. } = &*delayed.effect else {
+    let Effect::CreateDelayedTrigger {
+        condition, effect, ..
+    } = &*delayed.effect
+    else {
         panic!("expected delayed return, got {:?}", delayed.effect);
     };
     assert_eq!(

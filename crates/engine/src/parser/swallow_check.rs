@@ -30,7 +30,7 @@ use super::oracle_ir::feature::{
 };
 use super::swallow_evidence::UnitEvidence;
 use crate::types::ability::{
-    AbilityCondition, AbilityDefinition, ActivationRestriction, CastingPermission, Comparator,
+    AbilityCondition, AbilityCost, AbilityDefinition, ActivationRestriction, CastingPermission, Comparator,
     ContinuousModification, CopyRetargetPermission, DamageModification, DelayedTriggerCondition,
     DoubleTarget, Duration, Effect, FilterProp, ManaProduction, ModalSelectionConstraint,
     OpponentMayScope, ParsedCondition, PlayerFilter, QuantityExpr, QuantityRef,
@@ -219,7 +219,7 @@ pub(crate) fn check_swallowed_clauses(
         detect_condition_as_long_as(&cleaned, fragment, &evidence, &scoped, &mut found);
         detect_duration_this_turn(&cleaned, fragment, &evidence, &mut found);
         detect_duration_next_turn(&cleaned, fragment, &evidence, &mut found);
-        detect_optional_may_have(&cleaned, fragment, &evidence, &mut found);
+        detect_optional_may_have(&cleaned, fragment, &scoped, &evidence, &mut found);
         detect_apnap(&cleaned, fragment, &scoped, &mut found);
         detect_modal_dynamic_max_dropped(&cleaned, fragment, &evidence, &mut found);
 
@@ -5012,11 +5012,28 @@ fn detect_duration_next_turn(
 fn detect_optional_may_have(
     cleaned: &str,
     original: &str,
+    parsed: &ParsedAbilities,
     evidence: &UnitEvidence,
     diagnostics: &mut Vec<OracleDiagnostic>,
 ) {
     let has_marker = cleaned.contains("may have ") || cleaned.contains("you may have "); // allow-noncombinator: swallow detector marker scan on classified text
     if !has_marker {
+        return;
+    }
+    // CR 118.9: a reverse-form alternative cost can make another player gain
+    // life: "rather than pay this spell's mana cost, you may have each other
+    // player gain 6 life." This is not the causative optional effect this
+    // detector normally audits. The casting option itself is the player's
+    // optional choice, and its typed effect cost carries the life-gain action.
+    // Keep this deliberately grammar- and carrier-specific: an unrelated
+    // casting option on the same audit unit must not suppress a real "may
+    // have" omission.
+    if cleaned.contains("rather than pay this spell's mana cost, you may have ")
+        && parsed
+            .casting_options
+            .iter()
+            .any(|option| matches!(option.cost, Some(AbilityCost::EffectCost { .. })))
+    {
         return;
     }
     // The "have causative" parser produces effects that recursively contain

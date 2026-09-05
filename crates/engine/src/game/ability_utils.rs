@@ -5734,7 +5734,9 @@ fn concretize_granting_object_in_cost(cost: &mut AbilityCost, granter: ObjectId)
                 concretize_granting_object_in_cost(c, granter);
             }
         }
-        AbilityCost::EffectCost { effect } => concretize_granting_object_in_effect(effect, granter),
+        AbilityCost::EffectCost { effect, .. } => {
+            concretize_granting_object_in_effect(effect, granter)
+        }
         _ => {}
     }
 }

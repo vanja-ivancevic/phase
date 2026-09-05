@@ -1351,7 +1351,7 @@ fn pay_ability_cost_inner(
         // A replacement on the resulting event can still require a player
         // choice, which parks the payment as `Paused` in the `PutCounter` arm
         // below.
-        AbilityCost::EffectCost { effect } => {
+        AbilityCost::EffectCost { effect, .. } => {
             use crate::types::ability::Effect;
             match effect.as_ref() {
                 Effect::PutCounter {
@@ -2176,7 +2176,7 @@ pub(crate) fn resolution_cost_includes_impossible_event(
             counter_kind,
             count,
         } => player_counter_gain_is_prohibited(state, payer, *counter_kind, *count),
-        AbilityCost::EffectCost { effect } => match effect.as_ref() {
+        AbilityCost::EffectCost { effect, .. } => match effect.as_ref() {
             // CR 614.17b + CR 702.24a: cumulative upkeep's source-counter effect-cost shape.
             Effect::PutCounter {
                 counter_type,
@@ -2609,6 +2609,7 @@ mod tests {
                     count: QuantityExpr::Fixed { value: 1 },
                     target: TargetFilter::SelfRef,
                 }),
+                player_scope: None,
             },
             AbilityCost::PerCounter { .. } => AbilityCost::PerCounter {
                 counter: CounterType::Age,
@@ -2728,6 +2729,7 @@ mod tests {
                     count: QuantityExpr::Fixed { value: 1 },
                     target: TargetFilter::SelfRef,
                 }),
+                player_scope: None,
             },
             AbilityCost::PerCounter {
                 counter: CounterType::Age,
@@ -3782,6 +3784,7 @@ mod tests {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::SelfRef,
             }),
+            player_scope: None,
         };
 
         // (i) Reach guard: the same cost on the same board is payable before the

@@ -39,7 +39,7 @@ fn cumulative_upkeep_typed_effect_cost_survives_deserialization() {
 
     assert!(matches!(
         keyword,
-        Keyword::CumulativeUpkeep(AbilityCost::EffectCost { effect })
+        Keyword::CumulativeUpkeep(AbilityCost::EffectCost { effect, .. })
             if matches!(
                 effect.as_ref(),
                 Effect::PutCounter {
@@ -78,6 +78,7 @@ fn aboroth_cumulative_upkeep_scales_and_pays_source_counter_effect_cost() {
             cost,
             AbilityCost::EffectCost {
                 effect,
+                ..
             } if matches!(
                 effect.as_ref(),
                 Effect::PutCounter {
@@ -185,7 +186,7 @@ fn aboroth_cumulative_upkeep_payment_ordered_by_two_replacements_is_still_paid()
                 assert!(
                     matches!(
                         cost,
-                        AbilityCost::EffectCost { effect } if matches!(
+                        AbilityCost::EffectCost { effect, .. } if matches!(
                             effect.as_ref(),
                             Effect::PutCounter {
                                 counter_type: CounterType::Minus1Minus1,
@@ -440,7 +441,7 @@ fn install_cumulative_upkeep_count(runner: &mut GameRunner, source: ObjectId, co
         .filter_map(|branch| branch.unless_pay.as_mut())
         .find_map(|unless| match &mut unless.cost {
             AbilityCost::PerCounter { base, .. } => match base.as_mut() {
-                AbilityCost::EffectCost { effect } => match effect.as_mut() {
+                AbilityCost::EffectCost { effect, .. } => match effect.as_mut() {
                     Effect::PutCounter { count, .. } => Some(count),
                     _ => None,
                 },
@@ -467,7 +468,7 @@ fn assert_unless_payment_carries_count(runner: &GameRunner, expected: &QuantityE
             assert!(
                 matches!(
                     cost,
-                    AbilityCost::EffectCost { effect } if matches!(
+                    AbilityCost::EffectCost { effect, .. } if matches!(
                         effect.as_ref(),
                         Effect::PutCounter {
                             counter_type: CounterType::Minus1Minus1,

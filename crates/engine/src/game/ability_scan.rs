@@ -5097,7 +5097,7 @@ fn scan_ability_cost(cost: &AbilityCost, mode: ScanMode) -> Axes {
             base,
         } => scan_target_filter(target, FilterReadContext::SnapshotOrEvent, mode)
             .or(scan_ability_cost(base, mode)),
-        AbilityCost::EffectCost { effect } => scan_effect(effect, mode),
+        AbilityCost::EffectCost { effect, .. } => scan_effect(effect, mode),
         // Fixed / bounded / structural costs: no dynamic board read (a
         // board-reading tap/exile aggregate that varies the *reduction* is caught
         // by the cost-keyword classifier, not here).

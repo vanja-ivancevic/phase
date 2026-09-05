@@ -16,8 +16,8 @@ use super::lower::BOUNDED_TARGET_CARDINALITIES;
 use super::{resolve_it_pronoun, ParseContext};
 use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, ChosenSubtypeKind, ColorChangeMode, ContinuousModification,
-    AggregateFunction, ControllerRef, Duration, EachDamageRecipient, Effect, EffectScope,
+    AbilityDefinition, AbilityKind, AggregateFunction, ChosenSubtypeKind, ColorChangeMode,
+    ContinuousModification, ControllerRef, Duration, EachDamageRecipient, Effect, EffectScope,
     FilterProp, MultiTargetSpec, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PtValue,
     QuantityExpr, QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
 };
@@ -2738,9 +2738,7 @@ pub(super) fn parse_subject_application(
     .is_ok()
     {
         return subject_filter_application(
-            TargetFilter::Typed(
-                TypedFilter::land().properties(vec![FilterProp::IsChosenLandType]),
-            ),
+            TargetFilter::Typed(TypedFilter::land().properties(vec![FilterProp::IsChosenLandType])),
             false,
         );
     }
@@ -8315,10 +8313,7 @@ mod tests {
             strip_trailing_subject_adverb("that player SIMULTANEOUSLY"),
             "that player"
         );
-        assert_eq!(
-            strip_trailing_subject_adverb("that player"),
-            "that player"
-        );
+        assert_eq!(strip_trailing_subject_adverb("that player"), "that player");
 
         let def = super::super::parse_effect_chain(
             "Choose target artifact a player controls and target artifact card in that player's graveyard. If both targets are still legal as this ability resolves, that player simultaneously sacrifices the artifact and returns the artifact card to the battlefield.",

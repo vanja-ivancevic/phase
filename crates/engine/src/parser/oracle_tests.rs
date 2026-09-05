@@ -8126,7 +8126,7 @@ fn land_grant_reveal_hand_alternative_cost_option() {
     );
     assert!(matches!(
         r.casting_options[0].cost,
-        Some(AbilityCost::EffectCost { ref effect })
+        Some(AbilityCost::EffectCost { ref effect, .. })
             if matches!(**effect, Effect::RevealHand { .. })
     ));
     assert!(matches!(
@@ -8148,6 +8148,46 @@ fn land_grant_reveal_hand_alternative_cost_option() {
     );
 }
 
+// CR 118.9 + CR 119.3: Reverent Silence's condition-first, reversed-order
+// alternative cost must be registered on the card and retain the every-other-
+// player life-gain payment scope; it is not a resolving spell instruction.
+#[test]
+fn reverent_silence_conditional_scoped_life_gain_alternative_cost() {
+    let r = parse(
+        "If you control a Forest, rather than pay this spell's mana cost, you may have each other player gain 6 life.\nDestroy all enchantments.",
+        "Reverent Silence",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    assert!(
+        matches!(
+            r.casting_options.as_slice(),
+            [SpellCastingOption {
+                cost: Some(AbilityCost::EffectCost {
+                    effect,
+                    player_scope: Some(crate::types::ability::PlayerFilter::Opponent),
+                }),
+                condition: Some(ParsedCondition::QuantityComparison { .. }),
+                ..
+            }] if matches!(
+                effect.as_ref(),
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 6 },
+                    ..
+                }
+            )
+        ),
+        "got {:#?}",
+        r.casting_options
+    );
+    assert!(
+        r.parse_warnings.is_empty(),
+        "warnings: {:#?}",
+        r.parse_warnings
+    );
+}
+
 #[test]
 fn void_keeps_its_chosen_number_as_a_mana_value_filter() {
     let parsed = parse(
@@ -8160,14 +8200,17 @@ fn void_keeps_its_chosen_number_as_a_mana_value_filter() {
     assert!(parsed.parse_warnings.is_empty(), "{parsed:#?}");
 
     let choose = parsed.abilities.first().expect("choose-number ability");
-    assert!(matches!(
-        choose.effect.as_ref(),
-        Effect::Choose {
-            choice_type: ChoiceType::NumberRange { .. },
-            persist: true,
-            ..
-        }
-    ), "{choose:#?}");
+    assert!(
+        matches!(
+            choose.effect.as_ref(),
+            Effect::Choose {
+                choice_type: ChoiceType::NumberRange { .. },
+                persist: true,
+                ..
+            }
+        ),
+        "{choose:#?}"
+    );
 
     let destroy = choose
         .sub_ability
@@ -8176,13 +8219,19 @@ fn void_keeps_its_chosen_number_as_a_mana_value_filter() {
     let Effect::DestroyAll { target, .. } = destroy.effect.as_ref() else {
         panic!("expected destroy-all clause, got {:?}", destroy.effect);
     };
-    assert!(target_has_controller_chosen_number_mana_value(target), "{target:#?}");
+    assert!(
+        target_has_controller_chosen_number_mana_value(target),
+        "{target:#?}"
+    );
 
     let reveal = destroy
         .sub_ability
         .as_ref()
         .expect("reveal clause follows the destruction");
-    assert!(matches!(reveal.effect.as_ref(), Effect::RevealHand { .. }), "{reveal:#?}");
+    assert!(
+        matches!(reveal.effect.as_ref(), Effect::RevealHand { .. }),
+        "{reveal:#?}"
+    );
 
     let discard = reveal
         .sub_ability
@@ -9768,7 +9817,7 @@ fn ability_word_prefixed_activated_ability_preserves_restrictions() {
     assert_eq!(ability.kind, AbilityKind::Activated);
     assert!(matches!(
         ability.cost.as_ref(),
-        Some(AbilityCost::EffectCost { effect })
+        Some(AbilityCost::EffectCost { effect, .. })
             if matches!(effect.as_ref(), Effect::PutAtLibraryPosition { .. })
     ));
     assert!(matches!(

@@ -1640,12 +1640,8 @@ then lose that much life.";
             "the player with the most life gains control of ~",
             AbilityKind::Spell,
         );
-        let resolved = ResolvedAbility::new(
-            def.effect.as_ref().clone(),
-            Vec::new(),
-            source,
-            PlayerId(0),
-        );
+        let resolved =
+            ResolvedAbility::new(def.effect.as_ref().clone(), Vec::new(), source, PlayerId(0));
         let mut events = Vec::new();
         resolve_give(&mut state, &resolved, &mut events).expect("handoff resolves");
         state.layers_dirty.mark_full();

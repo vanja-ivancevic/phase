@@ -943,8 +943,80 @@ fn spell_alternative_cost_is_payable(
         AbilityCost::Composite { costs } => costs
             .iter()
             .all(|sub_cost| spell_alternative_cost_is_payable(state, player, object_id, sub_cost)),
+        // CR 118.3 + CR 119.3 + CR 119.7: An effect-cost that has each
+        // selected player gain life is payable only if every selected player
+        // can actually gain it.  The normal `AbilityCost::is_payable` path has
+        // no spell-cost context for this retained player scope.
+        AbilityCost::EffectCost {
+            effect,
+            player_scope: Some(scope),
+        } if matches!(effect.as_ref(), Effect::GainLife { .. }) => state
+            .players
+            .iter()
+            .filter(|candidate| {
+                super::effects::matches_player_scope(state, candidate.id, scope, player, object_id)
+            })
+            .all(|candidate| {
+                !super::static_abilities::player_has_cant_gain_life(state, candidate.id)
+            }),
         other => other.is_payable(state, player, object_id),
     }
+}
+
+/// CR 118.3 + CR 119.3: Execute a deterministic life-gain effect cost for
+/// every player selected by its retained Oracle subject. `EffectCost` carries
+/// the action and `player_scope` carries the enclosing "each ... player"
+/// grammar that an `Effect` alone cannot represent.
+fn pay_scoped_life_gain_effect_cost(
+    state: &mut GameState,
+    payer: PlayerId,
+    source_id: ObjectId,
+    effect: &Effect,
+    player_scope: &crate::types::ability::PlayerFilter,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
+    let Effect::GainLife { amount, .. } = effect else {
+        return Err(EngineError::ActionNotAllowed(
+            "Only life-gain effect costs support a player scope".to_string(),
+        ));
+    };
+    let recipients: Vec<PlayerId> = state
+        .players
+        .iter()
+        .filter(|candidate| {
+            super::effects::matches_player_scope(
+                state,
+                candidate.id,
+                player_scope,
+                payer,
+                source_id,
+            )
+        })
+        .map(|candidate| candidate.id)
+        .collect();
+    if recipients
+        .iter()
+        .any(|recipient| super::static_abilities::player_has_cant_gain_life(state, *recipient))
+    {
+        return Err(EngineError::ActionNotAllowed(
+            "A player required to gain life cannot gain life".to_string(),
+        ));
+    }
+    let amount =
+        super::quantity::resolve_quantity_with_targets(state, amount, ability).max(0) as u32;
+    for recipient in recipients {
+        // A replacement-ordering choice during cost payment needs a resumable
+        // multi-recipient frame. Refuse this exceptional board state until that
+        // existing replacement continuation has such a frame, rather than
+        // silently losing a payment event.
+        if super::effects::life::apply_life_gain(state, recipient, amount, events).is_err() {
+            return Err(EngineError::ActionNotAllowed(
+                "A life-gain replacement choice cannot yet be paid as this cost".to_string(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn eligible_behold_choices(
@@ -7526,6 +7598,29 @@ fn pay_additional_cost_with_source(
         cost
     };
 
+    // CR 118.3 + CR 119.3: Effect-costs retain a player scope when the Oracle
+    // cost reads "have each other player gain N life".  Pay the deterministic
+    // life-gain events before the spell is cast; neither this cast nor a later
+    // spell resolution may occur between those events.
+    if let AbilityCost::EffectCost {
+        effect,
+        player_scope: Some(scope),
+    } = &cost
+    {
+        if matches!(effect.as_ref(), Effect::GainLife { .. }) {
+            pay_scoped_life_gain_effect_cost(
+                state,
+                player,
+                pending.object_id,
+                effect,
+                scope,
+                &pending.ability,
+                events,
+            )?;
+            return finish_pending_cost_or_cast(state, player, pending, events);
+        }
+    }
+
     // CR 601.2b + CR 601.2h: Legacy card data represents an optional
     // "exile any number of [quality] cards" cost as ChangeZone. Surface every
     // eligible card and allow the caster to select any subset.
@@ -8251,7 +8346,7 @@ pub(crate) fn is_exile_any_number_effect_cost(cost: &AbilityCost) -> bool {
 fn exile_any_number_effect_cost_parts(
     cost: &AbilityCost,
 ) -> Option<(ExileCostSourceZone, &TargetFilter)> {
-    let AbilityCost::EffectCost { effect } = cost else {
+    let AbilityCost::EffectCost { effect, .. } = cost else {
         return None;
     };
     let Effect::ChangeZone {
@@ -14161,9 +14256,9 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::types::ability::{
         AbilityCost, AbilityDefinition, AbilityKind, Comparator, ControllerRef, Effect, FilterProp,
-        ManaContribution, ManaProduction, PtStat, PtValue, PtValueScope, QuantityExpr,
-        ReplacementDefinition, ReplacementMode, StaticDefinition, TargetFilter, TargetRef,
-        TriggerDefinition, TypeFilter, TypedFilter,
+        ManaContribution, ManaProduction, PlayerFilter, PtStat, PtValue, PtValueScope,
+        QuantityExpr, ReplacementDefinition, ReplacementMode, StaticDefinition, TargetFilter,
+        TargetRef, TriggerDefinition, TypeFilter, TypedFilter,
     };
     use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
@@ -25014,5 +25109,32 @@ its replicate cost was paid.)\nDraw a card.";
             None,
             "the in-flight graveyard origin must outrank the stale Hand stamp"
         );
+    }
+
+    #[test]
+    fn scoped_life_gain_effect_cost_pays_each_other_player() {
+        let mut state = GameState::new_two_player(42);
+        let payer = PlayerId(0);
+        let opponent = PlayerId(1);
+        let ability = ResolvedAbility::new(Effect::NoOp, Vec::new(), ObjectId(700), payer);
+        let effect = Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 6 },
+            player: TargetFilter::Controller,
+        };
+        let mut events = Vec::new();
+
+        pay_scoped_life_gain_effect_cost(
+            &mut state,
+            payer,
+            ObjectId(700),
+            &effect,
+            &PlayerFilter::Opponent,
+            &ability,
+            &mut events,
+        )
+        .expect("a deterministic scoped life-gain cost should be payable");
+
+        assert_eq!(state.players[payer.0 as usize].life, 20);
+        assert_eq!(state.players[opponent.0 as usize].life, 26);
     }
 }
