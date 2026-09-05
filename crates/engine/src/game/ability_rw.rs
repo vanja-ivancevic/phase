@@ -2874,6 +2874,9 @@ fn legacy_continuous_modification(m: &ContinuousModification) -> bool {
         | ContinuousModification::GrantAllTriggeredAbilitiesOf { source } => {
             legacy_target_filter(source)
         }
+        ContinuousModification::CopyTopOfZone {
+            controller, filter, ..
+        } => legacy_controller_ref(controller) || legacy_target_filter(filter),
         ContinuousModification::SetDynamicPower { value }
         | ContinuousModification::SetDynamicToughness { value }
         | ContinuousModification::SetPowerDynamic { value }

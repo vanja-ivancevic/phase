@@ -7790,6 +7790,7 @@ pub(crate) fn render_modification_descriptions(
         ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
         | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
         | ContinuousModification::CopyValues { .. }
+        | ContinuousModification::CopyTopOfZone { .. }
         | ContinuousModification::CopyChosen
         | ContinuousModification::SetName { .. }
         | ContinuousModification::SetTextName { .. }

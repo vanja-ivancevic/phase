@@ -10409,6 +10409,7 @@ fn apply_where_x_continuous_modification(
         // Keep this wildcard-free so a future QuantityExpr-carrying variant
         // forces a deliberate where-X decision.
         ContinuousModification::CopyValues { .. }
+        | ContinuousModification::CopyTopOfZone { .. }
         // CR 707.2c (Metamorphic Alteration): inert copy marker — no where-X carrier.
         | ContinuousModification::CopyChosen
         | ContinuousModification::SetName { .. }
@@ -10511,6 +10512,7 @@ fn rebind_target_anaphor_continuous_modification(modification: &mut ContinuousMo
         ContinuousModification::AddCounterOnEnter { .. }
         | ContinuousModification::SetStartingLoyalty { .. } => {}
         ContinuousModification::CopyValues { .. }
+        | ContinuousModification::CopyTopOfZone { .. }
         // CR 707.2c (Metamorphic Alteration): inert copy marker — no where-X carrier.
         | ContinuousModification::CopyChosen
         | ContinuousModification::SetName { .. }

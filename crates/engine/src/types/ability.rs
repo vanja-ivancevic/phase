@@ -25297,15 +25297,25 @@ impl TriggerBaseSetInstanceRef {
 #[serde(transparent)]
 pub struct TriggerGrantInstanceRef(pub u64);
 
-/// Exact Layer-1 origin of a winning `CopyValues` continuous effect.
+/// Exact Layer-1 origin of a winning copy effect.
 ///
-/// The transient continuous-effect id is already serialized and monotonic; the
-/// modification index distinguishes two `CopyValues` modifications installed by
-/// the same effect.
+/// Most copies are resolution-created and retain the monotonic transient id.
+/// A continuous static can instead read its donor live from an ordered zone, so
+/// it needs the same stable source-definition identity that trigger producers
+/// use. Keeping both origins explicit prevents an invented transient id from
+/// colliding with a real resolving copy effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct CopyEffectInstanceRef {
-    pub continuous_effect_id: u64,
-    pub modification_index: usize,
+#[serde(tag = "type")]
+pub enum CopyEffectInstanceRef {
+    Transient {
+        continuous_effect_id: u64,
+        modification_index: usize,
+    },
+    Static {
+        source: ObjectIncarnationRef,
+        definition_index: usize,
+        modification_index: usize,
+    },
 }
 
 /// Payload-free identity of the continuous-effect occurrence which produced a
@@ -27419,6 +27429,20 @@ pub enum ContinuousModification {
         /// `None` for printed-card sources.
         #[serde(default)]
         token_image_ref: Option<TokenImageRef>,
+    },
+    /// CR 613.1a + CR 707.2: continuously copy the copiable values of the
+    /// qualifying top card of an ordered player zone. Unlike `CopyValues`, the
+    /// donor is deliberately re-read on every layer pass: this is a printed
+    /// static, not a resolving effect whose values lock when it begins.
+    ///
+    /// `zone` is intentionally a normal `Zone` so the representation can serve
+    /// both library- and graveyard-top copy effects. The runtime admits only
+    /// zones with a rules-defined top (currently Library and Graveyard), and
+    /// declines an unsupported zone rather than guessing an order.
+    CopyTopOfZone {
+        zone: crate::types::zones::Zone,
+        controller: ControllerRef,
+        filter: TargetFilter,
     },
     /// CR 707.2c + CR 613.1a: Parse-time MARKER for the static ability
     /// "enchanted creature is a copy of the chosen creature" (Metamorphic
