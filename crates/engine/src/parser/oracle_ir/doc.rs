@@ -1448,6 +1448,7 @@ fn stamp_effect_printed_slot(effect: &mut Effect, slot: usize, kind: PrintedItem
         Effect::CounterAll { .. } => {}
         Effect::GainLife { .. } => {}
         Effect::LoseLife { .. } => {}
+        Effect::LoseAllUnspentMana { .. } => {}
         Effect::SetTapState { .. } => {}
         Effect::RemoveCounter { .. } => {}
         Effect::Sacrifice { .. } => {}

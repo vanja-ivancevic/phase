@@ -674,6 +674,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             }
             acc
         }
+        Effect::LoseAllUnspentMana { player } => scan_target_filter(player, target_ctx, mode),
         Effect::SetTapState {
             target,
             scope: _,
@@ -6015,6 +6016,7 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         // Effect variant is a compile error until classified census-vs-snapshot.
         Effect::GainLife { .. }
         | Effect::LoseLife { .. }
+        | Effect::LoseAllUnspentMana { .. }
         | Effect::StartYourEngines { .. }
         | Effect::ChangeSpeed { .. }
         | Effect::DealDamage { .. }
@@ -6416,6 +6418,7 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         // scale with the battlefield growth class.
         Effect::GainLife { .. }
         | Effect::LoseLife { .. }
+        | Effect::LoseAllUnspentMana { .. }
         | Effect::StartYourEngines { .. }
         | Effect::ChangeSpeed { .. }
         | Effect::DealDamage { .. }
@@ -6635,6 +6638,7 @@ pub(crate) fn effect_is_randomness_bearing(e: &Effect) -> bool {
         //     exhaustiveness (every variant named; no wildcard). ---
         Effect::GainLife { .. }
         | Effect::LoseLife { .. }
+        | Effect::LoseAllUnspentMana { .. }
         | Effect::StartYourEngines { .. }
         | Effect::ChangeSpeed { .. }
         | Effect::DealDamage { .. }

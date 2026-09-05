@@ -808,6 +808,7 @@ where
         | Effect::CounterAll { .. }
         | Effect::GainLife { .. }
         | Effect::LoseLife { .. }
+        | Effect::LoseAllUnspentMana { .. }
         | Effect::ExchangeLifeWithStat { .. }
         | Effect::ExchangeLifeTotals { .. }
         // CR 701.26a/b: all tap/untap scopes are leaf effects here.

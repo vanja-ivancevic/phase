@@ -155,6 +155,7 @@ mod intensify_tests;
 pub mod investigate;
 pub mod learn;
 pub mod life;
+pub mod mana_loss;
 pub mod mana;
 pub mod manifest;
 pub mod manifest_dread;
@@ -5214,6 +5215,7 @@ pub fn resolve_effect(
         Effect::Token { .. } => token::resolve(state, ability, events),
         Effect::GainLife { .. } => life::resolve_gain(state, ability, events),
         Effect::LoseLife { .. } => life::resolve_lose(state, ability, events),
+        Effect::LoseAllUnspentMana { .. } => mana_loss::resolve(state, ability, events),
         // CR 701.26a/b: scope (Single vs All) and state (Tap vs Untap) are
         // dispatched inside `resolve_set_tap_state`.
         Effect::SetTapState { .. } => tap_untap::resolve_set_tap_state(state, ability, events),

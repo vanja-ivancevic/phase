@@ -9197,6 +9197,20 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     {
         return parsed_clause(Effect::NoOp);
     }
+    // CR 106.4: This is an instruction-driven mana-loss event, not a mana
+    // payment and not the automatic emptying that occurs as steps and phases
+    // end. Keep the player target on the effect so the ordinary target-binding
+    // path also supplies the following "lands they control" clause.
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "target player loses all unspent mana",
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        return parsed_clause(Effect::LoseAllUnspentMana {
+            player: TargetFilter::Player,
+        });
+    }
     // CR 608.2d + CR 608.2c: A single instruction may announce multiple named
     // choices ("choose a land type and a basic land type") before a following
     // sentence consumes both values.  The ordinary named-choice parser is
