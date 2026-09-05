@@ -872,6 +872,20 @@ fn is_replacement_pattern_head_scoped(lower: &str) -> bool {
         return true;
     }
 
+    // CR 614.12 + CR 119.4: a self-entry payment such as Phyrexian
+    // Processor's "As this artifact enters, pay any amount of life" modifies
+    // the entry event.  It must reach the replacement parser rather than the
+    // ordinary effect path, which has no pre-entry payment timing.  Keep this
+    // deliberately narrower than a blanket `as ... enters` classifier: choice,
+    // copy, and external-entry forms have their own guards, while this one is
+    // exactly the reusable zero-or-more-life payment grammar.
+    if lower_starts_with(lower, "as ")
+        && (scan_contains(lower, "enters, pay any amount of life")
+            || scan_contains(lower, "enters the battlefield, pay any amount of life"))
+    {
+        return true;
+    }
+
     is_replacement_compound_pattern(lower)
 }
 
@@ -1290,6 +1304,20 @@ mod tests {
         let lower = "each other vehicle and creature you control enters with an additional +1/+1 counter on it if its mana value is 4 or less. otherwise, it enters with three additional +1/+1 counters on it.";
         assert!(is_static_pattern(lower));
         assert!(is_replacement_pattern(lower));
+    }
+
+    #[test]
+    fn classifies_as_enters_pay_any_amount_of_life_as_replacement() {
+        assert!(is_replacement_pattern(
+            "as this artifact enters, pay any amount of life."
+        ));
+        assert!(is_replacement_pattern(
+            "as this creature enters the battlefield, pay any amount of life."
+        ));
+        assert!(
+            !is_replacement_pattern("when this artifact enters, you may pay any amount of life."),
+            "a post-entry trigger is not an entry replacement"
+        );
     }
 
     // -------------------------------------------------------------------
