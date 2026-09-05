@@ -8361,7 +8361,7 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
     #[test]
     fn mana_short_has_targeted_unspent_mana_loss_without_unimplemented_text() {
         let parsed = parse_named(
-            "Target player loses all unspent mana and taps all lands they control.",
+            "Tap all lands target player controls and that player loses all unspent mana.",
             "Mana Short",
             &["Instant"],
         );
@@ -8374,12 +8374,20 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         let mana_loss = parsed
             .abilities
             .iter()
-            .find_map(|definition| match definition.effect.as_ref() {
-                Effect::LoseAllUnspentMana { player } => Some(player),
-                _ => None,
+            .find_map(|definition| {
+                let mut found = None;
+                super::visit_ability_def(definition, &mut |effect| {
+                    if let Effect::LoseAllUnspentMana { player } = effect {
+                        found = Some(player);
+                        std::ops::ControlFlow::Break(())
+                    } else {
+                        std::ops::ControlFlow::Continue(())
+                    }
+                });
+                found
             })
             .expect("Mana Short must retain its unspent-mana-loss instruction");
-        assert_eq!(*mana_loss, TargetFilter::Player);
+        assert_eq!(*mana_loss, TargetFilter::ParentTarget);
         assert!(
             !any_ability_has_unimplemented(&parsed),
             "Mana Short must retain its tap-all-lands follow-up"
