@@ -3033,8 +3033,9 @@ fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
 }
 
 /// CR 611.3a + CR 613.1: Does a continuous static definition depend on the
-/// membership of `zone` through its recipient filter, enabling condition, or a
-/// dynamic quantity? All three surfaces must participate in zone invalidation.
+/// membership of `zone` through its recipient filter, enabling condition,
+/// dynamic quantity, or an ordered-zone copy donor? All four surfaces must
+/// participate in zone invalidation.
 fn static_definition_reads_zone_membership(def: &StaticDefinition, zone: Zone) -> bool {
     def.mode == StaticMode::Continuous
         && (def
@@ -3048,6 +3049,18 @@ fn static_definition_reads_zone_membership(def: &StaticDefinition, zone: Zone) -
             || def.modifications.iter().any(|modification| {
                 continuous_modification_dynamic_quantity(modification)
                     .is_some_and(|quantity| quantity_expr_reads_zone(quantity, zone))
+                    // CR 707.2 + CR 611.3a: a live copy of the top card in an
+                    // ordered zone changes whenever an object enters or leaves
+                    // that zone. This is deliberately separate from filter
+                    // inspection: the donor's *position*, not merely whether it
+                    // matches the filter, is the dependency.
+                    || matches!(
+                        modification,
+                        ContinuousModification::CopyTopOfZone {
+                            zone: donor_zone,
+                            ..
+                        } if *donor_zone == zone
+                    )
             }))
 }
 
@@ -3062,9 +3075,15 @@ pub(crate) fn any_active_static_reads_zone_membership(state: &GameState, zone: Z
         if found {
             return;
         }
+        // A self-referential live copy replaces the object's derived static
+        // set in layer 1. Its originating static is nevertheless restored from
+        // `base_static_definitions` at the next pass, so a zone transition must
+        // still invalidate that pass rather than losing the dependency merely
+        // because the current donor had no matching static of its own.
         if obj
             .static_definitions
             .iter_all()
+            .chain(obj.base_static_definitions.iter())
             .any(|def| static_definition_reads_zone_membership(def, zone))
         {
             found = true;
@@ -3087,10 +3106,10 @@ fn static_condition_reads_top_of_library(condition: &StaticCondition) -> bool {
 }
 
 /// CR 401.5 + CR 611.3a: True when any active continuous static is gated on the
-/// top card of a library (`TopOfLibraryMatches`, Vampire Nocturnus). The
-/// continuous effect isn't locked in (CR 611.3a), so a library-top change must
-/// re-evaluate it — but only when such a static is live, so routine library
-/// churn (draws, mills, shuffles with no top-gated static) stays cheap. Mirrors
+/// top card of a library (`TopOfLibraryMatches`, Vampire Nocturnus) or copies
+/// it as live copiable values (`CopyTopOfZone`). The continuous effect isn't
+/// locked in (CR 611.3a), so a library-top change must re-evaluate it — but only
+/// when such a static is live, so routine library churn stays cheap. Mirrors
 /// `any_active_static_reads_zone_membership`.
 pub(crate) fn any_active_static_reads_top_of_library(state: &GameState) -> bool {
     let mut found = false;
@@ -3098,13 +3117,27 @@ pub(crate) fn any_active_static_reads_top_of_library(state: &GameState) -> bool 
         if found {
             return;
         }
-        if obj.static_definitions.iter_all().any(|def| {
-            def.mode == StaticMode::Continuous
-                && def
-                    .condition
-                    .as_ref()
-                    .is_some_and(static_condition_reads_top_of_library)
-        }) {
+        if obj
+            .static_definitions
+            .iter_all()
+            .chain(obj.base_static_definitions.iter())
+            .any(|def| {
+                def.mode == StaticMode::Continuous
+                    && (def
+                        .condition
+                        .as_ref()
+                        .is_some_and(static_condition_reads_top_of_library)
+                        || def.modifications.iter().any(|modification| {
+                            matches!(
+                                modification,
+                                ContinuousModification::CopyTopOfZone {
+                                    zone: Zone::Library,
+                                    ..
+                                }
+                            )
+                        }))
+            })
+        {
             found = true;
         }
     });
@@ -3112,9 +3145,10 @@ pub(crate) fn any_active_static_reads_top_of_library(state: &GameState) -> bool 
 }
 
 /// CR 401.5 + CR 611.3a: Force a full layer recompute after a library-top-changing
-/// event (shuffle, mill, put-on-top, draw), but only when a `TopOfLibraryMatches`
-/// static is actually live. Single authority called by every top-changing library
-/// move and shuffle helper so a stale layer cache can't survive the change.
+/// event (shuffle, mill, put-on-top, draw), but only when a
+/// `TopOfLibraryMatches` or `CopyTopOfZone { Library, .. }` static is live.
+/// Single authority called by every top-changing library move and shuffle helper
+/// so a stale layer cache can't survive the change.
 pub(crate) fn mark_layers_full_if_top_of_library_static_live(state: &mut GameState) {
     if any_active_static_reads_top_of_library(state) {
         mark_layers_full(state);
@@ -4499,7 +4533,9 @@ fn modification_characteristic_writes_at(
         // (CR 109.3). `CopyChosen` applies as a no-op here because the real copy
         // is installed as a latched `CopyValues`, but classifying it truthfully
         // is free.
-        ContinuousModification::CopyValues { .. } | ContinuousModification::CopyChosen => {
+        ContinuousModification::CopyValues { .. }
+        | ContinuousModification::CopyTopOfZone { .. }
+        | ContinuousModification::CopyChosen => {
             CharacteristicKinds::ALL
         }
         // CR 202.1: the mana cost is only writable by copy effects; this variant
@@ -4875,6 +4911,11 @@ fn copy_grants_continuous_static(modification: &ContinuousModification) -> bool 
                 &values.static_definitions,
             )
         }
+        // A live zone-top donor can carry any continuous-static set. The
+        // donor's exact values are available only while the layer pass is
+        // applying, so conservatively schedule the source-index rebuild rather
+        // than treating an unknown donor as non-generating.
+        ContinuousModification::CopyTopOfZone { .. } => true,
         // CR 707.9b: name-only override; never writes `static_definitions`.
         ContinuousModification::SetName { .. } => false,
         // CR 707.2c: parse-time marker whose apply arm is an explicit no-op. The
@@ -4953,6 +4994,10 @@ fn copy_grants_copy_layer_static(modification: &ContinuousModification) -> bool 
             // construction-site bug to fix there, not a case to quietly admit by
             // special-casing it out of this totality.
             .any(ContinuousModification::is_copy_layer),
+        // Like the broader generator check, the current zone-top donor is only
+        // known while applying the effect. It may itself expose another live
+        // copy-layer static, so retain the normal fixed-point discovery pass.
+        ContinuousModification::CopyTopOfZone { .. } => true,
         // CR 707.9a: the unbounded retain merges the LIVE source's
         // `base_static_definitions`, which are not in this payload to inspect, so
         // it is answered conservatively — as in `copy_grants_continuous_static`.
@@ -7485,6 +7530,72 @@ fn collect_scan_zones(state: &GameState, filter: &TargetFilter, out: &mut Vec<Zo
     }
 }
 
+/// Live donor snapshot for a Layer-1 copy that reads the top card of an
+/// ordered player zone. The source is deliberately resolved here, during each
+/// layer pass: CR 611.3a makes a printed static continuously apply, unlike the
+/// values latched by a resolving `CopyValues` effect.
+#[derive(Clone)]
+struct TopZoneCopySnapshot {
+    values: CopiableValues,
+    display_source: DisplaySource,
+    printed_ref: Option<crate::types::card::PrintedCardRef>,
+    token_image_ref: Option<crate::types::card::TokenImageRef>,
+}
+
+fn top_zone_copy_snapshot(
+    state: &GameState,
+    source_id: ObjectId,
+    source_controller: PlayerId,
+    zone: Zone,
+    controller: &crate::types::ability::ControllerRef,
+    filter: &TargetFilter,
+) -> Option<TopZoneCopySnapshot> {
+    let player_id = crate::game::filter::controller_ref_player(
+        state,
+        source_id,
+        Some(source_controller),
+        None,
+        controller,
+    )?;
+    let player = state.players.iter().find(|player| player.id == player_id)?;
+    // Library is stored top-first; graveyard is ordered oldest-to-newest, so
+    // its top is the newest object. Other zones have no rules-defined top and
+    // must not be given an arbitrary vector position.
+    let donor_id = match zone {
+        Zone::Library => *player.library.front()?,
+        Zone::Graveyard => *player.graveyard.back()?,
+        _ => return None,
+    };
+    if !matches_target_filter(
+        state,
+        donor_id,
+        filter,
+        &FilterContext::from_source_with_controller(source_id, source_controller),
+    ) {
+        return None;
+    }
+    let donor = state.objects.get(&donor_id)?;
+    Some(TopZoneCopySnapshot {
+        values: compute_current_copiable_values(state, donor_id)?,
+        display_source: donor.display_source,
+        printed_ref: donor.printed_ref.clone(),
+        token_image_ref: donor.token_image_ref.clone(),
+    })
+}
+
+fn static_copy_effect_instance(
+    state: &GameState,
+    effect: &ActiveContinuousEffect,
+) -> Option<crate::types::ability::CopyEffectInstanceRef> {
+    let definition_index = effect.def_index?;
+    let source = state.objects.get(&effect.source_id)?;
+    Some(crate::types::ability::CopyEffectInstanceRef::Static {
+        source: ObjectIncarnationRef::from_object(source),
+        definition_index,
+        modification_index: effect.mod_index,
+    })
+}
+
 fn apply_continuous_effect_filtered(
     state: &mut GameState,
     effect: &ActiveContinuousEffect,
@@ -7833,6 +7944,28 @@ fn apply_continuous_effect_filtered(
         } else {
             dynamic_pt_shared
         };
+        // CR 611.3a + CR 707.2: resolve the ordered-zone donor before taking
+        // the mutable recipient borrow. A changed graveyard top therefore
+        // selects new values on the next full layer pass instead of freezing a
+        // prior card's characteristics as if this were a resolving copy spell.
+        let top_zone_copy = match &effect.modification {
+            ContinuousModification::CopyTopOfZone {
+                zone,
+                controller,
+                filter,
+            } => top_zone_copy_snapshot(
+                state,
+                effect.source_id,
+                effect_controller,
+                *zone,
+                controller,
+                filter,
+            ),
+            _ => None,
+        };
+        let top_zone_copy_effect = top_zone_copy
+            .as_ref()
+            .and_then(|_| static_copy_effect_instance(state, effect));
 
         let obj = match state.objects.get_mut(&id) {
             Some(o) => o,
@@ -7847,13 +7980,23 @@ fn apply_continuous_effect_filtered(
             // `Effect::ChoosePermanent` answer (values fixed per CR 707.2c) —
             // so applying anything here would double-install. Explicit no-op.
             ContinuousModification::CopyChosen => {}
+            ContinuousModification::CopyTopOfZone { .. } => {
+                if let (Some(snapshot), Some(copy_effect)) =
+                    (top_zone_copy.as_ref(), top_zone_copy_effect)
+                {
+                    apply_copiable_values(obj, &snapshot.values, copy_effect);
+                    obj.display_source = snapshot.display_source;
+                    obj.printed_ref = snapshot.printed_ref.clone();
+                    obj.token_image_ref = snapshot.token_image_ref.clone();
+                }
+            }
             ContinuousModification::CopyValues {
                 values,
                 display_source,
                 printed_ref,
                 token_image_ref,
             } => {
-                let copy_effect = crate::types::ability::CopyEffectInstanceRef {
+                let copy_effect = crate::types::ability::CopyEffectInstanceRef::Transient {
                     continuous_effect_id: effect
                         .transient_id
                         .expect("CopyValues must originate from a transient continuous effect"),
@@ -8748,6 +8891,23 @@ pub(crate) fn compute_current_copiable_values(
                     if !triggers.iter().any(|t| t == trigger.as_ref()) {
                         triggers.push(*trigger.clone());
                     }
+                }
+            }
+            ContinuousModification::CopyTopOfZone {
+                zone,
+                controller,
+                filter,
+            } => {
+                let effect_controller = active_effect_condition_controller(state, effect);
+                if let Some(snapshot) = top_zone_copy_snapshot(
+                    state,
+                    effect.source_id,
+                    effect_controller,
+                    *zone,
+                    controller,
+                    filter,
+                ) {
+                    values = snapshot.values;
                 }
             }
             // CR 707.9b: Name overrides from "except its name is X" clauses
@@ -16450,6 +16610,73 @@ mod tests {
         );
     }
 
+    /// CR 707.2 + CR 611.3a: a continuous copy of the qualifying top card of
+    /// an ordered zone is live rather than latched. This is the shared runtime
+    /// shape behind Volrath's Shapeshifter: moving a new card from Exile into a
+    /// graveyard must invalidate the static (without relying on a battlefield,
+    /// hand, or library transition) and select the new top on the next flush.
+    #[test]
+    fn copy_top_of_graveyard_is_live_and_reacts_to_zone_moves() {
+        let mut state = setup();
+        let player = PlayerId(0);
+        let source = make_creature(&mut state, "Copy Host", 0, 1, player);
+        install_static_definition(
+            &mut state,
+            source,
+            StaticDefinition::continuous()
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![ContinuousModification::CopyTopOfZone {
+                    zone: Zone::Graveyard,
+                    controller: ControllerRef::You,
+                    filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+                }]),
+        );
+
+        let make_exiled = |state: &mut GameState, name: &str, creature: bool, power, toughness| {
+            let id = create_object(state, CardId(99), player, name.to_string(), Zone::Exile);
+            let object = state.objects.get_mut(&id).expect("just created");
+            if creature {
+                object.card_types.core_types.push(CoreType::Creature);
+                object.base_card_types = object.card_types.clone();
+                object.power = Some(power);
+                object.toughness = Some(toughness);
+                object.base_power = Some(power);
+                object.base_toughness = Some(toughness);
+            }
+            id
+        };
+
+        let first = make_exiled(&mut state, "First Donor", true, 3, 4);
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, first, Zone::Graveyard, &mut events);
+        flush_layers(&mut state);
+        assert_eq!(state.objects[&source].name, "First Donor");
+        assert_eq!(state.objects[&source].power, Some(3));
+        assert_eq!(state.objects[&source].toughness, Some(4));
+
+        // Exile -> Graveyard hits none of the generic battlefield/hand/library
+        // invalidators. This assertion therefore pins the ordered-zone donor
+        // dependency itself, before checking the visible reversion.
+        let noncreature = make_exiled(&mut state, "Top Noncreature", false, 0, 0);
+        state.layers_dirty = LayersDirty::Clean;
+        crate::game::zones::move_to_zone(&mut state, noncreature, Zone::Graveyard, &mut events);
+        assert!(
+            state.layers_dirty.is_dirty(),
+            "a graveyard-top copy must invalidate after a graveyard-only zone transition"
+        );
+        flush_layers(&mut state);
+        assert_eq!(state.objects[&source].name, "Copy Host");
+        assert_eq!(state.objects[&source].power, Some(0));
+        assert_eq!(state.objects[&source].toughness, Some(1));
+
+        let second = make_exiled(&mut state, "Second Donor", true, 5, 6);
+        crate::game::zones::move_to_zone(&mut state, second, Zone::Graveyard, &mut events);
+        flush_layers(&mut state);
+        assert_eq!(state.objects[&source].name, "Second Donor");
+        assert_eq!(state.objects[&source].power, Some(5));
+        assert_eq!(state.objects[&source].toughness, Some(6));
+    }
+
     // CR 401.5 + CR 611.3a: placing a white card on top via `move_to_library_at_index`
     // (the put-on-top path that bypasses `move_to_zone`) must recompute the static.
     #[test]
@@ -22524,7 +22751,7 @@ mod tests {
     /// than a fallback guess. Every variant here is also asserted to report
     /// `Layer::Copy` (and the layers-2-7 sample NOT to), which pins the claim the
     /// catch-all rests on. `layer()` itself is deliberately not consulted by the
-    /// function under test: six of its arms are `unreachable!()` panics, so the
+    /// function under test: seven of its arms are `unreachable!()` panics, so the
     /// `debug_assert_eq!(other.layer(), Layer::Copy)` guard this replaced could
     /// abort inside itself — `AddCounterOnEnter` below is one such variant and is
     /// answered without ever asking for its layer.
@@ -22571,6 +22798,19 @@ mod tests {
             (copy_of(anthem_values), true, false),
             (copy_of(copy_static_values), true, true),
             (copy_of(plain_values), false, false),
+            // The donor is selected from the current ordered-zone top at apply
+            // time, so its static payload cannot be inspected here. Both answers
+            // are deliberately conservative; the fixed point stops when its
+            // second gather finds no newly-started effect.
+            (
+                ContinuousModification::CopyTopOfZone {
+                    zone: Zone::Graveyard,
+                    controller: ControllerRef::You,
+                    filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+                },
+                true,
+                true,
+            ),
             // CR 707.9a: merges the source's whole printed set, INCLUDING its
             // `base_static_definitions`, onto the recipient (see the apply arm).
             // The live source is not in the payload, so both answers are

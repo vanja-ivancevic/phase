@@ -92,6 +92,7 @@ impl ContinuousModification {
         matches!(
             self,
             ContinuousModification::CopyValues { .. }
+                | ContinuousModification::CopyTopOfZone { .. }
                 | ContinuousModification::CopyChosen
                 | ContinuousModification::SetName { .. }
                 | ContinuousModification::RetainPrintedTriggerFromSource { .. }
@@ -104,6 +105,7 @@ impl ContinuousModification {
     pub fn layer(&self) -> Layer {
         match self {
             ContinuousModification::CopyValues { .. } => Layer::Copy,
+            ContinuousModification::CopyTopOfZone { .. } => Layer::Copy,
             // CR 707.2c + CR 613.1a: parse-time marker for Metamorphic
             // Alteration's static copy. Layered at Copy purely for ordering; its
             // `apply_continuous_effect` arm is an explicit no-op (the real copy

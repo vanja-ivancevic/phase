@@ -5724,6 +5724,17 @@ fn scan_mana_production(p: &ManaProduction, mode: ScanMode) -> Axes {
 /// recursion terminates.
 fn scan_continuous_modification(m: &ContinuousModification, mode: ScanMode) -> Axes {
     match m {
+        // A live ordered-zone donor reads its controller reference and card
+        // characteristics. The donor can change whenever the zone top changes,
+        // so conservatively classify its filter under the normal live-board
+        // context rather than treating a copy payload as read-free.
+        ContinuousModification::CopyTopOfZone {
+            controller, filter, ..
+        } => scan_controller_ref(controller).or(scan_target_filter(
+            filter,
+            FilterReadContext::LiveBoardCensus,
+            mode,
+        )),
         // descend the dynamic P/T / dynamic-keyword / enter-counter QuantityExpr
         ContinuousModification::SetDynamicPower { value }
         | ContinuousModification::SetDynamicToughness { value }

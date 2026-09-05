@@ -4733,6 +4733,15 @@ fn fmt_modification(m: &crate::types::ability::ContinuousModification) -> String
     use crate::types::ability::ContinuousModification;
     match m {
         ContinuousModification::CopyValues { .. } => "copy values".into(),
+        ContinuousModification::CopyTopOfZone {
+            zone,
+            controller,
+            filter,
+        } => format!(
+            "copy qualifying top card of {} ({controller:?}; {})",
+            fmt_zone(zone),
+            fmt_target(filter)
+        ),
         // CR 707.2c (Metamorphic Alteration): parse-time marker for the enchanted
         // host's copy — the runtime copy is the latched `CopyValues` TCE.
         ContinuousModification::CopyChosen => "copy chosen".into(),

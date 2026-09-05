@@ -4410,6 +4410,27 @@ fn detect_condition_as_long_as(
     if any_static_has_attached_subject_qualifier_grant(parsed) {
         return;
     }
+    // CR 707.2 + CR 611.3a: an ordered-zone top copy encodes the complete
+    // "as long as the top card … is a <filter>" condition in its donor
+    // selection. There is no independent `StaticCondition`: if the top card
+    // does not qualify, `CopyTopOfZone` applies no values. Treat that typed
+    // mechanism as coverage rather than reporting the represented gate as
+    // swallowed.
+    if parsed.statics.iter().any(|static_def| {
+        static_def
+            .description
+            .as_ref()
+            .is_some_and(|description| description.to_ascii_lowercase().contains("as long as "))
+            && static_def
+                .modifications
+                .iter()
+                .any(|modification| matches!(
+                    modification,
+                    ContinuousModification::CopyTopOfZone { .. }
+                ))
+    }) {
+        return;
+    }
     diagnostics.push(OracleDiagnostic::swallowed_clause(
         OracleSemanticFeature::ConditionAsLongAs.detector_label(),
         truncate(original, 140),
@@ -5313,6 +5334,26 @@ mod tests {
                 } if warning_detector == detector
             )
         })
+    }
+
+    #[test]
+    fn condition_as_long_as_accepts_ordered_zone_top_copy() {
+        let parsed = parse_named(
+            "As long as the top card of your graveyard is a creature card, this creature has the full text of that card and has the text \"{2}: Discard a card.\"\n{2}: Discard a card.",
+            "Volrath's Shapeshifter",
+            &["Creature"],
+        );
+        assert!(parsed.statics.iter().any(|static_def| {
+            static_def.modifications.iter().any(|modification| matches!(
+                modification,
+                ContinuousModification::CopyTopOfZone { .. }
+            ))
+        }));
+        assert!(
+            !has_swallowed_detector(&parsed, "Condition_AsLongAs"),
+            "the ordered-zone top-copy mechanism represents the as-long-as gate: {:?}",
+            parsed.parse_warnings
+        );
     }
 
     /// Every swallow finding on this face, with its stamped unit provenance.

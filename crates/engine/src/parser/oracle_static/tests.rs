@@ -35118,3 +35118,33 @@ fn attached_conditional_grant_state_backed_gate_still_passes_through() {
         def.condition
     );
 }
+
+/// CR 613.1a + CR 707.2: a live top-of-graveyard copy is a Layer-1 modifier,
+/// not an unrecognized condition attached to an otherwise harmless ability
+/// grant. The quoted ability remains a separate later-layer grant so it is
+/// retained after the copied characteristic set replaces the source's text.
+#[test]
+fn top_of_graveyard_full_text_copy_is_live_layer_one_static() {
+    for subject in ["this creature", "~"] {
+        let def = parse_static_line(&format!(
+            "As long as the top card of your graveyard is a creature card, {subject} has the full text of that card and has the text \"{{2}}: Discard a card.\""
+        ))
+        .expect("top-of-graveyard full-text copy should parse");
+
+        assert_eq!(def.mode, StaticMode::Continuous);
+        assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+        assert!(matches!(
+            def.modifications.first(),
+            Some(ContinuousModification::CopyTopOfZone {
+                zone: Zone::Graveyard,
+                controller: ControllerRef::You,
+                filter,
+            }) if matches!(filter, TargetFilter::Typed(typed) if typed.type_filters == vec![TypeFilter::Creature])
+        ));
+        assert!(def.modifications.iter().any(|modification| matches!(
+            modification,
+            ContinuousModification::GrantAbility { definition }
+                if matches!(*definition.effect, Effect::Discard { .. })
+        )));
+    }
+}

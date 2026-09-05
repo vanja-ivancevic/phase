@@ -67,6 +67,60 @@ fn parse_enchanted_is_copy_of_chosen(tp: &TextPair, text: &str) -> Option<Static
     )
 }
 
+/// CR 613.1a + CR 707.2: an object can continuously take the full copiable
+/// values of the qualifying top card of its controller's graveyard while
+/// retaining an explicitly quoted ability. The donor is a live zone position,
+/// not a choice or a one-shot copy snapshot, so this lowers to
+/// `CopyTopOfZone` rather than `CopyValues`.
+///
+/// The grammar deliberately owns the reusable sentence shape, not a card name:
+/// `As long as the top card of your graveyard is a <filter>, this creature has
+/// the full text of that card and has the text "<ability>."`.
+fn parse_top_of_graveyard_full_text_copy(tp: &TextPair, text: &str) -> Option<StaticDefinition> {
+    let rest = nom_tag_tp(tp, "as long as the top card of your graveyard is a ")?;
+    // Card-name normalization has already replaced a named self-reference with
+    // `~` by the time this dispatcher sees database Oracle text. Hand-authored
+    // and rules-template input can still use the generic "this creature" form.
+    // Both are the same self subject; accepting them here keeps the mechanism
+    // template-driven rather than coupled to any particular card name.
+    let marker = [
+        ", this creature has the full text of that card and has the text ",
+        ", ~ has the full text of that card and has the text ",
+    ]
+    .into_iter()
+    .find(|candidate| rest.lower.contains(candidate))?;
+    let marker_index = rest.lower.find(marker)?;
+    let filter_text = rest.original[..marker_index].trim();
+    let (filter, filter_remainder) = parse_type_phrase(filter_text);
+    if !filter_remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
+        return None;
+    }
+
+    let grants_text = rest.original[marker_index + marker.len()..]
+        .trim()
+        .trim_end_matches('.')
+        .trim();
+    if !grants_text.starts_with('"') || !grants_text.ends_with('"') {
+        return None;
+    }
+    let mut modifications = vec![ContinuousModification::CopyTopOfZone {
+        zone: Zone::Graveyard,
+        controller: ControllerRef::You,
+        filter,
+    }];
+    modifications.extend(parse_quoted_ability_modifications(grants_text));
+    if modifications.len() == 1 {
+        return None;
+    }
+
+    Some(
+        StaticDefinition::continuous()
+            .affected(TargetFilter::SelfRef)
+            .modifications(modifications)
+            .description(text.to_string()),
+    )
+}
+
 /// CR 208.1 + CR 113.7: Parse the dynamic referent of a "{X} … less to activate,
 /// where X is [source]'s {power|toughness|mana value}" activated-ability cost
 /// reduction (Agatha of the Vile Cauldron — "where X is Agatha's power", which
@@ -747,6 +801,14 @@ pub(crate) fn parse_static_line_inner(
     let text = strip_reminder_text(text);
     let lower = text.to_lowercase();
     let tp = TextPair::new(&text, &lower);
+
+    // CR 613.1a + CR 707.2: must precede the generic inverted-as-long-as
+    // fallback below. That fallback can retain the quoted ability while
+    // reducing the live donor condition to `Unrecognized`, which would make
+    // coverage look healthier than the rules implementation actually is.
+    if let Some(def) = parse_top_of_graveyard_full_text_copy(&tp, &text) {
+        return Some(def);
+    }
 
     if let Some(def) = parse_same_is_true_type_static(&text, &lower) {
         return Some(def);
