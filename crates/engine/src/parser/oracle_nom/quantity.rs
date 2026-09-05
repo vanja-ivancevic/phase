@@ -959,6 +959,21 @@ pub(crate) fn parse_extreme_chosen_number_ref(input: &str) -> OracleResult<'_, Q
     .parse(input)
 }
 
+/// A singular number chosen earlier while resolving this ability. The caller
+/// supplies the provenance gate: without a preceding `NumberRange` choice,
+/// these ordinary anaphors have no resolution-local meaning.
+pub(crate) fn parse_resolution_chosen_number_ref(
+    input: &str,
+) -> OracleResult<'_, QuantityRef> {
+    value(
+        QuantityRef::PlayerChosenNumber {
+            player: crate::types::ability::PlayerScope::Controller,
+        },
+        alt((tag("that number"), tag("the number"))),
+    )
+    .parse(input)
+}
+
 pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     alt((
         alt((
@@ -10574,6 +10589,24 @@ mod tests {
                 "{unrelated} must not read as a chosen-number extremum"
             );
         }
+    }
+
+    #[test]
+    fn parse_resolution_chosen_number_ref_shape() {
+        for text in ["that number", "the number"] {
+            let (rest, qty) = parse_resolution_chosen_number_ref(text).unwrap();
+            assert_eq!(rest, "");
+            assert_eq!(
+                qty,
+                QuantityRef::PlayerChosenNumber {
+                    player: PlayerScope::Controller,
+                },
+                "{text}"
+            );
+        }
+
+        let (rest, _) = parse_resolution_chosen_number_ref("the number of cards").unwrap();
+        assert_eq!(rest, " of cards");
     }
 
     /// The extremum reference is NOT reachable from the context-free

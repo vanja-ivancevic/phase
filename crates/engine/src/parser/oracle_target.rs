@@ -6428,12 +6428,13 @@ pub(crate) fn parse_mana_value_suffix(
             take_till::<_, _, OracleError<'_>>(|c: char| c == ',' || c == '.')
                 .parse(after_equal_to)
                 .ok()?;
-        let parse_value = |phrase: &str| -> Option<QuantityExpr> {
+        let mut parse_value = |phrase: &str| -> Option<QuantityExpr> {
             let phrase = phrase.trim();
-            crate::parser::oracle_quantity::parse_cda_quantity(phrase).or_else(|| {
-                parse_mana_value_reference_expr(phrase)
-                    .and_then(|(value, after)| after.trim().is_empty().then_some(value))
-            })
+            crate::parser::oracle_quantity::parse_cda_quantity_with_context(phrase, ctx)
+                .or_else(|| {
+                    parse_mana_value_reference_expr(phrase)
+                        .and_then(|(value, after)| after.trim().is_empty().then_some(value))
+                })
         };
         // CR 119.3 + CR 400.1 + CR 108.3: Resolve the dynamic quantity, preferring
         // the FULL phrase first. A quantity whose own grammar already includes a
@@ -9336,7 +9337,7 @@ mod tests {
     use super::*;
     use crate::parser::oracle_ir::context::ParseContext;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
-    use crate::types::ability::{PtStat, PtValueScope};
+    use crate::types::ability::{ChoiceType, NumberDistinctness, PlayerScope, PtStat, PtValueScope};
     use crate::types::counter::CounterType;
 
     fn typed_leg(filter: &TargetFilter) -> Option<&TypedFilter> {
@@ -18975,6 +18976,31 @@ mod tests {
             ),
             "expected Cmc LE Fixed(3), got {prop:?}"
         );
+    }
+
+    #[test]
+    fn mana_value_suffix_binds_a_resolution_number_choice() {
+        let mut ctx = ParseContext::default();
+        ctx.pending_choice_type = Some(ChoiceType::NumberRange {
+            min: 0,
+            max: None,
+            distinctness: NumberDistinctness::Repeatable,
+        });
+        let input = "with mana value equal to that number";
+        let (prop, consumed) = parse_mana_value_suffix(input, &mut ctx)
+            .expect("resolution-local chosen number suffix parses");
+        assert_eq!(consumed, input.len());
+        assert!(matches!(
+            prop,
+            FilterProp::Cmc {
+                comparator: Comparator::EQ,
+                value: QuantityExpr::Ref {
+                    qty: QuantityRef::PlayerChosenNumber {
+                        player: PlayerScope::Controller,
+                    },
+                },
+            }
+        ));
     }
 
     /// CR 107.3a: control — a bare "with mana value X or less" with NO binder

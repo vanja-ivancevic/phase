@@ -833,6 +833,11 @@ pub(crate) fn parse_cda_quantity_with_context(
         ctx.pending_choice_type,
         Some(crate::types::ability::ChoiceType::NumberRange { .. })
     ) {
+        if let Ok((rest, qty)) = nom_quantity::parse_resolution_chosen_number_ref(text) {
+            if rest.is_empty() {
+                return Some(QuantityExpr::Ref { qty });
+            }
+        }
         if let Ok((rest, qty)) = nom_quantity::parse_extreme_chosen_number_ref(text) {
             if rest.is_empty() {
                 return Some(QuantityExpr::Ref { qty });

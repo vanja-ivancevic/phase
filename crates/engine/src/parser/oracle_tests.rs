@@ -8148,6 +8148,80 @@ fn land_grant_reveal_hand_alternative_cost_option() {
     );
 }
 
+#[test]
+fn void_keeps_its_chosen_number_as_a_mana_value_filter() {
+    let parsed = parse(
+        "Choose a number. Destroy all artifacts and creatures with mana value equal to that number. Then target player reveals their hand and discards all nonland cards with mana value equal to that number.",
+        "Void",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    assert!(parsed.parse_warnings.is_empty(), "{parsed:#?}");
+
+    let choose = parsed.abilities.first().expect("choose-number ability");
+    assert!(matches!(
+        choose.effect.as_ref(),
+        Effect::Choose {
+            choice_type: ChoiceType::NumberRange { .. },
+            persist: true,
+            ..
+        }
+    ), "{choose:#?}");
+
+    let destroy = choose
+        .sub_ability
+        .as_ref()
+        .expect("destroy clause follows the number choice");
+    let Effect::DestroyAll { target, .. } = destroy.effect.as_ref() else {
+        panic!("expected destroy-all clause, got {:?}", destroy.effect);
+    };
+    assert!(target_has_controller_chosen_number_mana_value(target), "{target:#?}");
+
+    let reveal = destroy
+        .sub_ability
+        .as_ref()
+        .expect("reveal clause follows the destruction");
+    assert!(matches!(reveal.effect.as_ref(), Effect::RevealHand { .. }), "{reveal:#?}");
+
+    let discard = reveal
+        .sub_ability
+        .as_ref()
+        .expect("discard clause follows the reveal");
+    let Effect::Discard { target, filter, .. } = discard.effect.as_ref() else {
+        panic!("expected filtered discard clause, got {:?}", discard.effect);
+    };
+    assert_eq!(*target, TargetFilter::ParentTarget, "{discard:#?}");
+    assert!(
+        filter
+            .as_ref()
+            .is_some_and(target_has_controller_chosen_number_mana_value),
+        "{discard:#?}"
+    );
+}
+
+fn target_has_controller_chosen_number_mana_value(target: &TargetFilter) -> bool {
+    match target {
+        TargetFilter::Typed(typed) => typed.properties.iter().any(|property| {
+            matches!(
+                property,
+                FilterProp::Cmc {
+                    comparator: Comparator::EQ,
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::PlayerChosenNumber {
+                            player: PlayerScope::Controller,
+                        },
+                    },
+                }
+            )
+        }),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => filters
+            .iter()
+            .any(target_has_controller_chosen_number_mana_value),
+        _ => false,
+    }
+}
+
 // CR 608.2c + CR 205.2b (GitHub #4710): Scourglass — "Destroy all permanents
 // except for artifacts and lands" must exclude both types (including artifact
 // creatures, per CR 205.2b's multi-type-object rule), not silently drop the
