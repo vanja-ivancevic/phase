@@ -13047,6 +13047,30 @@ fn repeat_this_process_you_may_sets_controller_choice() {
     );
 }
 
+/// Trade Secrets assigns its unbounded repeat decision to the targeted opponent,
+/// not to the spell's controller. The loop must retain that target reference so
+/// every later iteration prompts the same player.
+#[test]
+fn trade_secrets_targeted_opponent_owns_repeat_choice() {
+    use crate::parser::oracle_effect::parse_effect_chain;
+    use crate::types::ability::{ControllerRef, RepeatContinuation};
+
+    let def = parse_effect_chain(
+        "Target opponent draws two cards, then you draw up to four cards. \
+         That opponent may repeat this process as many times as they choose.",
+        AbilityKind::Spell,
+    );
+
+    assert_eq!(
+        def.repeat_until,
+        Some(RepeatContinuation::PlayerChoice {
+            player: ControllerRef::TargetOpponent,
+        }),
+        "Trade Secrets must retain its targeted opponent as the repeat actor: {:?}",
+        def.repeat_until,
+    );
+}
+
 #[test]
 fn repeat_this_process_if_you_do_stays_recognized_without_predicate() {
     use crate::parser::oracle_effect::parse_effect_chain;

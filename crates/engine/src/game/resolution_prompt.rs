@@ -625,9 +625,12 @@ pub(crate) fn chain_offers_choice(a: &ResolvedAbility) -> bool {
     if modal.is_some() || !mode_abilities.is_empty() {
         return true;
     }
-    // CR 608.2c + CR 107.1c: only the controller-prompted repeat variant is a
-    // player choice; while / until-stop predicates are pure re-evaluation.
-    if matches!(repeat_until, Some(RepeatContinuation::ControllerChoice)) {
+    // CR 608.2c + CR 107.1c: both controller- and process-bound-repeat variants
+    // prompt a player; while / until-stop predicates are pure re-evaluation.
+    if matches!(
+        repeat_until,
+        Some(RepeatContinuation::ControllerChoice | RepeatContinuation::PlayerChoice { .. })
+    ) {
         return true;
     }
     // CR 608.2d + CR 107.1c: an "up to N" REPEAT COUNT is a resolution-time choice

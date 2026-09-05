@@ -370,11 +370,13 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
 }
 
 /// CR 608.2c / CR 107.1c: a loop-continuation predicate. Only `WhileCondition`
-/// re-reads game state (per-iteration re-evaluation); the controller-prompted and
-/// boolean-stop variants read no dynamic resource.
+/// re-reads game state (per-iteration re-evaluation); a player-bound prompt
+/// reads only its controller reference, while boolean-stop variants read no
+/// dynamic resource.
 fn scan_repeat_continuation(r: &RepeatContinuation, mode: ScanMode) -> Axes {
     match r {
         RepeatContinuation::ControllerChoice => Axes::NONE,
+        RepeatContinuation::PlayerChoice { player } => scan_controller_ref(player),
         RepeatContinuation::UntilStopConditions {
             stop_on_put_to_hand: _,
             stop_on_duplicate_exiled_names: _,

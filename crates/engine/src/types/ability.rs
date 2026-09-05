@@ -22440,13 +22440,14 @@ impl SiblingCondition {
 /// `repeat_for` (a fixed `QuantityExpr` count) — this predicate decides
 /// per-iteration whether to re-follow the resolving ability's instructions.
 ///
-/// Three forms are modeled: the controller-decision form ("you may repeat this
-/// process any number of times", `ControllerChoice`), the stop-predicate form
-/// ("repeat this process until …", `UntilStopConditions`, Tainted Pact), and
-/// the game-state-predicate form ("[if condition,] repeat this process
-/// [once]", `WhileCondition`). The optional-put pause semantics that the
-/// `WhileCondition` loop depends on are shared with `UntilStopConditions` via
-/// the repeat-until frame resume path.
+/// Four forms are modeled: the controller-decision form ("you may repeat this
+/// process any number of times", `ControllerChoice`), a decision assigned to a
+/// player already bound by the process ("that opponent may repeat this
+/// process", `PlayerChoice`), the stop-predicate form ("repeat this process
+/// until …", `UntilStopConditions`, Tainted Pact), and the game-state-predicate
+/// form ("[if condition,] repeat this process [once]", `WhileCondition`). The
+/// optional-put pause semantics that the `WhileCondition` loop depends on are
+/// shared with `UntilStopConditions` via the repeat-until frame resume path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum RepeatContinuation {
@@ -22454,6 +22455,13 @@ pub enum RepeatContinuation {
     /// each iteration fully resolves, the controller is prompted
     /// (`WaitingFor::RepeatDecision`) to repeat or stop.
     ControllerChoice,
+    /// CR 608.2c + CR 109.4: a player already bound by the resolving process
+    /// decides whether to repeat it. `TargetOpponent` powers Trade Secrets:
+    /// its targeted opponent, rather than its controller, chooses after each
+    /// iteration. The reference is resolved against the retained ability when
+    /// the prompt is raised, so a chained root's declared player target remains
+    /// available across every repeat.
+    PlayerChoice { player: ControllerRef },
     /// CR 608.2c + CR 107.1c: "repeat this process until [stop conditions],
     /// whichever comes first" — after each iteration fully resolves, the engine
     /// checks the configured stop predicates and auto-repeats when none fired.
