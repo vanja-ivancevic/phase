@@ -1518,6 +1518,7 @@ mod tests {
     use crate::types::counter::CounterType;
     use crate::types::game_state::{PendingContinuation, WaitingFor};
     use crate::types::identifiers::{CardId, ObjectId};
+    use crate::types::mana::ManaColor;
     use crate::types::player::PlayerId;
     use crate::types::replacements::ReplacementEvent;
     use crate::types::resolution::ChangeZoneFrame;
@@ -2350,6 +2351,49 @@ mod tests {
 
         assert!(state.players[0].graveyard.contains(&named));
         assert!(state.players[0].hand.contains(&other));
+    }
+
+    #[test]
+    fn filtered_discard_only_offers_cards_matching_resolution_local_color() {
+        let mut state = GameState::new_two_player(42);
+        let red = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Lightning Bolt".into(),
+            Zone::Hand,
+        );
+        let green = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Giant Growth".into(),
+            Zone::Hand,
+        );
+        state.objects.get_mut(&red).unwrap().color = vec![ManaColor::Red];
+        state.objects.get_mut(&green).unwrap().color = vec![ManaColor::Green];
+        state.last_named_choice = Some(ChoiceValue::Color(ManaColor::Red));
+        let ability = ResolvedAbility::new(
+            Effect::Discard {
+                count: QuantityExpr::Fixed { value: 7 },
+                target: TargetFilter::Any,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                unless_filter: None,
+                filter: Some(TargetFilter::Typed(
+                    TypedFilter::default()
+                        .properties(vec![crate::types::ability::FilterProp::IsChosenColor]),
+                )),
+            },
+            vec![],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        assert!(state.players[0].graveyard.contains(&red));
+        assert!(state.players[0].hand.contains(&green));
     }
 
     #[test]

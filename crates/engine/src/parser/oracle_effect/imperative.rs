@@ -1402,6 +1402,29 @@ fn parse_discard_card_filter_inner(
         return Some(TargetFilter::HasChosenName);
     }
 
+    // CR 105.4 + CR 608.2d: a color chosen earlier in this resolution can
+    // qualify a following discard instruction. The filter remains generic;
+    // the resolver supplies the resolution-local color when matching each
+    // card in the affected hand.
+    if nom_parse_lower(&lower, |input| {
+        all_consuming(value(
+            (),
+            alt((
+                tag::<_, _, OracleError<'_>>("card of that color"),
+                tag("cards of that color"),
+                tag("card of the chosen color"),
+                tag("cards of the chosen color"),
+            )),
+        ))
+        .parse(input)
+    })
+    .is_some()
+    {
+        return Some(TargetFilter::Typed(
+            TypedFilter::default().properties(vec![FilterProp::IsChosenColor]),
+        ));
+    }
+
     let (filter, remainder) = parse_type_phrase(tail);
     let is_bare_card = matches!(
         &filter,
@@ -14695,6 +14718,48 @@ mod tests {
                 "{wording:?} must retain the preceding named choice"
             );
         }
+    }
+
+    #[test]
+    fn discard_filter_preserves_resolution_local_chosen_color() {
+        for wording in [
+            "cards of that color",
+            "cards of the chosen color",
+            "CARD OF THAT COLOR",
+        ] {
+            let Some(TargetFilter::Typed(filter)) = parse_discard_card_filter(wording) else {
+                panic!("{wording:?} must retain the preceding color choice");
+            };
+            assert!(
+                filter.properties.contains(&FilterProp::IsChosenColor),
+                "{wording:?} must retain IsChosenColor, got {:?}",
+                filter.properties
+            );
+        }
+    }
+
+    #[test]
+    fn persecute_chains_its_color_choice_into_filtered_discard() {
+        let definition = super::super::parse_effect_chain(
+            "Choose a color. Target player reveals their hand and discards all cards of that color.",
+            AbilityKind::Spell,
+        );
+        let reveal = definition
+            .sub_ability
+            .as_deref()
+            .expect("color choice must retain the reveal instruction");
+        let discard = reveal
+            .sub_ability
+            .as_deref()
+            .expect("reveal instruction must retain the filtered discard");
+        let Effect::Discard {
+            filter: Some(TargetFilter::Typed(filter)),
+            ..
+        } = discard.effect.as_ref()
+        else {
+            panic!("expected Persecute-style filtered discard, got {:?}", discard.effect);
+        };
+        assert!(filter.properties.contains(&FilterProp::IsChosenColor));
     }
 
     /// Matrix row 18 — the mana ROLE must survive the cost-resource AST
