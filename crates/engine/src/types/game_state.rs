@@ -17005,6 +17005,8 @@ declare_game_state! {
 
     // Replacement effects
     pub pending_replacement: Option<PendingReplacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_entry_life_payment: Option<PendingEntryLifePayment>,
     /// CR 510.2 + CR 616.1: see [`PendingCombatLifelink`]. Boxed like its
     /// `pending_discard_batch` sibling — `GameState` is moved by value through
     /// the server action and AI paths and has a hard stack budget
@@ -20279,6 +20281,16 @@ pub struct PendingReplacement {
     pub may_cost_remaining: Option<AbilityCost>,
 }
 
+/// CR 614.12 + CR 119.4: A life-payment choice made while a permanent is
+/// entering. The delivery seam consumes the resolved amount only after the
+/// object has become its new CR 400.7 incarnation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingEntryLifePayment {
+    pub object_id: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<u32>,
+}
+
 /// CR 701.21a: The subject and controller of a sacrifice whose inner zone
 /// change is paused in the replacement pipeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -23156,6 +23168,7 @@ impl GameState {
             max_lands_per_turn: 1,
             priority_pass_count: 0,
             pending_replacement: None,
+            pending_entry_life_payment: None,
             pending_combat_lifelink: None,
             liminal_entries: HashMap::new(),
             pending_liminal_entry_resume: None,
@@ -25166,6 +25179,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         max_lands_per_turn: _,
         priority_pass_count: _,
         pending_replacement: _,
+        pending_entry_life_payment: _,
         //   - `pending_combat_lifelink`: COMPARED (hand-written `impl PartialEq` conjunct) — the
         //     parked tail of one CR 510.2 combat-damage batch. `remaining` only SHRINKS and
         //     `batch_events` only GROWS within a batch, so two states differing in this field are
@@ -25535,6 +25549,7 @@ impl PartialEq for GameState {
             && self.max_lands_per_turn == other.max_lands_per_turn
             && self.priority_pass_count == other.priority_pass_count
             && self.pending_replacement == other.pending_replacement
+            && self.pending_entry_life_payment == other.pending_entry_life_payment
             && self.deferred_entry_events == other.deferred_entry_events
             && self.pending_token_battlefield_entry == other.pending_token_battlefield_entry
             && self.layers_dirty == other.layers_dirty

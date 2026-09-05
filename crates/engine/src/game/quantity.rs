@@ -1080,7 +1080,8 @@ pub(crate) fn quantity_expr_uses_unspent_mana(expr: &QuantityExpr) -> bool {
 fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
     match qty {
         QuantityRef::UnspentMana { .. } => true,
-        QuantityRef::HandSize { .. }
+        QuantityRef::EntryLifePaid
+        | QuantityRef::HandSize { .. }
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::GraveyardSize { .. }
         | QuantityRef::LifeAboveStarting
@@ -1423,7 +1424,8 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         }
         // Player-level, single-object, history-record, payment, and choice
         // references: unaffected by another object's battlefield entry/exit.
-        QuantityRef::HandSize { .. }
+        QuantityRef::EntryLifePaid
+        | QuantityRef::HandSize { .. }
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::UnspentMana { .. }
         | QuantityRef::GraveyardSize { .. }
@@ -1737,7 +1739,8 @@ fn quantity_ref_characteristic_reads(qty: &QuantityRef, depth: u32) -> Character
         // characteristics), payments, choices, and the FROZEN per-turn /
         // per-game history journals described in the doc comment. Enumerated
         // explicitly (no wildcard).
-        QuantityRef::HandSize { .. }
+        QuantityRef::EntryLifePaid
+        | QuantityRef::HandSize { .. }
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::GraveyardSize { .. }
         | QuantityRef::LifeAboveStarting
@@ -1992,7 +1995,8 @@ fn entered_object_perturbs_quantity_ref(
         // Player-level, single-object, history-record, payment, and choice refs:
         // an object's battlefield entry/exit cannot change their value. Identical
         // enumeration to the `false` arm of `quantity_ref_uses_object_count`.
-        QuantityRef::HandSize { .. }
+        QuantityRef::EntryLifePaid
+        | QuantityRef::HandSize { .. }
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::UnspentMana { .. }
         | QuantityRef::GraveyardSize { .. }
@@ -4402,6 +4406,11 @@ fn resolve_ref(
         //      continuation fallbacks (e.g. "discard up to N, then draw that
         //      many"; "dealt excess damage this way, add that much {R}").
         //   6. `0` — undefined.
+        QuantityRef::EntryLifePaid => state
+            .objects
+            .get(&source_id)
+            .map(|object| object.entry_life_paid as i32)
+            .unwrap_or(0),
         QuantityRef::EventContextAmount => state
             // CR 614.1a: Moonlit-scoped "that many" copy count — highest priority,
             // un-shadowable. `Some` only while a `CopyTokenOf` substitution

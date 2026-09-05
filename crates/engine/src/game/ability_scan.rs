@@ -2013,6 +2013,7 @@ fn scan_property_aggregate_source(source: &CardTypeSetSource, mode: ScanMode) ->
 
 fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
     match x {
+        QuantityRef::EntryLifePaid => Axes::NONE,
         QuantityRef::HandSize { player, .. } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_player_scope(player));

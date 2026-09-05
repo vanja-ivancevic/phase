@@ -7863,9 +7863,9 @@ fn drain_pending_deferred_life_cost_resume(
             }
             crate::types::game_state::DeferredLifeCostResume::PayAmount {
                 player, total, ..
-            } => Ok(super::engine_resolution_choices::finish_pay_amount_choice(
+            } => super::engine_resolution_choices::finish_pay_amount_choice(
                 state, player, total, events,
-            )),
+            ),
             crate::types::game_state::DeferredLifeCostResume::ManaRoot {
                 player,
                 resume,

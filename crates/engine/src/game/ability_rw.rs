@@ -2166,7 +2166,8 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         | QuantityRef::ObjectNameWordCount { scope, .. }
         | QuantityRef::ObjectTypelineComponentCount { scope, .. }
         | QuantityRef::ManaSymbolsInManaCost { scope, .. } => legacy_object_scope(scope),
-        QuantityRef::HandSize { .. }
+        QuantityRef::EntryLifePaid
+        | QuantityRef::HandSize { .. }
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::LifeAboveStarting
         | QuantityRef::StartingLifeTotal
@@ -6181,6 +6182,7 @@ fn rw_choice_type(choice_type: &crate::types::ability::ChoiceType) -> RwProfile 
 
 fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
     match x {
+        QuantityRef::EntryLifePaid => RwProfile::empty(),
         // §4.3.1 (CR 401/402): a hand-size read, refined by its player axis
         // (Rekindled `Opponent` ⇒ Opponents, Brink cond `Controller` ⇒ You).
         QuantityRef::HandSize { player } => {

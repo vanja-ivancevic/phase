@@ -1785,6 +1785,7 @@ mod tests {
         let mut repl_maycost_cost = ReplacementDefinition::new(ReplacementEvent::ChangeZone);
         repl_maycost_cost.mode = ReplacementMode::MayCost {
             cost: fight_cost(),
+            payment_record: None,
             decline: None,
         };
         cases.push((
@@ -1801,6 +1802,7 @@ mod tests {
         let mut repl_maycost_decline = ReplacementDefinition::new(ReplacementEvent::ChangeZone);
         repl_maycost_decline.mode = ReplacementMode::MayCost {
             cost: AbilityCost::Tap,
+            payment_record: None,
             decline: Some(Box::new(fight_def())),
         };
         cases.push((

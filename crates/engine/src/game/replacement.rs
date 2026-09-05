@@ -6,9 +6,10 @@ use crate::types::ability::{
     AbilityCost, AbilityDefinition, CastingPermission, CombatDamageScope, ControllerRef,
     DamageModification, DamageRedirectTarget, DamageTargetFilter, DamageTargetPlayerScope,
     Duration, Effect, EffectScope, ManaSpendPermission, PermissionGrantee,
-    PostReplacementContinuation, PreventionAmount, QuantityExpr, QuantityModification,
+    PostReplacementContinuation, PreventionAmount, QuantityExpr, QuantityModification, QuantityRef,
     RedirectionLifetime, ReplacementCondition, ReplacementDefinition, ReplacementMode,
-    ResolvedAbility, ShieldKind, TapStateChange, TargetFilter, TargetRef, EXILE_COST_ANY_NUMBER,
+    ReplacementPaymentRecord, ResolvedAbility, ShieldKind, TapStateChange, TargetFilter,
+    TargetRef, EXILE_COST_ANY_NUMBER,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
@@ -1051,7 +1052,7 @@ fn optional_replacement_choice_labels(
 
     replacement_definition_for_id(state, replacement_id)
         .map(|replacement| match &replacement.mode {
-            ReplacementMode::MayCost { cost, decline } => {
+            ReplacementMode::MayCost { cost, decline, .. } => {
                 let decline = decline
                     .as_ref()
                     .and_then(|effect| effect.description.clone())
@@ -1440,6 +1441,7 @@ fn pay_replacement_may_cost(
     player: PlayerId,
     source_id: ObjectId,
     cost: &AbilityCost,
+    payment_record: Option<ReplacementPaymentRecord>,
     events: &mut Vec<GameEvent>,
 ) -> MayCostOutcome {
     if replacement_may_cost_has_self_zone_move(cost) {
@@ -1455,6 +1457,43 @@ fn pay_replacement_may_cost(
     let paid = match cost {
         AbilityCost::Mana { cost } => {
             crate::game::casting::pay_unless_cost(state, player, cost, events).is_ok()
+        }
+        // CR 614.12 + CR 119.4: an as-enters "pay any amount of life" choice
+        // is made before delivery. Park the outer replacement and let the
+        // ordinary amount prompt use the single life-cost authority; its resume
+        // records the result on the new permanent incarnation.
+        AbilityCost::PayLife {
+            amount:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::Variable { name },
+                },
+        } if name == "X" && payment_record == Some(ReplacementPaymentRecord::EntryLifePaid) => {
+            let team_life = crate::game::players::team_life_total(state, player);
+            let max = if team_life > 0
+                && crate::game::life_costs::can_pay_life_cost(state, player, 1)
+            {
+                u32::try_from(team_life).unwrap_or(0)
+            } else {
+                0
+            };
+            state.pending_entry_life_payment = Some(
+                crate::types::game_state::PendingEntryLifePayment {
+                    object_id: source_id,
+                    amount: None,
+                },
+            );
+            state.waiting_for = crate::types::game_state::WaitingFor::PayAmountChoice {
+                player,
+                resource: crate::types::game_state::PayableResource::Life,
+                min: 0,
+                max,
+                accumulated: 0,
+                source_id,
+                pending_mana_ability: None,
+            };
+            return MayCostOutcome::PausedForChoice {
+                remaining_cost: None,
+            };
         }
         AbilityCost::PayLife { amount } => {
             let amount =
@@ -1481,7 +1520,14 @@ fn pay_replacement_may_cost(
             // mid-composite pause carries the unpaid suffix so the resume
             // completes the rest before the replacement applies.
             for (index, sub_cost) in costs.iter().enumerate() {
-                match pay_replacement_may_cost(state, player, source_id, sub_cost, events) {
+                match pay_replacement_may_cost(
+                    state,
+                    player,
+                    source_id,
+                    sub_cost,
+                    payment_record,
+                    events,
+                ) {
                     MayCostOutcome::Paid => {}
                     MayCostOutcome::PausedForChoice { remaining_cost } => {
                         return MayCostOutcome::PausedForChoice {
@@ -10055,17 +10101,21 @@ fn continue_replacement_impl(
         // per-source bookkeeping is needed here.
 
         // Extract the accept/decline effects before applying
-        let (accept_effect, decline_effect, may_cost) = replacement_definition_for_id(state, rid)
+        let (accept_effect, decline_effect, may_cost, payment_record) = replacement_definition_for_id(state, rid)
             .map(|repl| {
                 let accept = repl.execute.clone();
                 let decline = replacement_mode_decline_cloned(&repl.mode);
-                let may_cost = match &repl.mode {
-                    ReplacementMode::MayCost { cost, .. } => Some(cost.clone()),
-                    ReplacementMode::Mandatory | ReplacementMode::Optional { .. } => None,
+                let (may_cost, payment_record) = match &repl.mode {
+                    ReplacementMode::MayCost {
+                        cost,
+                        payment_record,
+                        ..
+                    } => (Some(cost.clone()), *payment_record),
+                    ReplacementMode::Mandatory | ReplacementMode::Optional { .. } => (None, None),
                 };
-                (accept, decline, may_cost)
+                (accept, decline, may_cost, payment_record)
             })
-            .unwrap_or((None, None, None));
+            .unwrap_or((None, None, None, None));
 
         // CR 614.12a: on accept, pay the MayCost (skipped on a paid resume). A
         // `PausedForChoice` outcome means the payment surfaced an interactive
@@ -10079,12 +10129,26 @@ fn continue_replacement_impl(
         } else if resuming_after_paid_cost {
             match &remaining_may_cost {
                 None => MayCostOutcome::Paid,
-                Some(cost) => pay_replacement_may_cost(state, payer, rid.source, cost, events),
+                Some(cost) => pay_replacement_may_cost(
+                    state,
+                    payer,
+                    rid.source,
+                    cost,
+                    payment_record,
+                    events,
+                ),
             }
         } else {
             match &may_cost {
                 None => MayCostOutcome::Paid,
-                Some(cost) => pay_replacement_may_cost(state, payer, rid.source, cost, events),
+                Some(cost) => pay_replacement_may_cost(
+                    state,
+                    payer,
+                    rid.source,
+                    cost,
+                    payment_record,
+                    events,
+                ),
             }
         };
 
@@ -11619,6 +11683,7 @@ mod tests {
                 cost: AbilityCost::PayLife {
                     amount: QuantityExpr::Fixed { value: amount },
                 },
+                payment_record: None,
                 decline: Some(Box::new(
                     AbilityDefinition::new(
                         AbilityKind::Spell,
@@ -11658,6 +11723,69 @@ mod tests {
     }
 
     #[test]
+    fn entry_life_payment_records_chosen_amount_on_the_new_permanent() {
+        let repl = crate::parser::oracle_replacement::parse_replacement_line(
+            "As this artifact enters, pay any amount of life.",
+            "Phyrexian Processor",
+        )
+        .expect("Processor entry payment must parse");
+        let object_id = ObjectId(10);
+        let mut state = test_state_with_object(object_id, Zone::Hand, vec![repl]);
+        state.players[0].hand.push_back(object_id);
+        let mut events = Vec::new();
+
+        let proposed = ProposedEvent::zone_change(object_id, Zone::Hand, Zone::Battlefield, None);
+        assert!(matches!(
+            replace_event(&mut state, proposed, &mut events),
+            ReplacementResult::NeedsChoice(PlayerId(0))
+        ));
+
+        let waiting_for = crate::game::engine_replacement::handle_replacement_choice(
+            &mut state,
+            0,
+            &mut events,
+        )
+        .expect("accepting the entry replacement must surface its amount prompt");
+        assert!(matches!(
+            waiting_for,
+            WaitingFor::PayAmountChoice {
+                player: PlayerId(0),
+                resource: crate::types::game_state::PayableResource::Life,
+                min: 0,
+                max: 20,
+                source_id,
+                ..
+            } if source_id == object_id
+        ));
+
+        let outcome = crate::game::engine_resolution_choices::handle_resolution_choice(
+            &mut state,
+            waiting_for,
+            GameAction::SubmitPayAmount { amount: 7 },
+            &mut events,
+        )
+        .expect("the selected entry-life amount must pay and resume the zone move");
+        assert!(matches!(
+            outcome,
+            crate::game::engine_resolution_choices::ResolutionChoiceOutcome::WaitingFor(_)
+        ));
+        assert_eq!(state.players[0].life, 13);
+        assert_eq!(state.objects[&object_id].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&object_id].entry_life_paid, 7);
+        assert!(state.pending_entry_life_payment.is_none());
+
+        let amount = crate::game::quantity::resolve_quantity(
+            &state,
+            &QuantityExpr::Ref {
+                qty: QuantityRef::EntryLifePaid,
+            },
+            PlayerId(0),
+            object_id,
+        );
+        assert_eq!(amount, 7, "later abilities read the entry payment live");
+    }
+
+    #[test]
     fn sutured_ghoul_any_number_replacement_surfaces_zone_choice() {
         let repl = crate::parser::oracle_replacement::parse_replacement_line(
             "As Sutured Ghoul enters, exile any number of creature cards from your graveyard.",
@@ -11677,6 +11805,7 @@ mod tests {
                     filter: Some(TargetFilter::Typed(_)),
                 },
                 decline: None,
+                ..
             }
         ));
 

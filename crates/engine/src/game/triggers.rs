@@ -10931,6 +10931,7 @@ fn player_scope_unbound_at_fire_time(scope: &PlayerScope) -> bool {
 /// while a wrong `false` deletes a real ability off the stack.
 fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
     match qty {
+        QuantityRef::EntryLifePaid => false,
         QuantityRef::CountersOn { scope, .. }
         | QuantityRef::Power { scope }
         | QuantityRef::BasePower { scope }
@@ -15228,6 +15229,7 @@ fn characteristic_source_references_cost_paid_object(source: &CardTypeSetSource)
 /// rather than silently falling through and dropping the snapshot propagation.
 fn quantity_ref_refs_cost_paid_object(qty: &QuantityRef) -> bool {
     match qty {
+        QuantityRef::EntryLifePaid => false,
         // Object-axis refs: read the cost-paid object iff scoped to it.
         QuantityRef::Power { scope }
         | QuantityRef::BasePower { scope }

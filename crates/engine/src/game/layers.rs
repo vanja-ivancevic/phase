@@ -2895,6 +2895,7 @@ fn player_filter_reads_zone(filter: &PlayerFilter, zone: Zone) -> bool {
 /// than silently under-escalating a zone-membership gate.
 fn quantity_ref_reads_zone(qty: &QuantityRef, zone: Zone) -> bool {
     match qty {
+        QuantityRef::EntryLifePaid => false,
         // Direct graveyard card count (CR 404). `player` scope is irrelevant to
         // the zone identity — any player's graveyard is still the graveyard.
         QuantityRef::GraveyardSize { .. } => zone == Zone::Graveyard,
@@ -3191,6 +3192,7 @@ fn quantity_expr_reads_life(expr: &QuantityExpr) -> bool {
 fn quantity_ref_reads_life(qty: &QuantityRef) -> bool {
     use crate::types::ability::CastManaSpentMetric;
     match qty {
+        QuantityRef::EntryLifePaid => false,
         // CR 119.3 + CR 119.9: the direct-leaf life-family readers — the exact
         // quantities a guarded life-mutation site changes (119.3: gain/loss
         // adjusts the life total; 119.9: life-gain events).

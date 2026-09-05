@@ -808,6 +808,12 @@ pub(crate) fn parse_cda_quantity_with_context(
 ) -> Option<QuantityExpr> {
     let text = text.trim().trim_end_matches('.');
 
+    if let Ok((rest, qty)) = nom_quantity::parse_entry_life_paid_ref(text) {
+        if rest.is_empty() {
+            return Some(QuantityExpr::Ref { qty });
+        }
+    }
+
     // CR 101.4 + CR 608.2d: "the highest number" / "the lowest number" — the
     // cross-player extremum of the numbers players secretly chose earlier in THIS
     // ability (Wheel of Misfortune, Menacing Ogre, Life at Stake).
@@ -8811,8 +8817,21 @@ mod tests {
             parse_cda_quantity("the number of Forests sacrificed as it entered"),
             None
         );
-        // Minion of the Wastes — "the life paid as it entered" (ETB snapshot)
-        assert_eq!(parse_cda_quantity("the life paid as it entered"), None);
+        // Minion of the Wastes uses the pronoun form; Phyrexian Processor's
+        // normalized Oracle line uses `~`. Both are the same entry-history
+        // quantity, not an ordinary resolution-local "that much" value.
+        for phrase in [
+            "the life paid as it entered",
+            "the life paid as ~ entered",
+        ] {
+            assert_eq!(
+                parse_cda_quantity(phrase),
+                Some(QuantityExpr::Ref {
+                    qty: QuantityRef::EntryLifePaid,
+                }),
+                "entry-life phrase must parse: {phrase}"
+            );
+        }
     }
 
     /// CR 402.1 + CR 109.5 (issue #5637): "for each opponent who has one or fewer

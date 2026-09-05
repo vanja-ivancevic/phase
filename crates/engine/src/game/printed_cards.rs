@@ -3579,6 +3579,7 @@ mod tests {
                     library_players: None,
                 }),
             },
+            payment_record: None,
             decline: Some(Box::new(conjure_ability(
                 "repl_maycost_decline",
                 Zone::Hand,

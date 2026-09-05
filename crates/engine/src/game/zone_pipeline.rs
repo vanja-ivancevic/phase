@@ -3617,6 +3617,28 @@ pub(crate) fn deliver_replaced_zone_change(
                 .objects
                 .get(&object_id)
                 .is_some_and(|obj| obj.zone == Zone::Battlefield);
+        // CR 614.12 + CR 400.7: The amount was chosen before the zone change,
+        // while `reset_for_battlefield_entry` creates the new object and clears
+        // old entry history. Bind it immediately after that reset and before any
+        // ETB trigger can observe the permanent. A redirected/blocked entry
+        // consumes the pending record without transferring stale history.
+        if state
+            .pending_entry_life_payment
+            .as_ref()
+            .is_some_and(|payment| payment.object_id == object_id)
+        {
+            let payment = state
+                .pending_entry_life_payment
+                .take()
+                .expect("entry payment was checked above");
+            if entered_battlefield {
+                if let (Some(amount), Some(object)) =
+                    (payment.amount, state.objects.get_mut(&object_id))
+                {
+                    object.entry_life_paid = amount;
+                }
+            }
+        }
         // CR 701.9a + CR 614.1: The inner move has now completed with its
         // final replacement-selected destination. Append one operation-owned
         // result exactly once; a prevented move never reaches this delivery.

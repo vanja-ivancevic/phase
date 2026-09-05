@@ -1310,6 +1310,7 @@ fn fmt_player_scope(scope: &PlayerScope) -> String {
 
 fn fmt_quantity_ref(qty: &QuantityRef) -> String {
     match qty {
+        QuantityRef::EntryLifePaid => "life paid as this entered".into(),
         QuantityRef::HandSize { player } => {
             format!("cards in hand ({})", fmt_player_scope(player))
         }
@@ -8405,6 +8406,7 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
 fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
     use FeatureSupport::*;
     match qref {
+        QuantityRef::EntryLifePaid => ("EntryLifePaid", Handled),
         QuantityRef::HandSize { .. } => ("HandSize", Handled),
         QuantityRef::LifeTotal { .. } => ("LifeTotal", Handled),
         QuantityRef::UnspentMana { .. } => ("UnspentMana", Handled),
