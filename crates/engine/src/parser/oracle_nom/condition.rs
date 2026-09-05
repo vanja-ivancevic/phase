@@ -312,6 +312,7 @@ fn parse_remaining_state_presence_conditions(input: &str) -> OracleResult<'_, St
         parse_opponent_poison_conditions,
         parse_defending_player_more_life_than_another_opponent,
         parse_defending_player_comparison_conditions,
+        parse_target_opponent_controls_more_comparison,
         parse_that_player_controls_more_comparison,
         parse_no_opponent_comparison_conditions,
         parse_triggering_player_has_unattacked_opponent,
@@ -8835,6 +8836,43 @@ fn parse_there_exists_condition(input: &str) -> OracleResult<'_, StaticCondition
     ))
 }
 
+/// Parse "target opponent controls more [type] than you" → QuantityComparison.
+///
+/// CR 115.1 + CR 608.2c: Unlike the existential "an opponent controls more"
+/// form, `target opponent` names one player that must be chosen while the spell
+/// or ability is announced. `ControllerRef::TargetOpponent` preserves both that
+/// declared-target identity and its opponent-only legality; ability construction
+/// surfaces the companion player target slot from this reference.
+fn parse_target_opponent_controls_more_comparison(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("target opponent controls more ").parse(input)?;
+    let (rest, type_text) = take_until::<_, _, OracleError<'_>>(" than you").parse(rest)?;
+    let (rest, _) = tag(" than you").parse(rest)?;
+
+    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any | TargetFilter::None) {
+        return Err(oracle_err(type_text));
+    }
+    let target_filter = inject_controller(filter.clone(), ControllerRef::TargetOpponent);
+    let you_filter = inject_controller(filter, ControllerRef::You);
+
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: target_filter,
+                },
+            },
+            comparator: Comparator::GT,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter: you_filter },
+            },
+        },
+    ))
+}
+
 /// Parse "that player controls more [type] than you" → QuantityComparison.
 ///
 /// CR 603.2b + CR 603.4 + CR 102.1: Phase triggers such as Keeper of the Accord
@@ -16029,6 +16067,41 @@ mod tests {
                     },
             } => {
                 assert_eq!(lhs.controller, Some(ControllerRef::ScopedPlayer));
+                assert_eq!(rhs.controller, Some(ControllerRef::You));
+            }
+            other => panic!("expected ObjectCount GT ObjectCount, got {other:?}"),
+        }
+    }
+
+    /// CR 115.1 + CR 608.2c: Tithe's conditional target is a specific
+    /// opponent, not the existential aggregate used by Land Tax / Weathered
+    /// Wayfarer. The AST must preserve `TargetOpponent` so announcement can
+    /// surface an opponent-only player slot and resolution can recheck the
+    /// chosen player's land count.
+    #[test]
+    fn test_target_opponent_controls_more_lands_than_you() {
+        let (rest, c) =
+            parse_inner_condition("target opponent controls more lands than you").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::ObjectCount {
+                                filter: TargetFilter::Typed(lhs),
+                            },
+                    },
+                comparator: Comparator::GT,
+                rhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::ObjectCount {
+                                filter: TargetFilter::Typed(rhs),
+                            },
+                    },
+            } => {
+                assert_eq!(lhs.controller, Some(ControllerRef::TargetOpponent));
                 assert_eq!(rhs.controller, Some(ControllerRef::You));
             }
             other => panic!("expected ObjectCount GT ObjectCount, got {other:?}"),

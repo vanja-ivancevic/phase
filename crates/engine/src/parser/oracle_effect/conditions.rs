@@ -344,8 +344,7 @@ fn parse_and_conjunction_condition(
 /// Without this fallback the `If <X>, ` head stays on the text, so the downstream
 /// `strip_optional_effect_prefix` (which requires `"you may "` at position 0)
 /// never fires and the optional flag is lost (e.g. Amareth's "If it shares a card
-/// type with that permanent, you may reveal that card and put it into your hand",
-/// Tithe's "If target opponent controls more lands than you, you may search …").
+/// type with that permanent, you may reveal that card and put it into your hand").
 /// Dropping the condition is acceptable because the upstream `Condition_If`
 /// swallow detector still flags these patterns as condition-unsupported — we are
 /// fixing the OPTIONAL representation here, NOT the condition. The condition
@@ -357,9 +356,11 @@ fn parse_and_conjunction_condition(
 /// offer the may-choice *ungated* — strictly more permissive than the printed
 /// `If <gate>` text. This is sound ONLY because `Condition_If` keeps the card
 /// `supported == false`, which holds it out of the engine's production-execution
-/// set. When a typed recognizer is later added for one of these conditions, the
-/// typed strip will match first, this fallback will stop firing for that shape,
-/// and the card transitions to a fully gated+optional AST in a single step.
+/// set. Tithe used this fallback historically, but its targeted land-count
+/// condition now has a typed recognizer and no longer reaches this path. When a
+/// typed recognizer is later added for another condition, the typed strip will
+/// match first, this fallback will stop firing for that shape, and the card
+/// transitions to a fully gated+optional AST in a single step.
 ///
 /// Mandatory-body guard: this function is a no-op when the body does NOT start
 /// with `"you may "`. That prevents turning, e.g.,
