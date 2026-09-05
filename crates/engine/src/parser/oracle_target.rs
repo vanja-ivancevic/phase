@@ -5491,6 +5491,20 @@ fn parse_controller_suffix(text: &str, ctx: &ParseContext) -> Option<(Controller
             .unwrap_or(ControllerRef::You);
         return Some((ctrl, leading_ws + trimmed.len() - rest.len()));
     }
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("opponent controls").parse(trimmed) {
+        // CR 109.4 + CR 608.2c: this is normally reached from the type-phrase
+        // "that opponent controls" suffix.  Like "that player controls", the
+        // noun is an anaphor to the player introduced by the triggering event
+        // (Karmic Justice's spell-or-ability controller, for example), rather
+        // than an arbitrary opponent of the ability controller.  Keep the
+        // explicit `Opponent` fallback for non-trigger contexts, where no
+        // event-relative player exists to bind.
+        let ctrl = ctx
+            .relative_player_scope
+            .clone()
+            .unwrap_or(ControllerRef::Opponent);
+        return Some((ctrl, leading_ws + trimmed.len() - rest.len()));
+    }
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("controlled by that player").parse(trimmed)
     {
         let ctrl = ctx
