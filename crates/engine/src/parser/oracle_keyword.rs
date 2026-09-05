@@ -2400,7 +2400,10 @@ fn is_numeric_count_keyword(name: &str) -> bool {
 
 fn normalize_escalate_cost(cost: AbilityCost) -> AbilityCost {
     match cost {
-        AbilityCost::EffectCost { effect } => match *effect {
+        AbilityCost::EffectCost {
+            effect,
+            player_scope,
+        } => match *effect {
             // CR 701.26a: a single-target tap effect-cost becomes a typed
             // tap-creatures cost. Untap / mass scopes keep the effect-cost form.
             Effect::SetTapState {
@@ -2413,6 +2416,7 @@ fn normalize_escalate_cost(cost: AbilityCost) -> AbilityCost {
             },
             effect => AbilityCost::EffectCost {
                 effect: Box::new(effect),
+                player_scope,
             },
         },
         other => other,

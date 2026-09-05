@@ -19019,9 +19019,13 @@ fn activation_cost_for_affordability(
 /// equip costs from card-data export into `AbilityCost::OneOf`.
 fn normalize_activation_cost(cost: AbilityCost) -> AbilityCost {
     match cost {
-        AbilityCost::EffectCost { effect } => {
-            disjunctive_effect_cost_as_one_of(&effect).unwrap_or(AbilityCost::EffectCost { effect })
-        }
+        AbilityCost::EffectCost {
+            effect,
+            player_scope,
+        } => disjunctive_effect_cost_as_one_of(&effect).unwrap_or(AbilityCost::EffectCost {
+            effect,
+            player_scope,
+        }),
         AbilityCost::Composite { costs } => AbilityCost::Composite {
             costs: costs.into_iter().map(normalize_activation_cost).collect(),
         },

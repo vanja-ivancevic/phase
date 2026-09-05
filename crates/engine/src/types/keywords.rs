@@ -5642,6 +5642,7 @@ mod tests {
                     count: QuantityExpr::Fixed { value: 1 },
                     target: TargetFilter::SelfRef,
                 }),
+                player_scope: None,
             }),
             // Stored form is the normalized singular ("Legends" → "Legend"),
             // and `normalize_bands_with_other_quality` is idempotent on it.
@@ -6125,6 +6126,7 @@ mod tests {
                     count: QuantityExpr::Fixed { value: 1 },
                     target: TargetFilter::SelfRef,
                 }),
+                player_scope: None,
             })
         );
 

@@ -11535,6 +11535,14 @@ pub enum AbilityCost {
     /// the effect on the source before the ability's own effect fires.
     EffectCost {
         effect: Box<Effect>,
+        /// CR 608.2c: An effect-cost may act once for every player selected by
+        /// an Oracle subject such as "each other player". Keeping that scope on
+        /// the cost is essential: an `Effect` alone cannot retain the enclosing
+        /// `AbilityDefinition::player_scope` produced by the Oracle lowerer.
+        ///
+        /// `None` preserves the historical single-effect cost shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        player_scope: Option<PlayerFilter>,
     },
     /// CR 702.24a: A cost that multiplies a base cost by the number of
     /// counters of `counter` type on `target`. The runtime resolves the
@@ -11653,7 +11661,7 @@ impl AbilityCost {
             AbilityCost::PerCounter { base, .. } => base.for_each_quantity_expr(f),
             // CR 118.3: the cost's effect body resolves on the source before
             // the ability's own effect — its quantity slots are live.
-            AbilityCost::EffectCost { effect } => effect.for_each_quantity_expr(f),
+            AbilityCost::EffectCost { effect, .. } => effect.for_each_quantity_expr(f),
             // --- Quantity-free costs: static mana pips, fixed `u32`/`i32`
             // --- counts and aggregate thresholds, or purely structural
             // --- payments with no `QuantityExpr` field.
@@ -11775,7 +11783,7 @@ impl AbilityCost {
 
             // CR 602.1a: "The activation cost is everything before the colon (:)"
             // — an effect written there is performed as a cost. Delegate one node.
-            AbilityCost::EffectCost { effect } => effect.moves_card_to_or_from_library(),
+            AbilityCost::EffectCost { effect, .. } => effect.moves_card_to_or_from_library(),
 
             // ---------- FALSE: no library endpoint ----------
             // Mana, energy, speed, life, and loyalty payments move no card at all.
@@ -11942,7 +11950,7 @@ impl AbilityCost {
     pub fn supports_effect_cost_payment(&self) -> bool {
         matches!(
             self,
-            AbilityCost::EffectCost { effect }
+            AbilityCost::EffectCost { effect, .. }
                 if matches!(
                     effect.as_ref(),
                     Effect::PutCounter {
@@ -12029,7 +12037,7 @@ impl AbilityCost {
             }
             AbilityCost::Waterbend { .. } => vec![CostCategory::KeywordCost],
             AbilityCost::NinjutsuFamily { .. } => vec![CostCategory::KeywordCost],
-            AbilityCost::EffectCost { effect } => match effect.as_ref() {
+            AbilityCost::EffectCost { effect, .. } => match effect.as_ref() {
                 Effect::PutCounter { .. } | Effect::PutCounterAll { .. } => {
                     vec![CostCategory::PutsCounters]
                 }

@@ -3349,6 +3349,7 @@ mod tests {
                 library_position: None,
                 library_players: None,
             }),
+            player_scope: None,
         });
         def.unless_pay = Some(UnlessPayModifier {
             cost: AbilityCost::EffectCost {
@@ -3364,6 +3365,7 @@ mod tests {
                     library_position: None,
                     library_players: None,
                 }),
+                player_scope: None,
             },
             payer: TargetFilter::Controller,
         });
@@ -3544,6 +3546,7 @@ mod tests {
                     library_position: None,
                     library_players: None,
                 }),
+                player_scope: None,
             },
             payer: TargetFilter::Controller,
         });
@@ -3578,6 +3581,7 @@ mod tests {
                     library_position: None,
                     library_players: None,
                 }),
+                player_scope: None,
             },
             payment_record: None,
             decline: Some(Box::new(conjure_ability(

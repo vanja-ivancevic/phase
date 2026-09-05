@@ -65,12 +65,18 @@ mod tests {
     #[test]
     fn target_player_loses_every_color_of_unspent_mana() {
         let mut state = GameState::new_two_player(42);
-        state.players[1]
-            .mana_pool
-            .add(ManaUnit::new(ManaType::Blue, ObjectId(10), false, Vec::new()));
-        state.players[1]
-            .mana_pool
-            .add(ManaUnit::new(ManaType::Red, ObjectId(11), false, Vec::new()));
+        state.players[1].mana_pool.add(ManaUnit::new(
+            ManaType::Blue,
+            ObjectId(10),
+            false,
+            Vec::new(),
+        ));
+        state.players[1].mana_pool.add(ManaUnit::new(
+            ManaType::Red,
+            ObjectId(11),
+            false,
+            Vec::new(),
+        ));
         let ability = ResolvedAbility::new(
             Effect::LoseAllUnspentMana {
                 player: TargetFilter::Player,
@@ -88,7 +94,13 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| matches!(event, GameEvent::ManaPoolEmptied { player_id: PlayerId(1), .. }))
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::ManaPoolEmptied {
+                        player_id: PlayerId(1),
+                        ..
+                    }
+                ))
                 .count(),
             2,
             "each lost mana unit must retain its ordinary loss event"
@@ -108,12 +120,18 @@ mod tests {
     #[test]
     fn inherited_player_target_loses_every_color_of_unspent_mana() {
         let mut state = GameState::new_two_player(42);
-        state.players[1]
-            .mana_pool
-            .add(ManaUnit::new(ManaType::Blue, ObjectId(10), false, Vec::new()));
-        state.players[1]
-            .mana_pool
-            .add(ManaUnit::new(ManaType::Red, ObjectId(11), false, Vec::new()));
+        state.players[1].mana_pool.add(ManaUnit::new(
+            ManaType::Blue,
+            ObjectId(10),
+            false,
+            Vec::new(),
+        ));
+        state.players[1].mana_pool.add(ManaUnit::new(
+            ManaType::Red,
+            ObjectId(11),
+            false,
+            Vec::new(),
+        ));
         let ability = ResolvedAbility::new(
             Effect::LoseAllUnspentMana {
                 player: TargetFilter::ParentTarget,
@@ -130,7 +148,10 @@ mod tests {
         assert!(state.players[1].mana_pool.mana.is_empty());
         assert!(events.iter().any(|event| matches!(
             event,
-            GameEvent::ManaPoolEmptied { player_id: PlayerId(1), .. }
+            GameEvent::ManaPoolEmptied {
+                player_id: PlayerId(1),
+                ..
+            }
         )));
     }
 }

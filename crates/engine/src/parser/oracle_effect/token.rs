@@ -1216,9 +1216,7 @@ fn parse_token_name_clause(text: &str) -> (Option<String>, &str) {
 /// creator. Keep this separate from the ordinary source/P/T continuation:
 /// the ability must remain a live Layer-7a static, not be resolved once at
 /// token creation.
-pub(super) fn parse_token_static_ability_followup(
-    text: &str,
-) -> Option<Vec<StaticDefinition>> {
+pub(super) fn parse_token_static_ability_followup(text: &str) -> Option<Vec<StaticDefinition>> {
     let lower = text.trim().to_ascii_lowercase();
     let prefix = ["it has ", "this token has ", "the token has "]
         .into_iter()
@@ -1291,12 +1289,11 @@ fn rewrite_token_creator_counter_refs(expr: &mut QuantityExpr) -> bool {
         | QuantityExpr::UpTo { max: inner } => rewrite_token_creator_counter_refs(inner),
         QuantityExpr::Power { exponent, .. } => rewrite_token_creator_counter_refs(exponent),
         QuantityExpr::Difference { left, right } => {
-            rewrite_token_creator_counter_refs(left)
-                || rewrite_token_creator_counter_refs(right)
+            rewrite_token_creator_counter_refs(left) || rewrite_token_creator_counter_refs(right)
         }
-        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => exprs
-            .iter_mut()
-            .any(rewrite_token_creator_counter_refs),
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => {
+            exprs.iter_mut().any(rewrite_token_creator_counter_refs)
+        }
     }
 }
 
@@ -3805,6 +3802,8 @@ mod token_attachment_connector_tests {
             r#"It has "~'s power and toughness are each equal to the number of fade counters on ~.""#
         )
         .is_some());
-        assert!(parse_token_static_ability_followup(r#"It has "This token can't block.""#).is_none());
+        assert!(
+            parse_token_static_ability_followup(r#"It has "This token can't block.""#).is_none()
+        );
     }
 }

@@ -156,8 +156,8 @@ mod intensify_tests;
 pub mod investigate;
 pub mod learn;
 pub mod life;
-pub mod mana_loss;
 pub mod mana;
+pub mod mana_loss;
 pub mod manifest;
 pub mod manifest_dread;
 pub mod mill;
@@ -14925,43 +14925,47 @@ pub(crate) fn evaluate_condition(
             // Mirror the `ParentTargetController` fallback (targeting.rs): when
             // `targets` has no object, resolve the anaphor against
             // `TriggeringSource` from the current trigger event.
-            let result_target_id = ability
-                .context
-                .resolution_result_context
-                .as_ref()
-                .and_then(|context| {
-                    context.targets.iter().find_map(|target| match target {
-                        TargetRef::Object(id) if context.object_pin_is_current(*id, state) => {
-                            Some(*id)
-                        }
-                        _ => None,
-                    })
-                });
-            let target_id = result_target_id.or_else(|| if let Some(index) = subject_slot {
-                match crate::game::targeting::resolve_parent_slot_from_root(state, ability, *index)
-                {
-                    Some(TargetRef::Object(id)) => Some(id),
-                    _ => None,
-                }
-            } else {
+            let result_target_id =
                 ability
-                    .targets
-                    .iter()
-                    .find_map(|t| match t {
-                        TargetRef::Object(id) => Some(*id),
-                        _ => None,
-                    })
-                    .or_else(|| {
-                        crate::game::targeting::resolve_event_context_target(
-                            state,
-                            &TargetFilter::TriggeringSource,
-                            ability.source_id,
-                        )
-                        .and_then(|t| match t {
-                            TargetRef::Object(id) => Some(id),
-                            TargetRef::Player(_) => None,
+                    .context
+                    .resolution_result_context
+                    .as_ref()
+                    .and_then(|context| {
+                        context.targets.iter().find_map(|target| match target {
+                            TargetRef::Object(id) if context.object_pin_is_current(*id, state) => {
+                                Some(*id)
+                            }
+                            _ => None,
                         })
-                    })
+                    });
+            let target_id = result_target_id.or_else(|| {
+                if let Some(index) = subject_slot {
+                    match crate::game::targeting::resolve_parent_slot_from_root(
+                        state, ability, *index,
+                    ) {
+                        Some(TargetRef::Object(id)) => Some(id),
+                        _ => None,
+                    }
+                } else {
+                    ability
+                        .targets
+                        .iter()
+                        .find_map(|t| match t {
+                            TargetRef::Object(id) => Some(*id),
+                            _ => None,
+                        })
+                        .or_else(|| {
+                            crate::game::targeting::resolve_event_context_target(
+                                state,
+                                &TargetFilter::TriggeringSource,
+                                ability.source_id,
+                            )
+                            .and_then(|t| match t {
+                                TargetRef::Object(id) => Some(id),
+                                TargetRef::Player(_) => None,
+                            })
+                        })
+                }
             });
             let matched = if let Some(id) = target_id {
                 if *use_lki {
@@ -15536,7 +15540,10 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
         // counter placement once for every age counter. Scaling its quantity
         // keeps it a single deterministic effect-cost payment, so the shared
         // counter replacement pipeline sees the complete payment at once.
-        AbilityCost::EffectCost { effect } => match effect.as_ref() {
+        AbilityCost::EffectCost {
+            effect,
+            player_scope,
+        } => match effect.as_ref() {
             Effect::PutCounter {
                 counter_type,
                 count,
@@ -15547,6 +15554,7 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
                     count: count.scaled_by(n),
                     target: TargetFilter::SelfRef,
                 }),
+                player_scope: player_scope.clone(),
             },
             // CR 702.24a: Every age counter requires a separate instance of
             // the fixed mana-producing cost. Combining its fixed color vector
@@ -15568,6 +15576,7 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
                 *colors = colors.repeat(n as usize);
                 AbilityCost::EffectCost {
                     effect: Box::new(scaled_effect),
+                    player_scope: player_scope.clone(),
                 }
             }
             _ => AbilityCost::Composite {

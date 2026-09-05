@@ -335,14 +335,18 @@ mod tests {
             state.waiting_for
         );
 
-        assert!(result.events.iter().any(|event| matches!(
-            event,
-            GameEvent::DamageDealt {
-                target: TargetRef::Object(id),
-                amount: 2,
-                ..
-            } if *id == victim
-        )), "Cursed Scroll result events: {:?}", result.events);
+        assert!(
+            result.events.iter().any(|event| matches!(
+                event,
+                GameEvent::DamageDealt {
+                    target: TargetRef::Object(id),
+                    amount: 2,
+                    ..
+                } if *id == victim
+            )),
+            "Cursed Scroll result events: {:?}",
+            result.events
+        );
     }
 
     #[test]

@@ -1722,7 +1722,7 @@ pub(super) fn handle_unless_payment(
                     }
                 }
             }
-            AbilityCost::EffectCost { effect } => match effect.as_ref() {
+            AbilityCost::EffectCost { effect, .. } => match effect.as_ref() {
                 Effect::DealDamage { .. } => {
                     let mut damage_ability = pending_effect.as_ref().clone();
                     damage_ability.effect = *effect.clone();
@@ -3404,6 +3404,7 @@ mod tests {
                     count: QuantityExpr::Fixed { value: 1 },
                     target: TargetFilter::OriginalController,
                 }),
+                player_scope: None,
             },
             pending_effect: Box::new(pending),
             trigger_event: None,

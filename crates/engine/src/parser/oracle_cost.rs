@@ -1217,6 +1217,7 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
                 choice_optional: false,
                 reveal: true,
             }),
+            player_scope: None,
         };
     }
 
@@ -1341,15 +1342,25 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
     // activation costs are structurally identical to effects ("Put a -1/-1
     // counter on ~", "Return a land you control to its owner's hand") and
     // the effect parser already handles them.
+    // CR 118.3: "have each other player gain 6 life" (Reverent Silence)
+    // names an action performed as a cost.  The normal effect lowerer already
+    // understands its player subject, but the modal verb belongs to the cost
+    // grammar rather than the effect grammar, so peel only that verb before
+    // delegating.  Retain the lowerer's `player_scope`; dropping it would turn
+    // a cost paid by every other player into a self-only life gain.
+    let effect_cost_text = lower.strip_prefix("have ").map_or(text, |_| &text[5..]);
     let def = super::oracle_effect::parse_effect_chain(
-        text,
+        effect_cost_text,
         crate::types::ability::AbilityKind::Activated,
     );
     if !matches!(
         def.effect.as_ref(),
         crate::types::ability::Effect::Unimplemented { .. }
     ) {
-        return AbilityCost::EffectCost { effect: def.effect };
+        return AbilityCost::EffectCost {
+            effect: def.effect,
+            player_scope: def.player_scope,
+        };
     }
 
     AbilityCost::Unimplemented {

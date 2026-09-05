@@ -28465,7 +28465,12 @@ mod tests {
             "cost=EffectCost(hostile)",
             with_execute_axis(necroblossom_snarl_def(), "cost=EffectCost(hostile)", {
                 let effect = Box::new((*hostile.effect).clone());
-                move |d: &mut AbilityDefinition| d.cost = Some(AbilityCost::EffectCost { effect })
+                move |d: &mut AbilityDefinition| {
+                    d.cost = Some(AbilityCost::EffectCost {
+                        effect,
+                        player_scope: None,
+                    })
+                }
             }),
         ));
 

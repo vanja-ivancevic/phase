@@ -1369,10 +1369,7 @@ pub(crate) fn parse_discard_card_filter(tail: &str) -> Option<TargetFilter> {
 /// mana value equal to that number"), so this path preserves the chain's
 /// quantity bindings while the cost and trigger callers retain their
 /// context-free contract.
-fn parse_discard_card_filter_with_ctx(
-    tail: &str,
-    ctx: &mut ParseContext,
-) -> Option<TargetFilter> {
+fn parse_discard_card_filter_with_ctx(tail: &str, ctx: &mut ParseContext) -> Option<TargetFilter> {
     parse_discard_card_filter_inner(tail, Some(ctx))
 }
 
@@ -1398,7 +1395,8 @@ fn parse_discard_card_filter_inner(
         ))
         .parse(input)
     })
-    .is_some() {
+    .is_some()
+    {
         return Some(TargetFilter::HasChosenName);
     }
 
@@ -3884,10 +3882,7 @@ pub(super) fn parse_hand_reveal_ast(
         // card as part of the effect, so it must not become a second interactive
         // hand-card choice. Preserve the possessive player axis and lower the
         // card filter to `None` (the random selection is the result object).
-        let random_prefixes = [
-            "a card at random from ",
-            "one card at random from ",
-        ];
+        let random_prefixes = ["a card at random from ", "one card at random from "];
         for prefix in random_prefixes {
             if let Some(hand_phrase) = after_reveal_lower.strip_prefix(prefix) {
                 let hand_phrase = hand_phrase.trim_end_matches('.').trim();
@@ -14757,7 +14752,10 @@ mod tests {
             ..
         } = discard.effect.as_ref()
         else {
-            panic!("expected Persecute-style filtered discard, got {:?}", discard.effect);
+            panic!(
+                "expected Persecute-style filtered discard, got {:?}",
+                discard.effect
+            );
         };
         assert!(filter.properties.contains(&FilterProp::IsChosenColor));
     }

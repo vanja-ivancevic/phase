@@ -1542,7 +1542,7 @@ fn fold_cost(acc: &mut NodeAcc, cost: &AbilityCost) {
             }
         },
         // CR 118.12: an effect performed as a cost is projected the same way.
-        AbilityCost::EffectCost { effect } => fold_projection(acc, effect_projection(effect)),
+        AbilityCost::EffectCost { effect, .. } => fold_projection(acc, effect_projection(effect)),
         // CR 601.2h: a Composite cost is conjunctive — every sub-cost is part of
         // the total cost and all are paid (partial payments are not allowed), so
         // the branches AND-fold (sum) into the node.

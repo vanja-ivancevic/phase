@@ -1120,9 +1120,9 @@ fn target_filter_reads_player_chosen_number(filter: &TargetFilter) -> bool {
         TargetFilter::Not { filter } | TargetFilter::TrackedSetFiltered { filter, .. } => {
             target_filter_reads_player_chosen_number(filter)
         }
-        TargetFilter::And { filters } | TargetFilter::Or { filters } => filters
-            .iter()
-            .any(target_filter_reads_player_chosen_number),
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            filters.iter().any(target_filter_reads_player_chosen_number)
+        }
         _ => false,
     }
 }
@@ -1134,9 +1134,7 @@ fn filter_prop_reads_player_chosen_number(prop: &FilterProp) -> bool {
         | FilterProp::PtComparison { value: count, .. } => {
             quantity_expr_reads_player_chosen_number(count)
         }
-        FilterProp::AnyOf { props } => props
-            .iter()
-            .any(filter_prop_reads_player_chosen_number),
+        FilterProp::AnyOf { props } => props.iter().any(filter_prop_reads_player_chosen_number),
         FilterProp::Not { prop } => filter_prop_reads_player_chosen_number(prop),
         _ => false,
     }
@@ -3157,8 +3155,12 @@ fn graveyard_snapshot_play_permission_effect() -> Effect {
             invalidation: None,
         },
         target: TargetFilter::Typed(TypedFilter::default().properties(vec![
-            FilterProp::InZone { zone: Zone::Graveyard },
-            FilterProp::Owned { controller: ControllerRef::You },
+            FilterProp::InZone {
+                zone: Zone::Graveyard,
+            },
+            FilterProp::Owned {
+                controller: ControllerRef::You,
+            },
             FilterProp::NonToken,
         ])),
         grantee: crate::types::ability::PermissionGrantee::AbilityController,
@@ -3172,26 +3174,33 @@ fn try_parse_temporary_own_graveyard_exile_replacement(text: &str) -> Option<Eff
         return None;
     }
 
-    let exile_effect = AbilityDefinition::new(AbilityKind::Spell, Effect::ChangeZone {
-        origin: None,
-        destination: Zone::Exile,
-        target: TargetFilter::SelfRef,
-        owner_library: false,
-        enter_transformed: false,
-        enters_under: None,
-        enter_tapped: crate::types::zones::EtbTapState::Unspecified,
-        enters_attacking: false,
-        up_to: false,
-        enter_with_counters: vec![],
-        conditional_enter_with_counters: vec![],
-        face_down_profile: None,
-        enters_modified_if: None,
-    });
+    let exile_effect = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::ChangeZone {
+            origin: None,
+            destination: Zone::Exile,
+            target: TargetFilter::SelfRef,
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: None,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            face_down_profile: None,
+            enters_modified_if: None,
+        },
+    );
     let mut replacement = ReplacementDefinition::new(ReplacementEvent::Moved)
-        .valid_card(TargetFilter::Typed(TypedFilter::default().properties(vec![
-            FilterProp::Owned { controller: ControllerRef::You },
-            FilterProp::NonToken,
-        ])))
+        .valid_card(TargetFilter::Typed(TypedFilter::default().properties(
+            vec![
+                FilterProp::Owned {
+                    controller: ControllerRef::You,
+                },
+                FilterProp::NonToken,
+            ],
+        )))
         .destination_zone(Zone::Graveyard)
         .execute(exile_effect);
     replacement.expiry = Some(RestrictionExpiry::EndOfTurn);
@@ -3204,13 +3213,16 @@ fn try_parse_temporary_own_graveyard_exile_replacement(text: &str) -> Option<Eff
 }
 
 const GRAVEYARD_PLAY_AND_REDIRECT: &str = "Until end of turn, you may play lands and cast spells from your graveyard. If a card would be put into your graveyard from anywhere this turn, exile that card instead.";
-const GRAVEYARD_PLAY_CLAUSE: &str = "Until end of turn, you may play lands and cast spells from your graveyard.";
-const GRAVEYARD_REDIRECT_CLAUSE: &str = "If a card would be put into your graveyard from anywhere this turn, exile that card instead.";
+const GRAVEYARD_PLAY_CLAUSE: &str =
+    "Until end of turn, you may play lands and cast spells from your graveyard.";
+const GRAVEYARD_REDIRECT_CLAUSE: &str =
+    "If a card would be put into your graveyard from anywhere this turn, exile that card instead.";
 
 /// Dispatches the complete text form before the second sentence is classified
 /// as an object-hosted replacement ability.
 pub(crate) fn is_turn_bound_graveyard_play_and_redirect(text: &str) -> bool {
-    text.trim().eq_ignore_ascii_case(GRAVEYARD_PLAY_AND_REDIRECT)
+    text.trim()
+        .eq_ignore_ascii_case(GRAVEYARD_PLAY_AND_REDIRECT)
 }
 
 /// CR 614.1a + CR 514.2 + CR 611.2c: Recognize the one-shot spell/trigger form
@@ -5781,6 +5793,7 @@ fn parse_unless_player_have_deal_damage_cost(after_unless: &str) -> Option<Abili
             damage_source: None,
             excess: None,
         }),
+        player_scope: None,
     })
 }
 
@@ -32591,10 +32604,9 @@ pub(crate) fn parse_effect_chain_ir(
     // splitting would divide both clauses at grammar that is essential to their
     // meaning. This is keyed to the complete rules text, not a card name.
     if is_turn_bound_graveyard_play_and_redirect(full_text) {
-        let redirect = try_parse_temporary_own_graveyard_exile_replacement(
-            GRAVEYARD_REDIRECT_CLAUSE,
-        )
-        .expect("the canonical graveyard redirect clause must parse");
+        let redirect =
+            try_parse_temporary_own_graveyard_exile_replacement(GRAVEYARD_REDIRECT_CLAUSE)
+                .expect("the canonical graveyard redirect clause must parse");
         let mut graveyard_builder = ClauseIrBuilder::new(full_text);
         graveyard_builder
             .clause(
@@ -37341,6 +37353,7 @@ fn parse_unless_have_deal_damage_cost(after_unless: &str) -> Option<(AbilityCost
                 damage_source: None,
                 excess: None,
             }),
+            player_scope: None,
         },
         payer,
     ))
@@ -37370,6 +37383,7 @@ fn parse_unless_have_you_draw_cost(after_unless: &str) -> Option<AbilityCost> {
             count: QuantityExpr::Fixed { value: 1 },
             target: TargetFilter::OriginalController,
         }),
+        player_scope: None,
     })
 }
 
