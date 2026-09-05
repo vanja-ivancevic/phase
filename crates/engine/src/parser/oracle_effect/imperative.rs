@@ -1380,6 +1380,28 @@ fn parse_discard_card_filter_inner(
     tail: &str,
     mut ctx: Option<&mut ParseContext>,
 ) -> Option<TargetFilter> {
+    // CR 201.2a + CR 608.2d: a preceding "choose a card name" instruction
+    // supplies a resolution-local name for a following discard instruction.
+    // This is deliberately a noun-phrase parser rather than card dispatch:
+    // Cabal Therapy, and any future wording with this grammar, share the same
+    // `HasChosenName` runtime filter.
+    let lower = tail.to_ascii_lowercase();
+    if nom_parse_lower(&lower, |input| {
+        all_consuming(value(
+            (),
+            alt((
+                tag::<_, _, OracleError<'_>>("card with that name"),
+                tag("cards with that name"),
+                tag("card with the chosen name"),
+                tag("cards with the chosen name"),
+            )),
+        ))
+        .parse(input)
+    })
+    .is_some() {
+        return Some(TargetFilter::HasChosenName);
+    }
+
     let (filter, remainder) = parse_type_phrase(tail);
     let is_bare_card = matches!(
         &filter,
@@ -14659,6 +14681,21 @@ fn try_parse_bolster(lower: &str) -> Option<Effect> {
 mod tests {
     use super::*;
     use crate::types::ability::ParitySource;
+
+    #[test]
+    fn discard_filter_preserves_resolution_local_chosen_name() {
+        for wording in [
+            "cards with that name",
+            "cards with the chosen name",
+            "CARD WITH THAT NAME",
+        ] {
+            assert_eq!(
+                parse_discard_card_filter(wording),
+                Some(TargetFilter::HasChosenName),
+                "{wording:?} must retain the preceding named choice"
+            );
+        }
+    }
 
     /// Matrix row 18 — the mana ROLE must survive the cost-resource AST
     /// round-trip byte-for-byte.
