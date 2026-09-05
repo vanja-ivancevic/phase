@@ -197,6 +197,14 @@ Use `cargo-release` via the workspace alias (`cargo release-local <version>`) â€
 - Do not run a full Phase Cargo gate on Beluga. Use the M4 wrapper for full
   Phase, card-data, WASM, and playable-app gates once its load/memory guard
   permits it.
+- On the M4, a focused Phase lib-test batch must run with
+  `RUST_MIN_STACK=33554432`: the upstream engine's existing parser and casting
+  tests overflow the default macOS libtest thread stack, while the enlarged
+  test stack is stable. This is a test-thread setting, not a reason to raise
+  Cargo parallelism. Keep `CARGO_BUILD_JOBS=1`, one codegen unit, debug info
+  disabled, incremental disabled, and LTO off for a memory-bounded build;
+  compile the shared lib harness once, then execute all focused tests from it
+  with `--test-threads=1`.
 
 ## Planning
 

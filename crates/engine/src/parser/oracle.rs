@@ -7153,11 +7153,12 @@ fn parse_activated_ability_ir(
 fn strip_activated_mana_payment_restriction(
     text: &str,
 ) -> (&str, Option<ActivationManaPaymentRestriction>) {
-    const SUFFIX: &str = ". spend only mana of the chosen color to activate this ability";
+    const CHOSEN_COLOR_SUFFIX: &str =
+        ". spend only mana of the chosen color to activate this ability";
     let lower = text.to_lowercase();
     let parsed = nom_on_lower(text, &lower, |input| {
-        let (input, prefix) = take_until(SUFFIX).parse(input)?;
-        let (input, _) = tag(SUFFIX).parse(input)?;
+        let (input, prefix) = take_until(CHOSEN_COLOR_SUFFIX).parse(input)?;
+        let (input, _) = tag(CHOSEN_COLOR_SUFFIX).parse(input)?;
         let (input, _) = opt(tag(".")).parse(input)?;
         let (input, _) = all_consuming(multispace0).parse(input)?;
         Ok((input, prefix.len()))
@@ -7167,8 +7168,34 @@ fn strip_activated_mana_payment_restriction(
             text[..prefix_len].trim_end(),
             Some(ActivationManaPaymentRestriction::OnlySourceChosenColor),
         ),
-        None => (text, None),
+        None => strip_activated_x_mana_payment_restriction(text),
     }
+}
+
+/// CR 107.1b + CR 118.3: Strip the terminal activated-ability rider "Spend
+/// only [color] mana on X." The rider describes payment, not resolution, so
+/// keeping it in the effect body would make an otherwise supported ability
+/// falsely unimplemented.
+fn strip_activated_x_mana_payment_restriction(
+    text: &str,
+) -> (&str, Option<ActivationManaPaymentRestriction>) {
+    // Find the sentence boundary in the original text before lowercasing the
+    // rider. Lowercase mappings are not universally byte-length-preserving,
+    // so an index found in the lowercase projection must never slice `text`.
+    let Some(marker_index) = text.rfind(". ") else {
+        return (text, None);
+    };
+    let rider_lower = text[marker_index + 2..]
+        .trim_end_matches('.')
+        .to_lowercase();
+    let Some(restriction) = super::oracle_casting::parse_x_mana_payment_restriction(&rider_lower)
+    else {
+        return (text, None);
+    };
+    (
+        text[..marker_index].trim_end(),
+        Some(ActivationManaPaymentRestriction::OnlyColorsOnX(restriction)),
+    )
 }
 
 /// Parse Oracle text into structured ability definitions.

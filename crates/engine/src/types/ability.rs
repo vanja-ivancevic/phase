@@ -21720,6 +21720,10 @@ pub enum ActivationManaPaymentRestriction {
     /// "Spend only mana of the chosen color to activate this ability." The
     /// source's live chosen color is resolved at payment time.
     OnlySourceChosenColor,
+    /// CR 107.1b + CR 118.3: "Spend only [color] mana on X." Unlike the
+    /// source-chosen-color rider, this constrains only the mana assigned to
+    /// the activated ability's announced X portion; fixed costs remain normal.
+    OnlyColorsOnX(crate::types::mana::XManaPaymentRestriction),
 }
 
 /// Structured spell-casting restrictions parsed from Oracle text.
@@ -21760,6 +21764,10 @@ pub enum CastingRestriction {
     /// `restrictions.rs` treats it as always-satisfied for the timing check and
     /// the mana-payment path excludes real pool mana when it is present.
     CantSpendMana,
+    /// CR 107.1b + CR 118.3: "Spend only [color] mana on X." This is a
+    /// payment restriction, not a timing gate. The casting pipeline replaces
+    /// only the announced X shards with the stored colored/hybrid shard.
+    OnlyColorsOnX(crate::types::mana::XManaPaymentRestriction),
 }
 
 /// CR 602.2b + CR 601.2f: Self-referential activation/cast cost modification.

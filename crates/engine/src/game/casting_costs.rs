@@ -12787,6 +12787,19 @@ pub fn enter_payment_step(
                 .and_then(|cost| additional_cost_x_max(state, player, pending.object_id, cost))
                 .or(activation_counter_x_max)
                 .map_or(mana_max, |cost_max| mana_max.min(cost_max));
+            // The ordinary arithmetic cap counts every mana unit, which is
+            // deliberately an upper bound for an Oracle rider such as "Spend
+            // only black mana on X." Refine it through the same payment probe
+            // that later pays the cost so the Choose-X UI never offers a value
+            // that can only be funded with forbidden colors.
+            let max =
+                if super::casting::pending_x_mana_payment_restriction(state, pending).is_some() {
+                    largest_x_satisfying_at_most(max, |value| {
+                        super::casting::pending_x_value_is_payable(state, pending, player, value)
+                    })
+                } else {
+                    max
+                };
             if min > max {
                 let pending_for_cancel = pending.clone();
                 state.pending_cast = None;

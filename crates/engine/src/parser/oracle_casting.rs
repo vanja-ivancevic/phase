@@ -13,6 +13,7 @@ use crate::types::ability::{
     AbilityCost, AdditionalCost, CastingRestriction, Comparator, ParsedCondition, QuantityExpr,
     QuantityRef, SpellCastingOption,
 };
+use crate::types::mana::{ManaColor, XManaPaymentRestriction};
 
 /// Split a combined additional-cost line from its trailing self-spell cost
 /// reduction (Rottenmouth Viper class: "...sacrifice N. This spell costs {1}
@@ -447,6 +448,9 @@ pub(crate) fn parse_casting_restriction_line(text: &str) -> Option<Vec<CastingRe
     if parse_cant_spend_mana_restriction(&trimmed_lower) {
         return Some(vec![CastingRestriction::CantSpendMana]);
     }
+    if let Some(restriction) = parse_x_mana_payment_restriction(&trimmed_lower) {
+        return Some(vec![CastingRestriction::OnlyColorsOnX(restriction)]);
+    }
     if let Some(restriction) = parse_negative_self_casting_restriction(&trimmed_lower) {
         return Some(vec![restriction]);
     }
@@ -500,6 +504,37 @@ pub(crate) fn parse_casting_restriction_line(text: &str) -> Option<Vec<CastingRe
     }
 
     (!restrictions.is_empty()).then_some(restrictions)
+}
+
+/// CR 107.1b + CR 118.3: Parse the complete spell line "Spend only [color]
+/// mana on X." The parser intentionally accepts exactly one color or an
+/// `and/or` pair. Wider phrases remain an explicit residual rather than being
+/// weakened into an unrestricted generic X payment.
+pub(crate) fn parse_x_mana_payment_restriction(lower: &str) -> Option<XManaPaymentRestriction> {
+    fn color(input: &str) -> nom::IResult<&str, ManaColor, OracleError<'_>> {
+        alt((
+            value(ManaColor::White, tag("white")),
+            value(ManaColor::Blue, tag("blue")),
+            value(ManaColor::Black, tag("black")),
+            value(ManaColor::Red, tag("red")),
+            value(ManaColor::Green, tag("green")),
+        ))
+        .parse(input)
+    }
+
+    let mut parser = all_consuming(map(
+        (
+            tag("spend only "),
+            color,
+            opt(preceded(tag(" and/or "), color)),
+            tag(" mana on x"),
+        ),
+        |(_, first, second, _)| match second {
+            Some(second) => XManaPaymentRestriction::Either(first, second),
+            None => XManaPaymentRestriction::One(first),
+        },
+    ));
+    parser.parse(lower).ok().map(|(_, restriction)| restriction)
 }
 
 /// CR 601.2g / CR 118.3: "You can't spend mana to cast this spell." A payment
@@ -836,6 +871,27 @@ mod tests {
             parse_casting_restriction_line("You can't spend mana to cast this spell.")
                 .expect("restriction should parse");
         assert_eq!(restrictions, vec![CastingRestriction::CantSpendMana]);
+    }
+
+    #[test]
+    fn x_mana_payment_restrictions_parse_as_payment_data() {
+        assert_eq!(
+            parse_casting_restriction_line("Spend only black mana on X."),
+            Some(vec![CastingRestriction::OnlyColorsOnX(
+                XManaPaymentRestriction::One(ManaColor::Black)
+            )])
+        );
+        assert_eq!(
+            parse_casting_restriction_line("Spend only black and/or red mana on X."),
+            Some(vec![CastingRestriction::OnlyColorsOnX(
+                XManaPaymentRestriction::Either(ManaColor::Black, ManaColor::Red)
+            )])
+        );
+        assert_eq!(
+            parse_casting_restriction_line("Spend only black, red, or green mana on X."),
+            None,
+            "unsupported wider color sets must remain an explicit parse gap"
+        );
     }
 
     #[test]

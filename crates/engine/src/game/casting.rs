@@ -2,12 +2,12 @@ use crate::types::ability::{
     is_variable_remove_counter_cost_count, AbilityBlockKind, AbilityBlockReason, AbilityCondition,
     AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, ActivationManaPaymentRestriction,
     AdditionalCost, BoardWideCostModifier, CardPlayMode, CardSelectionMode, CardTypeSetSource,
-    CastTimingPermission, CastingPermission, ChoiceType, ContinuousModification, CostObjectCount,
-    CostPaidObjectSnapshot, CounterCostSelection, Duration, Effect, EffectKind, FilterProp,
-    GameRestriction, ModalSelectionCondition, ObjectScope, PlayerFilter, PlayerScope,
-    ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility, RestrictionExpiry,
-    RestrictionPlayerScope, StaticCondition, StaticDefinition, SubAbilityLink,
-    TapCreaturesRequirement, TargetFilter, TargetRef, TypeFilter,
+    CastTimingPermission, CastingPermission, CastingRestriction, ChoiceType,
+    ContinuousModification, CostObjectCount, CostPaidObjectSnapshot, CounterCostSelection,
+    Duration, Effect, EffectKind, FilterProp, GameRestriction, ModalSelectionCondition,
+    ObjectScope, PlayerFilter, PlayerScope, ProhibitedActivity, QuantityExpr, QuantityRef,
+    ResolvedAbility, RestrictionExpiry, RestrictionPlayerScope, StaticCondition, StaticDefinition,
+    SubAbilityLink, TapCreaturesRequirement, TargetFilter, TargetRef, TypeFilter,
 };
 use crate::types::actions::{AlternativeCastDecision, GameAction};
 use crate::types::card::LayoutKind;
@@ -26,6 +26,7 @@ use crate::types::keywords::{FlashbackCost, Keyword, KeywordKind};
 use crate::types::mana::{
     ActivationManaColorConstraint, ManaColor, ManaCost, ManaCostShard, ManaSourceOutput,
     ManaSourceSelection, ManaSpellGrant, ManaType, PaymentContext, SpecialAction, SpellMeta,
+    XManaPaymentRestriction,
 };
 use crate::types::player::PlayerId;
 use crate::types::resolved_commands::ManaPaymentRecipient;
@@ -8135,7 +8136,7 @@ pub(super) fn recompute_pending_mana_total(
     let Some(base) = pending.base_cost.as_ref() else {
         let mut cost = pending.cost.clone();
         if let Some(x) = x {
-            cost.concretize_x(x);
+            concretize_pending_x(&mut cost, x);
         }
         if !casting_costs::cost_has_x(&cost) {
             apply_cost_floor(state, player, pending.object_id, &mut cost);
@@ -8147,12 +8148,13 @@ pub(super) fn recompute_pending_mana_total(
                 &mut cost,
             );
         }
+        apply_pending_x_mana_payment_restriction(state, pending, &mut cost, x);
         return cost;
     };
 
     let mut cost = base.clone();
     if let Some(x) = x {
-        cost.concretize_x(x);
+        concretize_pending_x(&mut cost, x);
     }
     for addition in &pending.declared_mana_additions {
         cost = super::restrictions::add_mana_cost(&cost, addition);
@@ -8182,6 +8184,7 @@ pub(super) fn recompute_pending_mana_total(
             &mut cost,
         );
     }
+    apply_pending_x_mana_payment_restriction(state, pending, &mut cost, x);
     cost
 }
 
@@ -8239,7 +8242,7 @@ pub(super) fn apply_post_x_cost_modifiers(
             // Legacy / in-flight saved game without a captured base: behavior
             // identical to the pre-change floor-only post-X pass.
             let mut cost = pending.cost.clone();
-            cost.concretize_x(x);
+            concretize_pending_x(&mut cost, x);
             apply_cost_floor(state, caster, object_id, &mut cost);
             apply_cost_floor_with_selected_targets(
                 state,
@@ -8248,12 +8251,137 @@ pub(super) fn apply_post_x_cost_modifiers(
                 &pending.ability,
                 &mut cost,
             );
+            apply_pending_x_mana_payment_restriction(state, pending, &mut cost, Some(x));
             cost
         }
     };
     debug_assert!(!casting_costs::cost_has_x(&new_cost));
     if let Some(pending) = state.pending_cast.as_mut() {
         pending.cost = new_cost;
+    }
+}
+
+/// CR 107.1b: Determine X as generic mana before CR 601.2f cost modifiers.
+/// A color rider is applied only after the total is locked by
+/// [`apply_pending_x_mana_payment_restriction`].
+pub(crate) fn concretize_pending_x(cost: &mut ManaCost, value: u32) {
+    cost.concretize_x(value);
+}
+
+pub(crate) fn pending_x_mana_payment_restriction(
+    state: &GameState,
+    pending: &PendingCast,
+) -> Option<XManaPaymentRestriction> {
+    if let Some(ability_index) = pending.activation_ability_index {
+        return activation_ability_definition(state, pending.object_id, ability_index).and_then(
+            |ability| match ability.activation_mana_payment_restriction {
+                Some(ActivationManaPaymentRestriction::OnlyColorsOnX(restriction)) => {
+                    Some(restriction)
+                }
+                _ => None,
+            },
+        );
+    }
+
+    state.objects.get(&pending.object_id).and_then(|object| {
+        object
+            .casting_restrictions
+            .iter()
+            .find_map(|restriction| match restriction {
+                CastingRestriction::OnlyColorsOnX(restriction) => Some(*restriction),
+                _ => None,
+            })
+    })
+}
+
+/// CR 107.1b + CR 118.3: Convert only the X portion that survives the full
+/// total-cost calculation into color-restricted payment shards. Keeping the
+/// X count separate from the post-modifier `generic` total lets a generic cost
+/// reduction reduce X when it must, without allowing off-color mana to pay the
+/// remaining portion.
+fn apply_pending_x_mana_payment_restriction(
+    state: &GameState,
+    pending: &PendingCast,
+    cost: &mut ManaCost,
+    chosen_x: Option<u32>,
+) {
+    let (Some(chosen_x), Some(restriction)) =
+        (chosen_x, pending_x_mana_payment_restriction(state, pending))
+    else {
+        return;
+    };
+    let x_shards = pending_x_shard_count(state, pending);
+    cost.restrict_generic_x_payment(chosen_x.saturating_mul(x_shards), restriction);
+}
+
+fn pending_x_shard_count(state: &GameState, pending: &PendingCast) -> u32 {
+    fn count(cost: &ManaCost) -> u32 {
+        match cost {
+            ManaCost::Cost { shards, .. } => shards
+                .iter()
+                .filter(|shard| matches!(shard, ManaCostShard::X))
+                .count() as u32,
+            _ => 0,
+        }
+    }
+
+    if let Some(base) = pending.base_cost.as_ref() {
+        return count(base);
+    }
+    pending
+        .activation_ability_index
+        .and_then(|index| activation_ability_definition(state, pending.object_id, index))
+        .and_then(|ability| {
+            ability
+                .cost
+                .as_ref()
+                .and_then(casting_costs::extract_x_mana_cost)
+        })
+        .map_or(0, |(cost, _)| count(&cost))
+}
+
+/// CR 107.1b + CR 118.3: Exact affordability predicate for a pending X value
+/// whose Oracle text constrains the colors assigned to X. This is deliberately
+/// a full payment probe, not a mana-pool color count: floating restricted mana,
+/// mana abilities, and the source's own activation-payment context all remain
+/// visible to the existing payment authority.
+pub(crate) fn pending_x_value_is_payable(
+    state: &GameState,
+    pending: &PendingCast,
+    player: PlayerId,
+    value: u32,
+) -> bool {
+    let mut trial = pending.clone();
+    trial.ability.set_chosen_x_recursive(value);
+    trial.cost = if trial.base_cost.is_some() {
+        recompute_pending_mana_total(state, player, &trial, Some(value))
+    } else {
+        let mut cost = trial.cost.clone();
+        concretize_pending_x(&mut cost, value);
+        apply_pending_x_mana_payment_restriction(state, &trial, &mut cost, Some(value));
+        cost
+    };
+
+    let mut simulated = state.clone();
+    if trial.activation_ability_index.is_some() {
+        super::layers::flush_layers(&mut simulated);
+        let activation_context =
+            activation_payment_context(&simulated, trial.object_id, trial.activation_ability_index);
+        let context = activation_context.as_payment_context();
+        can_pay_mana_cost_after_auto_tap_with_context_and_cache(
+            &mut simulated,
+            player,
+            Some(trial.object_id),
+            &trial.cost,
+            Some(&context),
+            &HashSet::new(),
+            AutoTapProbeOptions {
+                source_cache: None,
+                explicit_tap_payment_mode: None,
+            },
+        )
+    } else {
+        can_pay_pending_cast_after_auto_tap_in_scratch(&mut simulated, &trial)
     }
 }
 
@@ -17978,6 +18106,13 @@ pub(super) fn activation_payment_context(
             .chosen_color()
             .map(ActivationManaColorConstraint::Only)
             .unwrap_or(ActivationManaColorConstraint::Impossible),
+        // This restriction is applied after CR 601.2f total-cost calculation:
+        // only the surviving announced X portion is colored. The remaining
+        // fixed activation cost stays normally payable, so the general
+        // activation context is not color-constrained here.
+        Some(ActivationManaPaymentRestriction::OnlyColorsOnX(_)) => {
+            ActivationManaColorConstraint::Unrestricted
+        }
     };
     ActivationPaymentContext {
         source_types,
