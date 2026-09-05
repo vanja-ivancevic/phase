@@ -12892,9 +12892,9 @@ mod tests {
     use super::*;
     use crate::parser::oracle::parse_oracle_text;
     use crate::types::ability::{
-        AbilityCondition, Comparator, ControllerRef, CountScope, QuantityExpr,
-        QuantityModification, QuantityRef, ReplacementCondition, RestrictionExpiry, ShieldKind,
-        ZoneRef,
+        AbilityCondition, Comparator, ContinuousModification, ControllerRef, CountScope, Effect,
+        PtValue, QuantityExpr, QuantityModification, QuantityRef, ReplacementCondition,
+        RestrictionExpiry, ShieldKind, ZoneRef,
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::keywords::Keyword;
@@ -12921,6 +12921,91 @@ mod tests {
                 decline: None,
             } if name == "X"
         ));
+    }
+
+    /// The payment fact is only useful if later card text reads the exact
+    /// battlefield incarnation that recorded it.  These are the two old-border
+    /// card shapes which motivated `EntryLifePaid`: an activated ability creates
+    /// a token from the payment (Processor), and a CDA sets the entrant's own
+    /// P/T from it (Minion).  Use their published wording, including the typed
+    /// self-reference in Processor's activation, to cover the full parser path.
+    #[test]
+    fn entry_life_paid_reaches_processor_token_and_minion_cda() {
+        let processor = parse_oracle_text(
+            "As this artifact enters, pay any amount of life.\n\
+             {4}, {T}: Create an X/X black Phyrexian Minion creature token, where X is the life paid as this artifact entered.",
+            "Phyrexian Processor",
+            &[],
+            &["Artifact".to_string()],
+            &[],
+        );
+        assert!(processor.replacements.iter().any(|replacement| {
+            matches!(
+                replacement.mode,
+                ReplacementMode::MayCost {
+                    payment_record: Some(ReplacementPaymentRecord::EntryLifePaid),
+                    ..
+                }
+            )
+        }));
+        assert!(processor.abilities.iter().any(|ability| {
+            matches!(
+                ability.effect.as_ref(),
+                Effect::Token {
+                    power: PtValue::Quantity(QuantityExpr::Ref {
+                        qty: QuantityRef::EntryLifePaid,
+                    }),
+                    toughness: PtValue::Quantity(QuantityExpr::Ref {
+                        qty: QuantityRef::EntryLifePaid,
+                    }),
+                    ..
+                }
+            )
+        }), "Processor's token must retain its entry-life P/T binding");
+
+        let minion = parse_oracle_text(
+            "Trample\n\
+             As this creature enters, pay any amount of life.\n\
+             Minion of the Wastes's power and toughness are each equal to the life paid as it entered.",
+            "Minion of the Wastes",
+            &[],
+            &["Creature".to_string()],
+            &[],
+        );
+        assert!(minion.replacements.iter().any(|replacement| {
+            matches!(
+                replacement.mode,
+                ReplacementMode::MayCost {
+                    payment_record: Some(ReplacementPaymentRecord::EntryLifePaid),
+                    ..
+                }
+            )
+        }));
+        let minion_pt = minion
+            .statics
+            .iter()
+            .find(|static_def| static_def.characteristic_defining)
+            .expect("Minion's printed P/T must lower as a CDA");
+        assert!(minion_pt.modifications.iter().any(|modification| {
+            matches!(
+                modification,
+                ContinuousModification::SetDynamicPower {
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::EntryLifePaid,
+                    },
+                }
+            )
+        }));
+        assert!(minion_pt.modifications.iter().any(|modification| {
+            matches!(
+                modification,
+                ContinuousModification::SetDynamicToughness {
+                    value: QuantityExpr::Ref {
+                        qty: QuantityRef::EntryLifePaid,
+                    },
+                }
+            )
+        }));
     }
 
     /// `take_damage_source_subject_clause` must stop at whichever terminator
