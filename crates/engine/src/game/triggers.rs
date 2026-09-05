@@ -12846,7 +12846,7 @@ fn check_trigger_constraint_with_ref(
             state.active_player == controller
                 && matches!(state.phase, Phase::PreCombatMain | Phase::PostCombatMain)
         }
-        // CR 109.5 + CR 603.2: Fires only when the triggering discard was caused
+        // CR 109.5 + CR 603.2: Fires only when the triggering event was caused
         // by a spell/ability controlled by `ctrl_ref` relative to the trigger's
         // controller (mirrors the replacement-side `EventSourceControlledBy`).
         TriggerConstraint::EventSourceControlledBy {
@@ -12857,6 +12857,12 @@ fn check_trigger_constraint_with_ref(
                     source_id: Some(source_id),
                     ..
                 }) => *source_id,
+                Some(GameEvent::ZoneChanged { record, .. }) => {
+                    let Some(source_id) = record.cause_source_id() else {
+                        return false;
+                    };
+                    source_id
+                }
                 _ => return false,
             };
             let Some(event_source_controller) = state
@@ -17437,6 +17443,64 @@ pub mod tests {
             !check_trigger_constraint(&state, &def, source, 0, PlayerId(0), &no_cause),
             "a discard with no recorded cause must NOT satisfy the constraint"
         );
+    }
+
+    /// CR 109.5 + CR 603.2: Zone-change causation is captured with the event,
+    /// so a later state cannot confuse the moving permanent's controller with
+    /// the spell or ability that caused its move (Sacred Ground).
+    #[test]
+    fn event_source_controlled_by_opponent_gates_zone_change_trigger() {
+        use crate::types::ability::{ControllerRef, TriggerConstraint};
+        let mut state = setup();
+        let source = make_creature(&mut state, PlayerId(0), "Sacred Ground", 0, 0);
+        let land = make_creature(&mut state, PlayerId(0), "Sacred Land", 0, 0);
+        let opponent_cause = make_creature(&mut state, PlayerId(1), "Opponent Spell", 0, 0);
+        let own_cause = make_creature(&mut state, PlayerId(0), "Own Spell", 0, 0);
+
+        let mut def = make_trigger(TriggerMode::ChangesZone);
+        def.constraint = Some(TriggerConstraint::EventSourceControlledBy {
+            controller: ControllerRef::Opponent,
+        });
+
+        let event_with_cause = |cause| {
+            let mut record = state.objects[&land].snapshot_for_zone_change(
+                land,
+                Some(Zone::Battlefield),
+                Zone::Graveyard,
+            );
+            record.stamp_cause_source_id(cause);
+            GameEvent::ZoneChanged {
+                object_id: land,
+                from: Some(Zone::Battlefield),
+                to: Zone::Graveyard,
+                record: Box::new(record),
+            }
+        };
+
+        assert!(check_trigger_constraint(
+            &state,
+            &def,
+            source,
+            0,
+            PlayerId(0),
+            &event_with_cause(Some(opponent_cause)),
+        ));
+        assert!(!check_trigger_constraint(
+            &state,
+            &def,
+            source,
+            0,
+            PlayerId(0),
+            &event_with_cause(Some(own_cause)),
+        ));
+        assert!(!check_trigger_constraint(
+            &state,
+            &def,
+            source,
+            0,
+            PlayerId(0),
+            &event_with_cause(None),
+        ));
     }
 
     /// Issue #5143 — Anje Falkenrath: intervening-if "if it has madness" must

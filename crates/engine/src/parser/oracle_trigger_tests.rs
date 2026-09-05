@@ -16349,6 +16349,45 @@ fn trigger_opponent_causes_you_to_discard_a_card() {
     ));
 }
 
+/// CR 109.5 + CR 603.2: Sacred Ground watches the event source, the departing
+/// land's owner, and the battlefield-to-graveyard transition independently.
+#[test]
+fn trigger_opponent_causes_land_to_enter_your_graveyard() {
+    let def = parse_trigger_line(
+        "Whenever a spell or ability an opponent controls causes a land to be put into your graveyard from the battlefield, \
+         return that card to the battlefield.",
+        "Sacred Ground",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.origin, Some(Zone::Battlefield));
+    assert_eq!(def.destination, Some(Zone::Graveyard));
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::Typed(
+            TypedFilter::land().properties(vec![FilterProp::Owned {
+                controller: ControllerRef::You,
+            }])
+        ))
+    );
+    assert_eq!(
+        def.constraint,
+        Some(
+            crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+                controller: ControllerRef::Opponent
+            }
+        )
+    );
+    assert!(matches!(
+        def.execute.as_deref().map(|ability| ability.effect.as_ref()),
+        Some(Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Battlefield,
+            target: TargetFilter::TriggeringSource,
+            ..
+        })
+    ));
+}
+
 /// CR 701.9 + CR 608.2k + CR 406.1: Necropotence's on-discard trigger
 /// exiles the just-discarded card from the graveyard. The "that card"
 /// anaphor must lift from `ParentTarget` to `TriggeringSource` so the

@@ -1054,6 +1054,26 @@ pub fn move_to_zone(
     move_to_zone_with_entry_flags(state, object_id, to, events, false);
 }
 
+/// Stamps a just-emitted zone-change record with its causal spell or ability.
+/// The caller supplies only the event slice produced by one delivery, avoiding
+/// any chance of rebinding a same-id zone change from an earlier instruction.
+pub(crate) fn stamp_zone_change_cause(
+    events: &mut [GameEvent],
+    object_id: ObjectId,
+    source_id: Option<ObjectId>,
+) {
+    let Some(source_id) = source_id else {
+        return;
+    };
+    if let Some(GameEvent::ZoneChanged { record, .. }) = events
+        .iter_mut()
+        .rev()
+        .find(|event| matches!(event, GameEvent::ZoneChanged { object_id: id, .. } if *id == object_id))
+    {
+        record.stamp_cause_source_id(Some(source_id));
+    }
+}
+
 /// CR 400.7: Move an object to a new zone. An object that moves to a new zone becomes a new object.
 ///
 /// `enter_transformed` (CR 712.14a) is the transient, single-authority "enters

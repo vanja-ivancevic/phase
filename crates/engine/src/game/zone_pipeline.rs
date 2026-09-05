@@ -3548,6 +3548,7 @@ pub(crate) fn deliver_replaced_zone_change(
         // redundant check below skip re-marking `Full`. `false` for both the
         // library-placement branch and the merge-survivor branch, neither of
         // which is analyzed by that carve-out.
+        let zone_event_start = events.len();
         let took_plain_zone_transfer;
         match (to, library_placement.as_ref()) {
             (Zone::Library, Some(position)) => {
@@ -3608,6 +3609,16 @@ pub(crate) fn deliver_replaced_zone_change(
         // unrelated move. Purely synchronous lifetime (set → consumed → cleared in
         // this one delivery), so it never crosses a pause.
         state.merged_card_component_route = None;
+        // CR 109.5: a zone-change trigger that says a spell or ability "causes"
+        // this move must read the source captured by the accepted delivery, not
+        // infer one from the moved object's later incarnation. Restrict the stamp
+        // to this delivery's event slice so repeated moves of one ObjectId cannot
+        // rebind an earlier record.
+        zones::stamp_zone_change_cause(
+            &mut events[zone_event_start..],
+            object_id,
+            cause.or(source_id),
+        );
         // CR 614.1d: determine whether the object actually entered the battlefield.
         // `move_to_zone` rejects a battlefield entry without moving the object when
         // a `CantEnterBattlefieldFrom` static (e.g. Grafdigger's Cage) matches, so
@@ -6412,5 +6423,56 @@ mod face_down_entry_referent_tests {
                 "the characteristics helper must not touch the referent slot (zone {zone:?})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod zone_causation_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::identifiers::CardId;
+
+    /// CR 109.5 + CR 603.2: the causal spell/ability identity belongs to the
+    /// exact zone-change event, not to the moved object's post-move state.
+    #[test]
+    fn effect_zone_move_stamps_its_zone_change_record_with_source() {
+        let mut state = GameState::new_two_player(7);
+        let land = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Test Land".to_string(),
+            Zone::Battlefield,
+        );
+        let source = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Opponent Spell".to_string(),
+            Zone::Battlefield,
+        );
+        let mut events = Vec::new();
+
+        assert!(matches!(
+            move_object(
+                &mut state,
+                ZoneMoveRequest::effect(land, Zone::Graveyard, source),
+                &mut events,
+            ),
+            ZoneMoveResult::Done
+        ));
+
+        let record = events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    object_id,
+                    record,
+                    ..
+                } if *object_id == land => Some(record),
+                _ => None,
+            })
+            .expect("effect move must emit a zone-change record");
+        assert_eq!(record.cause_source_id(), Some(source));
     }
 }
