@@ -8761,7 +8761,11 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::And { .. } => ("And", Handled),
         StaticCondition::Or { .. } => ("Or", Handled),
         StaticCondition::Not { .. } => ("Not", Handled),
-        StaticCondition::DefendingPlayerControls { .. } => ("DefendingPlayerControls", Unhandled),
+        // CR 509.1b: resolved by `layers::evaluate_condition` from the
+        // source's live attacker record, then evaluated against the defending
+        // player's battlefield. This is a combat-relative condition, not an
+        // unsupported parser placeholder.
+        StaticCondition::DefendingPlayerControls { .. } => ("DefendingPlayerControls", Handled),
         StaticCondition::SourceAttackingAlone => ("SourceAttackingAlone", Unhandled),
         // CR 508.1k / 509.1g / 509.1h: runtime-evaluated against the live combat
         // attacker/blocker sets (conditions.rs:81 / layers.rs:1118 / layers.rs:1123).
@@ -16351,6 +16355,21 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                 "StaticCondition::{expected_name} is resolved by layers::evaluate_condition",
             );
         }
+    }
+
+    /// CR 509.1b: conditional evasion such as "can't be blocked as long as
+    /// defending player controls an artifact" is evaluated from the source's
+    /// combat attacker record by `layers::evaluate_condition`. The coverage
+    /// classifier must therefore not falsely mark every card using this typed
+    /// condition unsupported.
+    #[test]
+    fn defending_player_controls_static_condition_is_marked_handled() {
+        let condition = StaticCondition::DefendingPlayerControls {
+            filter: TargetFilter::Any,
+        };
+        let (name, support) = static_condition_feature(&condition);
+        assert_eq!(name, "DefendingPlayerControls");
+        assert_eq!(support, FeatureSupport::Handled);
     }
 
     /// `extract_static_condition_features` must recurse
