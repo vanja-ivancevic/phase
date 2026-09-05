@@ -1859,6 +1859,7 @@ fn legacy_target_constraint(c: &TargetSelectionConstraint) -> bool {
 fn legacy_repeat_continuation(r: &RepeatContinuation) -> bool {
     match r {
         RepeatContinuation::WhileCondition { condition, .. } => legacy_ability_condition(condition),
+        RepeatContinuation::PlayerChoice { player } => legacy_controller_ref(player),
         RepeatContinuation::ControllerChoice | RepeatContinuation::UntilStopConditions { .. } => {
             false
         }
@@ -4317,6 +4318,7 @@ fn rw_modal_choice(m: &ModalChoice) -> RwProfile {
 fn rw_repeat_continuation(r: &RepeatContinuation) -> RwProfile {
     match r {
         RepeatContinuation::ControllerChoice => RwProfile::empty(),
+        RepeatContinuation::PlayerChoice { player } => rw_controller_ref(player),
         RepeatContinuation::UntilStopConditions {
             stop_on_put_to_hand: _,
             stop_on_duplicate_exiled_names: _,

@@ -30771,8 +30771,9 @@ enum RepeatProcessOutcome {
     ConsumeOnly,
 }
 
-/// CR 608.2c: Recognize a trailing "[if <condition>,] [you may] repeat this
-/// process [once | N times]" directive and map it to a `RepeatContinuation`.
+/// CR 608.2c: Recognize a trailing "[if <condition>,] [you/that opponent may]
+/// repeat this process [once | N times]" directive and map it to a
+/// `RepeatContinuation`.
 ///
 /// The directive is a chain back-reference, not an independent effect, so the
 /// chunk loop consumes it. A leading game-state condition ("then if an opponent
@@ -30780,7 +30781,8 @@ enum RepeatProcessOutcome {
 /// stripped via the shared condition helpers and threaded into a
 /// `WhileCondition` predicate; the trailing "once"/"N times" sets its
 /// `max_iterations` cap. With no condition, "you may repeat …" maps to
-/// `ControllerChoice` and the bare / "if you do" forms are consumed only.
+/// `ControllerChoice`, "that opponent may repeat …" maps to a bound
+/// `PlayerChoice`, and the bare / "if you do" forms are consumed only.
 fn try_parse_repeat_process_directive(
     text: &str,
     ctx: &mut ParseContext,
@@ -30820,7 +30822,16 @@ fn try_parse_repeat_process_directive(
 
     let body_lower = body.to_lowercase();
     let (parsed_directive, _) = nom_on_lower(body.as_str(), &body_lower, |i| {
-        let (i, you_may) = opt(tag::<_, _, OracleError<'_>>("you may ")).parse(i)?;
+        // CR 608.2c + CR 109.4: a repeat decision can belong either to the
+        // ability controller ("you may") or to the already-declared target
+        // opponent (Trade Secrets). Keep the actor typed instead of deriving it
+        // from a pronoun after parsing: `TargetOpponent` is both target-legality
+        // constrained and resolved from the retained root targets at runtime.
+        let (i, choice_player) = opt(alt((
+            value(ControllerRef::You, tag::<_, _, OracleError<'_>>("you may ")),
+            value(ControllerRef::TargetOpponent, tag("that opponent may ")),
+        )))
+        .parse(i)?;
         // The bare/"if you do" forms have no condition and no "you may" — keep
         // them recognized (consume-only) so they don't leak Unimplemented gaps.
         let (i, _) = opt(alt((
@@ -30850,15 +30861,19 @@ fn try_parse_repeat_process_directive(
             value(Some(2u32), tag(" twice")),
             value(Some(3u32), tag(" three times")),
             value(None, tag(" any number of times")),
+            // Trade Secrets's current Oracle wording; retain the historical
+            // singular-pronoun form so regenerated older data parses identically.
+            value(None, tag(" as many times as they choose")),
+            value(None, tag(" as many times as he or she chooses")),
         )))
         .parse(i)?;
         let cap = cap.flatten();
         let (i, _) = opt(tag(".")).parse(i)?;
         eof(i)?;
-        Ok((i, (cap, you_may.is_some(), more_times)))
+        Ok((i, (cap, choice_player, more_times)))
     })?;
 
-    let (cap, you_may, more_times) = parsed_directive;
+    let (cap, choice_player, more_times) = parsed_directive;
     if let Some(condition) = condition {
         return Some(RepeatProcessOutcome::Continuation(
             RepeatContinuation::WhileCondition {
@@ -30874,10 +30889,11 @@ fn try_parse_repeat_process_directive(
             offset: 1,
         }));
     }
-    if you_may {
-        return Some(RepeatProcessOutcome::Continuation(
-            RepeatContinuation::ControllerChoice,
-        ));
+    if let Some(choice_player) = choice_player {
+        return Some(RepeatProcessOutcome::Continuation(match choice_player {
+            ControllerRef::You => RepeatContinuation::ControllerChoice,
+            player => RepeatContinuation::PlayerChoice { player },
+        }));
     }
     Some(RepeatProcessOutcome::ConsumeOnly)
 }

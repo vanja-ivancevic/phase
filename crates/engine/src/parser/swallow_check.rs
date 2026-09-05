@@ -768,12 +768,15 @@ fn def_tree_has_optional(def: &AbilityDefinition) -> bool {
     if def.optional || def.optional_targeting {
         return true;
     }
-    // CR 107.1c: "you may repeat this process [any number of times]" is a
-    // controller decision captured on `repeat_until` — an optional player
-    // action, so the "you may" in the text is accounted for.
+    // CR 107.1c: a controller- or process-bound player may repeat the process;
+    // `repeat_until` carries that optional action so the printed "may" is not
+    // counted as swallowed.
     if matches!(
         def.repeat_until,
-        Some(crate::types::ability::RepeatContinuation::ControllerChoice)
+        Some(
+            crate::types::ability::RepeatContinuation::ControllerChoice
+                | crate::types::ability::RepeatContinuation::PlayerChoice { .. }
+        )
     ) {
         return true;
     }

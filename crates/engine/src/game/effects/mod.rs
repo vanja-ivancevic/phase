@@ -1184,13 +1184,15 @@ fn drain_active_repeat_until(state: &mut GameState) {
     };
     let crate::types::game_state::PendingRepeatUntil { ability } = pending;
     match &ability.repeat_until {
-        // CR 107.1c: the iteration's choice has resolved — prompt the
-        // controller whether to repeat the process.
-        Some(RepeatContinuation::ControllerChoice) => {
-            state.waiting_for = WaitingFor::RepeatDecision {
-                player: ability.controller,
-                ability,
-            };
+        // CR 107.1c + CR 109.4: the iteration's choice has resolved — prompt
+        // the controller or the player the process bound as its repeat actor.
+        Some(
+            choice @ (RepeatContinuation::ControllerChoice
+            | RepeatContinuation::PlayerChoice { .. }),
+        ) => {
+            if let Some(player) = repeat_choice_player(state, &ability, choice) {
+                state.waiting_for = WaitingFor::RepeatDecision { player, ability };
+            }
         }
         Some(RepeatContinuation::UntilStopConditions {
             stop_on_put_to_hand,
@@ -10622,7 +10624,10 @@ pub fn resolve_ability_chain(
     );
     match ability.repeat_until.clone() {
         None => resolve_chain_body(state, ability, events, depth),
-        Some(RepeatContinuation::ControllerChoice) => {
+        Some(
+            choice @ (RepeatContinuation::ControllerChoice
+            | RepeatContinuation::PlayerChoice { .. }),
+        ) => {
             let initial_waiting_for = state.waiting_for.clone();
             let stack_depth_before_iteration = state.resolution_stack.capture_child_boundary();
             resolve_chain_body(state, ability, events, depth)?;
@@ -10637,12 +10642,14 @@ pub fn resolve_ability_chain(
                     stack_depth_before_iteration,
                 );
             } else {
-                // CR 107.1c: after the iteration fully resolved, prompt the
-                // controller to repeat the process or stop.
-                state.waiting_for = WaitingFor::RepeatDecision {
-                    player: ability.controller,
-                    ability: Box::new(ability.clone()),
-                };
+                // CR 107.1c + CR 109.4: after the iteration fully resolved,
+                // prompt the controller or process-bound player to repeat.
+                if let Some(player) = repeat_choice_player(state, ability, &choice) {
+                    state.waiting_for = WaitingFor::RepeatDecision {
+                        player,
+                        ability: Box::new(ability.clone()),
+                    };
+                }
             }
             Ok(())
         }
@@ -10725,6 +10732,30 @@ pub fn resolve_ability_chain(
                 }
             }
         }
+    }
+}
+
+/// CR 608.2c + CR 109.4: resolve who owns a repeat-process decision from the
+/// retained resolving ability. `PlayerChoice` deliberately uses the same
+/// controller-reference authority as effect recipients, so a declared target
+/// remains stable when the chain is re-entered instead of falling back to the
+/// spell controller.
+fn repeat_choice_player(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    continuation: &RepeatContinuation,
+) -> Option<PlayerId> {
+    match continuation {
+        RepeatContinuation::ControllerChoice => Some(ability.controller),
+        RepeatContinuation::PlayerChoice { player } => crate::game::filter::controller_ref_player(
+            state,
+            ability.source_id,
+            Some(ability.controller),
+            Some(ability),
+            player,
+        ),
+        RepeatContinuation::UntilStopConditions { .. }
+        | RepeatContinuation::WhileCondition { .. } => None,
     }
 }
 
@@ -24131,6 +24162,66 @@ mod tests {
             state.players[0].life,
             start_life + 3,
             "initial iteration + 2 accepted = 3 resolutions, each gaining 1 life",
+        );
+    }
+
+    /// CR 608.2c + CR 109.4: a repeat-process decision may be assigned to a
+    /// declared player target. Trade Secrets uses this shape: its targeted
+    /// opponent, rather than the spell's controller, accepts or declines each
+    /// later pass of the full process.
+    #[test]
+    fn repeat_until_targeted_opponent_prompts_and_repeats_for_that_opponent() {
+        let mut state = GameState::new_two_player(42);
+        let opponent = PlayerId(1);
+        let start_life = state.players[1].life;
+
+        let mut ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Player,
+            },
+            vec![TargetRef::Player(opponent)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        ability.repeat_until = Some(RepeatContinuation::PlayerChoice {
+            player: ControllerRef::TargetOpponent,
+        });
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::RepeatDecision { player, .. } if player == opponent
+        ));
+        assert_eq!(state.players[1].life, start_life + 1);
+
+        crate::game::engine::apply(
+            &mut state,
+            opponent,
+            crate::types::actions::GameAction::DecideOptionalEffect { accept: true },
+        )
+        .unwrap();
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::RepeatDecision { player, .. } if player == opponent
+        ));
+        assert_eq!(
+            state.players[1].life,
+            start_life + 2,
+            "the accepted repeat re-runs the target-player process"
+        );
+
+        crate::game::engine::apply(
+            &mut state,
+            opponent,
+            crate::types::actions::GameAction::DecideOptionalEffect { accept: false },
+        )
+        .unwrap();
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::RepeatDecision { .. }),
+            "the target opponent may end the repeat loop"
         );
     }
 
