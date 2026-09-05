@@ -55,6 +55,21 @@ pub fn parse_quantity_ref_complete(input: &str) -> OracleResult<'_, QuantityRef>
     all_consuming(parse_quantity_ref).parse(input)
 }
 
+/// CR 614.12 + CR 119.4: persistent entry-payment provenance, used by cards
+/// whose later abilities refer to the life paid as this permanent entered.
+pub fn parse_entry_life_paid_ref(input: &str) -> OracleResult<'_, QuantityRef> {
+    value(
+        QuantityRef::EntryLifePaid,
+        alt((
+            tag("the life paid as ~ entered the battlefield"),
+            tag("the life paid as it entered the battlefield"),
+            tag("the life paid as ~ entered"),
+            tag("the life paid as it entered"),
+        )),
+    )
+    .parse(input)
+}
+
 pub fn parse_for_each_clause_ref_complete(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, mut qty) = parse_for_each_clause_ref_complete_deferred(input)?;
     // CR 608.2k: a caller reaching this entry has no antecedent for a deferred
@@ -947,6 +962,7 @@ pub(crate) fn parse_extreme_chosen_number_ref(input: &str) -> OracleResult<'_, Q
 pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     alt((
         alt((
+            parse_entry_life_paid_ref,
             parse_guessed_number_ref,
             parse_object_count_by_shared_quality,
             parse_chosen_number_ref,

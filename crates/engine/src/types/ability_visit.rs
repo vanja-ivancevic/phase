@@ -335,7 +335,7 @@ where
     // The mode carries the decline continuation (and, for MayCost, a cost),
     // either of which may conjure. Descend into both.
     match &replacement.mode {
-        ReplacementMode::MayCost { cost, decline } => {
+        ReplacementMode::MayCost { cost, decline, .. } => {
             visit_cost_scoped(cost, scope, visit)?;
             if let Some(decline) = decline {
                 visit_ability_def_scoped(decline, scope, visit)?;

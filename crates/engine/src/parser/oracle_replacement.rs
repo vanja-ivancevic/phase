@@ -42,7 +42,8 @@ use crate::types::ability::{
     LibraryPosition, ManaModification, ManaReplacementScope, ManaSpendPermission,
     PermissionGrantee, PlayerFilter, PreventionAmount, QuantityExpr, QuantityModification,
     QuantityRef, RedirectionLifetime, ReplacementCondition, ReplacementDefinition, ReplacementMode,
-    ReplacementPlayerScope, SourceExclusion, StaticCondition, StaticDefinition, TapStateChange,
+    ReplacementPaymentRecord, ReplacementPlayerScope, SourceExclusion, StaticCondition,
+    StaticDefinition, TapStateChange,
     TargetFilter, TriggerDefinition, TypeFilter, TypedFilter, EXILE_COST_ANY_NUMBER,
 };
 use crate::types::ability::{CardPlayMode, CastingPermission};
@@ -141,6 +142,14 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     //     disguise). CR 614.1e + CR 708.11: the effect applies as the permanent is
     //     turned face up, so it is a replacement, not a stack triggered ability. ---
     if let Some(def) = parse_turned_face_up_replacement(&norm_lower, &text) {
+        return Some(def);
+    }
+
+    // CR 614.12 + CR 119.4: "As this artifact/creature enters, pay any
+    // amount of life" is a pre-entry replacement, not a resolution-time
+    // instruction. `MayCost` supplies the existing zero-inclusive interactive
+    // payment seam; the runtime records the paid value on this incarnation.
+    if let Some(def) = parse_as_enters_pay_any_amount_of_life(&norm_lower, &normalized, &text) {
         return Some(def);
     }
 
@@ -1332,6 +1341,7 @@ fn parse_self_enters_pay_cost_replacement(
         ReplacementDefinition::new(ReplacementEvent::Moved)
             .mode(ReplacementMode::MayCost {
                 cost,
+                payment_record: None,
                 decline: Some(Box::new(decline)),
             })
             .valid_card(TargetFilter::SelfRef)
@@ -1398,6 +1408,51 @@ fn parse_as_enters_exile_any_number_from_graveyard(
         ReplacementDefinition::new(ReplacementEvent::Moved)
             .mode(ReplacementMode::MayCost {
                 cost,
+                payment_record: None,
+                decline: None,
+            })
+            .valid_card(TargetFilter::SelfRef)
+            .destination_zone(Zone::Battlefield)
+            .description(original_text.to_string()),
+    )
+}
+
+/// CR 614.12 + CR 119.4: Parse the reusable self-entry life-payment shape.
+/// The accepted zero payment is observationally the same as declining the
+/// zero-inclusive `MayCost`, while the accepted path preserves the chosen
+/// amount for a later ability on the entered permanent.
+fn parse_as_enters_pay_any_amount_of_life(
+    norm_lower: &str,
+    normalized: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    let ((), rest) = nom_on_lower(normalized, norm_lower, |input| {
+        value(
+            (),
+            preceded(
+                tag("as "),
+                alt((
+                    tag("~ enters, pay any amount of life"),
+                    tag("~ enters the battlefield, pay any amount of life"),
+                )),
+            ),
+        )
+        .parse(input)
+    })?;
+    if !rest.trim().trim_end_matches('.').trim().is_empty() {
+        return None;
+    }
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::Moved)
+            .mode(ReplacementMode::MayCost {
+                cost: AbilityCost::PayLife {
+                    amount: QuantityExpr::Ref {
+                        qty: QuantityRef::Variable {
+                            name: "X".to_string(),
+                        },
+                    },
+                },
+                payment_record: Some(ReplacementPaymentRecord::EntryLifePaid),
                 decline: None,
             })
             .valid_card(TargetFilter::SelfRef)
@@ -1492,6 +1547,7 @@ fn parse_as_enters_exile_from_graveyards(
         ReplacementDefinition::new(ReplacementEvent::Moved)
             .mode(ReplacementMode::MayCost {
                 cost,
+                payment_record: None,
                 decline: None, // No decline branch — enters normally if declined
             })
             .execute(continuation)
@@ -2114,6 +2170,7 @@ fn parse_shock_land(norm_lower: &str, original_text: &str) -> Option<Replacement
             cost: AbilityCost::PayLife {
                 amount: QuantityExpr::Fixed { value: amount },
             },
+            payment_record: None,
             decline: Some(Box::new(decline)),
         })
         .valid_card(TargetFilter::SelfRef)
@@ -12842,6 +12899,30 @@ mod tests {
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::keywords::Keyword;
 
+    #[test]
+    fn as_enters_pay_any_life_is_a_self_entry_replacement() {
+        let replacement = parse_replacement_line(
+            "As this artifact enters, pay any amount of life.",
+            "Phyrexian Processor",
+        )
+        .expect("Processor entry payment must parse");
+        assert_eq!(replacement.event, ReplacementEvent::Moved);
+        assert_eq!(replacement.valid_card, Some(TargetFilter::SelfRef));
+        assert_eq!(replacement.destination_zone, Some(Zone::Battlefield));
+        assert!(matches!(
+            replacement.mode,
+            ReplacementMode::MayCost {
+                cost: AbilityCost::PayLife {
+                    amount: QuantityExpr::Ref {
+                        qty: QuantityRef::Variable { ref name },
+                    },
+                },
+                payment_record: Some(ReplacementPaymentRecord::EntryLifePaid),
+                decline: None,
+            } if name == "X"
+        ));
+    }
+
     /// `take_damage_source_subject_clause` must stop at whichever terminator
     /// occurs EARLIEST in the text, not whichever is tried first. Regression
     /// guard for a review finding: a plain `alt()` over three `take_until`
@@ -13502,7 +13583,7 @@ mod tests {
         assert_eq!(def.event, ReplacementEvent::Moved);
         assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
         match &def.mode {
-            ReplacementMode::MayCost { cost, decline } => {
+            ReplacementMode::MayCost { cost, decline, .. } => {
                 assert!(
                     matches!(cost, AbilityCost::Sacrifice(ref c) if c.requirement.fixed_count() == Some(2)),
                     "expected Sacrifice count 2, got {cost:?}"
@@ -13867,7 +13948,7 @@ mod tests {
         .expect("Mox Diamond should parse as a replacement");
         assert_eq!(def.event, ReplacementEvent::Moved);
         match &def.mode {
-            ReplacementMode::MayCost { cost, decline } => {
+            ReplacementMode::MayCost { cost, decline, .. } => {
                 assert!(
                     matches!(cost, AbilityCost::Discard { .. }),
                     "expected Discard cost, got {cost:?}"
@@ -13894,7 +13975,7 @@ mod tests {
         assert_eq!(def.event, ReplacementEvent::Moved);
         assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
         match &def.mode {
-            ReplacementMode::MayCost { cost, decline } => {
+            ReplacementMode::MayCost { cost, decline, .. } => {
                 assert!(
                     matches!(cost, AbilityCost::Exile { count, zone, filter } if *count == 2 && *zone == Some(Zone::Graveyard) && filter.is_some()),
                     "expected Exile count 2 from Graveyard, got {cost:?}"
@@ -16092,7 +16173,7 @@ mod tests {
         assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
         assert_eq!(def.destination_zone, Some(Zone::Battlefield));
         match def.mode {
-            ReplacementMode::MayCost { cost, decline } => {
+            ReplacementMode::MayCost { cost, decline, .. } => {
                 assert!(decline.is_none());
                 assert!(matches!(
                     cost,

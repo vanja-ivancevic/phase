@@ -1310,6 +1310,12 @@ pub struct GameObject {
     #[serde(default, skip_serializing_if = "is_zero_u32_field")]
     pub phyrexian_life_paid: u32,
 
+    /// CR 614.12 + CR 400.7: Amount of life paid as this object entered the
+    /// battlefield. It is entry-history, rather than a copiable characteristic
+    /// or cast-payment fact, and therefore resets for every new incarnation.
+    #[serde(default, skip_serializing_if = "is_zero_u32_field")]
+    pub entry_life_paid: u32,
+
     /// CR 106.3 + CR 601.2h: Source snapshots for each mana spent to cast this
     /// object. One entry per spent mana lets source-qualified dynamic quantities
     /// count "mana from a Cave/Treasure/artifact source" without depending on
@@ -1526,6 +1532,7 @@ fn _gameobject_partition_is_total(o: &GameObject) {
         colors_spent_to_cast: _,
         mana_spent_to_cast_amount: _,
         phyrexian_life_paid: _,
+        entry_life_paid: _,
         mana_spent_source_snapshots: _,
         phase_status: _,
         protection_start_exempt_attachments: _,
@@ -2456,6 +2463,7 @@ impl GameObject {
             colors_spent_to_cast: ColoredManaCount::default(),
             mana_spent_to_cast_amount: 0,
             phyrexian_life_paid: 0,
+            entry_life_paid: 0,
             mana_spent_source_snapshots: Vec::new(),
             phase_status: PhaseStatus::PhasedIn,
             mana_spent_to_activate: Vec::new(),
@@ -2585,6 +2593,8 @@ impl GameObject {
         self.pair_controller = None;
         self.chosen_attributes.clear();
         self.cast_variant_paid = None;
+        // CR 400.7: a new battlefield incarnation has no prior entry payment.
+        self.entry_life_paid = 0;
         // CR 400.7d: the cast-cost-paid object (e.g. the emerge-sacrificed
         // creature) is bound to the casting event that produced this object. A
         // re-entering permanent has no memory of it — clear here and let the
@@ -3400,6 +3410,25 @@ mod tests {
         assert!(
             obj.gift_recipient.is_none(),
             "gift_recipient must clear on battlefield entry (CR 400.7d)"
+        );
+    }
+
+    #[test]
+    fn reset_for_battlefield_entry_clears_entry_life_payment() {
+        let mut obj = GameObject::new(
+            ObjectId(1),
+            CardId(1),
+            PlayerId(0),
+            "Entry payment recorder".to_string(),
+            Zone::Exile,
+        );
+        obj.entry_life_paid = 9;
+
+        obj.reset_for_battlefield_entry(1, 1);
+
+        assert_eq!(
+            obj.entry_life_paid, 0,
+            "CR 400.7 makes a re-entered permanent a new object"
         );
     }
 

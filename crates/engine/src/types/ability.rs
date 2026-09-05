@@ -7406,6 +7406,11 @@ fn quantity_ref_from_value<E: serde::de::Error>(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum QuantityRef {
+    /// CR 614.12 + CR 119.4: Life paid while this permanent entered the
+    /// battlefield. This is entry-specific historical information, not the
+    /// resolution-local "that much" value: Processor and Minion of the Wastes
+    /// can read it from later activated/static abilities for this incarnation.
+    EntryLifePaid,
     /// CR 402: Number of cards in `player`'s hand. `PlayerScope::Controller`
     /// is the default reading; `Target`, `Opponent { .. }`, and `AllPlayers`
     /// cover targeted-player and cross-player aggregate variants.
@@ -8335,7 +8340,8 @@ impl QuantityRef {
             | QuantityRef::CardsDiscardedThisTurn { player }
             | QuantityRef::TokensCreatedThisTurn { player, .. }
             | QuantityRef::PlayerActionsThisTurn { player, .. } => Some(player),
-            QuantityRef::LifeAboveStarting
+            QuantityRef::EntryLifePaid
+            | QuantityRef::LifeAboveStarting
             | QuantityRef::StartingLifeTotal
             | QuantityRef::TriggeringDiscoverValue
             | QuantityRef::TriggeringScryLookCount
@@ -26617,9 +26623,25 @@ pub enum ReplacementMode {
     /// paid, and `decline` runs on decline or failed payment.
     MayCost {
         cost: AbilityCost,
+        /// A narrowly-scoped fact produced by this payment that a later part of
+        /// the same replacement needs to retain. This is intentionally typed
+        /// rather than inferred from the cost shape: a future `Pay {X} life`
+        /// replacement must not accidentally inherit entry-payment behavior.
+        #[serde(default)]
+        payment_record: Option<ReplacementPaymentRecord>,
         #[serde(default)]
         decline: Option<Box<AbilityDefinition>>,
     },
+}
+
+/// A fact deliberately retained from a replacement payment.
+///
+/// Payment amounts normally belong only to the cost event. A small family of
+/// cards refers to the amount later on the permanent that entered, so the
+/// replacement parser explicitly requests this durable record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReplacementPaymentRecord {
+    EntryLifePaid,
 }
 
 /// CR 614.6 + CR 615.5: Continuation effect that runs after a replacement

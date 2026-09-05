@@ -3551,6 +3551,7 @@ fn quantity_ref_counts_population_matching(
     filter_pred: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
     match qty {
+        QuantityRef::EntryLifePaid => false,
         // Owned `TargetFilter` naming the counted population.
         QuantityRef::ObjectCount { filter }
         | QuantityRef::ObjectCountDistinct { filter, .. }
