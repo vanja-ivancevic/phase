@@ -16077,6 +16077,14 @@ pub enum Effect {
         #[serde(default)]
         choose_scope: CopyChooseScope,
     },
+    /// CR 101.4 + CR 701.20 + CR 608.2c: Reveal the cards selected by each
+    /// player from a preceding per-player hidden-zone choice. Of the revealed
+    /// creature cards, put every card tied for the lowest mana value onto the
+    /// battlefield under its owner's control. The selected cards are read from
+    /// the chain's fresh tracked set, so the effect composes with
+    /// `ChooseFromZone { zone: Hand, zone_owner: Each(_), chooser: OwningPlayer }`
+    /// without exposing a choice before every player has made one.
+    RevealChosenLowestManaValueCreatures,
     /// CR 702.110b: Exploit — sacrifice a creature you control (optional).
     /// The controller may sacrifice any creature they control, including the exploiter itself.
     Exploit {
@@ -18843,6 +18851,7 @@ impl Effect {
                 other => other.as_ref(),
             },
             Effect::ChooseDrawnThisTurnPayOrTopdeck { player, .. } => Some(player),
+            Effect::RevealChosenLowestManaValueCreatures => None,
         }
     }
 
@@ -19489,7 +19498,8 @@ impl Effect {
             | Effect::UnattachAll { .. }
             | Effect::Unsuspect { .. }
             | Effect::ReproduceEventCounters { .. }
-            | Effect::WinTheGame { .. } => false,
+            | Effect::WinTheGame { .. }
+            | Effect::RevealChosenLowestManaValueCreatures => false,
         }
     }
 
@@ -20124,7 +20134,8 @@ impl Effect {
             // CR 122.1: the per-kind magnitude is `EventCounterReproductionCount`,
             // not a `QuantityExpr`, so there is nothing to visit here.
             | Effect::ReproduceEventCounters { .. }
-            | Effect::Unimplemented { .. } => {}
+            | Effect::Unimplemented { .. }
+            | Effect::RevealChosenLowestManaValueCreatures => {}
         }
     }
 
@@ -20397,7 +20408,8 @@ impl Effect {
             // CR 122.1: per-kind magnitude is `EventCounterReproductionCount`,
             // not a `QuantityExpr`.
             | Effect::ReproduceEventCounters { .. }
-            | Effect::WinTheGame { .. } => None,
+            | Effect::WinTheGame { .. }
+            | Effect::RevealChosenLowestManaValueCreatures => None,
         }
     }
 
@@ -20661,7 +20673,8 @@ impl Effect {
             // CR 122.1: per-kind magnitude is `EventCounterReproductionCount`,
             // not a `QuantityExpr`.
             | Effect::ReproduceEventCounters { .. }
-            | Effect::WinTheGame { .. } => None,
+            | Effect::WinTheGame { .. }
+            | Effect::RevealChosenLowestManaValueCreatures => None,
         }
     }
 }
@@ -20848,6 +20861,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::ChooseObjectsIntoTrackedSet { .. } => "ChooseObjectsIntoTrackedSet",
         Effect::ChooseAndSacrificeRest { .. } => "ChooseAndSacrificeRest",
         Effect::EachPlayerCopyChosen { .. } => "EachPlayerCopyChosen",
+        Effect::RevealChosenLowestManaValueCreatures => "RevealChosenLowestManaValueCreatures",
         Effect::Exploit { .. } => "Exploit",
         Effect::GainEnergy { .. } => "GainEnergy",
         Effect::GivePlayerCounter { .. } => "GivePlayerCounter",
@@ -21098,6 +21112,7 @@ pub enum EffectKind {
     PutChosenCounter,
     ChooseAndSacrificeRest,
     EachPlayerCopyChosen,
+    RevealChosenLowestManaValueCreatures,
     Exploit,
     GainEnergy,
     GivePlayerCounter,
@@ -21385,6 +21400,9 @@ impl From<&Effect> for EffectKind {
             Effect::PutChosenCounter { .. } => EffectKind::PutChosenCounter,
             Effect::ChooseAndSacrificeRest { .. } => EffectKind::ChooseAndSacrificeRest,
             Effect::EachPlayerCopyChosen { .. } => EffectKind::EachPlayerCopyChosen,
+            Effect::RevealChosenLowestManaValueCreatures => {
+                EffectKind::RevealChosenLowestManaValueCreatures
+            }
             Effect::Exploit { .. } => EffectKind::Exploit,
             Effect::GainEnergy { .. } => EffectKind::GainEnergy,
             Effect::GivePlayerCounter { .. } => EffectKind::GivePlayerCounter,

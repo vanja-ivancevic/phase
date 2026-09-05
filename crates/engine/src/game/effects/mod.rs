@@ -108,6 +108,7 @@ pub mod energy;
 pub mod epic;
 pub mod exile_resolving_spell;
 pub mod put_chosen_counter;
+pub mod reveal_chosen_lowest_mana_value_creatures;
 // Tests for `epic` live in a sibling file (declared here, not in `epic.rs`, so
 // `epic.rs` stays implementation-only).
 #[cfg(test)]
@@ -5470,6 +5471,9 @@ pub fn resolve_effect(
         }
         Effect::EachPlayerCopyChosen { .. } => {
             each_player_copy_chosen::resolve(state, ability, events)
+        }
+        Effect::RevealChosenLowestManaValueCreatures => {
+            reveal_chosen_lowest_mana_value_creatures::resolve(state, ability, events)
         }
         Effect::Exploit { .. } => exploit::resolve(state, ability, events),
         Effect::GainEnergy { .. } => energy::resolve_gain(state, ability, events),

@@ -589,6 +589,7 @@ where
 {
     visit(effect)?;
     match effect {
+        Effect::RevealChosenLowestManaValueCreatures => {}
         Effect::Intensify { .. } => {}
         Effect::ApplyPerpetual { .. } => {}
         // CR 614.11: A one-shot draw replacement nests its substitute Effect

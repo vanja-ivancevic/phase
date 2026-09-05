@@ -3999,6 +3999,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         | Effect::AddPendingEntersModifications { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::EachPlayerCopyChosen { .. }
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::ChooseOneOf { .. }
         | Effect::ChooseCounterAdjustment { .. }
         | Effect::ReturnAsAura { .. }
@@ -7025,6 +7026,7 @@ fn visit_direct_effect_ability_payloads<'a>(
         | Effect::ChooseObjectsIntoTrackedSet { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::EachPlayerCopyChosen { .. }
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::Exploit { .. }
         | Effect::GainEnergy { .. }
         | Effect::GivePlayerCounter { .. }

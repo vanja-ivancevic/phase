@@ -1956,6 +1956,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
         Effect::RedistributeLifeTotals => Axes::NONE,
         Effect::ReverseTurnOrder => Axes::NONE,
         Effect::ChooseOneOf { .. } => Axes::CONSERVATIVE,
+        Effect::RevealChosenLowestManaValueCreatures => Axes::NONE,
         Effect::Unimplemented {
             name: _,
             description: _,
@@ -6238,6 +6239,7 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         | Effect::RedistributeLifeTotals
         | Effect::ReverseTurnOrder
         | Effect::ChooseOneOf { .. }
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::Unimplemented { .. } => FilterReadContext::SnapshotOrEvent,
     }
 }
@@ -6604,6 +6606,7 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::RedistributeLifeTotals
         | Effect::ReverseTurnOrder
         | Effect::ChooseOneOf { .. }
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::Unimplemented { .. } => CensusRole::Relax(RelaxReason::BoundedOrNoPopulation),
     }
 }
@@ -6870,6 +6873,7 @@ pub(crate) fn effect_is_randomness_bearing(e: &Effect) -> bool {
         | Effect::RedistributeLifeTotals
         | Effect::ReverseTurnOrder
         | Effect::ChooseOneOf { .. }
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::Unimplemented { .. } => false,
     }
 }

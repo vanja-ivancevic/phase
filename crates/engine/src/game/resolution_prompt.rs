@@ -513,6 +513,7 @@ fn effect_offers_choice(e: &Effect) -> bool {
         | Effect::RedistributeLifeTotals
         | Effect::ReverseTurnOrder
         | Effect::ChooseOneOf { .. }
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::Unimplemented { .. } => true,
     }
 }

@@ -31061,6 +31061,66 @@ pub(crate) fn parse_each_player_copy_chosen_ir(
     ))
 }
 
+/// CR 101.4 + CR 701.20 + CR 608.2c: Stronghold Gambit-class text. Every
+/// player makes one private hand choice in APNAP order, all choices are then
+/// revealed, and the globally lowest-mana-value creature choices enter
+/// simultaneously. The generic selection stage is intentionally composed with
+/// a semantic consequence rather than encoding a card name in the resolver.
+fn parse_each_player_reveal_lowest_mana_creature_ir(
+    text: &str,
+    kind: AbilityKind,
+    ctx: &ParseContext,
+) -> Option<EffectChainIr> {
+    let normalized = text.trim().trim_end_matches('.').to_ascii_lowercase();
+    if normalized != "each player chooses a card in their hand. then each player reveals their chosen card. the owner of each creature card revealed this way with the lowest mana value puts it onto the battlefield" {
+        return None;
+    }
+
+    let mut builder = ClauseIrBuilder::new(text);
+    builder
+        .clause(
+            "Each player chooses a card in their hand.",
+            parsed_clause(Effect::ChooseFromZone {
+                count: 1,
+                zone: Zone::Hand,
+                additional_zones: Vec::new(),
+                zone_owner: ZoneOwner::Each(PerPlayerScope::AllPlayers),
+                filter: None,
+                chooser: Chooser::OwningPlayer,
+                up_to: false,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                constraint: None,
+            }),
+            Some(ClauseBoundary::Sentence),
+            ClauseDisposition::Emit {
+                followup: None,
+                intrinsic: None,
+            },
+        )
+        .push();
+    builder
+        .clause(
+            "Then each player reveals their chosen card. The owner of each creature card revealed this way with the lowest mana value puts it onto the battlefield.",
+            parsed_clause(Effect::RevealChosenLowestManaValueCreatures),
+            None,
+            ClauseDisposition::Emit {
+                followup: None,
+                intrinsic: None,
+            },
+        )
+        .push();
+    Some(EffectChainIr {
+        clauses: builder.finish(),
+        kind,
+        continuation_kind: Some(kind),
+        player_scope_rewrite: PlayerScopeRewrite::Preserve,
+        chain_rounding: None,
+        actor: ctx.actor.clone(),
+        in_trigger: ctx.in_trigger,
+        repeat_until: None,
+    })
+}
+
 /// CR 122.1 + CR 208.1: Parse the optional scaling sentence of
 /// [`parse_each_player_copy_chosen_ir`] — "then each player who chose a second
 /// <noun> puts a number of <counter> counters on the token they created equal to
@@ -32457,6 +32517,9 @@ pub(crate) fn parse_effect_chain_ir(
         return ir;
     }
     if let Some(ir) = parse_each_player_copy_chosen_ir(text, kind, ctx) {
+        return ir;
+    }
+    if let Some(ir) = parse_each_player_reveal_lowest_mana_creature_ir(text, kind, ctx) {
         return ir;
     }
     if let Some(ir) = parse_exile_top_each_library_with_collection_counter_ir(text, kind, ctx) {
