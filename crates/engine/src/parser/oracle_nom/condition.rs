@@ -225,10 +225,60 @@ fn parse_control_presence_conditions(input: &str) -> OracleResult<'_, StaticCond
         // "you control N or more creatures".
         parse_creatures_are_attacking_count_ge,
         parse_source_controlled_or_your_commander,
+        parse_you_control_more_than_combat_player,
         parse_you_control_more_than_each_opponent,
         parse_control_conditions,
     ))
     .parse(input)
+}
+
+/// CR 508.1b + CR 509.1a: "you control more <type> than defending/attacking
+/// player" is a combat-relative object-count comparison.  The left side is
+/// always the static ability's controller; the right-side anchor is preserved
+/// as a controller reference for combat legality to bind at declaration time.
+///
+/// This is intentionally a normal `QuantityComparison`, rather than a
+/// Goblin-Goon-specific condition.  Attack declaration binds
+/// `DefendingPlayer` to the proposed target; block declaration's attacking
+/// player is the active player (CR 508.1a).  That leaves the parser reusable
+/// for any future relative-count combat restriction.
+fn parse_you_control_more_than_combat_player(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("you control more ").parse(input)?;
+    let (rest, type_text) = take_until(" than ").parse(rest)?;
+    let (rest, _) = tag(" than ").parse(rest)?;
+    let (rest, relative_controller) = alt((
+        value(ControllerRef::DefendingPlayer, tag("defending player")),
+        // CR 508.1a: the player declaring attackers is the active player.
+        value(ControllerRef::ActivePlayer, tag("attacking player")),
+    ))
+    .parse(rest)?;
+    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any | TargetFilter::None) {
+        return Err(oracle_err(type_text));
+    }
+
+    let you_filter = match filter.clone() {
+        TargetFilter::Typed(typed) => TargetFilter::Typed(typed.controller(ControllerRef::You)),
+        other => other,
+    };
+    let relative_filter = match filter {
+        TargetFilter::Typed(typed) => TargetFilter::Typed(typed.controller(relative_controller)),
+        other => other,
+    };
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter: you_filter },
+            },
+            comparator: Comparator::GT,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: relative_filter,
+                },
+            },
+        },
+    ))
 }
 
 /// CR 109.5 + CR 102.2: "you control more [type] than each opponent" is a
@@ -240,17 +290,14 @@ fn parse_control_presence_conditions(input: &str) -> OracleResult<'_, StaticCond
 /// semantics exact: two opponents with one creature each do not collectively
 /// stop a player who controls two creatures.
 ///
-/// Goblin Goon is the old-border combat-restriction user: it may attack or
-/// block precisely while this condition is true.
-fn parse_you_control_more_than_each_opponent(
-    input: &str,
-) -> OracleResult<'_, StaticCondition> {
+/// This is distinct from Goblin Goon's current combat-player comparison above:
+/// here every opponent is checked independently.
+fn parse_you_control_more_than_each_opponent(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("you control more ").parse(input)?;
     let (rest, type_text) = take_until(" than each opponent").parse(rest)?;
     let (rest, _) = tag(" than each opponent").parse(rest)?;
     let (filter, remainder) = parse_type_phrase(type_text.trim());
-    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any | TargetFilter::None)
-    {
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any | TargetFilter::None) {
         return Err(oracle_err(type_text));
     }
 
@@ -15928,7 +15975,12 @@ mod tests {
         let (rest, condition) =
             parse_inner_condition("you control more creatures than each opponent").unwrap();
         assert_eq!(rest, "");
-        let StaticCondition::QuantityComparison { lhs, comparator, rhs } = condition else {
+        let StaticCondition::QuantityComparison {
+            lhs,
+            comparator,
+            rhs,
+        } = condition
+        else {
             panic!("expected quantity comparison");
         };
         assert_eq!(comparator, Comparator::GT);
@@ -15952,6 +16004,58 @@ mod tests {
                 },
             }
         );
+    }
+
+    /// Goblin Goon's current Oracle text compares against the relevant combat
+    /// player, not an aggregate of opponents.  The parser must preserve the
+    /// two different bindings: proposed defender while attacking and active
+    /// attacking player while blocking.
+    #[test]
+    fn test_you_control_more_creatures_than_combat_player() {
+        for (text, expected_controller) in [
+            (
+                "you control more creatures than defending player",
+                ControllerRef::DefendingPlayer,
+            ),
+            (
+                "you control more creatures than attacking player",
+                ControllerRef::ActivePlayer,
+            ),
+        ] {
+            let (rest, condition) = parse_inner_condition(text).unwrap();
+            assert_eq!(rest, "", "{text}");
+            let StaticCondition::QuantityComparison {
+                lhs,
+                comparator,
+                rhs,
+            } = condition
+            else {
+                panic!("{text}: expected quantity comparison");
+            };
+            assert_eq!(comparator, Comparator::GT, "{text}");
+            assert!(matches!(
+                lhs,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            controller: Some(ControllerRef::You),
+                            ..
+                        }),
+                    },
+                }
+            ));
+            assert!(matches!(
+                rhs,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            controller: Some(controller),
+                            ..
+                        }),
+                    },
+                } if controller == expected_controller
+            ));
+        }
     }
 
     /// Issue #859: Weathered Wayfarer — "Activate only if an opponent controls

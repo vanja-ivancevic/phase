@@ -29622,6 +29622,51 @@ fn non_aura_multi_sentence_anthem_scope_unchanged() {
     }
 }
 
+/// Stronghold's Goblin Goon is two independent combat restrictions in one
+/// Oracle line.  The static sentence splitter must retain both, and the
+/// `unless` parser must leave their distinct combat-player count anchors in the
+/// typed condition instead of accepting only the first sentence.
+#[test]
+fn goblin_goon_relative_creature_count_restrictions_parse_as_two_statics() {
+    use crate::types::ability::StaticCondition;
+
+    let defs = parse_static_line_multi(
+        "This creature can't attack unless you control more creatures than defending player. \
+         This creature can't block unless you control more creatures than attacking player.",
+    );
+    assert_eq!(
+        defs.len(),
+        2,
+        "both combat restrictions must survive: {defs:?}"
+    );
+    assert!(matches!(defs[0].mode, StaticMode::CantAttack));
+    assert!(matches!(defs[1].mode, StaticMode::CantBlock));
+
+    for (def, expected_controller) in [
+        (&defs[0], ControllerRef::DefendingPlayer),
+        (&defs[1], ControllerRef::ActivePlayer),
+    ] {
+        let Some(StaticCondition::Not { condition }) = &def.condition else {
+            panic!("expected an unless condition on {def:?}");
+        };
+        assert!(matches!(
+            condition.as_ref(),
+            StaticCondition::QuantityComparison {
+                comparator: Comparator::GT,
+                rhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            controller: Some(controller),
+                            ..
+                        }),
+                    },
+                },
+                ..
+            } if controller == &expected_controller
+        ));
+    }
+}
+
 /// first-sentence parse previously swallowed the period, mangled the ward cost,
 /// and dropped the entire second sentence.
 ///
