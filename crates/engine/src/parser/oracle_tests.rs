@@ -1723,18 +1723,19 @@ fn compound_target_player_continuations_share_one_target() {
 }
 
 use crate::types::ability::{
-    AbilityCondition, AbilityDefinition, AggregateFunction, BasicLandType, Comparator,
-    ContinuousModification, ControllerRef, DelayedTriggerCondition, Duration, Effect, EffectScope,
-    FilterProp, ManaProduction, ManaSpendRestriction, ModalSelectionConstraint, MultiTargetSpec,
-    ObjectProperty, ObjectScope, ParsedCondition, PlayerFilter, PlayerScope, PreventionAmount,
-    PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition, RoundingMode,
+    AbilityCondition, AbilityDefinition, AggregateFunction, BasicLandType, CardPlayMode,
+    CastingPermission, Comparator, ContinuousModification, ControllerRef, DelayedTriggerCondition,
+    Duration, Effect, EffectScope, FilterProp, ManaProduction, ManaSpendRestriction,
+    ModalSelectionConstraint, MultiTargetSpec, ObjectProperty, ObjectScope, ParsedCondition,
+    PermissionGrantee, PlayerFilter, PlayerScope, PreventionAmount, PtStat, PtValue, PtValueScope,
+    QuantityExpr, QuantityRef, ReplacementCondition, RestrictionExpiry, RoundingMode,
     SacrificeCost, SacrificeRequirement, SharedQuality, SharedQualityRelation, ShieldKind,
     StaticCondition, TapStateChange, TargetFilter, TriggerCondition, TypeFilter, TypedFilter,
 };
 use crate::types::keywords::{FlashbackCost, Keyword, KeywordKind, WardCost};
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, StepEndManaAction};
 use crate::types::replacements::ReplacementEvent;
-use crate::types::statics::{CostModifyMode, ProhibitionScope, StaticMode};
+use crate::types::statics::{CastFrequency, CostModifyMode, ProhibitionScope, StaticMode};
 use crate::types::triggers::{PlaneswalkRole, TriggerMode};
 use crate::types::zones::Zone;
 
@@ -3920,6 +3921,53 @@ fn free_cast_window_clause_chains_rider_and_self_exile() {
         "trailing self-exile must lower to a ChangeZone→Exile, got {:?}",
         sub.effect
     );
+}
+
+/// CR 611.2a + CR 614.1a + CR 514.2: The turn-bound controller-graveyard
+/// permission and redirect form must lower through existing mechanics rather
+/// than become a card-specific runtime path.
+#[test]
+fn yawgmoths_will_lowers_to_graveyard_snapshot_permission_and_redirect() {
+    let result = parse(
+        "Until end of turn, you may play lands and cast spells from your graveyard. If a card would be put into your graveyard from anywhere this turn, exile that card instead.",
+        "Yawgmoth's Will",
+        &[],
+        &[],
+        &[],
+    );
+
+    let effects = collect_all_effects(&result.abilities);
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Unimplemented { .. })),
+        "Yawgmoth's Will must have no unimplemented clauses: {effects:?}"
+    );
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::GrantCastingPermission {
+            permission: CastingPermission::PlayFromExile {
+                mode: CardPlayMode::Play,
+                duration: Duration::UntilEndOfTurn,
+                frequency: CastFrequency::Unlimited,
+                ..
+            },
+            target: TargetFilter::Typed(TypedFilter { properties, .. }),
+            grantee: PermissionGrantee::AbilityController,
+        } if properties.contains(&FilterProp::InZone { zone: Zone::Graveyard })
+            && properties.contains(&FilterProp::Owned { controller: ControllerRef::You })
+            && properties.contains(&FilterProp::NonToken)
+    )));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::AddTargetReplacement {
+            replacement,
+            target: TargetFilter::None,
+        } if replacement.event == ReplacementEvent::Moved
+            && replacement.destination_zone == Some(Zone::Graveyard)
+            && replacement.expiry == Some(RestrictionExpiry::EndOfTurn)
+            && matches!(replacement.valid_card.as_ref(), Some(TargetFilter::Typed(TypedFilter { properties, .. })) if properties.contains(&FilterProp::Owned { controller: ControllerRef::You }) && properties.contains(&FilterProp::NonToken))
+    )));
 }
 
 /// CR 608.2g + CR 601.2 + CR 118.9: The free-cast window parser is a class
