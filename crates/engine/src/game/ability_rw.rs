@@ -3618,6 +3618,7 @@ fn legacy_effect(x: &Effect) -> bool {
         | Effect::ManifestDread
         | Effect::Choose { .. }
         | Effect::ApplyPostReplacementDamage { .. }
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::Unimplemented { .. } => false,
     }
 }
@@ -6081,6 +6082,7 @@ fn rw_effect(
         | Effect::ReassembleContraptionOnSprocket { .. }
         | Effect::ApplySticker { .. }
         | Effect::ProcessRadCounters => (RwProfile::conservative(), None),
+        Effect::RevealChosenLowestManaValueCreatures => (RwProfile::conservative(), None),
     }
 }
 

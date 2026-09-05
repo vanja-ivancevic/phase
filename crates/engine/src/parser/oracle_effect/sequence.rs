@@ -6528,6 +6528,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         // CR 708.2a: turning a permanent face down is its own resolving effect,
         // not a Dig-lookback-transparent clause.
         Effect::TurnFaceDown { .. } => false,
+        Effect::RevealChosenLowestManaValueCreatures => false,
         Effect::StartYourEngines { .. }
         | Effect::EpicCopy { .. }
         | Effect::ChangeSpeed { .. }

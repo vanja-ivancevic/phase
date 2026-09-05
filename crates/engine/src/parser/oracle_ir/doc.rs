@@ -1321,6 +1321,7 @@ fn stamp_retained_mods(mods: &mut [ContinuousModification], slot: usize, kind: P
 /// carry no printed-slot self-reference and resolve to `=> {}`.
 fn stamp_effect_printed_slot(effect: &mut Effect, slot: usize, kind: PrintedItemKind) {
     match effect {
+        Effect::RevealChosenLowestManaValueCreatures => {}
         // ---- Direct Vec<ContinuousModification> carriers ---------------------
         // The "…except it has this ability" copy-except clause (CR 707.9a) lands
         // in one of these on the enclosing trigger/ability.

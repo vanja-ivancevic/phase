@@ -1024,6 +1024,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::CrankContraptions
         | EffectKind::ReassembleContraption
         | EffectKind::AssembleContraptionOnSprocket
+        | EffectKind::RevealChosenLowestManaValueCreatures
         | EffectKind::ReassembleContraptionOnSprocket => {}
     }
 }
