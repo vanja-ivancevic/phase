@@ -27325,6 +27325,33 @@ fn combat_tax_self_ref_subject_cant_attack_only() {
     assert!(matches!(scaling, UnlessPayScaling::PerQuantityRef { .. }));
 }
 
+/// CR 508.1c + CR 509.1b: Goblin Goon's one condition gates both combat
+/// restrictions.  It is a board-state gate, not a mana-payment tax: when the
+/// controller has more creatures than every opponent, the `Not` condition is
+/// false and the Goon may both attack and block.
+#[test]
+fn goblin_goon_universal_creature_count_gates_attack_and_block() {
+    let def = parse_static_line(
+        "~ can't attack or block unless you control more creatures than each opponent.",
+    )
+    .expect("Goblin Goon combat restriction should parse");
+    assert_eq!(def.mode, StaticMode::CantAttackOrBlock);
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert!(matches!(
+        def.condition,
+        Some(crate::types::ability::StaticCondition::Not { condition })
+            if matches!(condition.as_ref(), crate::types::ability::StaticCondition::QuantityComparison {
+                comparator: Comparator::GT,
+                rhs: QuantityExpr::Ref { qty: QuantityRef::ControlledByEachPlayer {
+                    aggregate: AggregateFunction::Max,
+                    relation: PlayerRelation::Opponent,
+                    ..
+                } },
+                ..
+            })
+    ));
+}
+
 /// CR 506.3 + CR 508.1d: Propaganda — `defended` field captures the
 /// "you" attack-target scope so the runtime tax only applies to attacks
 /// targeting the static's controller. Regression for issue #302
