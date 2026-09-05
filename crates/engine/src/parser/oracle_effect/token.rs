@@ -1226,16 +1226,25 @@ pub(super) fn parse_token_static_ability_followup(
     let quoted = lower.strip_prefix(prefix)?.trim();
     let quoted = quoted.strip_prefix('"')?.strip_suffix('"')?;
     let body = quoted.trim_end_matches('.').trim();
-    let marker = "this token's power and toughness are each equal to ";
-    let quantity_text = body.strip_prefix(marker)?;
+    // `normalize_card_name_refs` rewrites the quoted granted ability's
+    // self-reference (`This token`) before this continuation sees it.  Accept
+    // both the direct parser surface and the normalized `~` surface: they name
+    // the token that receives the static, while the counter reference below is
+    // deliberately rebound to its creator.
+    let (quantity_text, _) = alt((
+        tag::<_, _, OracleError<'_>>("this token's power and toughness are each equal to "),
+        tag("~'s power and toughness are each equal to "),
+    ))
+    .parse(body)
+    .ok()?;
     let quantity = crate::parser::oracle_quantity::parse_cda_quantity(quantity_text)?;
     let mut definitions = parse_static_line_multi(body);
     if definitions.is_empty() {
         return None;
     }
-    // The wrapper's exact subject ("This token's … on the creator") proves
-    // that source-scoped counter reads in this one static refer to the token's
-    // creator, not to the token that carries the granted ability.
+    // The wrapper's exact subject (either printed "This token's" or normalized
+    // `~'s`) proves that source-scoped counter reads in this one static refer
+    // to the token's creator, not to the token that carries the granted ability.
     let mut rewrote = false;
     for definition in &mut definitions {
         for modification in &mut definition.modifications {
@@ -3790,6 +3799,10 @@ mod token_attachment_connector_tests {
         );
         assert!(parse_token_static_ability_followup(
             r#"It has "This token's power and toughness are each equal to the number of fade counters on ~.""#
+        )
+        .is_some());
+        assert!(parse_token_static_ability_followup(
+            r#"It has "~'s power and toughness are each equal to the number of fade counters on ~.""#
         )
         .is_some());
         assert!(parse_token_static_ability_followup(r#"It has "This token can't block.""#).is_none());

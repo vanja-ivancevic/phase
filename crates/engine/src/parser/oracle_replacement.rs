@@ -13008,6 +13008,38 @@ mod tests {
         }));
     }
 
+    /// The token's creator-counter CDA and its departure LKI path already have
+    /// focused unit coverage.  This card-level guard keeps those mechanisms
+    /// reachable from the printed activated ability: an ordinary token with
+    /// no printed numeric P/T acquires its P/T from the quoted static ability.
+    #[test]
+    fn saproling_burst_full_oracle_reaches_creator_counter_token_cda() {
+        let parsed = parse_oracle_text(
+            "Fading 7 (This enchantment enters with seven fade counters on it. At the beginning of your upkeep, remove a fade counter from it. If you can't, sacrifice it.)\n\
+             Remove a fade counter from this enchantment: Create a green Saproling creature token. It has \"This token's power and toughness are each equal to the number of fade counters on Saproling Burst.\"\n\
+             When this enchantment leaves the battlefield, destroy all tokens created with this enchantment. They can't be regenerated.",
+            "Saproling Burst",
+            &[],
+            &["Enchantment".to_string()],
+            &[],
+        );
+
+        assert!(
+            parsed.parse_warnings.is_empty(),
+            "Saproling Burst must not drop its token-creation ability: {:?}",
+            parsed.parse_warnings
+        );
+        assert!(parsed.abilities.iter().any(|ability| {
+            matches!(
+                ability.effect.as_ref(),
+                Effect::Token {
+                    static_abilities,
+                    ..
+                } if !static_abilities.is_empty()
+            )
+        }), "Saproling Burst must lower its activated token CDA");
+    }
+
     /// `take_damage_source_subject_clause` must stop at whichever terminator
     /// occurs EARLIEST in the text, not whichever is tried first. Regression
     /// guard for a review finding: a plain `alt()` over three `take_until`
