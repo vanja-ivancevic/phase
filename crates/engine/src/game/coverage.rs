@@ -9790,7 +9790,23 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 || after_ability_word.is_some_and(|aw| aw.starts_with(&kw_name))
         }) || is_keyword_line(&lower)
             || after_ability_word.is_some_and(is_keyword_line);
-        let covered_by_casting = !face.casting_restrictions.is_empty()
+        let covered_by_x_mana_payment = lower.starts_with("spend only ")
+            // Consume Spirit / Drain Life attach the rider to the spell;
+            // Crypt Rats / Crimson Hellkite attach it to an activation. Keep
+            // both typed homes visible to the audit, while refusing to green
+            // unrelated mana-production "Spend only" text.
+            && (face.casting_restrictions.iter().any(|restriction| {
+                matches!(
+                    restriction,
+                    crate::types::ability::CastingRestriction::OnlyColorsOnX(_)
+                )
+            }) || face.abilities.iter().any(|ability| {
+                matches!(
+                    ability.activation_mana_payment_restriction,
+                    Some(crate::types::ability::ActivationManaPaymentRestriction::OnlyColorsOnX(_))
+                )
+            }));
+        let covered_by_casting = (!face.casting_restrictions.is_empty()
             && (lower.starts_with("cast this spell only ")
                 || lower.starts_with("you can't cast ")
                 || lower.starts_with("you cannot cast ")
@@ -9798,7 +9814,8 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 // Hogaak, Arisen Necropolis (issue #1095): "You can't spend mana
                 // to cast this spell" is parsed to CastingRestriction::CantSpendMana.
                 || lower.starts_with("you can't spend mana to cast ")
-                || lower.starts_with("you can\u{2019}t spend mana to cast "));
+                || lower.starts_with("you can\u{2019}t spend mana to cast ")))
+            || covered_by_x_mana_payment;
         // Casting option lines ("You may pay X rather than pay...", "If you control a
         // commander, you may cast this spell without paying its mana cost", etc.)
         let covered_by_casting_option = !face.casting_options.is_empty()
@@ -14456,6 +14473,45 @@ mod tests {
     // -----------------------------------------------------------------------
     // Semantic audit tests
     // -----------------------------------------------------------------------
+
+    /// The old-border "Spend only [color] mana on X" payment rider has two
+    /// typed homes: a spell-level casting restriction (Consume Spirit / Drain
+    /// Life) and an activation-level restriction (Crypt Rats / Crimson
+    /// Hellkite). Both must discharge the rider line without blessing unrelated
+    /// "Spend only" Oracle text.
+    #[test]
+    fn x_mana_payment_rider_is_covered_for_spells_and_activations() {
+        use crate::types::ability::{ActivationManaPaymentRestriction, CastingRestriction};
+        use crate::types::mana::XManaPaymentRestriction;
+
+        let oracle = "Spend only black mana on X.";
+        let mut spell_face = make_face();
+        spell_face.casting_restrictions = vec![CastingRestriction::OnlyColorsOnX(
+            XManaPaymentRestriction::One(ManaColor::Black),
+        )];
+        assert!(
+            audit_card_lines(oracle, &spell_face).is_empty(),
+            "a typed spell rider must cover its own Oracle line"
+        );
+
+        let mut activation_face = make_face();
+        let mut ability = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        );
+        ability.activation_mana_payment_restriction =
+            Some(ActivationManaPaymentRestriction::OnlyColorsOnX(
+                XManaPaymentRestriction::One(ManaColor::Black),
+            ));
+        activation_face.abilities.push(ability);
+        assert!(
+            audit_card_lines(oracle, &activation_face).is_empty(),
+            "a typed activated rider must cover its own Oracle line"
+        );
+    }
 
     #[test]
     fn test_audit_per_line_detects_dropped_condition() {

@@ -7,16 +7,17 @@ use crate::parser::oracle_static::{
     parse_discard_matching_color_alternative_cost, parse_static_line,
 };
 use crate::types::ability::{
-    AbilityCost, AbilityTag, ActivationRestriction, AdditionalCost, AggregateFunction,
-    BasicLandType, CastPermissionConstraint, CastVariantPaid, CastingPermission, ChosenAttribute,
-    ChosenSubtypeKind, Comparator, ContinuousModification, ControllerRef, CostCategory, CountScope,
-    EffectScope, FilterProp, GameRestriction, KickerVariant, ManaContribution, ManaProduction,
-    ManaSpendPermission, ManaSpendRestriction, ModalChoice, ModalSelectionCondition,
-    ModalSelectionConstraint, MultiTargetSpec, ObjectProperty, ProhibitedActivity, PtStat, PtValue,
-    PtValueScope, QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode,
-    RestrictionExpiry, RestrictionPlayerScope, SacrificeCost, SacrificeRequirement,
-    SearchSelectionConstraint, StaticCondition, StaticDefinition, TapStateChange, TargetFilter,
-    TargetRef, TypeFilter, TypedFilter,
+    AbilityCost, AbilityTag, ActivationManaPaymentRestriction, ActivationRestriction,
+    AdditionalCost, AggregateFunction, BasicLandType, CastPermissionConstraint, CastVariantPaid,
+    CastingPermission, CastingRestriction, ChosenAttribute, ChosenSubtypeKind, Comparator,
+    ContinuousModification, ControllerRef, CostCategory, CountScope, EffectScope, FilterProp,
+    GameRestriction, KickerVariant, ManaContribution, ManaProduction, ManaSpendPermission,
+    ManaSpendRestriction, ModalChoice, ModalSelectionCondition, ModalSelectionConstraint,
+    MultiTargetSpec, ObjectProperty, ProhibitedActivity, PtStat, PtValue, PtValueScope,
+    QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode, RestrictionExpiry,
+    RestrictionPlayerScope, SacrificeCost, SacrificeRequirement, SearchSelectionConstraint,
+    StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TargetRef, TypeFilter,
+    TypedFilter,
 };
 use crate::types::actions::GameAction;
 use crate::types::card_type::{CoreType, Supertype};
@@ -26,7 +27,7 @@ use crate::types::game_state::{ManaChoice, ManaChoicePrompt, SpellCastRecord};
 use crate::types::keywords::{EmergeCost, EscapeCost, FlashbackCost, Keyword, KeywordKind};
 use crate::types::mana::{
     ManaColor, ManaCost, ManaCostShard, ManaRestriction, ManaSourceSelection, ManaSpellGrant,
-    ManaType, ManaUnit,
+    ManaType, ManaUnit, XManaPaymentRestriction,
 };
 use crate::types::phase::Phase;
 use crate::types::replacements::ReplacementEvent;
@@ -1787,6 +1788,143 @@ fn x_spell_cap_excludes_mana_restricted_to_activated_abilities() {
         ),
         other => panic!("expected ChooseXValue, got {other:?}"),
     }
+}
+
+/// CR 107.1b + CR 118.3: a spell rider such as Consume Spirit's "Spend only
+/// black mana on X" constrains the selected X units, but not the printed
+/// colored or generic portion of the cost. The full cast path must therefore
+/// cap X from black mana rather than the raw pool total, then spend ordinary
+/// mana for the unrelated generic pip.
+#[test]
+fn x_mana_color_rider_caps_spell_x_and_preserves_fixed_generic_payment() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_object(
+        &mut state,
+        CardId(9_030),
+        PlayerId(0),
+        "Consume Spirit Stand-In".to_string(),
+        Zone::Hand,
+    );
+    {
+        let obj = state.objects.get_mut(&spell).unwrap();
+        obj.card_types.core_types.push(CoreType::Sorcery);
+        obj.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::X, ManaCostShard::Black],
+            generic: 1,
+        };
+        obj.base_mana_cost = obj.mana_cost.clone();
+        obj.casting_restrictions = vec![CastingRestriction::OnlyColorsOnX(
+            XManaPaymentRestriction::One(ManaColor::Black),
+        )];
+        Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        ));
+    }
+    add_mana(&mut state, PlayerId(0), ManaType::Black, 2);
+    add_mana(&mut state, PlayerId(0), ManaType::Blue, 2);
+
+    apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: spell,
+            card_id: CardId(9_030),
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        },
+    )
+    .expect("Consume Spirit stand-in should enter the X-selection path");
+    match state.waiting_for {
+        WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+            max, 1,
+            "two black and two blue mana pay {{X}}{{B}}{{1}} only at X=1; blue cannot pay X"
+        ),
+        ref other => panic!("expected ChooseXValue, got {other:?}"),
+    }
+    assert!(
+        apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).is_err(),
+        "the engine must reject an X value above the color-restricted cap"
+    );
+
+    apply_as_current(&mut state, GameAction::ChooseX { value: 1 })
+        .expect("the offered maximum must traverse real automatic payment");
+    assert_eq!(
+        state.stack.len(),
+        1,
+        "the spell reaches the stack after payment"
+    );
+    assert_eq!(
+        state.players[0].mana_pool.total(),
+        1,
+        "X and the printed {{B}} spend black, while the fixed {{1}} may spend blue"
+    );
+}
+
+/// CR 602.2b + CR 118.3: the same rider on Crypt Rats-style activated
+/// abilities is governed by the normal activation pipeline, including its
+/// Choose-X cap and automatic payment.
+#[test]
+fn x_mana_color_rider_caps_activated_ability_x() {
+    let mut state = setup_game_at_main_phase();
+    let source = create_object(
+        &mut state,
+        CardId(9_031),
+        PlayerId(0),
+        "Crypt Rats Stand-In".to_string(),
+        Zone::Battlefield,
+    );
+    {
+        let obj = state.objects.get_mut(&source).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        let mut ability = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        )
+        .cost(AbilityCost::Mana {
+            cost: ManaCost::Cost {
+                shards: vec![ManaCostShard::X],
+                generic: 0,
+            },
+        });
+        ability.activation_mana_payment_restriction =
+            Some(ActivationManaPaymentRestriction::OnlyColorsOnX(
+                XManaPaymentRestriction::One(ManaColor::Black),
+            ));
+        Arc::make_mut(&mut obj.abilities).push(ability);
+    }
+    add_mana(&mut state, PlayerId(0), ManaType::Black, 1);
+    add_mana(&mut state, PlayerId(0), ManaType::Blue, 2);
+
+    apply_as_current(
+        &mut state,
+        GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: 0,
+        },
+    )
+    .expect("Crypt Rats stand-in should enter the X-selection path");
+    match state.waiting_for {
+        WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+            max, 1,
+            "the two blue units cannot inflate an activated ability's black-only X"
+        ),
+        ref other => panic!("expected ChooseXValue, got {other:?}"),
+    }
+
+    apply_as_current(&mut state, GameAction::ChooseX { value: 1 })
+        .expect("the legal activated X value must be payable");
+    assert_eq!(state.stack.len(), 1, "the activation reaches the stack");
+    assert_eq!(
+        state.players[0].mana_pool.total(),
+        2,
+        "the black X payment is consumed while the blue mana remains"
+    );
 }
 
 #[test]

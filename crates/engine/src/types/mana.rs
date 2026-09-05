@@ -70,6 +70,65 @@ impl From<ManaColor> for ManaType {
     }
 }
 
+/// CR 107.1b + CR 118.3: The actual mana colors that may pay an announced
+/// `{X}` portion of a cost. This is deliberately a one-or-two-color value:
+/// the corresponding payment is represented by an existing colored or hybrid
+/// [`ManaCostShard`], so every existing solver, auto-tap preview, and manual
+/// payment path enforces it without a parallel X-payment algorithm.
+///
+/// Oracle wording in the supported class is "Spend only black mana on X" or
+/// "Spend only black and/or red mana on X." The type is extensible if a
+/// future card needs a wider color set; do not silently lower an unsupported
+/// wider set to generic mana.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum XManaPaymentRestriction {
+    One(ManaColor),
+    Either(ManaColor, ManaColor),
+}
+
+impl XManaPaymentRestriction {
+    /// The concrete shard that replaces one chosen-X unit. `Either` maps to
+    /// the printed hybrid shape, whose payment semantics are exactly "one mana
+    /// of either listed color" for this cost-only restriction.
+    pub const fn payment_shard(self) -> ManaCostShard {
+        match self {
+            Self::One(ManaColor::White) => ManaCostShard::White,
+            Self::One(ManaColor::Blue) => ManaCostShard::Blue,
+            Self::One(ManaColor::Black) => ManaCostShard::Black,
+            Self::One(ManaColor::Red) => ManaCostShard::Red,
+            Self::One(ManaColor::Green) => ManaCostShard::Green,
+            Self::Either(ManaColor::White, ManaColor::Blue)
+            | Self::Either(ManaColor::Blue, ManaColor::White) => ManaCostShard::WhiteBlue,
+            Self::Either(ManaColor::White, ManaColor::Black)
+            | Self::Either(ManaColor::Black, ManaColor::White) => ManaCostShard::WhiteBlack,
+            Self::Either(ManaColor::White, ManaColor::Red)
+            | Self::Either(ManaColor::Red, ManaColor::White) => ManaCostShard::RedWhite,
+            Self::Either(ManaColor::White, ManaColor::Green)
+            | Self::Either(ManaColor::Green, ManaColor::White) => ManaCostShard::GreenWhite,
+            Self::Either(ManaColor::Blue, ManaColor::Black)
+            | Self::Either(ManaColor::Black, ManaColor::Blue) => ManaCostShard::BlueBlack,
+            Self::Either(ManaColor::Blue, ManaColor::Red)
+            | Self::Either(ManaColor::Red, ManaColor::Blue) => ManaCostShard::BlueRed,
+            Self::Either(ManaColor::Blue, ManaColor::Green)
+            | Self::Either(ManaColor::Green, ManaColor::Blue) => ManaCostShard::GreenBlue,
+            Self::Either(ManaColor::Black, ManaColor::Red)
+            | Self::Either(ManaColor::Red, ManaColor::Black) => ManaCostShard::BlackRed,
+            Self::Either(ManaColor::Black, ManaColor::Green)
+            | Self::Either(ManaColor::Green, ManaColor::Black) => ManaCostShard::BlackGreen,
+            Self::Either(ManaColor::Red, ManaColor::Green)
+            | Self::Either(ManaColor::Green, ManaColor::Red) => ManaCostShard::RedGreen,
+            // A repeated color is semantically the one-color form. Keeping it
+            // explicit makes this total over the public enum and avoids a
+            // permissive fallback if a caller constructs it directly.
+            Self::Either(ManaColor::White, ManaColor::White) => ManaCostShard::White,
+            Self::Either(ManaColor::Blue, ManaColor::Blue) => ManaCostShard::Blue,
+            Self::Either(ManaColor::Black, ManaColor::Black) => ManaCostShard::Black,
+            Self::Either(ManaColor::Red, ManaColor::Red) => ManaCostShard::Red,
+            Self::Either(ManaColor::Green, ManaColor::Green) => ManaCostShard::Green,
+        }
+    }
+}
+
 /// CR 107.4f + CR 118.3a + CR 118.3b: Set of mana colors for which a player
 /// may substitute 2 life rather than 1 colored mana at payment time, granted
 /// by static abilities like K'rrik, Son of Yawgmoth ("For each {B} in a cost,
@@ -2191,6 +2250,28 @@ impl ManaCost {
             *generic += value * x_count as u32;
         }
     }
+
+    /// CR 107.1b + CR 118.3: After total-cost determination, replace this
+    /// many remaining generic units with a color-restricted X payment shard.
+    ///
+    /// This must run *after* reductions and increases. Before then, `{X}` is
+    /// generic mana for CR 601.2f purposes; eagerly converting it to a colored
+    /// shard would make a generic reduction fail to reduce it. `count` is the
+    /// surviving X portion, clamped to the generic amount after every modifier.
+    pub fn restrict_generic_x_payment(&mut self, count: u32, restriction: XManaPaymentRestriction) {
+        let ManaCost::Cost { shards, generic } = self else {
+            return;
+        };
+        let count = count.min(*generic);
+        if count == 0 {
+            return;
+        }
+        *generic -= count;
+        shards.extend(std::iter::repeat_n(
+            restriction.payment_shard(),
+            count as usize,
+        ));
+    }
 }
 
 impl Default for ManaCost {
@@ -4260,6 +4341,77 @@ mod tests {
         assert_eq!(cost.mana_value_with_x(Zone::Stack, Some(5)), 3);
         assert_eq!(cost.mana_value_with_x(Zone::Stack, None), 3);
         assert_eq!(cost.mana_value_with_x(Zone::Graveyard, Some(5)), 3);
+    }
+
+    #[test]
+    fn restrict_generic_x_payment_leaves_non_x_generic_unchanged() {
+        let mut cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Black],
+            generic: 3,
+        };
+
+        cost.restrict_generic_x_payment(2, XManaPaymentRestriction::One(ManaColor::Black));
+
+        assert_eq!(
+            cost,
+            ManaCost::Cost {
+                // The two surviving X units are black-only. The printed {B}
+                // and the unrelated generic {1} remain independent.
+                shards: vec![
+                    ManaCostShard::Black,
+                    ManaCostShard::Black,
+                    ManaCostShard::Black,
+                ],
+                generic: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn restrict_generic_x_payment_with_two_colors_uses_hybrid_shards() {
+        let mut cost = ManaCost::Cost {
+            shards: Vec::new(),
+            generic: 2,
+        };
+
+        cost.restrict_generic_x_payment(
+            2,
+            XManaPaymentRestriction::Either(ManaColor::Black, ManaColor::Red),
+        );
+
+        assert_eq!(
+            cost,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::BlackRed, ManaCostShard::BlackRed],
+                generic: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn generic_reduction_can_reduce_x_before_its_color_rider_applies() {
+        // Start with Consume Spirit's {X}{B}, choose X=2, then model a
+        // one-generic reduction during CR 601.2f. Only one X unit survives
+        // to be black-restricted; applying the rider before the reduction
+        // would incorrectly leave two black shards.
+        let mut cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::X, ManaCostShard::Black],
+            generic: 0,
+        };
+        cost.concretize_x(2);
+        let ManaCost::Cost { generic, .. } = &mut cost else {
+            unreachable!();
+        };
+        *generic = generic.saturating_sub(1);
+        cost.restrict_generic_x_payment(2, XManaPaymentRestriction::One(ManaColor::Black));
+
+        assert_eq!(
+            cost,
+            ManaCost::Cost {
+                shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+                generic: 0,
+            }
+        );
     }
 
     #[test]

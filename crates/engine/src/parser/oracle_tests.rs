@@ -26205,6 +26205,66 @@ fn throne_of_eldraine_parses_all_chosen_color_mana_riders() {
     );
 }
 
+/// CR 107.1b + CR 118.3: The two old-border wordings are attached to their
+/// actual payment scopes instead of becoming unresolved effect text. Consume
+/// Spirit is a spell; Crypt Rats is an activated ability.
+#[test]
+fn old_border_x_mana_color_riders_parse_on_spell_and_activation() {
+    use crate::types::ability::{ActivationManaPaymentRestriction, CastingRestriction};
+    use crate::types::mana::{ManaColor, XManaPaymentRestriction};
+
+    let spell = parse_oracle_text(
+        "Spend only black mana on X.\nConsume Spirit deals X damage to any target and you gain X life.",
+        "Consume Spirit",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    assert_eq!(
+        spell.casting_restrictions,
+        vec![CastingRestriction::OnlyColorsOnX(
+            XManaPaymentRestriction::One(ManaColor::Black)
+        )]
+    );
+
+    // Soul Burn is the decklist-bearing two-color variant. Its later
+    // black-mana-attribution life-gain clause is deliberately a separate
+    // mechanism; this assertion only proves that the shared payment rider is
+    // attached to the spell rather than lost in the effect text.
+    let soul_burn = parse_oracle_text(
+        "Spend only black and/or red mana on X.\nSoul Burn deals X damage to any target.",
+        "Soul Burn",
+        &[],
+        &["Sorcery".to_string()],
+        &[],
+    );
+    assert_eq!(
+        soul_burn.casting_restrictions,
+        vec![CastingRestriction::OnlyColorsOnX(
+            XManaPaymentRestriction::Either(ManaColor::Black, ManaColor::Red)
+        )]
+    );
+
+    let activation = parse_oracle_text(
+        "{X}: Crypt Rats deals X damage to each creature and each player. Spend only black mana on X.",
+        "Crypt Rats",
+        &[],
+        &["Creature".to_string()],
+        &["Rat".to_string()],
+    );
+    let rats = activation.abilities.first().expect("Crypt Rats ability");
+    assert_eq!(
+        rats.activation_mana_payment_restriction,
+        Some(ActivationManaPaymentRestriction::OnlyColorsOnX(
+            XManaPaymentRestriction::One(ManaColor::Black)
+        ))
+    );
+    assert!(
+        !super::has_unimplemented(rats),
+        "the payment rider must not poison the resolved damage effect: {rats:#?}"
+    );
+}
+
 /// Helper: count `Effect::Unimplemented` markers carrying `key` anywhere in a
 /// parsed card, so the honesty tests below assert on the pattern-class key
 /// rather than on a Debug substring.

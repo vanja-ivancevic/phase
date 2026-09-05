@@ -11688,7 +11688,9 @@ fn apply_action(
                 // whether or not the ability has deferred targets.
                 let mut trial = pending.as_ref().clone();
                 trial.ability.set_chosen_x_recursive(value);
-                trial.cost.concretize_x(value);
+                let mut trial_cost = trial.cost.clone();
+                casting::concretize_pending_x(&mut trial_cost, value);
+                trial.cost = trial_cost;
                 if trial.activation_ability_index.is_some()
                     && trial.activation_cost.as_ref().is_some_and(|cost| {
                         !casting_costs::activation_cost_is_payable_after_x_choice(
@@ -11737,7 +11739,9 @@ fn apply_action(
                 EngineError::InvalidAction("No pending cast awaiting X".to_string())
             })?;
             pending.ability.set_chosen_x_recursive(value);
-            pending.cost.concretize_x(value);
+            let mut concrete_cost = pending.cost.clone();
+            casting::concretize_pending_x(&mut concrete_cost, value);
+            pending.cost = concrete_cost;
             let object_id = pending.object_id;
             events.push(GameEvent::XValueChosen {
                 player,

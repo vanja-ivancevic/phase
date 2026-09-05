@@ -2484,7 +2484,7 @@ mod tests {
     use crate::types::game_state::LayersDirty;
     use crate::types::identifiers::CardId;
     use crate::types::identifiers::ObjectId;
-    use crate::types::mana::{ManaColor, ManaRestriction, SpellMeta};
+    use crate::types::mana::{ManaColor, ManaRestriction, SpellMeta, XManaPaymentRestriction};
     use crate::types::zones::Zone;
 
     /// The building-block predicate must classify each shape the parser can produce.
@@ -3222,6 +3222,31 @@ mod tests {
             generic: 2,
         };
         assert!(can_pay(&pool, &cost));
+    }
+
+    #[test]
+    fn x_color_rider_requires_its_color_but_not_the_fixed_generic_cost() {
+        // Consume Spirit at X=2 has {B}{B}{B}{1} after total-cost
+        // determination: the X portion and printed {B} need black, while the
+        // unrelated generic unit can use any mana.
+        let mut cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::X, ManaCostShard::Black],
+            generic: 1,
+        };
+        cost.concretize_x(2);
+        cost.restrict_generic_x_payment(2, XManaPaymentRestriction::One(ManaColor::Black));
+
+        assert!(can_pay(
+            &pool_with(&[(ManaType::Black, 3), (ManaType::Blue, 1)]),
+            &cost
+        ));
+        assert!(
+            !can_pay(
+                &pool_with(&[(ManaType::Black, 2), (ManaType::Blue, 2)]),
+                &cost
+            ),
+            "an off-color unit may pay fixed generic mana, never the black-only X portion"
+        );
     }
 
     #[test]
