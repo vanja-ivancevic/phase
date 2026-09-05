@@ -225,9 +225,55 @@ fn parse_control_presence_conditions(input: &str) -> OracleResult<'_, StaticCond
         // "you control N or more creatures".
         parse_creatures_are_attacking_count_ge,
         parse_source_controlled_or_your_commander,
+        parse_you_control_more_than_each_opponent,
         parse_control_conditions,
     ))
     .parse(input)
+}
+
+/// CR 109.5 + CR 102.2: "you control more [type] than each opponent" is a
+/// universal comparison, not an aggregate count of all opponents' permanents.
+///
+/// It therefore compares your count to the *maximum* count held by any one
+/// opponent.  This is the object-count counterpart of the existing hand-size
+/// grammar for "more cards in hand than each opponent" and keeps multiplayer
+/// semantics exact: two opponents with one creature each do not collectively
+/// stop a player who controls two creatures.
+///
+/// Goblin Goon is the old-border combat-restriction user: it may attack or
+/// block precisely while this condition is true.
+fn parse_you_control_more_than_each_opponent(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("you control more ").parse(input)?;
+    let (rest, type_text) = take_until(" than each opponent").parse(rest)?;
+    let (rest, _) = tag(" than each opponent").parse(rest)?;
+    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any | TargetFilter::None)
+    {
+        return Err(oracle_err(type_text));
+    }
+
+    let you_filter = match filter.clone() {
+        TargetFilter::Typed(typed) => TargetFilter::Typed(typed.controller(ControllerRef::You)),
+        other => other,
+    };
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter: you_filter },
+            },
+            comparator: Comparator::GT,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::ControlledByEachPlayer {
+                    filter,
+                    aggregate: AggregateFunction::Max,
+                    relation: PlayerRelation::Opponent,
+                },
+            },
+        },
+    ))
 }
 
 /// CR 903.3 + CR 903.3d + CR 611.3a: "you control ~ or it's your commander"
@@ -15833,6 +15879,41 @@ mod tests {
             } => {}
             other => panic!("expected existential opponent ControlsCount GE 1, got {other:?}"),
         }
+    }
+
+    /// CR 109.5 + CR 102.2: Goblin Goon's "than each opponent" comparison is
+    /// universal.  The opponent side must therefore be the per-player maximum,
+    /// never a sum across opponents or the existential PlayerCount shape used by
+    /// "an opponent controls more creatures than you".
+    #[test]
+    fn test_you_control_more_creatures_than_each_opponent() {
+        let (rest, condition) =
+            parse_inner_condition("you control more creatures than each opponent").unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison { lhs, comparator, rhs } = condition else {
+            panic!("expected quantity comparison");
+        };
+        assert_eq!(comparator, Comparator::GT);
+        assert_eq!(
+            lhs,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(
+                        TypedFilter::creature().controller(ControllerRef::You),
+                    ),
+                },
+            }
+        );
+        assert_eq!(
+            rhs,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ControlledByEachPlayer {
+                    filter: TargetFilter::Typed(TypedFilter::creature()),
+                    aggregate: AggregateFunction::Max,
+                    relation: PlayerRelation::Opponent,
+                },
+            }
+        );
     }
 
     /// Issue #859: Weathered Wayfarer — "Activate only if an opponent controls
