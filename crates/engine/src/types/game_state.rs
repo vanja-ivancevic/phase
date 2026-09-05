@@ -593,6 +593,12 @@ pub struct TriggerSourceContext {
     pub additional_cost_payments: Vec<AdditionalCostInstancePayment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_cost_paid_object: Option<CostPaidObjectSnapshot>,
+    /// The spell or ability source that caused the zone change carrying this
+    /// record. This is event provenance, not a characteristic of the departing
+    /// object: it is stored in the record-owned context so it survives deferred
+    /// trigger collection, serialization, and a later same-id reincarnation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_change_cause_source_id: Option<ObjectId>,
 }
 
 impl std::fmt::Debug for TriggerSourceContext {
@@ -670,6 +676,10 @@ impl std::fmt::Debug for TriggerSourceContext {
             )
             .field("additional_cost_payments", &self.additional_cost_payments)
             .field("cast_cost_paid_object", &self.cast_cost_paid_object)
+            .field(
+                "zone_change_cause_source_id",
+                &self.zone_change_cause_source_id,
+            )
             .finish()
     }
 }
@@ -1608,6 +1618,24 @@ pub struct ZoneChangeRecord {
 }
 
 impl ZoneChangeRecord {
+    /// CR 109.5: The spell or ability source that caused this zone change, if
+    /// the authoritative delivery carried one. Legacy or synthetic records
+    /// without a record-owned source context deliberately answer `None`.
+    pub fn cause_source_id(&self) -> Option<ObjectId> {
+        self.trigger_source_context
+            .as_ref()
+            .and_then(|context| context.zone_change_cause_source_id)
+    }
+
+    /// Stamps event provenance after the single zone-delivery authority emits
+    /// this record. The cause cannot be reconstructed later from a current
+    /// object: that object may have changed zones or reincarnated already.
+    pub(crate) fn stamp_cause_source_id(&mut self, source_id: Option<ObjectId>) {
+        if let Some(context) = &mut self.trigger_source_context {
+            context.zone_change_cause_source_id = source_id;
+        }
+    }
+
     /// Returns the owned source context captured with this exact event record.
     /// Callers must not reconstruct a source from a current object or from an
     /// ObjectId-keyed LKI cache when this is absent. The sole compatibility

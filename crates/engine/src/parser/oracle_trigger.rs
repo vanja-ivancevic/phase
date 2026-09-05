@@ -16276,6 +16276,30 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
         }
     }
 
+    // CR 109.5 + CR 603.2: a land put into the controller's graveyard from the
+    // battlefield by an opponent-controlled spell or ability (Sacred Ground).
+    // The source-controller predicate is evaluated against the delivery's
+    // record-owned cause rather than the land's controller or a later object.
+    if matches!(
+        lower,
+        "whenever a spell or ability an opponent controls causes a land to be put into your graveyard from the battlefield"
+    ) {
+        let mut def = make_base();
+        def.mode = TriggerMode::ChangesZone;
+        def.valid_card = Some(with_owner_scope(
+            TargetFilter::Typed(TypedFilter::land()),
+            ControllerRef::You,
+        ));
+        def.origin = Some(Zone::Battlefield);
+        def.destination = Some(Zone::Graveyard);
+        def.constraint = Some(
+            crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+                controller: ControllerRef::Opponent,
+            },
+        );
+        return Some((TriggerMode::ChangesZone, def));
+    }
+
     // Discard triggers: prefix-based matching for broader card coverage.
     // Handles "you discard", "an opponent discards", "a player discards",
     // "each player discards" with optional type filters.
