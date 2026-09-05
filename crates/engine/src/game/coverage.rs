@@ -5150,6 +5150,22 @@ pub fn build_parse_details(
         build_additional_cost_items(additional_cost, &mut items);
     }
 
+    // CR 207.2c + CR 601.2f: a per-target casting-cost surcharge is a
+    // load-bearing Oracle line even though it is stored on the card face,
+    // rather than as an ability. Represent it explicitly so the silent-drop
+    // audit neither mistakes an implemented Fireball-style rider for a gap nor
+    // makes casting metadata invisible in the coverage tree.
+    if face.strive_cost.is_some() {
+        items.push(ParsedItem {
+            category: ParseCategory::Cost,
+            label: "Strive".to_string(),
+            source_text: strive_cost_source_text(&face.oracle_text),
+            supported: true,
+            details: vec![],
+            children: vec![],
+        });
+    }
+
     // Spell-casting options (alternative-cost lines such as Force of Will's
     // pitch cost, Snapcaster-style flash, "without paying its mana cost", etc.).
     // Each `SpellCastingOption` corresponds to its own Oracle line, so it must
@@ -5279,6 +5295,26 @@ fn build_cost_item(cost: &AbilityCost, items: &mut Vec<ParsedItem>) {
         }
         _ => {}
     }
+}
+
+/// Return the source line for a parsed per-target casting-cost surcharge.
+///
+/// The parser stores this structure on `CardFace::strive_cost`, rather than on
+/// an ability definition. Keeping its original line in the coverage tree makes
+/// the accounting audit explain *why* the extra cost item exists. The narrow
+/// phrases mirror the two parser entry points: the keyworded Strive template
+/// and the older bare "This spell costs … for each target beyond the first"
+/// template used by Fireball.
+fn strive_cost_source_text(oracle_text: &Option<String>) -> Option<String> {
+    oracle_text.as_deref().and_then(|text| {
+        text.lines().map(str::trim).find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            (lower.starts_with("strive ")
+                || (lower.starts_with("this spell costs")
+                    && lower.contains("for each target beyond the first")))
+            .then(|| line.to_string())
+        })
+    })
 }
 
 /// Build `ParsedItem` nodes for additional costs (kicker, etc.).
@@ -5616,6 +5652,32 @@ fn extract_gap_details(items: &[ParsedItem]) -> Vec<GapDetail> {
     let mut details = Vec::new();
     extract_gap_details_inner(items, &mut seen, &mut details);
     details
+}
+
+/// Add every coverage-predicate failure which was not already represented by
+/// the parse tree or a parser warning. `missing` is deduplicated by every
+/// checker, but the existing details may already contain the same handler.
+fn append_missing_gap_details(missing: &[String], details: &mut Vec<GapDetail>) {
+    let mut seen: std::collections::HashSet<String> = details
+        .iter()
+        .map(|detail| detail.handler.clone())
+        .collect();
+    // A swallowed-clause / target-fallback parse gap often also reduces the
+    // parse-tree line count. The resulting SilentDrop label is useful when it
+    // is the only evidence, but is redundant when the parser already named the
+    // semantic gap; keep the per-card distance-to-supported metric causal.
+    let has_existing_parse_gap = !seen.is_empty();
+    for handler in missing {
+        if has_existing_parse_gap && handler.starts_with("SilentDrop:") {
+            continue;
+        }
+        if seen.insert(handler.clone()) {
+            details.push(GapDetail {
+                handler: handler.clone(),
+                source_text: None,
+            });
+        }
+    }
 }
 
 fn extract_gap_details_inner(
@@ -6101,6 +6163,12 @@ pub fn analyze_coverage(card_db: &CardDatabase) -> CoverageSummary {
                 });
             }
         }
+        // `missing` is the authoritative support predicate. Some checks (for
+        // example SilentDrop and resolver-feature auditing) have no unsupported
+        // parse-tree node to extract, so surface their labels here as well.
+        // Otherwise a card can truthfully be `supported: false` while reporting
+        // `gap_count: 0`, making the deck-priority tally impossible to trust.
+        append_missing_gap_details(&missing, &mut gap_details);
         let gap_count = gap_details.len();
         for warning in &face.parse_warnings {
             let (category, pattern) = parse_warning_pattern(warning, face.oracle_text.as_deref());
@@ -15671,6 +15739,74 @@ mod tests {
         assert!(
             missing.is_empty(),
             "supported additional cost should not trigger SilentDrop: {missing:?}"
+        );
+    }
+
+    /// Fireball's older per-target surcharge is stored as `strive_cost`, not an
+    /// ability. The coverage tree must still represent that Oracle line; otherwise
+    /// the generic silent-drop audit marks a fully implemented card unsupported.
+    #[test]
+    fn strive_cost_emits_parsed_item_for_silent_drop_parity() {
+        let mut face = make_face();
+        face.strive_cost = Some(crate::types::mana::ManaCost::generic(1));
+        face.oracle_text = Some(
+            "This spell costs {1} more to cast for each target beyond the first.\n\
+             Fireball deals X damage divided evenly, rounded down, among any number of targets."
+                .to_string(),
+        );
+        face.abilities.push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::DealDamage {
+                amount: QuantityExpr::Ref {
+                    qty: crate::types::ability::QuantityRef::Variable {
+                        name: "X".to_string(),
+                    },
+                },
+                target: TargetFilter::Any,
+                damage_source: None,
+                excess: None,
+            },
+        ));
+
+        let parse_details = build_parse_details_for_face(&face);
+        assert_eq!(count_effective_parsed_items(&parse_details), 2);
+        let strive = parse_details
+            .iter()
+            .find(|item| item.category == ParseCategory::Cost && item.label == "Strive")
+            .expect("implemented per-target surcharge must be visible in coverage");
+        assert!(strive.supported);
+        assert_eq!(
+            strive.source_text.as_deref(),
+            Some("This spell costs {1} more to cast for each target beyond the first.")
+        );
+
+        let mut missing = Vec::new();
+        check_silent_drops(&face.oracle_text, &parse_details, &mut missing);
+        assert!(
+            missing.is_empty(),
+            "represented per-target surcharge must not be reported as a silent drop: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn audit_only_missing_labels_are_visible_in_gap_details() {
+        let mut details = Vec::new();
+        append_missing_gap_details(
+            &[
+                "SilentDrop:1_of_2".to_string(),
+                "ResolverFeature:Foo".to_string(),
+            ],
+            &mut details,
+        );
+        append_missing_gap_details(&["SilentDrop:1_of_2".to_string()], &mut details);
+
+        assert_eq!(
+            details
+                .iter()
+                .map(|detail| detail.handler.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SilentDrop:1_of_2", "ResolverFeature:Foo"],
+            "every unsupported predicate must have exactly one reportable gap"
         );
     }
 
