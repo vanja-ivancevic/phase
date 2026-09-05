@@ -7828,6 +7828,19 @@ pub enum QuantityRef {
         )]
         aggregate: AggregateFunction,
     },
+    /// CR 608.2c + CR 120.3: The amount of damage actually dealt by the
+    /// immediately preceding instruction, limited by the damaged target's
+    /// pre-damage life total, toughness, or loyalty.
+    ///
+    /// This is the typed quantity for the Drain Life class: "You gain life
+    /// equal to the damage dealt, but not more life than the player's life
+    /// total before the damage was dealt, the planeswalker's loyalty before
+    /// the damage was dealt, or the creature's toughness." The cap is
+    /// captured while applying the damage, before that application mutates
+    /// life, loyalty, or damage-marking state. It is resolution-local and
+    /// deliberately distinct from `PreviousEffectAmount`: ordinary
+    /// "damage dealt this way" has no target-derived ceiling.
+    PreviousDamageAmountCappedByTargetPreDamageValue,
     /// Engine bookkeeping for the immediately preceding resolution-local effect
     /// count. This reads `GameState::last_effect_count` directly, defaults an
     /// unavailable count to zero, and is not limited to object choices.
@@ -8361,6 +8374,7 @@ impl QuantityRef {
             | QuantityRef::FilteredTrackedSetSize { .. }
             | QuantityRef::ExiledFromHandThisResolution
             | QuantityRef::PreviousEffectAmount { .. }
+            | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
             | QuantityRef::PreviousEffectCount
             | QuantityRef::UnspentMana { .. }
             | QuantityRef::EventContextAmount

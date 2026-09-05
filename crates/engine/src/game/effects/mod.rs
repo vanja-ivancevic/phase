@@ -3627,6 +3627,7 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::TrackedSetSize
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::PartySize { .. }
@@ -10474,6 +10475,9 @@ pub fn resolve_ability_chain(
         state.last_effect_amount = None;
         // CR 120.10: resolution-local excess channel resets with its total twin.
         state.last_effect_excess_amount = None;
+        // CR 608.2c + CR 120.3: Drain Life's target-derived ceiling belongs to
+        // this one resolution, just like the preceding-effect damage amount.
+        state.last_damage_target_pre_damage_life_gain_cap = None;
         // NOTE: `state.die_result_this_resolution` is intentionally NOT cleared
         // here. `roll_die::resolve` stamps it AFTER this depth-0 prelude runs
         // (the prelude runs once at chain top, before `RollDie` executes), so
@@ -12592,6 +12596,20 @@ fn resolve_chain_body(
     // discard accounting so controller-only "discard your hand, then draw that
     // many" chains (Tolarian Winds) stamp `last_effect_count`.
     let parent_events = &events[events_before..];
+    // CR 608.2c + CR 120.3: the Drain Life quantity is licensed only by one
+    // immediately preceding damage event. `apply_damage_after_replacement`
+    // captures a target ceiling at damage time; discard it here when this
+    // parent produced no damage, or a multi-target/multi-recipient batch for
+    // which one scalar ceiling would be ambiguous. This prevents a later
+    // unrelated previous-effect quantity from inheriting a stale target value.
+    if parent_events
+        .iter()
+        .filter(|event| matches!(event, GameEvent::DamageDealt { .. }))
+        .count()
+        != 1
+    {
+        state.last_damage_target_pre_damage_life_gain_cap = None;
+    }
     let counts_by_player = previous_effect_counts_by_player_from_events(
         EffectKind::from(&ability.effect),
         ability.source_id,

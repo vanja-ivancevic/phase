@@ -790,6 +790,23 @@ fn parse_life_equal_quantity(
         .parse(after_verb_lower)
         .ok()?;
     let qty_text = qty_text.trim_end_matches('.').trim();
+    // CR 608.2c + CR 120.3: Drain Life's second instruction is a bounded
+    // immediate look-back at the actual damage dealt by the first. This must
+    // be recognized before the generic "damage dealt" parser: the trailing
+    // cap is semantic text, not ignorable prose. Kept narrow to the full
+    // Oracle form so a superficially similar but differently scoped clause
+    // remains an honest coverage gap instead of silently acquiring this rule.
+    if all_consuming((
+        tag::<_, _, OracleError<'_>>("the damage dealt, but not more life than the player's life total before the damage was dealt, the planeswalker's loyalty before the damage was dealt, or the creature's toughness"),
+        opt(tag(".")),
+    ))
+    .parse(qty_text)
+    .is_ok()
+    {
+        return Some(QuantityExpr::Ref {
+            qty: QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue,
+        });
+    }
     // CR 115.1: target-relative "they/that player lost/gained this turn" → Target
     // scope. Tried before the generic delegation, which would otherwise map the
     // third-person anaphor to the controller (see helper doc).

@@ -1645,6 +1645,9 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 "excess amount from preceding effect".into()
             }
         },
+        QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue => {
+            "damage dealt capped by target's pre-damage value".into()
+        }
         QuantityRef::PreviousEffectCount => "count from preceding effect".into(),
         QuantityRef::TrackedSetSize => "cards moved".into(),
         QuantityRef::FilteredTrackedSetSize { filter, .. } => {
@@ -8555,6 +8558,9 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::DistinctCounterKindsAmong { .. } => ("DistinctCounterKindsAmong", Handled),
         QuantityRef::VoteCount { .. } => ("VoteCount", Handled),
         QuantityRef::PreviousEffectAmount { .. } => ("PreviousEffectAmount", Handled),
+        QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue => {
+            ("PreviousDamageAmountCappedByTargetPreDamageValue", Handled)
+        }
         QuantityRef::PreviousEffectCount => ("PreviousEffectCount", Handled),
         QuantityRef::TrackedSetSize => ("TrackedSetSize", Handled),
         QuantityRef::FilteredTrackedSetSize { .. } => ("FilteredTrackedSetSize", Handled),
@@ -13451,6 +13457,38 @@ mod tests {
             rarities: Default::default(),
             attraction_lights: vec![],
         }
+    }
+
+    /// Coverage must track the Drain Life-class cap as a handled runtime
+    /// quantity. Without the typed quantity and its coverage registration, the
+    /// parser could retain both instructions while the deck-gap report still
+    /// marked every Drain Life printing red.
+    #[test]
+    fn drain_life_bounded_damage_gain_is_fully_supported() {
+        let oracle = "Spend only black mana on X.\n\
+Drain Life deals X damage to any target. You gain life equal to the damage dealt, but not more life than the player's life total before the damage was dealt, the planeswalker's loyalty before the damage was dealt, or the creature's toughness.";
+        let parsed = crate::parser::parse_oracle_text(
+            oracle,
+            "Drain Life",
+            &[],
+            &["Sorcery".to_string()],
+            &[],
+        );
+        let mut face = make_face();
+        face.name = "Drain Life".to_string();
+        face.oracle_text = Some(oracle.to_string());
+        face.abilities = parsed.abilities;
+        face.casting_restrictions = parsed.casting_restrictions;
+
+        assert!(
+            !card_face_has_unimplemented_parts(&face),
+            "Drain Life must not retain an unimplemented effect: {face:?}"
+        );
+        assert!(
+            card_face_gaps(&face).is_empty(),
+            "Drain Life's bounded prior-damage gain must be a handled coverage feature, got {:?}",
+            card_face_gaps(&face)
+        );
     }
 
     fn delayed_trigger_payload(effect: Effect) -> AbilityDefinition {
