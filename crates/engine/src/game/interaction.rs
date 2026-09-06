@@ -227,6 +227,7 @@ fn human_response_model(waiting_for: &WaitingFor, semantic_owner: PlayerId) -> H
         | WaitingFor::KeepWithinTotalPowerChoice { .. }
         | WaitingFor::KeepExactPermanentsChoice { .. }
         | WaitingFor::ScryChoice { .. }
+        | WaitingFor::ReorderLibraryChoice { .. }
         | WaitingFor::ArrangePlanarDeckTopChoice { .. }
         | WaitingFor::DigChoice { .. }
         | WaitingFor::SurveilChoice { .. }
@@ -319,6 +320,7 @@ fn human_response_model(waiting_for: &WaitingFor, semantic_owner: PlayerId) -> H
         | WaitingFor::CastingVariantChoice { .. }
         | WaitingFor::ChoosePermanentTypeSlot { .. }
         | WaitingFor::OptionalEffectChoice { .. }
+        | WaitingFor::RepeatPaidLibraryLookPayment { .. }
         | WaitingFor::ResolutionOptionalPaymentChoice { .. }
         | WaitingFor::PairChoice { .. }
         | WaitingFor::TributeChoice { .. }
@@ -500,6 +502,7 @@ fn classify_waiting_for(waiting_for: &WaitingFor) -> WaitingClassification {
         | WaitingFor::KeepWithinTotalPowerChoice { .. }
         | WaitingFor::KeepExactPermanentsChoice { .. }
         | WaitingFor::ScryChoice { .. }
+        | WaitingFor::ReorderLibraryChoice { .. }
         | WaitingFor::ArrangePlanarDeckTopChoice { .. }
         | WaitingFor::DigChoice { .. }
         | WaitingFor::SurveilChoice { .. }
@@ -557,6 +560,7 @@ fn classify_waiting_for(waiting_for: &WaitingFor) -> WaitingClassification {
         | WaitingFor::CastingVariantChoice { .. }
         | WaitingFor::ChoosePermanentTypeSlot { .. }
         | WaitingFor::OptionalEffectChoice { .. }
+        | WaitingFor::RepeatPaidLibraryLookPayment { .. }
         | WaitingFor::ResolutionOptionalPaymentChoice { .. }
         | WaitingFor::PairChoice { .. }
         | WaitingFor::TributeChoice { .. }
@@ -3099,6 +3103,7 @@ fn selection_projection(
         WaitingFor::ChooseRingBearer { candidates, .. } => candidates.len(),
         WaitingFor::ChooseUntapSubset { group, .. } => group.len(),
         WaitingFor::ScryChoice { cards, .. }
+        | WaitingFor::ReorderLibraryChoice { cards, .. }
         | WaitingFor::ArrangePlanarDeckTopChoice { cards, .. }
         | WaitingFor::SurveilChoice { cards, .. }
         | WaitingFor::SearchChoice { cards, .. }
@@ -3425,6 +3430,16 @@ fn selection_projection(
                 source_id: None,
             })
         }
+        WaitingFor::ReorderLibraryChoice {
+            cards, source_id, ..
+        } => Some(SelectionProjection {
+            object_ids: cards.clone(),
+            constraint: count_constraint(cards.len(), cards.len()),
+            confirm: ConfirmSemantics::Explicit,
+            intent: InteractionIntentCode::Choose,
+            action: SelectionAction::SelectCards,
+            source_id: *source_id,
+        }),
         WaitingFor::ArrangePlanarDeckTopChoice {
             cards, keep_on_top, ..
         } => Some(SelectionProjection {
@@ -3690,6 +3705,7 @@ fn selection_projection(
         | WaitingFor::MultiTargetSelection { .. }
         | WaitingFor::AbilityModeChoice { .. }
         | WaitingFor::OptionalEffectChoice { .. }
+        | WaitingFor::RepeatPaidLibraryLookPayment { .. }
         | WaitingFor::ResolutionOptionalPaymentChoice { .. }
         | WaitingFor::PairChoice { .. }
         | WaitingFor::TributeChoice { .. }

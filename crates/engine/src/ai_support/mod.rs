@@ -508,6 +508,7 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
         )
         | (WaitingFor::RevealUntilKeptChoice { .. }, GameAction::DecideOptionalEffect { .. })
         | (WaitingFor::RepeatDecision { .. }, GameAction::DecideOptionalEffect { .. })
+        | (WaitingFor::RepeatPaidLibraryLookPayment { .. }, GameAction::DecideOptionalEffect { .. })
         | (
             WaitingFor::CastOffer {
                 kind: CastOfferKind::Cascade { .. },
@@ -587,6 +588,10 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
                 )
             })
         }
+        (
+            WaitingFor::ReorderLibraryChoice { cards, .. },
+            GameAction::SelectCards { cards: chosen },
+        ) => selection_mismatch(chosen, cards, Some(cards.len())),
         (
             WaitingFor::ScryChoice { player: _, cards },
             GameAction::SelectCards { cards: chosen },

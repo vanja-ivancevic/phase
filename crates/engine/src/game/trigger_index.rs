@@ -1025,7 +1025,8 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::ReassembleContraption
         | EffectKind::AssembleContraptionOnSprocket
         | EffectKind::RevealChosenLowestManaValueCreatures
-        | EffectKind::ReassembleContraptionOnSprocket => {}
+        | EffectKind::ReassembleContraptionOnSprocket
+        | EffectKind::RepeatPaidLibraryLook => {}
     }
 }
 

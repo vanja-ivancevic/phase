@@ -7812,6 +7812,16 @@ fn drain_pending_deferred_life_cost_resume(
     let resume_for_restore = resume.clone();
     let result = (|| -> Result<WaitingFor, EngineError> {
         match resume {
+            crate::types::game_state::DeferredLifeCostResume::RepeatPaidLibraryLook {
+                player,
+                source_id,
+                cards,
+                ..
+            } => Ok(
+                crate::game::effects::repeat_paid_library_look::resume_after_paid_life(
+                    state, player, source_id, cards,
+                ),
+            ),
             crate::types::game_state::DeferredLifeCostResume::Cast {
                 player,
                 pending,
@@ -11322,6 +11332,40 @@ fn apply_action(
             GameAction::CancelCast,
         ) => engine_casting::cancel_pending_cast(state, *player, pending_cast, &mut events)?,
         // CR 608.2d: Player decided whether to perform an optional effect ("You may X").
+        (
+            WaitingFor::RepeatPaidLibraryLookPayment {
+                player,
+                source_id,
+                cards,
+                life_payment,
+            },
+            GameAction::DecideOptionalEffect { accept },
+        ) => crate::game::effects::repeat_paid_library_look::handle_payment(
+            state,
+            *player,
+            *source_id,
+            cards.clone(),
+            *life_payment,
+            accept,
+            &mut events,
+        )?,
+        (
+            WaitingFor::ReorderLibraryChoice {
+                player,
+                cards,
+                top,
+                source_id,
+            },
+            GameAction::SelectCards { cards: ordered },
+        ) => crate::game::effects::repeat_paid_library_look::handle_reorder(
+            state,
+            *player,
+            cards.clone(),
+            *top,
+            *source_id,
+            ordered,
+            &mut events,
+        )?,
         (
             WaitingFor::OptionalEffectChoice {
                 player, source_id, ..

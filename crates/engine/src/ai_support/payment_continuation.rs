@@ -753,7 +753,10 @@ fn classify_deferred_life_root(
             | ManaAbilityResume::UnlessPayment { .. }
             | ManaAbilityResume::EffectPayCost { .. } => PaymentContinuationState::NotAffiliated,
         },
-        DeferredLifeCostResume::PayAmount { .. } => PaymentContinuationState::NotAffiliated,
+        DeferredLifeCostResume::PayAmount { .. }
+        | DeferredLifeCostResume::RepeatPaidLibraryLook { .. } => {
+            PaymentContinuationState::NotAffiliated
+        }
     }
 }
 

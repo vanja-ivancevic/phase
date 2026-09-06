@@ -3619,6 +3619,7 @@ fn legacy_effect(x: &Effect) -> bool {
         | Effect::Choose { .. }
         | Effect::ApplyPostReplacementDamage { .. }
         | Effect::RevealChosenLowestManaValueCreatures
+        | Effect::RepeatPaidLibraryLook
         | Effect::Unimplemented { .. } => false,
     }
 }
@@ -6083,6 +6084,7 @@ fn rw_effect(
         | Effect::ApplySticker { .. }
         | Effect::ProcessRadCounters => (RwProfile::conservative(), None),
         Effect::RevealChosenLowestManaValueCreatures => (RwProfile::conservative(), None),
+        Effect::RepeatPaidLibraryLook => (RwProfile::conservative(), None),
     }
 }
 

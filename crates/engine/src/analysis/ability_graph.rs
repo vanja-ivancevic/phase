@@ -1044,6 +1044,7 @@ fn effect_projection(effect: &Effect) -> Projection {
         | Effect::ChooseCounterKind { .. }
         | Effect::PutChosenCounter { .. }
         | Effect::RevealChosenLowestManaValueCreatures
+        | Effect::RepeatPaidLibraryLook
         | Effect::Unimplemented { .. } => return Projection::Unmodeled,
     }
     b.finish()

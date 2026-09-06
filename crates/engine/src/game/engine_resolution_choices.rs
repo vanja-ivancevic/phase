@@ -7984,7 +7984,7 @@ fn finish_effect_zone_put_at_library_position(
     finish_with_continuation(state, player, events);
 }
 
-fn finish_with_continuation(
+pub(crate) fn finish_with_continuation(
     state: &mut GameState,
     player: crate::types::player::PlayerId,
     events: &mut Vec<GameEvent>,
