@@ -15675,9 +15675,15 @@ pub enum Effect {
     /// "the next time you would draw a card this turn, [effect] instead" draw
     /// replacement (Words of Worship/Wilding). Mirrors CreateDamageReplacement for
     /// the Draw event class; the substitute is a heterogeneous Effect resolved via
-    /// the post-replacement continuation. RUNTIME: create_draw_replacement::resolve.
+    /// the post-replacement continuation. `replacement_sub_ability` extends that
+    /// substitute into a full ability chain when its consequence needs an
+    /// interactive selection before a follow-up (Words of Wind). It is optional
+    /// so the established single-effect representation remains wire-compatible.
+    /// RUNTIME: create_draw_replacement::resolve.
     CreateDrawReplacement {
         replacement_effect: Box<Effect>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement_sub_ability: Option<Box<AbilityDefinition>>,
     },
     /// CR 614.1a + CR 611.2 + CR 901.9c: Install a floating "if a player would
     /// planeswalk as a result of rolling the planar die, [replacement_effect]

@@ -6110,6 +6110,7 @@ mod tests {
                 "CreateDrawReplacement",
                 Effect::CreateDrawReplacement {
                     replacement_effect: Box::new(draw_one()),
+                    replacement_sub_ability: None,
                 },
             ),
             (

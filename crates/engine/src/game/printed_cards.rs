@@ -3615,6 +3615,7 @@ mod tests {
                 library_position: None,
                 library_players: None,
             }),
+            replacement_sub_ability: None,
         };
         walk_effect(&draw_repl, &mut names);
 

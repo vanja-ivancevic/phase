@@ -3539,11 +3539,20 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                 d.push(("recipient_object_filter".into(), fmt_target(f)));
             }
         }
-        Effect::CreateDrawReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
             d.push((
                 "replacement_effect".into(),
                 crate::types::ability::effect_variant_name(replacement_effect).to_string(),
             ));
+            if let Some(sub) = replacement_sub_ability {
+                d.push((
+                    "replacement_sub_ability".into(),
+                    crate::types::ability::effect_variant_name(&sub.effect).to_string(),
+                ));
+            }
         }
         Effect::CreatePlaneswalkReplacement { replacement_effect } => {
             d.push((

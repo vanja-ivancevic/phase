@@ -7607,8 +7607,16 @@ fn render_effect_descriptions(effect: &mut Effect, card_name: &str) {
         Effect::AddTargetReplacement { replacement, .. } => {
             render_replacement_descriptions(replacement, card_name)
         }
-        Effect::CreateDrawReplacement { replacement_effect }
-        | Effect::CreatePlaneswalkReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
+            render_effect_descriptions(replacement_effect, card_name);
+            if let Some(sub) = replacement_sub_ability {
+                render_ability_descriptions(sub, card_name);
+            }
+        }
+        Effect::CreatePlaneswalkReplacement { replacement_effect } => {
             render_effect_descriptions(replacement_effect, card_name)
         }
         // CR 611.2 + CR 111.1: a resolution-time grant onto a target, and a created
