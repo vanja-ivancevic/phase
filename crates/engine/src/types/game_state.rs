@@ -6888,6 +6888,15 @@ fn default_origin_zone() -> Zone {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum DeferredLifeCostResume {
+    /// Resume a repeated paid-library-look after a life-loss replacement has
+    /// settled. The life cost was already paid; only its ordered bottom choice
+    /// remains, so the payment must never be replayed.
+    RepeatPaidLibraryLook {
+        player: PlayerId,
+        source_id: ObjectId,
+        cards: Vec<ObjectId>,
+        resume_at_resolution_depth: usize,
+    },
     /// Continue a spell cast or activated-ability payment without replaying the
     /// life payment. Mana-payment callers set `cost` to `NoCost` and preserve
     /// the amount already spent in `prepaid_actual_mana_spent`.
@@ -6929,7 +6938,11 @@ pub enum DeferredLifeCostResume {
 impl DeferredLifeCostResume {
     pub fn resume_at_resolution_depth(&self) -> usize {
         match self {
-            DeferredLifeCostResume::Cast {
+            DeferredLifeCostResume::RepeatPaidLibraryLook {
+                resume_at_resolution_depth,
+                ..
+            }
+            | DeferredLifeCostResume::Cast {
                 resume_at_resolution_depth,
                 ..
             }
@@ -12400,6 +12413,26 @@ pub enum WaitingFor {
         #[serde(default)]
         enters_attacking: bool,
     },
+    /// CR 701.20e + CR 118.3: The player may pay life to repeat a private
+    /// library look. `cards` is the exact current look; accepting leads to an
+    /// ordered bottom-placement prompt, while declining leads to the final
+    /// shuffle/top-placement prompt.
+    RepeatPaidLibraryLookPayment {
+        player: PlayerId,
+        source_id: ObjectId,
+        cards: Vec<ObjectId>,
+        life_payment: u32,
+    },
+    /// CR 401.2 + CR 701.20e: Submit the complete looked-at group in its
+    /// chosen order. `top = false` appends it to the library bottom; `top =
+    /// true` places it on top after the Vault-family final shuffle.
+    ReorderLibraryChoice {
+        player: PlayerId,
+        cards: Vec<ObjectId>,
+        top: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<ObjectId>,
+    },
     SurveilChoice {
         player: PlayerId,
         cards: Vec<ObjectId>,
@@ -14467,6 +14500,8 @@ impl WaitingFor {
             WaitingFor::RedistributeLifeTotals { .. } => "RedistributeLifeTotals",
             WaitingFor::CoinFlipKeepChoice { .. } => "CoinFlipKeepChoice",
             WaitingFor::DigChoice { .. } => "DigChoice",
+            WaitingFor::RepeatPaidLibraryLookPayment { .. } => "RepeatPaidLibraryLookPayment",
+            WaitingFor::ReorderLibraryChoice { .. } => "ReorderLibraryChoice",
             WaitingFor::SurveilChoice { .. } => "SurveilChoice",
             WaitingFor::RevealChoice { .. } => "RevealChoice",
             WaitingFor::SearchChoice { .. } => "SearchChoice",
@@ -14624,6 +14659,8 @@ impl WaitingFor {
             | WaitingFor::RedistributeLifeTotals { player, .. }
             | WaitingFor::CoinFlipKeepChoice { player, .. }
             | WaitingFor::DigChoice { player, .. }
+            | WaitingFor::RepeatPaidLibraryLookPayment { player, .. }
+            | WaitingFor::ReorderLibraryChoice { player, .. }
             | WaitingFor::SurveilChoice { player, .. }
             | WaitingFor::RevealChoice { player, .. }
             | WaitingFor::SearchChoice { player, .. }
@@ -15070,6 +15107,7 @@ impl WaitingFor {
                 | WaitingFor::ArrangePlanarDeckTopChoice { .. }
                 | WaitingFor::SurveilChoice { .. }
                 | WaitingFor::DigChoice { .. }
+                | WaitingFor::ReorderLibraryChoice { .. }
         )
     }
 

@@ -13942,6 +13942,12 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "DigSource::is_library")]
         source: DigSource,
     },
+    /// CR 701.20e + CR 118.3: Repeatedly look at the top cards of your
+    /// library, optionally pay life to put that exact group on the bottom in
+    /// any order, then finally shuffle and put the last group on top in any
+    /// order. This is a semantic unit because neither Scry nor Dig can express
+    /// an arbitrary full bottom ordering followed by a paid loop.
+    RepeatPaidLibraryLook,
     GainControl {
         #[serde(default = "default_target_filter_any")]
         target: TargetFilter,
@@ -18859,6 +18865,7 @@ impl Effect {
                 other => other.as_ref(),
             },
             Effect::ChooseDrawnThisTurnPayOrTopdeck { player, .. } => Some(player),
+            Effect::RepeatPaidLibraryLook => None,
             Effect::RevealChosenLowestManaValueCreatures => None,
         }
     }
@@ -19507,6 +19514,7 @@ impl Effect {
             | Effect::Unsuspect { .. }
             | Effect::ReproduceEventCounters { .. }
             | Effect::WinTheGame { .. }
+            | Effect::RepeatPaidLibraryLook
             | Effect::RevealChosenLowestManaValueCreatures => false,
         }
     }
@@ -20142,6 +20150,7 @@ impl Effect {
             // CR 122.1: the per-kind magnitude is `EventCounterReproductionCount`,
             // not a `QuantityExpr`, so there is nothing to visit here.
             | Effect::ReproduceEventCounters { .. }
+            | Effect::RepeatPaidLibraryLook
             | Effect::Unimplemented { .. }
             | Effect::RevealChosenLowestManaValueCreatures => {}
         }
@@ -20417,6 +20426,7 @@ impl Effect {
             // not a `QuantityExpr`.
             | Effect::ReproduceEventCounters { .. }
             | Effect::WinTheGame { .. }
+            | Effect::RepeatPaidLibraryLook
             | Effect::RevealChosenLowestManaValueCreatures => None,
         }
     }
@@ -20682,6 +20692,7 @@ impl Effect {
             // not a `QuantityExpr`.
             | Effect::ReproduceEventCounters { .. }
             | Effect::WinTheGame { .. }
+            | Effect::RepeatPaidLibraryLook
             | Effect::RevealChosenLowestManaValueCreatures => None,
         }
     }
@@ -20729,6 +20740,7 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::ChangeZone { .. } => "ChangeZone",
         Effect::ChangeZoneAll { .. } => "ChangeZoneAll",
         Effect::Dig { .. } => "Dig",
+        Effect::RepeatPaidLibraryLook => "RepeatPaidLibraryLook",
         Effect::GainControl { .. } => "GainControl",
         Effect::GainControlAll { .. } => "GainControlAll",
         Effect::ControlNextTurn { .. } => "ControlNextTurn",
@@ -20981,6 +20993,7 @@ pub enum EffectKind {
     ChangeZone,
     ChangeZoneAll,
     Dig,
+    RepeatPaidLibraryLook,
     GainControl,
     GainControlAll,
     ControlNextTurn,
@@ -21244,6 +21257,7 @@ impl From<&Effect> for EffectKind {
             Effect::ChangeZone { .. } => EffectKind::ChangeZone,
             Effect::ChangeZoneAll { .. } => EffectKind::ChangeZoneAll,
             Effect::Dig { .. } => EffectKind::Dig,
+            Effect::RepeatPaidLibraryLook => EffectKind::RepeatPaidLibraryLook,
             Effect::GainControl { .. } => EffectKind::GainControl,
             Effect::GainControlAll { .. } => EffectKind::GainControlAll,
             Effect::ControlNextTurn { .. } => EffectKind::ControlNextTurn,

@@ -32515,11 +32515,39 @@ fn trailing_for_each_repeat_is_supported(effect: &Effect) -> bool {
     )
 }
 
+/// CR 701.20e + CR 118.3: Recognize the complete repeated paid-library-look
+/// grammar. The exact, full-body guard makes this a structural parser rule,
+/// rather than a card-name exception: an Oracle card with the same instruction
+/// receives the same semantic effect, while a near match falls through to the
+/// ordinary parser and remains honestly unsupported.
+fn parse_repeat_paid_library_look_ir(
+    text: &str,
+    kind: AbilityKind,
+    ctx: &ParseContext,
+) -> Option<EffectChainIr> {
+    let lower = text.to_ascii_lowercase();
+    let canonical = "look at the top five cards of your library. as many times as you choose, you may pay 1 life, put those cards on the bottom of your library in any order, then look at the top five cards of your library. then shuffle and put the last cards you looked at this way on top in any order.";
+    if lower.trim() != canonical {
+        return None;
+    }
+    Some(EffectChainIr::single_clause(
+        text,
+        kind,
+        parsed_clause(Effect::RepeatPaidLibraryLook),
+        None,
+        ctx.actor.clone(),
+        ctx.in_trigger,
+    ))
+}
+
 pub(crate) fn parse_effect_chain_ir(
     text: &str,
     kind: AbilityKind,
     ctx: &mut ParseContext,
 ) -> EffectChainIr {
+    if let Some(ir) = parse_repeat_paid_library_look_ir(text, kind, ctx) {
+        return ir;
+    }
     if let Some(ir) = parse_choose_survivors_destroy_rest_ir(text, kind, ctx) {
         return ir;
     }

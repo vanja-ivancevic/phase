@@ -515,6 +515,7 @@ fn effect_offers_choice(e: &Effect) -> bool {
         | Effect::ChooseOneOf { .. }
         | Effect::RevealChosenLowestManaValueCreatures
         | Effect::Unimplemented { .. } => true,
+        Effect::RepeatPaidLibraryLook => true,
     }
 }
 

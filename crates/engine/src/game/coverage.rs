@@ -4004,6 +4004,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         | Effect::ChooseCounterAdjustment { .. }
         | Effect::ReturnAsAura { .. }
         | Effect::Specialize => {}
+        Effect::RepeatPaidLibraryLook => {}
     }
     d
 }
@@ -7138,6 +7139,7 @@ fn visit_direct_effect_ability_payloads<'a>(
         | Effect::ApplyPerpetual { .. }
         | Effect::Intensify { .. }
         | Effect::DraftFromSpellbook { .. }
+        | Effect::RepeatPaidLibraryLook
         | Effect::Unimplemented { .. } => {}
     }
 }

@@ -1029,6 +1029,7 @@ where
         | Effect::ChooseCounterKind { .. }
         | Effect::PutChosenCounter { .. }
         | Effect::ReproduceEventCounters { .. }
+        | Effect::RepeatPaidLibraryLook
         | Effect::Unimplemented { .. } => {}
     }
     ControlFlow::Continue(())

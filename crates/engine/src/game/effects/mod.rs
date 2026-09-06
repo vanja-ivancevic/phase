@@ -108,6 +108,7 @@ pub mod energy;
 pub mod epic;
 pub mod exile_resolving_spell;
 pub mod put_chosen_counter;
+pub mod repeat_paid_library_look;
 pub mod reveal_chosen_lowest_mana_value_creatures;
 // Tests for `epic` live in a sibling file (declared here, not in `epic.rs`, so
 // `epic.rs` stays implementation-only).
@@ -5234,6 +5235,7 @@ pub fn resolve_effect(
         Effect::ChangeZone { .. } => return change_zone::resolve(state, ability, events),
         Effect::ChangeZoneAll { .. } => change_zone::resolve_all(state, ability, events),
         Effect::Dig { .. } => dig::resolve(state, ability, events),
+        Effect::RepeatPaidLibraryLook => repeat_paid_library_look::resolve(state, ability, events),
         Effect::GainControl { .. } => gain_control::resolve(state, ability, events),
         Effect::GainControlAll { .. } => gain_control::resolve_all(state, ability, events),
         Effect::Goad { .. } | Effect::GoadAll { .. } => goad::resolve(state, ability, events),

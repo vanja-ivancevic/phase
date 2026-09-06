@@ -6764,6 +6764,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         // resolving effects, not Dig-lookback-transparent.
         | Effect::ChooseCounterKind { .. }
         | Effect::PutChosenCounter { .. }
+        | Effect::RepeatPaidLibraryLook
         | Effect::Unimplemented { .. } => false,
     }
 }
