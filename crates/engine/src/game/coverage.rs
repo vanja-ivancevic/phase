@@ -5181,6 +5181,31 @@ pub fn build_parse_details(
         });
     }
 
+    // CR 601.3: a card-level "Cast this spell only ..." restriction is
+    // executable casting metadata, not an ability definition. Project its
+    // source line as one coverage item so the line-count audit does not
+    // mistake a fully enforced restriction (for example, Seedtime's "during
+    // your turn") for a silent parser drop.
+    //
+    // A single Oracle sentence can lower to several conjunctive restrictions
+    // (Wake the Dead has both combat and opponent-turn constraints), so this
+    // is deliberately one item for the metadata line rather than one item per
+    // enum variant.
+    if !face.casting_restrictions.is_empty() {
+        items.push(ParsedItem {
+            category: ParseCategory::Cost,
+            label: "CastingRestriction".to_string(),
+            source_text: casting_restriction_source_text(&face.oracle_text),
+            supported: true,
+            details: face
+                .casting_restrictions
+                .iter()
+                .map(|restriction| ("restriction".to_string(), format!("{restriction:?}")))
+                .collect(),
+            children: vec![],
+        });
+    }
+
     // Spell-casting options (alternative-cost lines such as Force of Will's
     // pitch cost, Snapcaster-style flash, "without paying its mana cost", etc.).
     // Each `SpellCastingOption` corresponds to its own Oracle line, so it must
@@ -5327,6 +5352,31 @@ fn strive_cost_source_text(oracle_text: &Option<String>) -> Option<String> {
             (lower.starts_with("strive ")
                 || (lower.starts_with("this spell costs")
                     && lower.contains("for each target beyond the first")))
+            .then(|| line.to_string())
+        })
+    })
+}
+
+/// Return the Oracle sentence represented by card-level casting metadata.
+///
+/// `CastingRestriction` is stored outside an ability definition, so unlike a
+/// spell effect it cannot retain its source description directly. The parser
+/// accepts the direct sentence and ability-word-prefixed form; use that same
+/// narrow surface shape for coverage provenance.
+fn casting_restriction_source_text(oracle_text: &Option<String>) -> Option<String> {
+    oracle_text.as_deref().and_then(|text| {
+        text.lines().map(str::trim).find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            (lower.starts_with("cast this spell only ")
+                || lower.starts_with("you can't cast ")
+                || lower.starts_with("you cannot cast ")
+                || lower.starts_with("you can\u{2019}t cast ")
+                || lower.starts_with("you can't spend mana to cast ")
+                || lower.starts_with("you can\u{2019}t spend mana to cast ")
+                || lower.contains(" — cast this spell only ")
+                || lower.contains(" — you can't cast ")
+                || lower.contains(" — you cannot cast ")
+                || lower.contains(" — you can\u{2019}t cast "))
             .then(|| line.to_string())
         })
     })
@@ -15842,6 +15892,45 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
         assert!(
             missing.is_empty(),
             "represented per-target surcharge must not be reported as a silent drop: {missing:?}"
+        );
+    }
+
+    /// CR 601.3: card-level spell timing restrictions are executable metadata,
+    /// not a child spell ability. They still consume an Oracle line and must be
+    /// visible to the count-based coverage audit.
+    #[test]
+    fn casting_restriction_emits_one_item_for_silent_drop_parity() {
+        let mut face = make_face();
+        face.oracle_text = Some(
+            "Cast this spell only during your turn.\n\
+             Take an extra turn after this one if an opponent cast a blue spell this turn."
+                .to_string(),
+        );
+        face.casting_restrictions = vec![crate::types::ability::CastingRestriction::DuringYourTurn];
+        face.abilities.push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ExtraTurn {
+                target: TargetFilter::Controller,
+            },
+        ));
+
+        let parse_details = build_parse_details_for_face(&face);
+        let restriction = parse_details
+            .iter()
+            .find(|item| item.category == ParseCategory::Cost && item.label == "CastingRestriction")
+            .expect("casting restriction must be visible in coverage");
+        assert!(restriction.supported);
+        assert_eq!(
+            restriction.source_text.as_deref(),
+            Some("Cast this spell only during your turn.")
+        );
+        assert_eq!(count_effective_parsed_items(&parse_details), 2);
+
+        let mut missing = Vec::new();
+        check_silent_drops(&face.oracle_text, &parse_details, &mut missing);
+        assert!(
+            missing.is_empty(),
+            "implemented casting metadata must not trigger SilentDrop: {missing:?}"
         );
     }
 
