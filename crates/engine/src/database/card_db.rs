@@ -456,16 +456,45 @@ impl CardDatabase {
         if let Some(alias) = self.name_alias_index.get(&fold_card_name_key(name)) {
             return alias.clone();
         }
-        if let Some((front, _)) = lower.split_once("//") {
-            let front = front.trim();
-            if self.face_index.contains_key(front) || self.cards.contains_key(front) {
-                return front.to_string();
-            }
-            if let Some(alias) = self.name_alias_index.get(&fold_card_name_key(front)) {
-                return alias.clone();
-            }
+        if let Some(key) = self.combined_front_key(&lower, "//") {
+            return key;
+        }
+        // Deck exports commonly abbreviate a split card's printed " // " separator
+        // to a single slash (for example, "Fire/Ice"). Only use that spelling as a
+        // fallback after exact-name lookup, and only when its front face is actually
+        // a split card, so an unrelated card name is never reinterpreted.
+        if let Some(key) = self
+            .combined_front_key(&lower, "/")
+            .filter(|key| self.is_split_face_key(key))
+        {
+            return key;
         }
         lower
+    }
+
+    fn combined_front_key(&self, name: &str, separator: &str) -> Option<String> {
+        let (front, back) = name.split_once(separator)?;
+        if front.trim().is_empty() || back.trim().is_empty() {
+            return None;
+        }
+        let front = front.trim();
+        let key = if self.face_index.contains_key(front) || self.cards.contains_key(front) {
+            front.to_string()
+        } else {
+            self.name_alias_index
+                .get(&fold_card_name_key(front))
+                .cloned()?
+        };
+
+        Some(key)
+    }
+
+    fn is_split_face_key(&self, key: &str) -> bool {
+        self.face_index
+            .get(key)
+            .and_then(|face| face.scryfall_oracle_id.as_deref())
+            .and_then(|oracle_id| self.layout_index.get(oracle_id))
+            .is_some_and(|layout| *layout == LayoutKind::Split)
     }
 }
 
@@ -1101,6 +1130,31 @@ mod tests {
                 .map(|face| face.name.as_str()),
             Some("Peter Parker")
         );
+    }
+
+    #[test]
+    fn single_slash_split_name_resolves_front_face() {
+        let mut db = CardDatabase::default();
+        let mut fire = test_face("Fire");
+        fire.scryfall_oracle_id = Some("fire-ice-oracle".to_string());
+        db.face_index.insert("fire".to_string(), fire);
+        db.layout_index
+            .insert("fire-ice-oracle".to_string(), LayoutKind::Split);
+
+        assert_eq!(
+            db.get_face_by_name("Fire/Ice")
+                .map(|face| face.name.as_str()),
+            Some("Fire")
+        );
+    }
+
+    #[test]
+    fn single_slash_name_does_not_resolve_an_ordinary_front_face() {
+        let mut db = CardDatabase::default();
+        db.face_index
+            .insert("front".to_string(), test_face("Front"));
+
+        assert!(db.get_face_by_name("Front/Back").is_none());
     }
 
     #[test]
