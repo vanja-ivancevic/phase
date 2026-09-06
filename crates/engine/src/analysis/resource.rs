@@ -29094,6 +29094,7 @@ mod tests {
                         chooser: PlayerFilter::Controller,
                         branches: vec![hostile.clone()],
                     }),
+                    replacement_sub_ability: None,
                 },
             ),
             (

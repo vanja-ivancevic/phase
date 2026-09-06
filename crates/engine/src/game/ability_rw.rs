@@ -3539,7 +3539,15 @@ fn legacy_effect(x: &Effect) -> bool {
         }
         Effect::EpicCopy { spell } => contains_legacy_event_ref(spell),
         Effect::CreateDelayedTrigger { effect, .. } => legacy_definition(effect),
-        Effect::CreateDrawReplacement { replacement_effect } => legacy_effect(replacement_effect),
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
+            legacy_effect(replacement_effect)
+                || replacement_sub_ability
+                    .as_deref()
+                    .is_some_and(legacy_definition)
+        }
         Effect::RollDie { count, results, .. } => {
             legacy_quantity_expr(count) || results.iter().any(|r| legacy_definition(&r.effect))
         }
@@ -5632,8 +5640,14 @@ fn rw_effect(
             effect,
             uses_tracked_set: _,
         } => (deferred(effect), None),
-        Effect::CreateDrawReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
             let (mut b, _) = rw_effect(replacement_effect, None, pscope, chain_move_owner);
+            if let Some(sub) = replacement_sub_ability {
+                b.merge(deferred(sub));
+            }
             b.drop_writes();
             (b, None)
         }

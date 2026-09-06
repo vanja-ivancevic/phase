@@ -30191,7 +30191,13 @@ fn resolve_difference_anaphor_in_effect(effect: &mut Effect, bound: Option<&Quan
     match effect {
         Effect::CreateDrawReplacement {
             replacement_effect: inner,
-        } => resolve_difference_anaphor_in_effect(inner, bound),
+            replacement_sub_ability,
+        } => {
+            resolve_difference_anaphor_in_effect(inner, bound);
+            if let Some(sub) = replacement_sub_ability.as_deref_mut() {
+                resolve_difference_anaphor_in_ability(sub, bound);
+            }
+        }
         // CR 603.7a: a delayed trigger carries a complete ability definition;
         // walk that definition so a comparison-derived binding reaches a
         // deferred "the difference" in its eventual effect body.

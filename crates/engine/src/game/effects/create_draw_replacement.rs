@@ -1,6 +1,6 @@
 use crate::types::ability::{
-    Effect, EffectError, EffectKind, ReplacementDefinition, ReplacementPlayerScope,
-    ResolvedAbility, RestrictionExpiry,
+    AbilityDefinition, AbilityKind, Effect, EffectError, EffectKind, ReplacementDefinition,
+    ReplacementPlayerScope, ResolvedAbility, RestrictionExpiry,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::GameState;
@@ -34,7 +34,11 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let Effect::CreateDrawReplacement { replacement_effect } = &ability.effect else {
+    let Effect::CreateDrawReplacement {
+        replacement_effect,
+        replacement_sub_ability,
+    } = &ability.effect
+    else {
         return Err(EffectError::InvalidParam(
             "expected CreateDrawReplacement effect".to_string(),
         ));
@@ -44,12 +48,26 @@ pub fn resolve(
     // Capture it as a `ResolvedAbility` so the post-replacement continuation
     // drain (`apply_post_replacement_resolved_effect`) dispatches it directly
     // with the source/controller bound at install time (CR 121.1).
-    let substitute = ResolvedAbility::new(
-        (**replacement_effect).clone(),
-        vec![],
-        ability.source_id,
-        ability.controller,
-    );
+    let substitute = if let Some(sub) = replacement_sub_ability {
+        // The replacement's consequence runs when the later draw is replaced,
+        // not when this shield is installed. Materialize its entire chain now
+        // so an interactive root can resume into its follow-up under the normal
+        // post-replacement continuation drain (CR 614.1a, CR 608.2c).
+        let def = AbilityDefinition::new(AbilityKind::Spell, (**replacement_effect).clone())
+            .sub_ability((**sub).clone());
+        crate::game::ability_utils::build_resolved_from_def(
+            &def,
+            ability.source_id,
+            ability.controller,
+        )
+    } else {
+        ResolvedAbility::new(
+            (**replacement_effect).clone(),
+            vec![],
+            ability.source_id,
+            ability.controller,
+        )
+    };
 
     // CR 614.1a + CR 113.7a: anchor the installing controller at resolution
     // time so the shield outlives the source permanent's zone/controller.
@@ -77,8 +95,13 @@ pub fn resolve(
 mod tests {
     use super::*;
     use crate::game::scenario::{GameScenario, P0, P1};
-    use crate::types::ability::{QuantityExpr, TargetFilter};
+    use crate::types::ability::{
+        AbilityDefinition, AbilityKind, CardSelectionMode, Chooser, PerPlayerScope, QuantityExpr,
+        TargetFilter, ZoneOwner,
+    };
+    use crate::types::actions::GameAction;
     use crate::types::card_type::CoreType;
+    use crate::types::game_state::WaitingFor;
     use crate::types::identifiers::ObjectId;
     use crate::types::player::PlayerId;
     use crate::types::zones::Zone;
@@ -103,6 +126,7 @@ mod tests {
                     amount: QuantityExpr::Fixed { value: 5 },
                     player: TargetFilter::Controller,
                 }),
+                replacement_sub_ability: None,
             },
             vec![],
             source,
@@ -239,6 +263,7 @@ mod tests {
         let install = ResolvedAbility::new(
             Effect::CreateDrawReplacement {
                 replacement_effect: Box::new(token_payload),
+                replacement_sub_ability: None,
             },
             vec![],
             source,
@@ -281,6 +306,105 @@ mod tests {
             bf_before + 1,
             "exactly one new permanent (the Bear)"
         );
+    }
+
+    /// Words of Wind, end-to-end: a replaced draw prompts each player to choose
+    /// their own permanent, then returns BOTH choices to their owners' hands.
+    /// This proves that `CreateDrawReplacement` preserves a paused substitute's
+    /// ability chain rather than resolving only its root selection.
+    #[test]
+    fn words_of_wind_replacement_runs_each_player_return_chain() {
+        let mut sc = GameScenario::new();
+        let source = sc.add_creature(P0, "Words of Wind", 0, 0).id();
+        let ours = sc.add_creature(P0, "Our permanent", 2, 2).id();
+        let theirs = sc.add_creature(P1, "Their permanent", 2, 2).id();
+        let top = sc.add_card_to_library_top(P0, "Mountain");
+        let mut state = sc.state;
+        let start_hand = state.players[0].hand.len();
+
+        let choose = Effect::ChooseFromZone {
+            count: 1,
+            zone: Zone::Battlefield,
+            additional_zones: Vec::new(),
+            zone_owner: ZoneOwner::Each(PerPlayerScope::AllPlayers),
+            filter: Some(TargetFilter::Typed(
+                crate::types::ability::TypedFilter::permanent(),
+            )),
+            chooser: Chooser::OwningPlayer,
+            up_to: false,
+            selection: CardSelectionMode::Chosen,
+            constraint: None,
+        };
+        let return_chosen = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Battlefield),
+                destination: Zone::Hand,
+                target: TargetFilter::TrackedSet {
+                    id: crate::types::identifiers::TrackedSetId(0),
+                },
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                enter_with_counters: vec![],
+                face_down_profile: None,
+                library_position: None,
+                random_order: false,
+            },
+        );
+        let install = ResolvedAbility::new(
+            Effect::CreateDrawReplacement {
+                replacement_effect: Box::new(choose),
+                replacement_sub_ability: Some(Box::new(return_chosen)),
+            },
+            vec![],
+            source,
+            P0,
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &install, &mut events).unwrap();
+        let mut events = Vec::new();
+        crate::game::effects::draw::resolve(&mut state, &draw_one_for(P0, source), &mut events)
+            .unwrap();
+
+        assert_eq!(
+            state.players[0].hand.len(),
+            start_hand,
+            "the draw is replaced"
+        );
+        assert!(
+            !state.players[0].hand.contains(&top),
+            "the top card stays undrawn"
+        );
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ChooseFromZoneChoice { player: P0, .. }
+        ));
+        crate::game::engine::apply(
+            &mut state,
+            P0,
+            GameAction::SelectCards { cards: vec![ours] },
+        )
+        .expect("the first owner must choose a permanent");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::ChooseFromZoneChoice { player: P1, .. }
+        ));
+        crate::game::engine::apply(
+            &mut state,
+            P1,
+            GameAction::SelectCards {
+                cards: vec![theirs],
+            },
+        )
+        .expect("the second owner must choose a permanent");
+
+        assert!(matches!(state.waiting_for, WaitingFor::Priority { .. }));
+        assert_eq!(state.objects[&ours].zone, Zone::Hand);
+        assert_eq!(state.objects[&theirs].zone, Zone::Hand);
+        assert!(state.players[0].hand.contains(&ours));
+        assert!(state.players[1].hand.contains(&theirs));
     }
 
     /// Source-player scope: the shield ("you would draw") does NOT replace an

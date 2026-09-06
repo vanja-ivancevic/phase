@@ -35,16 +35,16 @@ use super::oracle_util::{
     strip_reminder_text, TextPair,
 };
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, CastVariantPaid, ChoiceType, CombatDamageScope,
+    AbilityCost, AbilityDefinition, AbilityKind, CardSelectionMode, CastVariantPaid, ChoiceType, Chooser, CombatDamageScope,
     Comparator, ContinuousModification, ControllerRef, CopyManaValueLimit, CountScope,
     CounterReplacementSubject, DamageModification, DamageRedirectTarget, DamageTargetFilter,
     DamageTargetPlayerScope, DrawReplacementScope, Duration, Effect, EffectScope, FilterProp,
     LibraryPosition, ManaModification, ManaReplacementScope, ManaSpendPermission,
-    PermissionGrantee, PlayerFilter, PreventionAmount, QuantityExpr, QuantityModification,
+    PerPlayerScope, PermissionGrantee, PlayerFilter, PreventionAmount, QuantityExpr, QuantityModification,
     QuantityRef, RedirectionLifetime, ReplacementCondition, ReplacementDefinition, ReplacementMode,
     ReplacementPaymentRecord, ReplacementPlayerScope, SourceExclusion, StaticCondition,
     StaticDefinition, TapStateChange,
-    TargetFilter, TriggerDefinition, TypeFilter, TypedFilter, EXILE_COST_ANY_NUMBER,
+    TargetFilter, TriggerDefinition, TypeFilter, TypedFilter, ZoneOwner, EXILE_COST_ANY_NUMBER,
 };
 use crate::types::ability::{CardPlayMode, CastingPermission};
 use crate::types::card_type::Supertype;
@@ -7082,12 +7082,11 @@ fn parse_oneshot_target_source_prevent(norm_lower: &str, ctx: &ParseContext) -> 
 /// prefix combinator + a `peek` for "would draw"; it returns `None` on any
 /// mismatch so it never shadows other "the next time" effects.
 ///
-/// SCOPE: the substitute payload is parsed by the generic `parse_effect`, which
-/// does NOT honor a player-scoped subject ("each player", "each opponent", "that
-/// player"). Words of Wind ("each player returns a permanent...") and Words of
-/// Waste ("each opponent discards...") would mis-lower to a `Controller`-scoped
-/// effect, so those subject-scoped payloads are REJECTED here (return `None`) to
-/// stay an honest Unimplemented gap rather than a silently-wrong parse.
+/// SCOPE: the substitute payload is usually parsed by the generic `parse_effect`.
+/// The one supported multi-player form below carries an explicit ability-chain
+/// continuation, because each player must choose their own permanent before all
+/// choices are returned. Other player-scoped payloads remain honest gaps rather
+/// than being silently lowered as controller-scoped effects.
 pub(crate) fn parse_oneshot_draw_replacement(norm_lower: &str) -> Option<Effect> {
     // CR 614.1a: "the next time ... would draw ... this turn ... instead".
     let (after_prefix, _) = preceded(
@@ -7115,6 +7114,46 @@ pub(crate) fn parse_oneshot_draw_replacement(norm_lower: &str) -> Option<Effect>
     }
     .trim();
 
+    // CR 614.1a + CR 101.4 + CR 701.17a: Words of Wind. Each player chooses
+    // one permanent they control in APNAP order, then all chosen permanents
+    // return to their owners' hands. The `ChooseFromZone` iterates owners and
+    // accumulates the choices into its tracked set; the replacement-specific
+    // continuation carries the final shared move until the later draw event.
+    if payload_text == "each player returns a permanent they control to its owner's hand" {
+        let choose = Effect::ChooseFromZone {
+            count: 1,
+            zone: Zone::Battlefield,
+            additional_zones: Vec::new(),
+            zone_owner: ZoneOwner::Each(PerPlayerScope::AllPlayers),
+            filter: Some(TargetFilter::Typed(TypedFilter::permanent())),
+            chooser: Chooser::OwningPlayer,
+            up_to: false,
+            selection: CardSelectionMode::Chosen,
+            constraint: None,
+        };
+        let return_chosen = Effect::ChangeZoneAll {
+            origin: Some(Zone::Battlefield),
+            destination: Zone::Hand,
+            target: TargetFilter::TrackedSet {
+                id: crate::types::identifiers::TrackedSetId(0),
+            },
+            enters_under: None,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enters_attacking: false,
+            enter_with_counters: vec![],
+            face_down_profile: None,
+            library_position: None,
+            random_order: false,
+        };
+        return Some(Effect::CreateDrawReplacement {
+            replacement_effect: Box::new(choose),
+            replacement_sub_ability: Some(Box::new(AbilityDefinition::new(
+                AbilityKind::Spell,
+                return_chosen,
+            ))),
+        });
+    }
+
     let payload = crate::parser::oracle_effect::parse_effect(payload_text);
     // Honest-gap guard 1: an Unimplemented payload is not a clean replacement.
     if matches!(payload, Effect::Unimplemented { .. }) {
@@ -7139,6 +7178,7 @@ pub(crate) fn parse_oneshot_draw_replacement(norm_lower: &str) -> Option<Effect>
 
     Some(Effect::CreateDrawReplacement {
         replacement_effect: Box::new(payload),
+        replacement_sub_ability: None,
     })
 }
 
@@ -25178,11 +25218,15 @@ mod snapshot_tests {
         )
         .expect("Words of Worship draw replacement must parse");
         match effect {
-            Effect::CreateDrawReplacement { replacement_effect } => {
+            Effect::CreateDrawReplacement {
+                replacement_effect,
+                replacement_sub_ability,
+            } => {
                 assert!(
                     matches!(*replacement_effect, Effect::GainLife { .. }),
                     "payload must be GainLife, got {replacement_effect:?}"
                 );
+                assert!(replacement_sub_ability.is_none());
             }
             other => panic!("expected CreateDrawReplacement, got {other:?}"),
         }
@@ -25210,29 +25254,60 @@ mod snapshot_tests {
         )
         .expect("Words of Wilding draw replacement must parse");
         match effect {
-            Effect::CreateDrawReplacement { replacement_effect } => {
+            Effect::CreateDrawReplacement {
+                replacement_effect,
+                replacement_sub_ability,
+            } => {
                 assert!(
                     matches!(*replacement_effect, Effect::Token { .. }),
                     "payload must be a Token, got {replacement_effect:?}"
                 );
+                assert!(replacement_sub_ability.is_none());
             }
             other => panic!("expected CreateDrawReplacement, got {other:?}"),
         }
     }
 
     #[test]
-    fn oneshot_draw_replacement_rejects_player_scoped_payload() {
-        // GUARD: Words of Wind ("each player returns a permanent...") and Words
-        // of Waste ("each opponent discards...") have player-scoped payloads
-        // that bare `parse_effect` mis-scopes — they must stay HONEST
-        // Unimplemented gaps (return None), NOT silently-wrong CreateDrawReplacement.
-        assert!(
-            parse_oneshot_draw_replacement(
-                "the next time you would draw a card this turn, each player returns a permanent they control to its owner's hand instead"
-            )
-            .is_none(),
-            "Words of Wind (each-player payload) must remain an honest gap"
-        );
+    fn oneshot_draw_replacement_words_of_wind_carries_each_player_chain() {
+        let effect = parse_oneshot_draw_replacement(
+            "the next time you would draw a card this turn, each player returns a permanent they control to its owner's hand instead",
+        )
+        .expect("Words of Wind must parse");
+        let Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } = effect
+        else {
+            panic!("expected CreateDrawReplacement");
+        };
+        assert!(matches!(
+            *replacement_effect,
+            Effect::ChooseFromZone {
+                zone: Zone::Battlefield,
+                zone_owner: ZoneOwner::Each(PerPlayerScope::AllPlayers),
+                chooser: Chooser::OwningPlayer,
+                up_to: false,
+                selection: CardSelectionMode::Chosen,
+                ..
+            }
+        ));
+        let sub = replacement_sub_ability.expect("Words needs the return continuation");
+        assert!(matches!(
+            *sub.effect,
+            Effect::ChangeZoneAll {
+                origin: Some(Zone::Battlefield),
+                destination: Zone::Hand,
+                target: TargetFilter::TrackedSet { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn oneshot_draw_replacement_rejects_unimplemented_player_scoped_payload() {
+        // GUARD: Words of Waste remains an honest gap until its opponents-only
+        // discard selection can be represented faithfully.
         assert!(
             parse_oneshot_draw_replacement(
                 "the next time you would draw a card this turn, each opponent discards a card instead"

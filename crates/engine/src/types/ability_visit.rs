@@ -605,9 +605,15 @@ where
         // effect of a resolving spell or ability replacing "that spell or
         // ability's own effect(s)"), so CR 605.1a's closing carve-out does not
         // reach it and the substitute effect is not part of THIS resolution.
-        Effect::CreateDrawReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
             if scope == ResolutionScope::IncludeRegisteredLater {
-                visit_effect_scoped(replacement_effect, scope, visit)?
+                visit_effect_scoped(replacement_effect, scope, visit)?;
+                if let Some(sub) = replacement_sub_ability {
+                    visit_ability_def_scoped(sub, scope, visit)?;
+                }
             }
         }
         // CR 614.1a: A planeswalk replacement nests its substitute Effect (Fixed

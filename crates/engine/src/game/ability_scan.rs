@@ -1432,9 +1432,15 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc
         }
         Effect::CreateDamageReplacement { .. } => Axes::CONSERVATIVE,
-        Effect::CreateDrawReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_effect(replacement_effect, mode));
+            if let Some(sub) = replacement_sub_ability {
+                acc = acc.or(ability_definition_axes(sub, mode));
+            }
             acc
         }
         Effect::LoseTheGame { target } => {

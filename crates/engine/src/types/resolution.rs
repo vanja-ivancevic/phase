@@ -3348,9 +3348,21 @@ impl ResolutionStack {
                 // guards (CR 121.2: a multi-card draw is that many individual
                 // card draws).
                 //
-                // The one frame that may sit above it is the frame that owns
-                // that choice: `FrameGate::DirectChoice(_)`, the prompt-owning
-                // family. No separate citation is carried here: the CR 614.11a /
+                // The usual one-frame form is a `FrameGate::DirectChoice(_)`
+                // prompt owner. The other admitted form is exactly the
+                // per-player zone chooser's parked continuation plus its
+                // prompt owner. `PerPlayerZoneChoice` is deliberately an
+                // `AfterChild` frame: it drives a sequence of ordinary
+                // `ChooseFromZoneChoice` prompts, so a substitute whose root
+                // is that chooser needs its own remaining chain immediately
+                // below it (Words of Wind: each player chooses, then all
+                // selected permanents return). The continuation is part of the
+                // replacement substitute, not a later instruction of the
+                // original draw; admitting only this exact two-frame shape
+                // preserves the pair's ordering while allowing CR 614.6's
+                // substitute to finish before the draw sequence resumes.
+                //
+                // No separate citation is carried here: the CR 614.11a /
                 // CR 614.6 / CR 608.2c basis stated one paragraph above is what
                 // makes a mid-application choice ordinary and is the whole
                 // authority for this admission.
@@ -3370,14 +3382,28 @@ impl ResolutionStack {
                 // puts it (CR 608.2c: instructions run in the order written).
                 let paired_child_is_reachable = match self.frames.frame_at_offset(index + 2) {
                     None => true,
-                    Some(above) => {
-                        matches!(above.gate(), FrameGate::DirectChoice(_))
-                            && index + 3 == self.frames.len()
+                    Some(above) if matches!(above.gate(), FrameGate::DirectChoice(_)) => {
+                        index + 3 == self.frames.len()
                     }
+                    Some(ResolutionFrame::AbilityContinuation(_)) => {
+                        matches!(
+                            (
+                                self.frames.frame_at_offset(index + 3),
+                                self.frames.frame_at_offset(index + 4),
+                                waiting_for,
+                            ),
+                            (
+                                Some(ResolutionFrame::PerPlayerZoneChoice(_)),
+                                None,
+                                WaitingFor::ChooseFromZoneChoice { .. },
+                            )
+                        )
+                    }
+                    Some(_) => false,
                 };
                 if !paired_child_is_reachable {
                     return Err(ResolutionStackError::InvalidAdjacentPair(
-                        "a paired multi-draw child is buried below frames other than the active direct-choice owner",
+                        "a paired multi-draw child is buried below an unsupported prompt owner",
                     ));
                 }
             }
