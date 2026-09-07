@@ -1617,10 +1617,9 @@ fn effect_is_replacement_carrier(effect: &Effect) -> bool {
         // Feather return / Lilah plot parameterization is a second consequence
         // folded into the same carrier, so it stays exempt either way).
         | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
-        // CR 701.6a + CR 614.1a: a countered spell's non-graveyard
-        // destination is the replacement itself, carried on Counter rather
-        // than in the top-level replacement collection (Memory Lapse,
-        // Remand, Spell Crumple).
+        // CR 701.6a + CR 614.1a: Memory Lapse / Remand / Spell Crumple fold
+        // the countered spell destination into Counter's typed replacement field.
+        // No separate sub-ability is expected.
         | Effect::Counter {
             countered_spell_zone: Some(_),
             ..
