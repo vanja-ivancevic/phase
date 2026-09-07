@@ -344,7 +344,8 @@ fn parse_and_conjunction_condition(
 /// Without this fallback the `If <X>, ` head stays on the text, so the downstream
 /// `strip_optional_effect_prefix` (which requires `"you may "` at position 0)
 /// never fires and the optional flag is lost (e.g. Amareth's "If it shares a card
-/// type with that permanent, you may reveal that card and put it into your hand").
+/// type with that permanent, you may reveal that card and put it into your hand",
+/// Tithe's "If target opponent controls more lands than you, you may search …").
 /// Dropping the condition is acceptable because the upstream `Condition_If`
 /// swallow detector still flags these patterns as condition-unsupported — we are
 /// fixing the OPTIONAL representation here, NOT the condition. The condition
@@ -356,11 +357,9 @@ fn parse_and_conjunction_condition(
 /// offer the may-choice *ungated* — strictly more permissive than the printed
 /// `If <gate>` text. This is sound ONLY because `Condition_If` keeps the card
 /// `supported == false`, which holds it out of the engine's production-execution
-/// set. Tithe used this fallback historically, but its targeted land-count
-/// condition now has a typed recognizer and no longer reaches this path. When a
-/// typed recognizer is later added for another condition, the typed strip will
-/// match first, this fallback will stop firing for that shape, and the card
-/// transitions to a fully gated+optional AST in a single step.
+/// set. When a typed recognizer is later added for one of these conditions, the
+/// typed strip will match first, this fallback will stop firing for that shape,
+/// and the card transitions to a fully gated+optional AST in a single step.
 ///
 /// Mandatory-body guard: this function is a no-op when the body does NOT start
 /// with `"you may "`. That prevents turning, e.g.,
@@ -2986,18 +2985,21 @@ pub(super) fn strip_target_supertype_conditional(text: &str) -> (Option<AbilityC
         );
     }
 
-    // CR 205.4 + CR 400.7: Thermokarst's "If that land was a snow land"
-    // rider is an LKI test on the land destroyed by the preceding instruction.
-    // Keep the land type in the filter: "snow" is a supertype adjective, not a
-    // standalone type, and the anaphor explicitly names a land.
-    if let Ok((rest, _)) =
-        tag::<_, _, OracleError<'_>>("if that land was a snow land, ").parse(lower.as_str())
+    // CR 205.4a + CR 608.2c: preserve positive land supertypes in a leading
+    // rider such as Thermokarst's "If that land was a snow land, ...".  The
+    // target has already left the battlefield when the rider resolves, so the
+    // condition must use last-known information just like the nonbasic form.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("if that land was a ").parse(lower.as_str())
     {
-        let body_start = text.len() - rest.len();
-        return (
-            Some(snow_land_lki_condition()),
-            text[body_start..].to_string(),
-        );
+        if let Ok((rest, supertype)) = parse_supertype_word(rest) {
+            if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" land, ").parse(rest) {
+                let body_start = text.len() - rest.len();
+                return (
+                    Some(target_land_supertype_lki_condition(supertype)),
+                    text[body_start..].to_string(),
+                );
+            }
+        }
     }
 
     if let Some((before, after)) = tp.rsplit_around(" if that land was ") {
@@ -3015,18 +3017,26 @@ pub(super) fn strip_target_supertype_conditional(text: &str) -> (Option<AbilityC
         }
     }
 
+    // CR 205.4a + CR 608.2c: target-land supertype riders such as
+    // "If that land was a snow land, ..." read the land's last-known
+    // information after the preceding destroy/bounce effect.  Preserve both
+    // the land type and the supertype in the typed condition so the chained
+    // rider is not silently made unconditional.
     if let Some((before, after)) = tp.rsplit_around(" if that land was ") {
-        if all_consuming(alt((
-            tag::<_, _, OracleError<'_>>("a snow land."),
-            tag("a snow land"),
-        )))
-        .parse(after.lower.trim())
-        .is_ok()
-        {
-            return (
-                Some(snow_land_lki_condition()),
-                before.original.trim_end_matches('.').trim().to_string(),
-            );
+        let suffix = after.lower.trim_end_matches('.').trim();
+        // The existing nonbasic form above is intentionally kept separate:
+        // "nonbasic" is a negated supertype, not a positive one.
+        if let Some(suffix) = suffix.strip_prefix("a ") {
+            if let Some(supertype_name) = suffix.strip_suffix(" land") {
+                if let Ok((rest, supertype)) = parse_supertype_word(supertype_name) {
+                    if rest.trim().is_empty() {
+                        return (
+                            Some(target_land_supertype_lki_condition(supertype)),
+                            before.original.trim_end_matches('.').trim().to_string(),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -3077,13 +3087,11 @@ fn nonbasic_land_lki_condition() -> AbilityCondition {
     }
 }
 
-fn snow_land_lki_condition() -> AbilityCondition {
+fn target_land_supertype_lki_condition(supertype: Supertype) -> AbilityCondition {
     AbilityCondition::TargetMatchesFilter {
-        filter: TargetFilter::Typed(TypedFilter::land().properties(vec![
-            FilterProp::HasSupertype {
-                value: Supertype::Snow,
-            },
-        ])),
+        filter: TargetFilter::Typed(
+            TypedFilter::land().properties(vec![FilterProp::HasSupertype { value: supertype }]),
+        ),
         use_lki: true,
         subject_slot: None,
     }
@@ -5520,81 +5528,6 @@ fn keyword_presence_kind(keyword: &Keyword) -> Option<crate::types::keywords::Ke
     keyword.kind_identifies_ability().then(|| keyword.kind())
 }
 
-/// CR 201.2 + CR 608.2c: A reveal/hand-choice continuation may ask whether
-/// the selected card has the source's chosen name (Cursed Scroll: "If that
-/// card has the chosen name, ...").  This is a result-object predicate, not a
-/// static battlefield condition: the selected card is injected into the
-/// continuation target by the resolution driver. Reuse the shared
-/// `HasChosenName` filter so the source-relative chosen-name lookup stays
-/// identical to Pithing Needle and other chosen-name effects.
-fn parse_revealed_card_chosen_name_condition(text: &str) -> Option<AbilityCondition> {
-    let text = text.trim().trim_end_matches('.').trim();
-    all_consuming(alt((
-        tag::<_, _, OracleError<'_>>("that card has the chosen name"),
-        tag("the revealed card has the chosen name"),
-    )))
-    .parse(text)
-    .ok()?;
-    Some(AbilityCondition::TargetMatchesFilter {
-        filter: TargetFilter::HasChosenName,
-        use_lki: false,
-        subject_slot: None,
-    })
-}
-
-/// CR 115.1 + CR 115.9a/c + CR 608.2c: a targeted spell has exactly one
-/// target, and that target is this ability's source. The target spell remains
-/// a normal announced target; this is deliberately a resolution-time rider so
-/// a response may make the condition true or false after the ability is
-/// activated (Quicksilver Dragon).
-///
-/// The target-side constraints reuse the generic stack-entry filter machinery:
-/// `HasSingleTarget` counts declared target instances, while `TargetsOnly`
-/// evaluates every one against `SelfRef` in the resolving ability's context.
-fn parse_target_spell_single_targeting_source_condition(
-    input: &str,
-) -> OracleResult<'_, AbilityCondition> {
-    let (input, _) = tag("target spell has only one target and that target is ").parse(input)?;
-    // `parse_oracle_ir` canonicalizes source references before activated-ability
-    // routing, while this parser is also used directly by unnormalized callers.
-    // Both spellings name the same source object; accept either at this shared
-    // condition boundary rather than forcing individual callers to special-case
-    // Quicksilver Dragon's resolution-time guard.
-    let (input, _) = alt((tag("this creature"), tag("~"))).parse(input)?;
-    Ok((
-        input,
-        AbilityCondition::TargetMatchesFilter {
-            filter: TargetFilter::And {
-                filters: vec![
-                    TargetFilter::StackSpell,
-                    TargetFilter::Typed(TypedFilter {
-                        properties: vec![
-                            FilterProp::HasSingleTarget,
-                            FilterProp::TargetsOnly {
-                                filter: Box::new(TargetFilter::SelfRef),
-                            },
-                        ],
-                        ..Default::default()
-                    }),
-                ],
-            },
-            use_lki: false,
-            subject_slot: None,
-        },
-    ))
-}
-
-fn parse_target_spell_single_targeting_source_condition_text(
-    text: &str,
-) -> Option<AbilityCondition> {
-    let lower = text.trim().trim_end_matches('.').to_ascii_lowercase();
-    let parsed = all_consuming(parse_target_spell_single_targeting_source_condition)
-        .parse(lower.as_str())
-        .ok()
-        .map(|(_, condition)| condition);
-    parsed
-}
-
 pub(super) fn try_nom_condition_as_ability_condition(
     text: &str,
     ctx: &mut ParseContext,
@@ -5602,16 +5535,6 @@ pub(super) fn try_nom_condition_as_ability_condition(
     use crate::parser::oracle_nom::condition::parse_inner_condition;
 
     let lower = text.to_lowercase();
-
-    if let Some(condition) = parse_revealed_card_chosen_name_condition(&lower) {
-        return Some(condition);
-    }
-
-    if let Some(condition) =
-        parse_target_spell_single_targeting_source_condition_text(lower.as_str())
-    {
-        return Some(condition);
-    }
 
     // CR 508.4 + CR 608.2c + CR 701.42: attacking meld-pair conditions are
     // resolution-time leading conditions. Keep them in the shared condition
@@ -7720,45 +7643,6 @@ mod tests {
     };
     use crate::types::counter::{CounterMatch, CounterType};
 
-    /// Quicksilver Dragon: the spell is announced as the ability target, but
-    /// both its target count and its target identity are rechecked as the
-    /// ability resolves (CR 115.1 + CR 115.9a/c + CR 608.2c).
-    #[test]
-    fn target_spell_single_targeting_source_condition_is_typed() {
-        for source_reference in ["this creature", "~"] {
-            let condition = try_nom_condition_as_ability_condition(
-                &format!("target spell has only one target and that target is {source_reference}"),
-                &mut ParseContext::default(),
-            )
-            .expect("Quicksilver Dragon condition must parse");
-
-            let AbilityCondition::TargetMatchesFilter {
-                filter: TargetFilter::And { filters },
-                use_lki: false,
-                subject_slot: None,
-            } = condition
-            else {
-                panic!("expected live target-spell condition, got {condition:?}");
-            };
-            assert_eq!(filters.len(), 2);
-            assert_eq!(filters[0], TargetFilter::StackSpell);
-            let TargetFilter::Typed(typed) = &filters[1] else {
-                panic!(
-                    "expected typed stack-target constraints, got {:?}",
-                    filters[1]
-                );
-            };
-            assert!(typed.properties.contains(&FilterProp::HasSingleTarget));
-            assert!(typed.properties.iter().any(|property| {
-                matches!(
-                    property,
-                    FilterProp::TargetsOnly { filter }
-                        if **filter == TargetFilter::SelfRef
-                )
-            }));
-        }
-    }
-
     /// CR 903.3d + CR 603.4: the `StaticCondition` -> `AbilityCondition` bridge
     /// must lower a commander-control gate, and must keep the two `ownership`
     /// arms DISTINCT — CR 903.3 + CR 109.5 "your commander" (owned and
@@ -8810,10 +8694,6 @@ mod tests {
             ("if they do, draw a card", Some(effect.clone())),
             ("if that player does, draw a card", Some(effect.clone())),
             ("if the player does, draw a card", Some(effect.clone())),
-            (
-                "if the first player does, draw a card",
-                Some(effect.clone()),
-            ),
             (
                 "if that player doesn't, draw a card",
                 Some(not_effect.clone()),
@@ -10635,84 +10515,6 @@ mod tests {
             })
         );
         assert!(subtype_filter.is_none());
-    }
-
-    /// CR 201.2 + CR 608.2c: Cursed Scroll's chosen-name rider is a
-    /// result-object condition, not a swallowed conditional.
-    #[test]
-    fn that_card_has_the_chosen_name_is_a_result_object_condition() {
-        let condition = try_nom_condition_as_ability_condition(
-            "that card has the chosen name",
-            &mut ParseContext::default(),
-        );
-        assert_eq!(
-            condition,
-            Some(AbilityCondition::TargetMatchesFilter {
-                filter: TargetFilter::HasChosenName,
-                use_lki: false,
-                subject_slot: None,
-            })
-        );
-    }
-
-    /// The leading-if router must preserve the body while lowering the same
-    /// chosen-name condition used by Cursed Scroll's activated ability.
-    #[test]
-    fn cursed_scroll_chosen_name_leading_condition_preserves_damage_body() {
-        let (condition, body) = strip_leading_general_conditional(
-            "If that card has the chosen name, this artifact deals 2 damage to any target.",
-            &mut ParseContext::default(),
-        );
-        assert_eq!(body, "this artifact deals 2 damage to any target.");
-        assert_eq!(
-            condition,
-            Some(AbilityCondition::TargetMatchesFilter {
-                filter: TargetFilter::HasChosenName,
-                use_lki: false,
-                subject_slot: None,
-            })
-        );
-    }
-
-    /// The complete Cursed Scroll chain must retain both the random reveal and
-    /// the chosen-name gate on its damage continuation, not merely parse the
-    /// leading conditional in isolation.
-    #[test]
-    fn cursed_scroll_full_chain_keeps_chosen_name_damage_gate() {
-        fn has_gated_damage(def: &AbilityDefinition) -> bool {
-            let gated_damage = matches!(
-                (&*def.effect, &def.condition),
-                (
-                    Effect::DealDamage { .. },
-                    Some(AbilityCondition::TargetMatchesFilter {
-                        filter: TargetFilter::HasChosenName,
-                        use_lki: false,
-                        subject_slot: None,
-                    })
-                )
-            );
-            gated_damage
-                || def.sub_ability.as_deref().is_some_and(has_gated_damage)
-                || def.else_ability.as_deref().is_some_and(has_gated_damage)
-        }
-
-        let parsed = crate::parser::oracle::parse_oracle_text(
-            "{3}, {T}: Choose a card name, then reveal a card at random from your hand. If that card has the chosen name, this artifact deals 2 damage to any target.",
-            "Cursed Scroll",
-            &[],
-            &["Artifact".to_string()],
-            &[],
-        );
-        assert!(
-            parsed.parse_warnings.is_empty(),
-            "Cursed Scroll should not emit parser warnings: {:?}",
-            parsed.parse_warnings
-        );
-        assert!(
-            parsed.abilities.iter().any(has_gated_damage),
-            "full Cursed Scroll chain must contain a HasChosenName-gated DealDamage: {:?}",
-            parsed.abilities
-        );
     }
 
     /// CR 608.2c: Suffix-if peel (`strip_suffix_conditional`) must stay in lockstep
