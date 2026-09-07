@@ -267,6 +267,11 @@ pub(crate) fn is_data_carrying_static(mode: &StaticMode) -> bool {
             // enforcement is in turns.rs::counter_removal_blocked. Not
             // registry-keyed.
             | StaticMode::CountersCantBeRemoved { .. }
+            // CR 201.2a: CountsAsNamed carries the alternate name used by
+            // graveyard name filters. Runtime matching is direct in
+            // filter.rs::matches_filter; the exact-name registry cannot key
+            // this parameterized mode.
+            | StaticMode::CountsAsNamed { .. }
     )
 }
 
@@ -17033,6 +17038,40 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
         assert_eq!(
             render(DamageChannel::Excess, AggregateFunction::Min),
             "excess amount from preceding effect"
+        );
+    }
+
+    /// CR 201.2a: CountsAsNamed is a parameterized runtime static, so it
+    /// cannot be keyed in the exact static registry but must remain covered.
+    #[test]
+    fn counts_as_named_static_has_no_coverage_gap() {
+        let mut face = make_face();
+        let oracle = "If this card is in a graveyard, effects from spells named Muscle Burst count it as a card named Muscle Burst.";
+        face.oracle_text = Some(oracle.to_string());
+        face.static_abilities.push(StaticDefinition {
+            mode: StaticMode::CountsAsNamed {
+                name: "Muscle Burst".to_string(),
+            },
+            affected: None,
+            modifications: vec![],
+            condition: None,
+            per_player_condition: None,
+            affected_zone: None,
+            effect_zone: None,
+            active_zones: vec![Zone::Graveyard],
+            characteristic_defining: false,
+            description: Some(oracle.to_string()),
+            attack_defended: None,
+            source_controller: None,
+            source_object: None,
+            bypass_beneficiary: None,
+            protection_does_not_remove: None,
+            room_door: None,
+        });
+
+        assert!(
+            card_face_gaps(&face).is_empty(),
+            "CountsAsNamed statics should be recognized as supported"
         );
     }
 }
