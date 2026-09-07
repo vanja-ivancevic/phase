@@ -7083,10 +7083,11 @@ fn parse_oneshot_target_source_prevent(norm_lower: &str, ctx: &ParseContext) -> 
 /// mismatch so it never shadows other "the next time" effects.
 ///
 /// SCOPE: the substitute payload is usually parsed by the generic `parse_effect`.
-/// The one supported multi-player form below carries an explicit ability-chain
-/// continuation, because each player must choose their own permanent before all
-/// choices are returned. Other player-scoped payloads remain honest gaps rather
-/// than being silently lowered as controller-scoped effects.
+/// The supported multi-player forms below carry explicit ability-chain metadata:
+/// Words of Wind needs a shared continuation after every player chooses, while
+/// Words of Waste needs an opponent-scoped discard node. Other player-scoped
+/// payloads remain honest gaps rather than being silently lowered as
+/// controller-scoped effects.
 pub(crate) fn parse_oneshot_draw_replacement(norm_lower: &str) -> Option<Effect> {
     // CR 614.1a: "the next time ... would draw ... this turn ... instead".
     let (after_prefix, _) = preceded(
@@ -7154,6 +7155,32 @@ pub(crate) fn parse_oneshot_draw_replacement(norm_lower: &str) -> Option<Effect>
         });
     }
 
+    // CR 614.1a + CR 701.8a + CR 101.4: Words of Waste. The substitute is
+    // not a controller-scoped discard: every opponent discards a card, and
+    // each player with a choice makes that choice independently. The existing
+    // delayed-replacement carrier has one root Effect plus an optional full
+    // AbilityDefinition continuation. Use its neutral root to preserve the
+    // scoped discard as the actual resolving node, rather than lowering it as
+    // an incorrect controller discard. This reuses the normal player-scope
+    // relay (including APNAP order and interactive DiscardChoice pauses).
+    if payload_text == "each opponent discards a card" {
+        let discard = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Discard {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+                selection: CardSelectionMode::Chosen,
+                unless_filter: None,
+                filter: None,
+            },
+        )
+        .player_scope(PlayerFilter::Opponent);
+        return Some(Effect::CreateDrawReplacement {
+            replacement_effect: Box::new(Effect::NoOp),
+            replacement_sub_ability: Some(Box::new(discard)),
+        });
+    }
+
     let payload = crate::parser::oracle_effect::parse_effect(payload_text);
     // Honest-gap guard 1: an Unimplemented payload is not a clean replacement.
     if matches!(payload, Effect::Unimplemented { .. }) {
@@ -7162,9 +7189,9 @@ pub(crate) fn parse_oneshot_draw_replacement(norm_lower: &str) -> Option<Effect>
     // Honest-gap guard 2: player-scoped subjects ("each player", "each
     // opponent", "that player", "target player/opponent") are NOT honored by
     // bare `parse_effect` (it would emit a Controller-scoped effect, dropping
-    // the scope). Reject so Words of Wind/Waste stay honest Unimplemented gaps
-    // rather than silently-wrong parses. This is a leaf reject-check on the
-    // already-split payload, not dispatch.
+    // the scope). Reject so other player-scoped payloads stay honest
+    // Unimplemented gaps rather than silently-wrong parses. This is a leaf
+    // reject-check on the already-split payload, not dispatch.
     if payload_text.starts_with("each ") // allow-noncombinator: leaf reject-guard on split payload
         || payload_text.starts_with("target player") // allow-noncombinator
         || payload_text.starts_with("target opponent") // allow-noncombinator
@@ -25305,16 +25332,22 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn oneshot_draw_replacement_rejects_unimplemented_player_scoped_payload() {
-        // GUARD: Words of Waste remains an honest gap until its opponents-only
-        // discard selection can be represented faithfully.
-        assert!(
-            parse_oneshot_draw_replacement(
-                "the next time you would draw a card this turn, each opponent discards a card instead"
-            )
-            .is_none(),
-            "Words of Waste (each-opponent payload) must remain an honest gap"
-        );
+    fn oneshot_draw_replacement_words_of_waste_carries_opponent_scoped_discard() {
+        let effect = parse_oneshot_draw_replacement(
+            "the next time you would draw a card this turn, each opponent discards a card instead",
+        )
+        .expect("Words of Waste must parse");
+        let Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } = effect
+        else {
+            panic!("expected CreateDrawReplacement");
+        };
+        assert!(matches!(*replacement_effect, Effect::NoOp));
+        let discard = replacement_sub_ability.expect("Words of Waste needs its scoped discard");
+        assert!(matches!(*discard.effect, Effect::Discard { .. }));
+        assert_eq!(discard.player_scope, Some(PlayerFilter::Opponent));
     }
 
     #[test]

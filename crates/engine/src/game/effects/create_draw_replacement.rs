@@ -407,6 +407,69 @@ mod tests {
         assert!(state.players[1].hand.contains(&theirs));
     }
 
+    /// Words of Waste, end-to-end: the replacement suppresses the draw and
+    /// makes each opponent choose a card to discard. The player scope lives on
+    /// the replacement continuation, so this specifically proves that a scoped
+    /// interactive substitute survives the delayed-replacement relay.
+    #[test]
+    fn words_of_waste_replacement_runs_opponent_discard_chain() {
+        let mut sc = GameScenario::new();
+        let source = sc.add_creature(P0, "Words of Waste", 0, 0).id();
+        let top = sc.add_card_to_library_top(P0, "Mountain");
+        let first = sc.add_card_to_hand(P1, "Discard first");
+        let second = sc.add_card_to_hand(P1, "Discard second");
+        let mut state = sc.state;
+        let start_hand = state.players[0].hand.len();
+
+        let replacement_effect = crate::parser::oracle_effect::parse_effect(
+            "the next time you would draw a card this turn, each opponent discards a card instead",
+        );
+        assert!(
+            matches!(replacement_effect, Effect::CreateDrawReplacement { .. }),
+            "Words of Waste must enter the live draw-replacement parser path"
+        );
+        let install = ResolvedAbility::new(
+            replacement_effect,
+            vec![],
+            source,
+            P0,
+        );
+
+        let mut events = Vec::new();
+        resolve(&mut state, &install, &mut events).unwrap();
+        let mut events = Vec::new();
+        crate::game::effects::draw::resolve(&mut state, &draw_one_for(P0, source), &mut events)
+            .unwrap();
+
+        assert_eq!(
+            state.players[0].hand.len(),
+            start_hand,
+            "the draw is replaced"
+        );
+        assert!(
+            !state.players[0].hand.contains(&top),
+            "the top card stays undrawn"
+        );
+        let WaitingFor::DiscardChoice { player, cards, .. } = &state.waiting_for else {
+            panic!(
+                "Words of Waste must prompt its opponent, got {:?}",
+                state.waiting_for
+            );
+        };
+        assert_eq!(*player, P1);
+        assert_eq!(cards.len(), 2);
+        crate::game::engine::apply(
+            &mut state,
+            P1,
+            GameAction::SelectCards { cards: vec![first] },
+        )
+        .expect("the opponent must be able to choose its discard");
+
+        assert_eq!(state.objects[&first].zone, Zone::Graveyard);
+        assert_eq!(state.objects[&second].zone, Zone::Hand);
+        assert_eq!(state.players[1].hand.len(), 1);
+    }
+
     /// Source-player scope: the shield ("you would draw") does NOT replace an
     /// opponent's draw this turn.
     #[test]

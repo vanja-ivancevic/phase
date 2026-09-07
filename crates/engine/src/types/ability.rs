@@ -15677,8 +15677,9 @@ pub enum Effect {
     /// the Draw event class; the substitute is a heterogeneous Effect resolved via
     /// the post-replacement continuation. `replacement_sub_ability` extends that
     /// substitute into a full ability chain when its consequence needs an
-    /// interactive selection before a follow-up (Words of Wind). It is optional
-    /// so the established single-effect representation remains wire-compatible.
+    /// interactive selection before a follow-up (Words of Wind) or a
+    /// player-scoped resolving node (Words of Waste). It is optional so the
+    /// established single-effect representation remains wire-compatible.
     /// RUNTIME: create_draw_replacement::resolve.
     CreateDrawReplacement {
         replacement_effect: Box<Effect>,
