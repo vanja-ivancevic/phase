@@ -1485,6 +1485,11 @@ pub enum DamageRedirectTarget {
     /// "...to target creature instead" — an object chosen as a target of the
     /// creating ability (Soltari Guerrillas).
     ChosenObjectTarget,
+    /// "...to any target instead" — a creature, planeswalker, battle, or
+    /// player chosen as a target of the creating ability (Zhalfirin Crusader).
+    /// Unlike [`Self::ChosenObjectTarget`], this preserves player recipients as
+    /// a concrete `TargetRef::Player` through the replacement event.
+    ChosenTarget,
     /// CR 303.4b + CR 301.5a: "...to enchanted creature instead" / "...to
     /// equipped creature instead" — the permanent this replacement's source is
     /// attached to (Pariah, Pariah's Shield, With Great Power . . .).
@@ -15644,9 +15649,10 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         redirect_amount: Option<PreventionAmount>,
         /// CR 115.1: The redirect recipient's target filter for the
-        /// `ChosenObjectTarget` form ("...deals that damage to target creature
-        /// instead" — Soltari Guerrillas). `None` for the `Controller` /
-        /// `SourceObject` redirect forms, which need no target slot.
+    /// chosen-target forms ("...deals that damage to target creature" or "any
+    /// target instead" — Soltari Guerrillas / Zhalfirin Crusader). `None` for
+    /// the `Controller` / `SourceObject` redirect forms, which need no target
+    /// slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         redirect_object_filter: Option<TargetFilter>,
         /// CR 115.1 + CR 614.9: The *original-recipient* target filter when the

@@ -219,7 +219,10 @@ pub fn resolve(
                 redirect_amount.unwrap_or(PreventionAmount::All),
                 redirect_lifetime,
             );
-            if recipient == DamageRedirectTarget::ChosenObjectTarget {
+            if matches!(
+                recipient,
+                DamageRedirectTarget::ChosenObjectTarget | DamageRedirectTarget::ChosenTarget
+            ) {
                 // The redirect target is the LAST declared object slot — the
                 // original-recipient slot (Jade Monolith) is declared first when
                 // both are present, though no single card has both today. The
@@ -227,8 +230,11 @@ pub fn resolve(
                 // the target its parent instruction already chose ("Choose target
                 // creature you control. …to the chosen creature instead"), which
                 // reaches this resolver through the propagated parent targets.
-                if let Some(id) = chosen_redirect_object(ability, recipient_consumes_slot) {
-                    shield = shield.redirect_target(TargetFilter::SpecificObject { id });
+                if let Some(target) = chosen_redirect_target(ability, recipient_consumes_slot) {
+                    shield = shield.redirect_target(match target {
+                        TargetRef::Object(id) => TargetFilter::SpecificObject { id },
+                        TargetRef::Player(id) => TargetFilter::SpecificPlayer { id },
+                    });
                 }
             }
         }
@@ -297,23 +303,25 @@ fn chosen_target_object(ability: &ResolvedAbility, skip: usize) -> Option<Object
         .nth(skip)
 }
 
-/// Return the object target slot for a `ChosenObjectTarget` redirect recipient.
-/// When the original recipient is itself a chosen target object (Jade Monolith —
-/// `recipient_consumed_slot` is `true`), the redirect slot is the *second*
-/// object target; otherwise (no recipient slot, or a self recipient like the
-/// en-Kor cycle) it is the first.
-fn chosen_redirect_object(
+/// Return the target slot for a chosen redirect recipient. When the original
+/// recipient is itself a chosen target object (Jade Monolith —
+/// `recipient_consumed_slot` is `true`), the redirect slot is the second
+/// declared slot; otherwise (no recipient slot, or a self recipient like the
+/// en-Kor cycle) it is the first. Unlike the legacy object-only helper, this
+/// preserves a player selected for an `any target` recipient.
+fn chosen_redirect_target(
     ability: &ResolvedAbility,
     recipient_consumed_slot: bool,
-) -> Option<ObjectId> {
+) -> Option<TargetRef> {
     let skip = if recipient_consumed_slot { 1 } else { 0 };
-    chosen_target_object(ability, skip)
+    ability.targets.get(skip).cloned()
 }
 
 /// CR 614.9: Resolve a redirection recipient to a concrete `TargetRef` against
 /// the live game state, at damage-apply time. `Controller` → the replacement
 /// source's controller; `SourceObject` → the source object itself;
-/// `ChosenObjectTarget` → `chosen_object`, captured at resolution time into the
+/// `ChosenObjectTarget` → its chosen object and `ChosenTarget` → its chosen
+/// object or player, captured at resolution time into the
 /// shield's `redirect_target` field (the shield host does not retain the
 /// creating ability's targets, so the applier reads them back from there);
 /// `AttachedToSource` → the permanent the source is attached to.
@@ -324,7 +332,7 @@ pub(crate) fn resolve_redirect_recipient(
     state: &GameState,
     recipient: DamageRedirectTarget,
     source_id: ObjectId,
-    chosen_object: Option<ObjectId>,
+    chosen_target: Option<TargetRef>,
 ) -> Option<TargetRef> {
     match recipient {
         DamageRedirectTarget::Controller => state
@@ -332,7 +340,11 @@ pub(crate) fn resolve_redirect_recipient(
             .get(&source_id)
             .map(|obj| TargetRef::Player(obj.controller)),
         DamageRedirectTarget::SourceObject => Some(TargetRef::Object(source_id)),
-        DamageRedirectTarget::ChosenObjectTarget => chosen_object.map(TargetRef::Object),
+        DamageRedirectTarget::ChosenObjectTarget => match chosen_target {
+            Some(TargetRef::Object(id)) => Some(TargetRef::Object(id)),
+            Some(TargetRef::Player(_)) | None => None,
+        },
+        DamageRedirectTarget::ChosenTarget => chosen_target,
         // CR 303.4b + CR 301.5a: the Aura's/Equipment's own host, read LIVE from
         // `attached_to` on every damage event rather than latched at install, so
         // moving the attachment moves the redirect (Pariah, Pariah's Shield, With
@@ -1333,6 +1345,70 @@ mod tests {
             state.objects.get(&redirect_dest).unwrap().damage_marked,
             3,
             "redirected combat damage must land on the chosen creature"
+        );
+    }
+
+    /// CR 614.9: unlike a creature-only redirect, an `any target` recipient
+    /// may be a player. The replacement must retain that player identity when
+    /// it is installed, then deliver the redirected combat damage to them.
+    #[test]
+    fn redirect_to_any_target_lands_on_chosen_player() {
+        let mut state = GameState::new_two_player(42);
+        let host = create_creature(&mut state, PlayerId(0), "Zhalfirin Crusader");
+        let attacker = create_creature(&mut state, PlayerId(1), "Attacker");
+        let redirect_dest = PlayerId(1);
+
+        let replacement_effect = crate::parser::oracle_effect::parse_effect(
+            "the next 1 damage that would be dealt to ~ this turn is dealt to any target instead",
+        );
+        assert!(
+            matches!(
+                replacement_effect,
+                Effect::CreateDamageReplacement {
+                    source_filter: None,
+                    combat_scope: None,
+                    recipient_object_filter: Some(TargetFilter::SelfRef),
+                    redirect_to: Some(DamageRedirectTarget::ChosenTarget),
+                    ..
+                }
+            ),
+            "Zhalfirin Crusader must enter the live one-shot redirection parser path"
+        );
+        let ability = ResolvedAbility::new(
+            replacement_effect,
+            vec![TargetRef::Player(redirect_dest)],
+            host,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        let shield = &state.objects.get(&host).unwrap().replacement_definitions[0];
+        assert_eq!(
+            shield.redirect_target,
+            Some(TargetFilter::SpecificPlayer { id: redirect_dest }),
+            "the chosen player must be captured on the shield"
+        );
+
+        let ctx = deal_damage::DamageContext::from_source(&state, attacker).unwrap();
+        let mut events = Vec::new();
+        deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Object(host),
+            3,
+            true,
+            &mut events,
+        )
+        .unwrap();
+        assert_eq!(
+            state.objects[&host].damage_marked,
+            2,
+            "only the next 1 damage is redirected; the remaining 2 stays on the creature"
+        );
+        assert_eq!(
+            state.players[1].life,
+            19,
+            "the chosen player takes exactly the redirected 1 damage"
         );
     }
 
