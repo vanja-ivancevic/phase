@@ -30,11 +30,11 @@ use super::oracle_ir::feature::{
 };
 use super::swallow_evidence::UnitEvidence;
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, ActivationRestriction, CastingPermission, Comparator,
-    ContinuousModification, CopyRetargetPermission, DamageModification, DelayedTriggerCondition,
-    DoubleTarget, Duration, Effect, FilterProp, ManaProduction, ModalSelectionConstraint,
-    OpponentMayScope, ParsedCondition, PlayerFilter, QuantityExpr, QuantityRef,
-    ReplacementCondition, ReplacementDefinition, ReplacementMode, RestrictionExpiry,
+    AbilityCondition, AbilityCost, AbilityDefinition, ActivationRestriction, CastingPermission,
+    Comparator, ContinuousModification, CopyRetargetPermission, DamageModification,
+    DelayedTriggerCondition, DoubleTarget, Duration, Effect, FilterProp, ManaProduction,
+    ModalSelectionConstraint, OpponentMayScope, ParsedCondition, PlayerFilter, QuantityExpr,
+    QuantityRef, ReplacementCondition, ReplacementDefinition, ReplacementMode, RestrictionExpiry,
     StaticCondition, StaticDefinition, TargetFilter, TriggerCondition, TriggerConstraint,
     TriggerDefinition, UnlessPayScaling,
 };
@@ -1617,10 +1617,9 @@ fn effect_is_replacement_carrier(effect: &Effect) -> bool {
         // Feather return / Lilah plot parameterization is a second consequence
         // folded into the same carrier, so it stays exempt either way).
         | Effect::ExileResolvingSpellInsteadOfGraveyard { .. }
-        // CR 701.6a + CR 614.1a: a countered spell's non-graveyard
-        // destination is the replacement itself, carried on Counter rather
-        // than in the top-level replacement collection (Memory Lapse,
-        // Remand, Spell Crumple).
+        // CR 701.6a + CR 614.1a: Memory Lapse / Remand / Spell Crumple fold
+        // the countered spell destination into Counter's typed replacement field.
+        // No separate sub-ability is expected.
         | Effect::Counter {
             countered_spell_zone: Some(_),
             ..
@@ -3734,10 +3733,7 @@ fn cast_this_way_alt_cost_is_only_if_marker(stripped: &str, evidence: &UnitEvide
 /// This is deliberately phrased in terms of the reusable target-legality
 /// mechanism, not a card name. The wording varies between "both"/"all" and
 /// "spell"/"ability", but the semantic carrier is the same.
-fn target_legality_rider_is_only_if_marker(
-    stripped: &str,
-    evidence: &UnitEvidence,
-) -> bool {
+fn target_legality_rider_is_only_if_marker(stripped: &str, evidence: &UnitEvidence) -> bool {
     let mut residual = stripped.to_owned();
     let mut matched = false;
     for target_count in ["both", "all"] {
@@ -3753,9 +3749,7 @@ fn target_legality_rider_is_only_if_marker(
             }
         }
     }
-    if !matched
-        || evidence.count_effect(|effect| matches!(effect, Effect::TargetOnly { .. })) < 2
-    {
+    if !matched || evidence.count_effect(|effect| matches!(effect, Effect::TargetOnly { .. })) < 2 {
         return false;
     }
 
@@ -4421,13 +4415,9 @@ fn detect_condition_as_long_as(
             .description
             .as_ref()
             .is_some_and(|description| description.to_ascii_lowercase().contains("as long as "))
-            && static_def
-                .modifications
-                .iter()
-                .any(|modification| matches!(
-                    modification,
-                    ContinuousModification::CopyTopOfZone { .. }
-                ))
+            && static_def.modifications.iter().any(|modification| {
+                matches!(modification, ContinuousModification::CopyTopOfZone { .. })
+            })
     }) {
         return;
     }
@@ -5361,10 +5351,9 @@ mod tests {
             &["Creature"],
         );
         assert!(parsed.statics.iter().any(|static_def| {
-            static_def.modifications.iter().any(|modification| matches!(
-                modification,
-                ContinuousModification::CopyTopOfZone { .. }
-            ))
+            static_def.modifications.iter().any(|modification| {
+                matches!(modification, ContinuousModification::CopyTopOfZone { .. })
+            })
         }));
         assert!(
             !has_swallowed_detector(&parsed, "Condition_AsLongAs"),

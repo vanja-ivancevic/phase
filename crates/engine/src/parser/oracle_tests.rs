@@ -1778,6 +1778,113 @@ fn urza_conditional_mana_replacement_is_not_reported_as_swallowed() {
     );
 }
 
+/// Cursed Scroll is a high-frequency old-border deck card.  Its random hand
+/// reveal publishes the revealed card as the subject of a typed chosen-name
+/// condition; the full activated ability must therefore not leave a residual
+/// `Condition_If` audit warning.
+#[test]
+fn cursed_scroll_random_reveal_condition_is_not_reported_as_swallowed() {
+    let parsed = parse(
+        "{3}, {T}: Choose a card name, then reveal a card at random from your hand. If that card has the chosen name, this artifact deals 2 damage to any target.",
+        "Cursed Scroll",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+
+    assert!(
+        parsed.parse_warnings.iter().all(|warning| !matches!(
+            warning,
+            OracleDiagnostic::SwallowedClause { detector, .. }
+                if detector == "Condition_If"
+        )),
+        "Cursed Scroll's represented chosen-name condition must not be flagged: {:?}",
+        parsed.parse_warnings
+    );
+}
+
+/// Memory Lapse is another frequent old-border deck card.  The parser folds
+/// its countered-spell destination into the typed `Counter` effect, so the
+/// full card must not be reported as a swallowed `instead` replacement.
+#[test]
+fn memory_lapse_counter_redirect_is_not_reported_as_swallowed() {
+    let parsed = parse(
+        "Counter target spell. If that spell is countered this way, put it on top of its owner's library instead of into that player's graveyard.",
+        "Memory Lapse",
+        &[],
+        &["Instant"],
+        &[],
+    );
+
+    assert!(
+        parsed.parse_warnings.iter().all(|warning| !matches!(
+            warning,
+            OracleDiagnostic::SwallowedClause { detector, .. }
+                if detector == "Replacement_Instead"
+        )),
+        "Memory Lapse's represented counter destination must not be flagged: {:?}",
+        parsed.parse_warnings
+    );
+}
+
+/// Thermokarst's snow-land rider follows a zone-changing destroy effect.  The
+/// target is gone by the time the rider resolves, so the condition must be
+/// represented with last-known information rather than swallowed as a generic
+/// `Condition_If` clause.
+#[test]
+fn thermokarst_snow_land_rider_is_not_reported_as_swallowed() {
+    let parsed = parse(
+        "Destroy target land. If that land was a snow land, you gain 1 life.",
+        "Thermokarst",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+
+    assert!(
+        parsed.parse_warnings.iter().all(|warning| !matches!(
+            warning,
+            OracleDiagnostic::SwallowedClause { detector, .. }
+                if detector == "Condition_If"
+        )),
+        "Thermokarst's represented snow-land condition must not be flagged: {:?}",
+        parsed.parse_warnings
+    );
+}
+
+/// CR 118.9 + CR 601.2b: Thwart's printed alternate cost is an exact three-
+/// object return, not an arbitrary effect.  Preserve both the quantity and
+/// the Island quality so the payability gate can reject a two-Island state and
+/// the payment detour can require exactly three selections.
+#[test]
+fn thwart_alternative_cost_preserves_three_island_quantity() {
+    let parsed = parse(
+        "You may return three Islands you control to their owner's hand rather than pay this spell's mana cost.\nCounter target spell.",
+        "Thwart",
+        &[],
+        &["Instant"],
+        &[],
+    );
+
+    assert_eq!(parsed.casting_options.len(), 1, "got {parsed:#?}");
+    match parsed.casting_options[0].cost.as_ref() {
+        Some(AbilityCost::ReturnToHand {
+            count,
+            filter: Some(TargetFilter::Typed(filter)),
+            from_zone: None,
+        }) => {
+            assert_eq!(*count, 3);
+            assert_eq!(filter.get_subtype(), Some("Island"));
+        }
+        other => panic!("expected typed three-Island ReturnToHand cost, got {other:?}"),
+    }
+    assert!(
+        parsed.parse_warnings.is_empty(),
+        "unexpected warnings: {:?}",
+        parsed.parse_warnings
+    );
+}
+
 /// CR 506.3 + CR 508.1d + CR 611.2c + CR 615: Gideon Jura (verbatim MTGJSON
 /// Oracle text) parses all three loyalty abilities with zero residual
 /// `Unimplemented`, and each lands on the exact shape its rules text requires.
