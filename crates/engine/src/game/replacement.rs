@@ -1855,10 +1855,10 @@ fn shield_rider_reflects_per_event(state: &GameState, rid: ReplacementId) -> boo
         .is_some_and(rider_reflects_per_event_damage_source)
 }
 
-/// CR 614.9: Read back the captured chosen-object recipient stashed in the
-/// matched replacement's `redirect_target` field (set at resolution time for
-/// `DamageRedirectTarget::ChosenObjectTarget` — "to target creature").
-fn redirect_chosen_object_for_rid(state: &GameState, rid: ReplacementId) -> Option<ObjectId> {
+/// CR 614.9: Read back the captured chosen recipient stashed in the matched
+/// replacement's `redirect_target` field. The effect-created one-shot path can
+/// carry either a permanent or a player ("to any target").
+fn redirect_chosen_target_for_rid(state: &GameState, rid: ReplacementId) -> Option<TargetRef> {
     let repl = if rid.source == ObjectId(0) {
         state.pending_damage_replacements.get(rid.index)
     } else {
@@ -1868,7 +1868,8 @@ fn redirect_chosen_object_for_rid(state: &GameState, rid: ReplacementId) -> Opti
             .and_then(|obj| obj.replacement_definitions.get(rid.index))
     };
     match repl.and_then(|r| r.redirect_target.as_ref()) {
-        Some(TargetFilter::SpecificObject { id }) => Some(*id),
+        Some(TargetFilter::SpecificObject { id }) => Some(TargetRef::Object(*id)),
+        Some(TargetFilter::SpecificPlayer { id }) => Some(TargetRef::Player(*id)),
         _ => None,
     }
 }
@@ -2044,7 +2045,7 @@ fn redirect_damage_event(
         });
     }
 
-    let chosen = redirect_chosen_object_for_rid(state, rid);
+    let chosen = redirect_chosen_target_for_rid(state, rid);
     let new_recipient = super::effects::create_damage_replacement::resolve_redirect_recipient(
         state, recipient, rid.source, chosen,
     )

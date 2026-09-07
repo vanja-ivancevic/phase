@@ -6863,6 +6863,7 @@ pub(crate) fn parse_oneshot_damage_replacement(
             DamageRedirectTarget::ChosenObjectTarget => {
                 parse_damage_to_target_filter(result_clause)
             }
+            DamageRedirectTarget::ChosenTarget => Some(TargetFilter::Any),
             // `redirect_object_filter` carries the filter for a CHOSEN object slot
             // the player must select. `AttachedToSource` joins the `None` arm
             // deliberately, not by default: like `SourceObject`, its recipient is
@@ -7431,21 +7432,29 @@ fn parse_oneshot_next_n_damage_to_self_redirect(norm_lower: &str) -> Option<Effe
         .parse(norm_lower)
         .ok()?;
 
-    // CR 115.1: redirect recipient — "target creature you control" (every en-Kor
-    // card) or the looser "target creature"; both become a chosen object target.
-    // (An "any target" redirect is intentionally NOT accepted here: it can be a
-    // player, but the CreateDamageReplacement resolver stores only object redirect
-    // targets, so a player choice would silently drop the redirect — fail closed.)
-    let (rest, redirect_object_filter) = alt((
+    // CR 115.1: redirect recipient. Object-only target forms retain their
+    // existing object identity; "any target" can also name a player and uses
+    // the generic chosen-target identity through the replacement resolver.
+    let (rest, (redirect_to, redirect_object_filter)) = alt((
         value(
-            inject_controller(
-                TargetFilter::Typed(TypedFilter::creature()),
-                ControllerRef::You,
+            (DamageRedirectTarget::ChosenTarget, TargetFilter::Any),
+            tag::<_, _, OracleError<'_>>("any target"),
+        ),
+        value(
+            (
+                DamageRedirectTarget::ChosenObjectTarget,
+                inject_controller(
+                    TargetFilter::Typed(TypedFilter::creature()),
+                    ControllerRef::You,
+                ),
             ),
             tag::<_, _, OracleError<'_>>("target creature you control"),
         ),
         value(
-            TargetFilter::Typed(TypedFilter::creature()),
+            (
+                DamageRedirectTarget::ChosenObjectTarget,
+                TargetFilter::Typed(TypedFilter::creature()),
+            ),
             tag("target creature"),
         ),
     ))
@@ -7463,7 +7472,7 @@ fn parse_oneshot_next_n_damage_to_self_redirect(norm_lower: &str) -> Option<Effe
         combat_scope: None,
         target_filter: None,
         modification: None,
-        redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+        redirect_to: Some(redirect_to),
         redirect_amount: Some(PreventionAmount::Next(amount)),
         redirect_object_filter: Some(redirect_object_filter),
         recipient_object_filter: Some(TargetFilter::SelfRef),
@@ -7538,15 +7547,17 @@ fn parse_oneshot_next_n_damage_to_target_redirect(norm_lower: &str) -> Option<Ef
         (DamageRedirectTarget::Controller, None)
     } else {
         let (filter, leftover) = crate::parser::oracle_target::parse_target(redirect_text);
-        // CR 115.1: require a fully-consumed chosen *object* target. `TargetFilter::Any`
-        // is intentionally rejected: it can resolve to a player, but the
-        // CreateDamageReplacement resolver stores only object redirect targets
-        // (`chosen_redirect_object`), so a player choice would silently drop the
-        // redirect. Fail closed on `Any`, scopes, and unparsed remainders.
-        if !leftover.trim().is_empty() || !matches!(filter, TargetFilter::Typed(_)) {
+        // CR 115.1: require one fully-consumed chosen target. Object-only
+        // filters retain their existing target identity; `any target` preserves
+        // either an object or player recipient through `ChosenTarget`.
+        if !leftover.trim().is_empty() {
             return None;
         }
-        (DamageRedirectTarget::ChosenObjectTarget, Some(filter))
+        match filter {
+            TargetFilter::Typed(_) => (DamageRedirectTarget::ChosenObjectTarget, Some(filter)),
+            TargetFilter::Any => (DamageRedirectTarget::ChosenTarget, Some(filter)),
+            _ => return None,
+        }
     };
 
     let (rest, _) = tag::<_, _, OracleError<'_>>(" instead")
@@ -7835,6 +7846,7 @@ fn parse_redirect_recipient_phrase(
             DamageRedirectTarget::ChosenObjectTarget,
             alt((tag("target creature"), tag("target permanent"))),
         ),
+        value(DamageRedirectTarget::ChosenTarget, tag("any target")),
     ))
     .parse(input)
 }
@@ -25637,26 +25649,22 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn oneshot_redirect_to_any_target_fails_closed() {
-        // CR 115.1: an "any target" redirect can resolve to a player, but the
-        // CreateDamageReplacement resolver stores only OBJECT redirect targets, so
-        // a player choice would silently drop the redirect. Both the `~`-recipient
-        // (Zhalfirin Crusader) and chosen-target-recipient forms must therefore
-        // fail closed on "any target" rather than mis-model it.
-        assert!(
-            parse_oneshot_damage_replacement(
-                "the next 1 damage that would be dealt to ~ this turn is dealt to any target instead",
-                &ParseContext::default())
-            .is_none(),
-            "en-Kor 'any target' redirect must fail closed (object-only resolver)"
-        );
-        assert!(
-            parse_oneshot_damage_replacement(
-                "the next 1 damage that would be dealt to target creature you control this turn is dealt to any target instead",
-                &ParseContext::default())
-            .is_none(),
-            "chosen-recipient 'any target' redirect must fail closed (object-only resolver)"
-        );
+    fn oneshot_redirect_to_any_target_preserves_generic_recipient() {
+        for clause in [
+            "the next 1 damage that would be dealt to ~ this turn is dealt to any target instead",
+            "the next 1 damage that would be dealt to target creature you control this turn is dealt to any target instead",
+        ] {
+            let effect = parse_oneshot_damage_replacement(clause, &ParseContext::default())
+                .expect("any-target redirection must parse");
+            assert!(matches!(
+                effect,
+                Effect::CreateDamageReplacement {
+                    redirect_to: Some(DamageRedirectTarget::ChosenTarget),
+                    redirect_object_filter: Some(TargetFilter::Any),
+                    ..
+                }
+            ));
+        }
     }
 
     /// CR 614.1a + CR 614.6 + CR 121.6 + CR 701.20a: Abundance — the
