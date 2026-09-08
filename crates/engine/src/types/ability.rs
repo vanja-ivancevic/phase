@@ -26457,6 +26457,10 @@ pub enum DamageModification {
     /// Provenance is a sibling variant rather than a field on `Minus` to
     /// preserve the established `Minus { value }` construction shape.
     PreventionMinus { value: u32 },
+    /// CR 615.1a + CR 107.1a: prevent half of the event's damage, rounded
+    /// down (Dark Sphere). The applier deals the unprevented remainder and
+    /// records the floored half as prevented damage.
+    PreventionHalf,
     /// CR 614.1a: Conditional — if amount < source's power, set amount = source's power.
     /// References the replacement source's (not the damage source's) current post-layer power.
     /// Used by Ojer Axonil: "deals damage equal to ~'s power instead."

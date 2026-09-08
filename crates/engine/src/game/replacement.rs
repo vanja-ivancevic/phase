@@ -2194,16 +2194,23 @@ fn damage_done_applier(
         {
             // CR 615.1a: typed prevention provenance, captured before the match
             // consumes `modification` (the `Plus`/`SetTo` arms move their
-            // non-`Copy` payload out). ONLY `PreventionMinus` — the CR 615
-            // prevention provenance of the shared subtraction — does prevention
+            // non-`Copy` payload out). ONLY the typed prevention variants —
+            // `PreventionMinus` and `PreventionHalf` — do prevention
             // bookkeeping below; plain arithmetic `Minus` (Benevolent Unicorn's
             // "that much damage minus 1") reduces the amount without preventing
             // anything.
-            let is_minus_prevention =
-                matches!(modification, DamageModification::PreventionMinus { .. });
+            let is_prevention_modification = matches!(
+                modification,
+                DamageModification::PreventionMinus { .. }
+                    | DamageModification::PreventionHalf
+            );
             let new_amount = match modification {
                 DamageModification::Double => amount.saturating_mul(2),
                 DamageModification::Triple => amount.saturating_mul(3),
+                // CR 615.1a + CR 107.1a: Dark Sphere prevents half the damage,
+                // rounded down. The surviving half is the original amount minus
+                // the prevented floor(amount / 2).
+                DamageModification::PreventionHalf => amount.saturating_sub(amount / 2),
                 // CR 614.1a + CR 120 + CR 107.1b: additive damage modification.
                 // The added magnitude is a game quantity resolved each time the
                 // replacement applies, clamped >= 0 (CR 107.1b). A `Fixed` value
@@ -2295,11 +2302,12 @@ fn damage_done_applier(
             if let Some(ShieldKind::DamageReplacementOneShot) = shield_kind_for_rid(state, rid) {
                 consume_prevention_shield(state, rid, None);
             }
-            // CR 615.1a + CR 702.64b + CR 510.2: `PreventionMinus` is the typed
-            // prevention provenance of the shared `Minus` subtraction — CR 702.64
+            // CR 615.1a + CR 702.64b + CR 510.2: `PreventionMinus` and
+            // `PreventionHalf` are typed prevention provenances. `PreventionMinus`
+            // is the prevention provenance of the shared `Minus` subtraction — CR 702.64
             // Absorb, the bare "prevent N of that damage" statics (Heart-Shaped
             // Herb #5902, Sphere of Purity, Orbs of Warding, ...), and the
-            // `PreventionMinus { value: u32::MAX }` prevent-all sentinel. When it
+            // `PreventionMinus { value: u32::MAX }` prevent-all sentinel. When either
             // actually reduces the event it prevents damage, so it performs the
             // same bookkeeping the `ShieldKind::Prevention` shields do (Branch 2),
             // with the same per-event vs post-batch binding semantics:
@@ -2320,7 +2328,7 @@ fn damage_done_applier(
             // Plain arithmetic `Minus` and the increase/no-op modifications
             // (Double, Triple, Plus, SetTo*, LifeFloor) are not prevention and
             // record nothing.
-            if is_minus_prevention {
+            if is_prevention_modification {
                 let prevented = amount.saturating_sub(new_amount);
                 if prevented > 0 {
                     let mut accumulated_in_batch = false;
@@ -5604,12 +5612,15 @@ fn is_damage_prevention_replacement(
         return false;
     };
 
-    // Ordinary damage modifications are not prevention, but `PreventionMinus`
-    // carries explicit prevention provenance and must be suppressed when damage
-    // can't be prevented.
+    // Ordinary damage modifications are not prevention, but the typed prevention
+    // variants carry explicit provenance and must be suppressed when damage can't
+    // be prevented.
     if matches!(
         repl.damage_modification,
-        Some(DamageModification::PreventionMinus { .. })
+        Some(
+            DamageModification::PreventionMinus { .. }
+                | DamageModification::PreventionHalf,
+        )
     ) {
         return true;
     }
@@ -9233,10 +9244,13 @@ fn damage_commute_class(modification: &DamageModification) -> CommuteClass {
     match modification {
         DamageModification::Double | DamageModification::Triple => CommuteClass::Multiplicative,
         DamageModification::Plus { .. } => CommuteClass::Additive,
-        // CR 616.1: both provenances of the shared subtraction commute alike.
+        // CR 616.1: both provenances of the shared subtraction commute alike;
+        // halving is non-commuting because the second replacement sees the
+        // first replacement's rounded result.
         DamageModification::Minus { .. } | DamageModification::PreventionMinus { .. } => {
             CommuteClass::Subtractive
         }
+        DamageModification::PreventionHalf => CommuteClass::NonCommuting,
         DamageModification::SetToSourcePower
         | DamageModification::SetTo { .. }
         | DamageModification::LifeFloor { .. } => CommuteClass::NonCommuting,
@@ -15921,6 +15935,37 @@ mod tests {
             }
             other => panic!("Expected Modified Damage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn damage_applier_prevention_half_rounds_prevented_amount_down() {
+        let repl = damage_repl(DamageModification::PreventionHalf)
+            .damage_replacement_oneshot_shield();
+        let mut state = test_state_with_damage_repl(ObjectId(10), PlayerId(0), vec![repl]);
+        let mut events = Vec::new();
+        let rid = ReplacementId {
+            source: ObjectId(10),
+            index: 0,
+        };
+
+        let result = damage_done_applier(damage_event(3), rid, &mut state, &mut events);
+        match result {
+            ApplyResult::Modified(ProposedEvent::Damage { amount, .. }) => {
+                assert_eq!(amount, 2, "3 damage minus floor(3 / 2) prevented")
+            }
+            other => panic!("expected modified damage, got {other:?}"),
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::DamagePrevented { amount: 1, .. })),
+            "the floored half must be reported as prevented"
+        );
+        assert_eq!(state.last_effect_count, Some(1));
+        assert!(
+            state.objects[&ObjectId(10)].replacement_definitions[0].is_consumed,
+            "Dark Sphere's one-shot shield must be spent"
+        );
     }
 
     /// CR 614.1a vs CR 615: plain arithmetic `Minus` (Benevolent Unicorn's

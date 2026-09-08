@@ -8523,6 +8523,10 @@ fn parse_damage_modification_phrase(
 ) -> nom::IResult<&str, DamageModification, OracleError<'_>> {
     alt((
         value(
+            DamageModification::PreventionHalf,
+            tag("prevent half that damage, rounded down"),
+        ),
+        value(
             DamageModification::Double,
             alt((
                 tag("double that damage"),
@@ -25123,6 +25127,30 @@ mod snapshot_tests {
                 ..
             } => {}
             other => panic!("expected Double amount one-shot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oneshot_half_prevention_from_chosen_source() {
+        // Dark Sphere: the chosen source's next damage to you loses half,
+        // rounded down, and the one-shot replacement is spent on that event.
+        let effect = parse_oneshot_damage_replacement(
+            "the next time a source of your choice would deal damage to you this turn, prevent half that damage, rounded down",
+            &ParseContext::default(),
+        )
+        .expect("Dark Sphere's half-prevention one-shot must parse");
+        match effect {
+            Effect::CreateDamageReplacement {
+                modification: Some(DamageModification::PreventionHalf),
+                redirect_to: None,
+                source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
+                target_filter: Some(DamageTargetFilter::Player {
+                    player: DamageTargetPlayerScope::Controller,
+                }),
+                redirect_lifetime: RedirectionLifetime::OneOpportunity,
+                ..
+            } => {}
+            other => panic!("expected Dark Sphere half-prevention replacement, got {other:?}"),
         }
     }
 

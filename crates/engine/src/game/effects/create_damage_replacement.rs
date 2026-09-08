@@ -1309,6 +1309,68 @@ mod tests {
         )
     }
 
+    #[test]
+    fn chosen_source_half_prevention_scopes_to_you_and_is_one_shot() {
+        use crate::types::game_state::ChosenDamageSource;
+
+        let mut state = GameState::new_two_player(42);
+        let host = create_creature(&mut state, PlayerId(0), "Dark Sphere");
+        let chosen_source = create_creature(&mut state, PlayerId(1), "Chosen Attacker");
+        state.last_chosen_damage_source = Some(ChosenDamageSource {
+            source_id: chosen_source,
+            source_filter: TargetFilter::ChosenDamageSource { filter: None },
+        });
+        let ability = ResolvedAbility::new(
+            Effect::CreateDamageReplacement {
+                redirect_lifetime: RedirectionLifetime::OneOpportunity,
+                source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
+                combat_scope: None,
+                target_filter: Some(DamageTargetFilter::Player {
+                    player: DamageTargetPlayerScope::Controller,
+                }),
+                modification: Some(DamageModification::PreventionHalf),
+                redirect_to: None,
+                redirect_amount: None,
+                redirect_object_filter: None,
+                recipient_object_filter: None,
+            },
+            vec![],
+            host,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+        state.last_chosen_damage_source = None;
+
+        let ctx = deal_damage::DamageContext::from_source(&state, chosen_source).unwrap();
+        let first = deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Player(PlayerId(0)),
+            3,
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(first, deal_damage::DamageResult::Applied(2)));
+        assert_eq!(state.players[0].life, 18);
+        assert!(
+            state.objects[&host].replacement_definitions[0].is_consumed,
+            "half-prevention one-shot must be consumed after the first matching event"
+        );
+
+        let second = deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Player(PlayerId(0)),
+            3,
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(second, deal_damage::DamageResult::Applied(3)));
+        assert_eq!(state.players[0].life, 15);
+    }
+
     /// CR 609.7a + CR 614.9 (Defect 2): An inline "a source of your choice"
     /// one-shot prompts the source choice when none is recorded, then on the
     /// continuation pass captures the chosen source into a DURABLE

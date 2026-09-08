@@ -8,7 +8,8 @@ use crate::parser::oracle_ir::static_ir::StaticIr;
 use crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
 use crate::types::ability::{
     AdditionalCostOrigin, AdditionalCostPaymentSource, CountScope, CounterAdjustment,
-    DamageRedirectTarget, DoorLockOp, PlayerRelation, RedirectionLifetime,
+    DamageModification, DamageRedirectTarget, DamageTargetFilter, DamageTargetPlayerScope,
+    DoorLockOp, PlayerRelation, RedirectionLifetime,
     SpellStackToGraveyardReplacement,
 };
 use crate::types::counter::{CounterMatch, CounterType};
@@ -4445,6 +4446,42 @@ fn reverberation_full_parse_preserves_target_sorcery_source_scope() {
             .any(|filter| matches!(filter, TargetFilter::ParentTargetSlot { index: 0 })),
         "target sorcery must be captured as source slot 0: {filters:?}"
     );
+}
+
+#[test]
+fn dark_sphere_full_parse_preserves_half_prevention() {
+    let r = parse(
+        "{T}, Sacrifice this artifact: The next time a source of your choice would deal damage to you this turn, prevent half that damage, rounded down.",
+        "Dark Sphere",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    assert!(
+        !parsed_has_unimplemented(&r),
+        "Dark Sphere must parse fully: {r:#?}"
+    );
+    let Some(effect) = r.abilities.iter().find_map(|ability| {
+        matches!(
+            ability.effect.as_ref(),
+            Effect::CreateDamageReplacement { .. }
+        )
+        .then_some(ability.effect.as_ref())
+    }) else {
+        panic!("expected Dark Sphere's damage replacement: {r:#?}");
+    };
+    assert!(matches!(
+        effect,
+        Effect::CreateDamageReplacement {
+            modification: Some(DamageModification::PreventionHalf),
+            source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
+            target_filter: Some(DamageTargetFilter::Player {
+                player: DamageTargetPlayerScope::Controller,
+            }),
+            redirect_lifetime: RedirectionLifetime::OneOpportunity,
+            ..
+        }
+    ), "unexpected Dark Sphere effect: {effect:?}");
 }
 
 /// Issue #1696 — Myrkul, Lord of Bones end-to-end: the death trigger exiles
