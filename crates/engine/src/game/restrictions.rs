@@ -1086,6 +1086,11 @@ fn activation_restriction_applies(
         }
         // CR 508.1c / CR 509.1b: Combat-phase restrictions on activation timing.
         ActivationRestriction::DuringCombat => state.phase.is_combat(),
+        ActivationRestriction::DuringPhase { phase } => state.phase == *phase,
+        ActivationRestriction::BeforePhase { phase } => state.phase < *phase,
+        ActivationRestriction::BeforeBlockersDeclared => {
+            matches!(state.phase, Phase::BeginCombat | Phase::DeclareAttackers)
+        }
         ActivationRestriction::BeforeAttackersDeclared => is_before_attackers_declared(state),
         ActivationRestriction::BeforeCombatDamage => is_before_combat_damage(state.phase),
         // CR 509.1 + CR 510.1 + CR 511.1: mirror the casting restriction's
@@ -5213,6 +5218,133 @@ mod tests {
         assert!(
             check_activation_restrictions(&state, player, ObjectId(10), 0, restrictions).is_err(),
             "DuringYourTurn must remain an independent gate"
+        );
+
+        let before_blockers = [ActivationRestriction::BeforeBlockersDeclared];
+        for phase in [Phase::BeginCombat, Phase::DeclareAttackers] {
+            state.phase = phase;
+            assert!(
+                check_activation_restrictions(
+                    &state,
+                    player,
+                    ObjectId(10),
+                    0,
+                    &before_blockers,
+                )
+                .is_ok(),
+                "before-blockers gate must be legal in {phase:?}"
+            );
+        }
+        for phase in [Phase::PreCombatMain, Phase::DeclareBlockers] {
+            state.phase = phase;
+            assert!(
+                check_activation_restrictions(
+                    &state,
+                    player,
+                    ObjectId(10),
+                    0,
+                    &before_blockers,
+                )
+                .is_err(),
+                "before-blockers gate must be illegal in {phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_combat_step_activation_windows_are_exact() {
+        let mut state = crate::types::game_state::GameState::new_two_player(42);
+        let player = PlayerId(0);
+        state.active_player = player;
+        state.priority_player = player;
+        state.waiting_for = WaitingFor::Priority { player };
+
+        for (restriction, allowed, rejected) in [
+            (
+                ActivationRestriction::DuringPhase {
+                    phase: Phase::DeclareAttackers,
+                },
+                [Phase::DeclareAttackers],
+                [Phase::BeginCombat, Phase::DeclareBlockers],
+            ),
+            (
+                ActivationRestriction::DuringPhase {
+                    phase: Phase::DeclareBlockers,
+                },
+                [Phase::DeclareBlockers],
+                [Phase::DeclareAttackers, Phase::CombatDamage],
+            ),
+            (
+                ActivationRestriction::DuringPhase {
+                    phase: Phase::EndCombat,
+                },
+                [Phase::EndCombat],
+                [Phase::CombatDamage, Phase::PostCombatMain],
+            ),
+        ] {
+            for phase in allowed {
+                state.phase = phase;
+                assert!(
+                    check_activation_restrictions(
+                        &state,
+                        player,
+                        ObjectId(10),
+                        0,
+                        std::slice::from_ref(&restriction),
+                    )
+                    .is_ok(),
+                    "{restriction:?} must be legal in {phase:?}"
+                );
+            }
+            for phase in rejected {
+                state.phase = phase;
+                assert!(
+                    check_activation_restrictions(
+                        &state,
+                        player,
+                        ObjectId(10),
+                        0,
+                        std::slice::from_ref(&restriction),
+                    )
+                    .is_err(),
+                    "{restriction:?} must be illegal in {phase:?}"
+                );
+            }
+        }
+
+        let before_end_combat = [ActivationRestriction::BeforePhase {
+            phase: Phase::EndCombat,
+        }];
+        for phase in [
+            Phase::Untap,
+            Phase::BeginCombat,
+            Phase::DeclareBlockers,
+            Phase::CombatDamage,
+        ] {
+            state.phase = phase;
+            assert!(
+                check_activation_restrictions(
+                    &state,
+                    player,
+                    ObjectId(10),
+                    0,
+                    &before_end_combat,
+                )
+                .is_ok(),
+                "before-end-combat gate must be legal in {phase:?}"
+            );
+        }
+        state.phase = Phase::EndCombat;
+        assert!(
+            check_activation_restrictions(
+                &state,
+                player,
+                ObjectId(10),
+                0,
+                &before_end_combat,
+            )
+            .is_err(),
+            "before-end-combat gate must close at EndCombat"
         );
     }
 

@@ -854,6 +854,91 @@ fn activation_during_gate_composes_turn_role_and_window_axes() {
     }
 }
 
+/// CR 508.1 + CR 509.1 + CR 511.1: pre-modern activated abilities use exact
+/// step wording that must remain narrower than the general combat windows.
+#[test]
+fn legacy_combat_step_activation_gates_preserve_exact_windows() {
+    for (text, phase, card_name) in [
+        (
+            "{T}: Draw a card. Activate only during the declare attackers step.",
+            Phase::DeclareAttackers,
+            "Kongming's Contraptions",
+        ),
+        (
+            "{R}: This creature gets +2/+0 until end of turn. Activate only during the declare blockers step.",
+            Phase::DeclareBlockers,
+            "Grizzled Wolverine",
+        ),
+        (
+            "{T}: This land deals 1 damage to target attacking creature. Activate only during the end of combat step.",
+            Phase::EndCombat,
+            "Desert",
+        ),
+    ] {
+        let r = parse(text, card_name, &[], &["Creature"], &[]);
+        assert_eq!(r.abilities.len(), 1, "{card_name}: got {:#?}", r.abilities);
+        assert!(
+            r.abilities[0]
+                .activation_restrictions
+                .contains(&ActivationRestriction::DuringPhase { phase }),
+            "{card_name}: expected exact phase gate, got {:?}",
+            r.abilities[0].activation_restrictions
+        );
+    }
+
+    let r = parse(
+        "{T}: This creature deals 2 damage to that creature at end of combat. Activate only before the end of combat step.",
+        "Dwarven Sea Clan",
+        &[],
+        &["Creature"],
+        &["Dwarf"],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {:#?}", r.abilities);
+    assert!(
+        r.abilities[0]
+            .activation_restrictions
+            .contains(&ActivationRestriction::BeforePhase {
+                phase: Phase::EndCombat,
+            }),
+        "expected pre-end-combat gate, got {:?}",
+        r.abilities[0].activation_restrictions
+    );
+
+    let r = parse(
+        "{T}: Draw a card. Activate only before blockers are declared.",
+        "Acidic Dagger",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {:#?}", r.abilities);
+    assert!(
+        r.abilities[0]
+            .activation_restrictions
+            .contains(&ActivationRestriction::BeforeBlockersDeclared),
+        "expected pre-blockers combat gate, got {:?}",
+        r.abilities[0].activation_restrictions
+    );
+
+    let r = parse(
+        "{2}, {T}: Draw a card. Activate this ability but only during their draw step.",
+        "Well of Knowledge",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {:#?}", r.abilities);
+    assert_eq!(
+        r.abilities[0].activation_restrictions,
+        vec![
+            ActivationRestriction::DuringYourTurn,
+            ActivationRestriction::DuringPhase { phase: Phase::Draw },
+        ],
+        "expected own draw-step gate, got {:?}",
+        r.abilities[0].activation_restrictions
+    );
+}
+
 /// CR 508.1: a STANDALONE combat-window activation gate — "Activate only before
 /// attackers are declared" / "Activate only before combat" (Arcum's Whistle,
 /// Arcum's Sleigh) with no "during <role>" first half — must map to the enforced

@@ -8446,7 +8446,9 @@ fn find_top_level_colon(line: &str) -> Option<usize> {
 /// `ActivationRestriction`(s). Used for the "Any player may activate this ability
 /// but only <phrase>" form (and composable with other timing-suffix handlers).
 /// Returns `None` for phrases without a recognized timing gate so the caller can
-/// decline rather than mis-classify.
+/// decline rather than mis-classify. Exact legacy combat-step phrases lower to
+/// the structured `DuringPhase`/`BeforePhase` variants so runtime enforcement
+/// does not widen them to the neighboring combat windows.
 /// The single-gate `during`-role / speed sub-combinator, factored out so it can
 /// be the first half of a compound "X and only Y" / "X, Y" activation-timing
 /// gate. Every arm emits an EXISTING `ActivationRestriction` variant — the
@@ -8466,17 +8468,47 @@ fn parse_activation_during_role_gate(i: &str) -> OracleResult<'_, ActivationRest
             tag::<_, _, OracleError<'_>>("as a sorcery"),
         ),
         value(ActivationRestriction::AsInstant, tag("as an instant")),
+        parse_activation_during_step_gate,
         parse_activation_during_gate,
     ))
     .parse(i)
 }
 
+/// CR 508.1 + CR 509.1 + CR 511.1: preserve the exact step named by the
+/// pre-modern activation wording. These are deliberately not lowered to the
+/// broader combat gates: an ability restricted to the declare blockers step
+/// must not be activatable in beginning of combat or during combat damage.
+fn parse_activation_during_step_gate(
+    i: &str,
+) -> OracleResult<'_, ActivationRestriction> {
+    value(
+        ActivationRestriction::DuringPhase {
+            phase: Phase::DeclareAttackers,
+        },
+        tag::<_, _, OracleError<'_>>("during the declare attackers step"),
+    )
+    .or(value(
+        ActivationRestriction::DuringPhase {
+            phase: Phase::DeclareBlockers,
+        },
+        tag("during the declare blockers step"),
+    ))
+    .or(value(
+        ActivationRestriction::DuringPhase {
+            phase: Phase::EndCombat,
+        },
+        tag("during the end of combat step"),
+    ))
+    .parse(i)
+}
+
 /// CR 508.1 + CR 509.1 + CR 510: the combat-window half of an activation-timing
-/// gate. Each phrasing maps to an EXISTING enforced variant, so no new variant is
-/// introduced:
+/// gate. Each phrasing maps to a structured, runtime-enforced variant:
 /// - "before the combat damage step" / "before combat damage [has been dealt]"
 ///   → `BeforeCombatDamage` (CR 510; enforced = `BeginCombat | DeclareAttackers
 ///   | DeclareBlockers`) — Angus Mackenzie, Save Point.
+/// - "before blockers are declared" → `BeforeBlockersDeclared` (CR 509.1;
+///   enforced = `BeginCombat | DeclareAttackers`) — Acidic Dagger.
 /// - "before attackers are declared" / "before combat" → `BeforeAttackersDeclared`
 ///   (CR 508.1; enforced = `PreCombatMain | BeginCombat`) — Arcum's Whistle.
 ///
@@ -8487,12 +8519,22 @@ fn parse_activation_during_role_gate(i: &str) -> OracleResult<'_, ActivationRest
 fn parse_activation_before_window_gate(i: &str) -> OracleResult<'_, ActivationRestriction> {
     alt((
         value(
+            ActivationRestriction::BeforePhase {
+                phase: Phase::EndCombat,
+            },
+            tag("before the end of combat step"),
+        ),
+        value(
             ActivationRestriction::BeforeCombatDamage,
             alt((
                 tag("before combat damage has been dealt"),
                 tag("before the combat damage step"),
                 tag("before combat damage"),
             )),
+        ),
+        value(
+            ActivationRestriction::BeforeBlockersDeclared,
+            tag("before blockers are declared"),
         ),
         value(
             ActivationRestriction::BeforeAttackersDeclared,
@@ -8529,6 +8571,19 @@ fn parse_activation_before_end_step_gate(i: &str) -> OracleResult<'_, Activation
 fn parse_activation_timing_restriction(phrase: &str) -> Option<Vec<ActivationRestriction>> {
     let phrase = phrase.trim().trim_end_matches('.').trim();
     let lower = phrase.to_lowercase();
+    // CR 504.1 + CR 602.5b: older Oracle uses "during your/their draw
+    // step" for the activating player's own draw step. Keep the player-role
+    // gate separate from the exact phase gate so shared-team turns do not
+    // widen this to a teammate's draw step.
+    if matches!(lower.as_str(), "during your draw step" | "during their draw step") {
+        return Some(vec![
+            ActivationRestriction::DuringYourTurn,
+            ActivationRestriction::DuringPhase { phase: Phase::Draw },
+        ]);
+    }
+    if lower == "during the draw step" {
+        return Some(vec![ActivationRestriction::DuringPhase { phase: Phase::Draw }]);
+    }
     // CR 602.5b + CR 503.1: "during any upkeep step" has no player-turn
     // axis. Reuse the existing unscoped upkeep condition instead of inventing
     // an activation-only enum variant; this is the same predicate that already
@@ -8928,6 +8983,27 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
         {
             if let Some(parsed) = parse_activation_timing_restriction(restriction.original) {
                 constraints.activator_filter = Some(PlayerFilter::Opponent);
+                constraints.restrictions.extend(parsed);
+                remaining = before
+                    .original
+                    .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
+                    .to_string();
+                if remaining.trim().is_empty() {
+                    break;
+                }
+                continue;
+            }
+        }
+
+        // CR 602.5b: pre-modern Oracle also phrases an activation timing
+        // rider as "Activate this ability but only <timing>". This is the
+        // same restriction as the modern "Activate only <timing>" form; keep
+        // the wrapper separate so the timing parser remains the single
+        // authority for the actual gate.
+        if let Some((before, restriction)) =
+            tp.rsplit_around("activate this ability but only ")
+        {
+            if let Some(parsed) = parse_activation_timing_restriction(restriction.original) {
                 constraints.restrictions.extend(parsed);
                 remaining = before
                     .original

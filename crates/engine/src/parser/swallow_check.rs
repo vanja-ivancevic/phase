@@ -573,7 +573,8 @@ fn detect_activate_only_during(
     diagnostics: &mut Vec<OracleDiagnostic>,
 ) {
     let has_marker = cleaned.contains("activate only during") // allow-noncombinator: swallow detector marker scan on classified text
-        || cleaned.contains("activate this ability only during"); // allow-noncombinator: swallow detector marker scan on classified text
+        || cleaned.contains("activate this ability only during") // allow-noncombinator: swallow detector marker scan on classified text
+        || cleaned.contains("activate this ability but only during"); // allow-noncombinator: swallow detector marker scan on classified text
     if !has_marker {
         return;
     }
@@ -2207,6 +2208,9 @@ fn restriction_is_activation_limit(restriction: &ActivationRestriction) -> bool 
         | ActivationRestriction::DuringYourTurn
         | ActivationRestriction::DuringYourUpkeep
         | ActivationRestriction::DuringCombat
+        | ActivationRestriction::DuringPhase { .. }
+        | ActivationRestriction::BeforePhase { .. }
+        | ActivationRestriction::BeforeBlockersDeclared
         | ActivationRestriction::BeforeAttackersDeclared
         | ActivationRestriction::BeforeCombatDamage
         | ActivationRestriction::AfterBlockersDeclared

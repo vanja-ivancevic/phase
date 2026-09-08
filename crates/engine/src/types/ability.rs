@@ -21760,6 +21760,25 @@ pub enum ActivationRestriction {
     DuringYourTurn,
     DuringYourUpkeep,
     DuringCombat,
+    /// CR 508.1: the ability can be activated only during the declare
+    /// attackers step. Kept distinct from `BeforeAttackersDeclared`: the
+    /// latter ends as soon as attackers are declared, while this window starts
+    /// when that step begins.
+    DuringPhase {
+        phase: Phase,
+    },
+    /// CR 511.1: the ability can be activated before the named phase/step
+    /// begins. This is currently used for the pre-modern wording "before the
+    /// end of combat step", whose window is not equivalent to either
+    /// `BeforeCombatDamage` or `AfterBlockersDeclared`.
+    BeforePhase {
+        phase: Phase,
+    },
+    /// CR 509.1: the ability can be activated only before the declare
+    /// blockers step begins. Unlike `BeforePhase`, this is the combat window
+    /// used by the old wording "before blockers are declared" and therefore
+    /// excludes pre-combat phases.
+    BeforeBlockersDeclared,
     BeforeAttackersDeclared,
     BeforeCombatDamage,
     /// CR 509.1 + CR 510.1 + CR 511.1: the ability can be activated after
