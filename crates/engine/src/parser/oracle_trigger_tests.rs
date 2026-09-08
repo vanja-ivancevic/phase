@@ -3662,6 +3662,16 @@ fn trigger_combat_damage_to_player() {
     assert_eq!(def.valid_target, Some(TargetFilter::Player));
 }
 
+/// CR 701.19: passive past-participle wording is equivalent to the active
+/// "regenerates" event and binds "it's" to the delayed trigger's source.
+#[test]
+fn passive_regenerated_trigger_binds_its_source() {
+    let mut ctx = ParseContext::default();
+    let (mode, def) = parse_trigger_condition("it's regenerated", &mut ctx);
+    assert_eq!(mode, TriggerMode::Regenerated);
+    assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+}
+
 #[test]
 fn that_creature_subject_resolves_to_parent_target() {
     let mut ctx = ParseContext::default();

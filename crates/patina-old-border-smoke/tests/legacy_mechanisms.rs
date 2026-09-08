@@ -6,7 +6,7 @@
 
 use engine::ai_support::legal_actions;
 use engine::game::casting::can_activate_ability_now;
-use engine::game::scenario::{GameScenario, P0};
+use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
     AbilityCondition, AbilityDefinition, AbilityKind, AbilityTag, Effect, FilterProp,
@@ -29,6 +29,8 @@ const QUICKSILVER_DRAGON_ORACLE: &str = concat!(
 );
 const MATOPI_GOLEM_ORACLE: &str =
     "{1}: Regenerate Matopi Golem. When it regenerates this way, put a -1/-1 counter on it.";
+const DEBT_OF_LOYALTY_ORACLE: &str =
+    "{1}: Regenerate target creature. You gain control of that creature if it regenerates this way.";
 
 fn cycling_index(state: &engine::types::game_state::GameState, card: ObjectId) -> usize {
     state.objects[&card]
@@ -199,4 +201,57 @@ fn matopi_golem_regeneration_rider_survives_and_puts_counter() {
         "the rider must resolve after the shield is consumed"
     );
     assert!(matopi_state.tapped, "regeneration must tap the creature");
+}
+
+/// CR 701.19 + CR 603.7b: Debt of Loyalty's rider changes control only after
+/// the target's regeneration shield is actually used, and retains the original
+/// target across the delayed-trigger boundary.
+#[test]
+fn debt_of_loyalty_regeneration_rider_gains_control_after_shield_use() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(ManaType::Colorless, ObjectId(9_903), false, vec![])],
+    );
+    let debt = scenario
+        .add_creature_from_oracle(
+            P0,
+            "Debt Probe",
+            2,
+            2,
+            DEBT_OF_LOYALTY_ORACLE,
+        )
+        .id();
+    let victim = scenario.add_creature(P1, "Target Creature", 3, 3).id();
+    let destroyer = scenario
+        .add_creature(P0, "Test Destroyer", 1, 1)
+        .with_ability_definition(AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Destroy {
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                cant_regenerate: false,
+            },
+        ))
+        .id();
+
+    let mut runner = scenario.build();
+    runner.activate(debt, 0).target_object(victim).resolve();
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "Debt Probe must install its delayed control rider"
+    );
+
+    let outcome = runner
+        .activate(destroyer, 0)
+        .target_object(victim)
+        .resolve();
+    outcome.assert_zone(&[victim], Zone::Battlefield);
+    assert_eq!(
+        outcome.state().objects[&victim].controller,
+        P0,
+        "the delayed rider must gain control after regeneration"
+    );
+    assert!(outcome.state().objects[&victim].tapped);
 }

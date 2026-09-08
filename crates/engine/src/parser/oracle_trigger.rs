@@ -9522,6 +9522,9 @@ fn parse_event_verb_start(input: &str) -> OracleResult<'_, ()> {
         parse_event_word("exploits"),
         parse_event_word("mutates"),
         parse_event_word("regenerates"),
+        parse_event_phrase("is regenerated"),
+        parse_event_phrase("are regenerated"),
+        parse_event_word("regenerated"),
         parse_event_word("transforms"),
         parse_event_phrase("becomes the target of a spell or ability"),
         parse_event_phrase("become the target of a spell or ability"),
@@ -10951,7 +10954,27 @@ fn parse_single_subject<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetFil
         // CR 701.19 + CR 603.12: reflexive regeneration riders use
         // "when it regenerates this way". The pronoun names the ability source,
         // just as "it enters this way" does for escape riders.
-        if tag::<_, _, OracleError<'_>>("regenerates").parse(rest).is_ok() {
+        if tag::<_, _, OracleError<'_>>("regenerates")
+            .parse(rest)
+            .is_ok()
+        {
+            return (TargetFilter::SelfRef, rest);
+        }
+    }
+    // CR 701.19 + CR 603.12: passive past-participle wording in delayed
+    // regeneration riders ("when it's regenerated"). Keep the contraction and
+    // expanded form explicit; a bare "it" remains intentionally unbound for
+    // unrelated event verbs.
+    if let Ok((rest, ())) = value(
+        (),
+        alt((tag::<_, _, OracleError<'_>>("it's "), tag("it is "))),
+    )
+    .parse(text)
+    {
+        if tag::<_, _, OracleError<'_>>("regenerated")
+            .parse(rest)
+            .is_ok()
+        {
             return (TargetFilter::SelfRef, rest);
         }
     }
@@ -13151,6 +13174,9 @@ fn try_parse_event(
             ),
             // CR 701.19: a regeneration trigger fires when a shield is used.
             value(SimpleEvent::Regenerates, tag("regenerates")),
+            value(SimpleEvent::Regenerates, tag("is regenerated")),
+            value(SimpleEvent::Regenerates, tag("are regenerated")),
+            value(SimpleEvent::Regenerates, tag("regenerated")),
             // CR 702.26c: "phases in" / "phase in" — phasing trigger.
             value(SimpleEvent::PhasesIn, tag("phases in")),
             value(SimpleEvent::PhasesIn, tag("phase in")),

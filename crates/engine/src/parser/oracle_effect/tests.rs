@@ -54345,6 +54345,57 @@ fn matopi_golem_regeneration_this_way_lowers_to_turn_bounded_counter() {
     assert_eq!(*target, TargetFilter::SelfRef);
 }
 
+/// CR 701.19 + CR 603.7b: Debt of Loyalty's second sentence waits for the
+/// targeted creature's regeneration shield to be used, then takes control of
+/// that same creature. It is a rider on `Regenerate`, not an immediate
+/// `GainControl` sibling and not an unbound conditional.
+#[test]
+fn debt_of_loyalty_regeneration_rider_lowers_to_delayed_gain_control() {
+    let def = parse_effect_chain(
+        "Regenerate target creature. You gain control of that creature if it regenerates this way.",
+        AbilityKind::Spell,
+    );
+
+    assert!(matches!(
+        def.effect.as_ref(),
+        Effect::Regenerate {
+            target: TargetFilter::Typed(_)
+        }
+    ));
+    let rider = def
+        .sub_ability
+        .as_deref()
+        .expect("control rider must attach to regeneration");
+    let Effect::CreateDelayedTrigger {
+        condition:
+            DelayedTriggerCondition::WhenNextEvent {
+                trigger,
+                lifetime,
+                or_trigger: None,
+            },
+        effect: inner,
+        uses_tracked_set: false,
+    } = rider.effect.as_ref()
+    else {
+        panic!(
+            "expected turn-bounded regeneration delayed trigger, got {:?}",
+            rider.effect
+        );
+    };
+    assert_eq!(*lifetime, DelayedTriggerLifetime::ThisTurn);
+    assert_eq!(
+        trigger.mode,
+        crate::types::triggers::TriggerMode::Regenerated
+    );
+    assert_eq!(trigger.valid_card, Some(TargetFilter::ParentTarget));
+    assert!(matches!(
+        inner.effect.as_ref(),
+        Effect::GainControl {
+            target: TargetFilter::ParentTarget
+        }
+    ));
+}
+
 // ── S25-B3 block-D: "when you lose control of that <permanent> this turn,
 // [if it's attached to <host>], unattach it" delayed unattach trigger ──
 

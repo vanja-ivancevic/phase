@@ -2743,6 +2743,45 @@ fn try_parse_die_exile_rider(lower: &str, kind: AbilityKind) -> Option<AbilityDe
     ))
 }
 
+/// CR 701.19 + CR 603.7b: Parse the Debt of Loyalty-style follow-up
+/// "you gain control of that creature if it regenerates this way".
+///
+/// The regeneration shield is created immediately by the preceding
+/// `Effect::Regenerate`, but the control change happens only if a later
+/// destruction actually consumes that shield. A turn-bounded one-shot delayed
+/// trigger therefore preserves both the event timing and the parent target.
+fn try_parse_regeneration_this_way_rider(
+    lower: &str,
+    kind: AbilityKind,
+) -> Option<AbilityDefinition> {
+    let lower = lower.trim_end_matches('.').trim();
+    if lower != "you gain control of that creature if it regenerates this way" {
+        return None;
+    }
+
+    let trigger = TriggerDefinition::new(TriggerMode::Regenerated)
+        .valid_card(TargetFilter::ParentTarget);
+    let inner = AbilityDefinition::new(
+        kind,
+        Effect::GainControl {
+            target: TargetFilter::ParentTarget,
+        },
+    );
+
+    Some(AbilityDefinition::new(
+        kind,
+        Effect::CreateDelayedTrigger {
+            condition: DelayedTriggerCondition::WhenNextEvent {
+                trigger: Box::new(trigger),
+                or_trigger: None,
+                lifetime: DelayedTriggerLifetime::ThisTurn,
+            },
+            effect: Box::new(inner),
+            uses_tracked_set: false,
+        },
+    ))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LeaveBattlefieldRiderSubject {
     Singular,
@@ -33550,6 +33589,37 @@ pub(crate) fn parse_effect_chain_ir(
         // previous def so it inherits the parent's resolved target via
         // ParentTarget at runtime.
         let rider_lower = normalized_text.to_lowercase();
+
+        // CR 701.19 + CR 603.7b: Debt of Loyalty's control rider belongs to
+        // the preceding regeneration effect. Keep this exact and
+        // predecessor-gated: the same words in an unrelated sentence must not
+        // manufacture a delayed trigger without a regeneration shield to wait
+        // for.
+        if builder
+            .clauses()
+            .iter()
+            .rev()
+            .find(|clause| !matches!(clause.disposition, ClauseDisposition::Continue { .. }))
+            .is_some_and(|clause| matches!(&clause.parsed.effect, Effect::Regenerate { .. }))
+        {
+            if let Some(rider_def) =
+                try_parse_regeneration_this_way_rider(rider_lower.trim(), kind)
+            {
+                builder
+                    .clause(
+                        normalized_text,
+                        placeholder_parsed_clause("regeneration_this_way_rider_placeholder"),
+                        chunk.boundary_after,
+                        ClauseDisposition::Absorb {
+                            rider: Box::new(rider_def),
+                            kind: AbsorbKind::RegenerationThisWay,
+                        },
+                    )
+                    .push();
+                continue;
+            }
+        }
+
         if let Some(rider_def) =
             try_parse_die_exile_rider(rider_lower.trim_end_matches('.').trim(), kind)
         {
