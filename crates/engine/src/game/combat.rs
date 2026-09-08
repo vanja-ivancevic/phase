@@ -785,7 +785,6 @@ pub fn place_blocking(state: &mut GameState, blocker_id: ObjectId, attacker_id: 
         .push(blocker_id);
     // CR 509.1a tracking: record the blocker for per-turn "blocked this turn" queries.
     state.creatures_blocked_this_turn.insert(blocker_id);
-    drop(combat);
     record_block_declaration(state, attacker_id, blocker_id);
     // CR 506.4 + CR 613.1f: a new blocking creature can satisfy Layer 6
     // `FilterProp::Blocking` grants; re-evaluate continuous effects.
@@ -826,7 +825,6 @@ pub fn mark_attacker_blocked(state: &mut GameState, oid: ObjectId) -> bool {
     // mutates nothing and is not journaled.
     let already_blocked = info.blocked;
     info.blocked = true;
-    drop(combat);
     // CR 613.1f: `FilterProp::Blocked` grants may now apply; re-evaluate layers.
     state.layers_dirty.mark_full();
     // CR 733: journal only the false-to-true transition, so the applier can
@@ -943,7 +941,6 @@ pub fn apply_resolved_combat_membership(
                 .or_default()
                 .push(object_id);
             state.creatures_blocked_this_turn.insert(object_id);
-            drop(combat);
             record_block_declaration(state, *resulting_attacker, object_id);
         }
         ResolvedCombatMembershipEdit::MarkBlocked => {
@@ -970,7 +967,6 @@ pub fn apply_resolved_combat_membership(
                 );
             }
             info.blocked = true;
-            drop(combat);
             record_attacker_blocked_without_blocker(state, object_id);
         }
         ResolvedCombatMembershipEdit::Remove {
