@@ -9803,6 +9803,23 @@ fn any_player_may_activate_but_only_records_timing_restriction() {
         restrictions
     );
 
+    // "during any upkeep step" (Armageddon Clock) has no turn-role scope;
+    // preserve the unscoped upkeep predicate while retaining any-player access.
+    let activation = activation_for(
+        "{T}: Draw a card. Any player may activate this ability but only during any upkeep step.",
+        "Test Any-Player Any-Upkeep",
+    );
+    assert_eq!(activation.activator_filter, Some(PlayerFilter::All));
+    assert!(
+        activation.activation_restrictions.contains(
+            &ActivationRestriction::RequiresCondition {
+                condition: Some(ParsedCondition::IsDuringUpkeep),
+            }
+        ),
+        "expected unscoped IsDuringUpkeep, got {:?}",
+        activation.activation_restrictions
+    );
+
     // "if <condition>" form (Lightning Storm) keeps the parsed condition gate.
     let activation = activation_for(
         "{T}: Draw a card. Any player may activate this ability but only if ~ is on the stack.",

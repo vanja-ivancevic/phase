@@ -8505,6 +8505,21 @@ fn parse_activation_before_window_gate(i: &str) -> OracleResult<'_, ActivationRe
 fn parse_activation_timing_restriction(phrase: &str) -> Option<Vec<ActivationRestriction>> {
     let phrase = phrase.trim().trim_end_matches('.').trim();
     let lower = phrase.to_lowercase();
+    // CR 602.5b + CR 503.1: "during any upkeep step" has no player-turn
+    // axis. Reuse the existing unscoped upkeep condition instead of inventing
+    // an activation-only enum variant; this is the same predicate that already
+    // enforces "any upkeep" for spell-casting restrictions.
+    if all_consuming((
+        tag::<_, _, OracleError<'_>>("during any upkeep"),
+        opt(tag(" step")),
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        return Some(vec![ActivationRestriction::RequiresCondition {
+            condition: Some(ParsedCondition::IsDuringUpkeep),
+        }]);
+    }
     // Speed / turn / upkeep gates — case-insensitive value matches. "their" is the
     // activating player's possessive, equivalent to "your" once an activator is fixed.
     let gate = parse_activation_during_role_gate(lower.as_str());
