@@ -10,9 +10,9 @@ use nom::Parser;
 use crate::types::ability::{
     AbilityCondition, AbilityDefinition, AbilityKind, AdditionalCostOrigin,
     AdditionalCostPaymentSource, ChoiceType, ControllerRef, Effect, ModalChoice,
-    ModalSelectionCondition, ModalSelectionConstraint, PlayerFilter, QuantityExpr, QuantityRef,
-    ReplacementDefinition, StaticCondition, TargetFilter, TargetSelectionMode, TriggerCondition,
-    TypedFilter,
+    ActivationManaPaymentRestriction, ModalSelectionCondition, ModalSelectionConstraint,
+    PlayerFilter, QuantityExpr, QuantityRef, ReplacementDefinition, StaticCondition, TargetFilter,
+    TargetSelectionMode, TriggerCondition, TypedFilter,
 };
 use crate::types::replacements::ReplacementEvent;
 use crate::types::triggers::TriggerMode;
@@ -1153,13 +1153,18 @@ pub(crate) fn lower_oracle_block_ir(
             modes,
             constraints,
         } => {
+            let choice = build_modal_choice(&header, &modes);
+            let mut modes = parse_modal_mode_irs(&modes, AbilityKind::Activated, ctx);
+            let activation_mana_payment_restriction =
+                take_uniform_modal_activation_mana_payment_restriction(&mut modes);
             let payload = ModalPayloadIr {
-                choice: build_modal_choice(&header, &modes),
-                modes: parse_modal_mode_irs(&modes, AbilityKind::Activated, ctx),
+                choice,
+                modes,
             };
             let mut ability = modal_marker_ir(&header, AbilityKind::Activated, payload, ctx);
             ability.shell.cost = Some(parse_oracle_cost(&cost_text));
             ability.shell.activation_restrictions = constraints.restrictions;
+            ability.shell.activation_mana_payment_restriction = activation_mana_payment_restriction;
             OracleBlockIr::Activated(ability)
         }
         OracleBlockAst::Modal { header, modes } => OracleBlockIr::Modal {
@@ -1374,7 +1379,21 @@ fn parse_modal_mode_irs(
             let mut mode_ctx = base_ctx.clone();
             mode_ctx.subject = mode_anaphor_subject(mode_ctx.subject.take());
             mode_ctx.diagnostics.clear();
-            let mut ability = parse_ability_ir_with_context(&mode.body, kind, &mut mode_ctx);
+            // CR 602.1b: old-border activated modal abilities sometimes repeat
+            // their payment rider at the end of every bullet (Atalya, Samite
+            // Master). The rider belongs to the common activation cost, not to
+            // a chosen resolving mode. Strip it before effect parsing and carry
+            // the typed value on the mode IR so the activated-modal root can
+            // consolidate it below.
+            let (mode_body, activation_mana_payment_restriction) =
+                if kind == AbilityKind::Activated {
+                    super::oracle::strip_activated_mana_payment_restriction(&mode.body)
+                } else {
+                    (mode.body.as_str(), None)
+                };
+            let mut ability = parse_ability_ir_with_context(mode_body, kind, &mut mode_ctx);
+            ability.shell.activation_mana_payment_restriction =
+                activation_mana_payment_restriction;
             guard_unsupported_mode_qualifiers_ir(&mut ability, kind, &mode_ctx);
             base_ctx.diagnostics.extend(mode_ctx.diagnostics);
             ModalModeIr {
@@ -1384,6 +1403,28 @@ fn parse_modal_mode_irs(
             }
         })
         .collect()
+}
+
+/// CR 602.1b: An activated modal ability has one payment scope shared by every
+/// selected mode. Consolidate a rider repeated on all mode bullets onto the
+/// modal root, where the activation/payment pipeline reads it.
+fn take_uniform_modal_activation_mana_payment_restriction(
+    modes: &mut [ModalModeIr],
+) -> Option<ActivationManaPaymentRestriction> {
+    let restriction = modes
+        .first()?
+        .ability
+        .shell
+        .activation_mana_payment_restriction?;
+    if !modes.iter().all(|mode| {
+        mode.ability.shell.activation_mana_payment_restriction == Some(restriction)
+    }) {
+        return None;
+    }
+    for mode in modes {
+        mode.ability.shell.activation_mana_payment_restriction = None;
+    }
+    Some(restriction)
 }
 
 fn anchor_mode_irs(

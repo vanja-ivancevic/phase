@@ -26567,6 +26567,40 @@ fn old_border_x_mana_color_riders_parse_on_spell_and_activation() {
     );
 }
 
+/// CR 602.1b: Atalya's old-border payment rider is printed at the end of each
+/// activated modal mode, but constrains the shared `{X}, {T}` activation cost.
+/// It must be consolidated on the modal root rather than left as an effect gap
+/// in both mode bodies.
+#[test]
+fn old_border_x_mana_rider_on_activated_modal_is_shared_by_all_modes() {
+    use crate::types::ability::ActivationManaPaymentRestriction;
+    use crate::types::mana::{ManaColor, XManaPaymentRestriction};
+
+    let parsed = parse_oracle_text(
+        "{X}, {T}: Choose one —\n• Prevent the next X damage that would be dealt to target creature this turn. Spend only white mana on X.\n• You gain X life. Spend only white mana on X.",
+        "Atalya, Samite Master",
+        &[],
+        &["Creature".to_string()],
+        &["Human".to_string(), "Cleric".to_string()],
+    );
+    let ability = parsed.abilities.first().expect("Atalya activated modal");
+    assert_eq!(
+        ability.activation_mana_payment_restriction,
+        Some(ActivationManaPaymentRestriction::OnlyColorsOnX(
+            XManaPaymentRestriction::One(ManaColor::White)
+        ))
+    );
+    assert_eq!(ability.mode_abilities.len(), 2);
+    assert!(
+        !super::has_unimplemented(ability)
+            && ability
+                .mode_abilities
+                .iter()
+                .all(|mode| !super::has_unimplemented(mode)),
+        "modal payment riders must not become effect gaps: {ability:#?}"
+    );
+}
+
 /// Helper: count `Effect::Unimplemented` markers carrying `key` anywhere in a
 /// parsed card, so the honesty tests below assert on the pattern-class key
 /// rather than on a Debug substring.

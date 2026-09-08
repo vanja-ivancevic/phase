@@ -7150,7 +7150,7 @@ fn parse_activated_ability_ir(
 /// This is intentionally an all-consuming nom grammar: other possessives,
 /// colors, subjects, or trailing words stay in the effect text and therefore
 /// remain an explicit residual parse gap rather than weakening a cost rule.
-fn strip_activated_mana_payment_restriction(
+pub(super) fn strip_activated_mana_payment_restriction(
     text: &str,
 ) -> (&str, Option<ActivationManaPaymentRestriction>) {
     const CHOSEN_COLOR_SUFFIX: &str =
