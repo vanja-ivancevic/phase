@@ -8,7 +8,11 @@ use engine::ai_support::legal_actions;
 use engine::game::casting::can_activate_ability_now;
 use engine::game::scenario::{GameScenario, P0};
 use engine::parser::oracle::parse_oracle_text;
-use engine::types::ability::{AbilityCondition, AbilityTag, Effect, FilterProp, TargetFilter};
+use engine::types::ability::{
+    AbilityCondition, AbilityDefinition, AbilityKind, AbilityTag, Effect, FilterProp,
+    TargetFilter, TypedFilter,
+};
+use engine::types::counter::CounterType;
 use engine::types::actions::GameAction;
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
@@ -23,6 +27,8 @@ const QUICKSILVER_DRAGON_ORACLE: &str = concat!(
     "change that spell's target to another creature.\n",
     "Morph {4}{U}"
 );
+const MATOPI_GOLEM_ORACLE: &str =
+    "{1}: Regenerate Matopi Golem. When it regenerates this way, put a -1/-1 counter on it.";
 
 fn cycling_index(state: &engine::types::game_state::GameState, card: ObjectId) -> usize {
     state.objects[&card]
@@ -145,4 +151,52 @@ fn quicksilver_dragon_parses_as_a_guarded_forced_retarget() {
         ),
         "Quicksilver Dragon ability={ability:#?}"
     );
+}
+
+/// CR 701.19 + CR 603.12: Matopi Golem's regeneration rider must watch the
+/// actual regeneration event, not the creation of the shield. This exercises
+/// the full parser → activation → destruction-replacement → delayed-trigger
+/// pipeline through the public old-border smoke harness.
+#[test]
+fn matopi_golem_regeneration_rider_survives_and_puts_counter() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.with_mana_pool(
+        P0,
+        vec![ManaUnit::new(ManaType::Colorless, ObjectId(9_902), false, vec![])],
+    );
+    let matopi = scenario
+        .add_creature_from_oracle(P0, "Matopi Golem", 3, 3, MATOPI_GOLEM_ORACLE)
+        .id();
+    let destroyer = scenario
+        .add_creature(P0, "Test Destroyer", 1, 1)
+        .with_ability_definition(AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Destroy {
+                target: TargetFilter::Typed(TypedFilter::creature()),
+                cant_regenerate: false,
+            },
+        ))
+        .id();
+
+    let mut runner = scenario.build();
+    runner.activate(matopi, 0).resolve();
+    assert_eq!(
+        runner.state().delayed_triggers.len(),
+        1,
+        "Matopi must install its one-shot turn-bounded regeneration rider"
+    );
+
+    let outcome = runner
+        .activate(destroyer, 0)
+        .target_object(matopi)
+        .resolve();
+    outcome.assert_zone(&[matopi], Zone::Battlefield);
+    let matopi_state = &outcome.state().objects[&matopi];
+    assert_eq!(
+        matopi_state.counters.get(&CounterType::Minus1Minus1),
+        Some(&1),
+        "the rider must resolve after the shield is consumed"
+    );
+    assert!(matopi_state.tapped, "regeneration must tap the creature");
 }

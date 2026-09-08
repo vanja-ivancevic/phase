@@ -266,6 +266,7 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
             push(TriggerEventKey::LeaveBattlefield(narrow));
             push(TriggerEventKey::Dies(narrow));
         }
+        TriggerMode::Regenerated => push(TriggerEventKey::Regenerated),
         TriggerMode::Taps | TriggerMode::TapAll => push(TriggerEventKey::Taps),
         TriggerMode::TapsForMana => push(TriggerEventKey::TapsForMana),
         TriggerMode::Untaps | TriggerMode::UntapAll => push(TriggerEventKey::Untaps),
@@ -673,8 +674,8 @@ pub(crate) fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         GameEvent::CrimeCommitted { .. } => push(TriggerEventKey::PlayerActionPerformed),
         GameEvent::Cycled { .. } => {}
         GameEvent::PlayerPerformedAction { .. } => push(TriggerEventKey::PlayerActionPerformed),
-        GameEvent::Regenerated { .. }
-        | GameEvent::CreatureSuspected { .. }
+        GameEvent::Regenerated { .. } => push(TriggerEventKey::Regenerated),
+        GameEvent::CreatureSuspected { .. }
         | GameEvent::CreatureNoLongerSuspected { .. }
         | GameEvent::Detained { .. }
         | GameEvent::BecamePrepared { .. }

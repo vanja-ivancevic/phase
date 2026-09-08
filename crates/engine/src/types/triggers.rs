@@ -84,6 +84,8 @@ pub enum TriggerEventKey {
     Sacrificed,
     /// CR 701.8: A permanent was destroyed.
     Destroyed,
+    /// CR 701.19: A permanent regenerated after a regeneration shield was used.
+    Regenerated,
     /// CR 611.3 (continuous-effect rules covering control-changing statics)
     /// — a permanent's controller changed via a `GainControl` effect.
     /// NOTE: Administrative control transfers on player elimination
@@ -321,6 +323,8 @@ pub enum TriggerMode {
     SacrificedOnce,
     /// CR 701.8: Triggers when a permanent is destroyed.
     Destroyed,
+    /// CR 701.19: Triggers when a permanent regenerates.
+    Regenerated,
     /// CR 701.26: Triggers when a permanent becomes tapped.
     Taps,
     /// CR 106.12a: Triggers when a permanent is tapped for mana.
@@ -712,6 +716,7 @@ impl FromStr for TriggerMode {
             "DamagePreventedOnce" => TriggerMode::DamagePreventedOnce,
             "DayTimeChanges" => TriggerMode::DayTimeChanges,
             "Destroyed" => TriggerMode::Destroyed,
+            "Regenerated" => TriggerMode::Regenerated,
             "Devoured" => TriggerMode::Devoured,
             "Discarded" => TriggerMode::Discarded,
             "DiscardedAll" => TriggerMode::DiscardedAll,

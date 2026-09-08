@@ -9521,6 +9521,7 @@ fn parse_event_verb_start(input: &str) -> OracleResult<'_, ()> {
         parse_event_phrase("explore "),
         parse_event_word("exploits"),
         parse_event_word("mutates"),
+        parse_event_word("regenerates"),
         parse_event_word("transforms"),
         parse_event_phrase("becomes the target of a spell or ability"),
         parse_event_phrase("become the target of a spell or ability"),
@@ -10945,6 +10946,12 @@ fn parse_single_subject<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetFil
     // remaining "enters this way" qualifier is consumed by the ETB rider).
     if let Ok((rest, ())) = value((), tag::<_, _, OracleError<'_>>("it ")).parse(text) {
         if tag::<_, _, OracleError<'_>>("enters").parse(rest).is_ok() {
+            return (TargetFilter::SelfRef, rest);
+        }
+        // CR 701.19 + CR 603.12: reflexive regeneration riders use
+        // "when it regenerates this way". The pronoun names the ability source,
+        // just as "it enters this way" does for escape riders.
+        if tag::<_, _, OracleError<'_>>("regenerates").parse(rest).is_ok() {
             return (TargetFilter::SelfRef, rest);
         }
     }
@@ -12878,6 +12885,7 @@ fn try_parse_event(
         BecomesMonstrous,
         BecomesRenowned,
         Mutates,
+        Regenerates,
         ExploitsCreature,
         Exploits,
         /// CR 701.44b: A permanent "explores" after the explore process completes.
@@ -13141,6 +13149,8 @@ fn try_parse_event(
                 SimpleEvent::BecomesTargetAbility,
                 tag("becomes the target of an ability"),
             ),
+            // CR 701.19: a regeneration trigger fires when a shield is used.
+            value(SimpleEvent::Regenerates, tag("regenerates")),
             // CR 702.26c: "phases in" / "phase in" — phasing trigger.
             value(SimpleEvent::PhasesIn, tag("phases in")),
             value(SimpleEvent::PhasesIn, tag("phase in")),
@@ -13354,6 +13364,10 @@ fn try_parse_event(
             }
             SimpleEvent::Mutates => {
                 def.mode = TriggerMode::Mutates;
+                def.valid_card = Some(subject.clone());
+            }
+            SimpleEvent::Regenerates => {
+                def.mode = TriggerMode::Regenerated;
                 def.valid_card = Some(subject.clone());
             }
             SimpleEvent::ExploitsCreature | SimpleEvent::Exploits => {

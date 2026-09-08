@@ -67,6 +67,7 @@ pub fn trigger_matcher(mode: TriggerMode) -> Option<TriggerMatcher> {
         TriggerMode::Discarded | TriggerMode::DiscardedAll => match_discarded,
         TriggerMode::Sacrificed | TriggerMode::SacrificedOnce => match_sacrificed,
         TriggerMode::Destroyed => match_destroyed,
+        TriggerMode::Regenerated => match_regenerated,
         TriggerMode::TokenCreated | TriggerMode::TokenCreatedOnce => match_token_created,
         TriggerMode::TurnBegin => match_turn_begin,
         TriggerMode::Phase | TriggerMode::PayEcho | TriggerMode::PayCumulativeUpkeep => match_phase,
@@ -279,6 +280,7 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
     r.insert(TriggerMode::Sacrificed, match_sacrificed);
     r.insert(TriggerMode::SacrificedOnce, match_sacrificed);
     r.insert(TriggerMode::Destroyed, match_destroyed);
+    r.insert(TriggerMode::Regenerated, match_regenerated);
     r.insert(TriggerMode::TokenCreated, match_token_created);
     r.insert(TriggerMode::TokenCreatedOnce, match_token_created);
     r.insert(TriggerMode::TurnBegin, match_turn_begin);
@@ -2679,6 +2681,23 @@ pub(super) fn match_destroyed(
     state: &GameState,
 ) -> bool {
     if let GameEvent::CreatureDestroyed { object_id, .. } = event {
+        valid_card_matches(trigger, state, *object_id, source_context)
+    } else {
+        false
+    }
+}
+
+/// CR 701.19: Regeneration triggers fire only when a regeneration shield is
+/// actually used to replace a destruction event, not when a shield is merely
+/// created. The replacement layer emits `GameEvent::Regenerated` after the
+/// creature survives and is removed from combat.
+pub(super) fn match_regenerated(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_context: &TriggerSourceContext,
+    state: &GameState,
+) -> bool {
+    if let GameEvent::Regenerated { object_id } = event {
         valid_card_matches(trigger, state, *object_id, source_context)
     } else {
         false

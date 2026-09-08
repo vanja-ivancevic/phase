@@ -54305,6 +54305,46 @@ fn rhinos_rampage_excess_damage_this_way_lowers_to_reflexive_destroy() {
     );
 }
 
+#[test]
+fn matopi_golem_regeneration_this_way_lowers_to_turn_bounded_counter() {
+    use crate::types::counter::CounterType;
+
+    let def = parse_effect_chain(
+        "When it regenerates this way, put a -1/-1 counter on it.",
+        AbilityKind::Spell,
+    );
+    let Effect::CreateDelayedTrigger {
+        condition:
+            DelayedTriggerCondition::WhenNextEvent {
+                trigger, lifetime, ..
+            },
+        effect: inner,
+        ..
+    } = &*def.effect
+    else {
+        panic!("expected CreateDelayedTrigger, got {:?}", def.effect);
+    };
+
+    assert_eq!(*lifetime, DelayedTriggerLifetime::ThisTurn);
+    assert_eq!(
+        trigger.mode,
+        crate::types::triggers::TriggerMode::Regenerated,
+        "the reflexive event must be a real Regenerated trigger"
+    );
+    assert_eq!(trigger.valid_card, Some(TargetFilter::SelfRef));
+
+    let Effect::PutCounter {
+        counter_type,
+        target,
+        ..
+    } = &*inner.effect
+    else {
+        panic!("expected inner PutCounter, got {:?}", inner.effect);
+    };
+    assert_eq!(*counter_type, CounterType::Minus1Minus1);
+    assert_eq!(*target, TargetFilter::SelfRef);
+}
+
 // ── S25-B3 block-D: "when you lose control of that <permanent> this turn,
 // [if it's attached to <host>], unattach it" delayed unattach trigger ──
 

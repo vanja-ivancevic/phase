@@ -1090,6 +1090,9 @@ fn trigger_axis(trig: &TriggerDefinition) -> Option<AxisKey> {
         TriggerMode::LeavesBattlefield => Some(AxisKey::Ltb),
         // CR 700.4: a dies/destroyed trigger consumes the Death event.
         TriggerMode::Destroyed => Some(AxisKey::Death),
+        // CR 701.19: regeneration is emitted by the replacement layer, but no
+        // resource-producer axis models that event yet.
+        TriggerMode::Regenerated => None,
         // CR 701.21: a sacrifice trigger consumes the Sac event.
         TriggerMode::Sacrificed | TriggerMode::SacrificedOnce => Some(AxisKey::Sac),
         // CR 119.3: life-gain / life-loss / pay-life triggers consume the Life axis.

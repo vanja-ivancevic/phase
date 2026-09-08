@@ -2342,8 +2342,11 @@ fn try_parse_when_next_generic_event(tp: TextPair) -> Option<ParsedEffectClause>
 /// A reflexive delayed trigger is created *and* checked during the same
 /// resolution and gets exactly one shot on that creation batch (unlike a bare
 /// CR 603.7b `WhenNextEvent`, which would linger for a later same-turn matching
-/// event). It lowers to a `WhenNextEvent` carrying the `Reflexive` lifetime;
-/// `check_delayed_triggers` discards it if unmatched on its first pass.
+/// event). It normally lowers to a `WhenNextEvent` carrying the `Reflexive`
+/// lifetime; `check_delayed_triggers` discards it if unmatched on its first
+/// pass. The CR 701.19 regeneration rider is the timing exception: its shield
+/// is consumed by a later destruction, so that delayed trigger is `ThisTurn`
+/// bounded and can survive the creating resolution.
 ///
 /// The subject-first / player-action condition grammar is shared with
 /// `parse_trigger_condition` ("you search your library" → `SearchedLibrary`); the
@@ -2393,13 +2396,23 @@ fn try_parse_reflexive_this_way_trigger(tp: TextPair) -> Option<ParsedEffectClau
 
     let inner = parse_effect_chain_with_context(after.original, AbilityKind::Spell, &mut inner_ctx);
 
+    // CR 701.19a + CR 603.7b: regeneration creates a shield now, but the
+    // `Regenerated` event is emitted only if a later destruction actually uses
+    // that shield. The shield expires at end of turn, so the one-shot delayed
+    // trigger is turn-bounded rather than the ordinary CR 603.12 reflexive that
+    // is checked and discarded at the end of this resolution's event batch.
+    let lifetime = if trigger_def.mode == crate::types::triggers::TriggerMode::Regenerated {
+        DelayedTriggerLifetime::ThisTurn
+    } else {
+        DelayedTriggerLifetime::Reflexive
+    };
+
     Some(ParsedEffectClause {
         effect: Effect::CreateDelayedTrigger {
             condition: DelayedTriggerCondition::WhenNextEvent {
                 trigger: Box::new(trigger_def),
                 or_trigger: None,
-                // CR 603.12: reflexive — one shot on the creating resolution's batch.
-                lifetime: DelayedTriggerLifetime::Reflexive,
+                lifetime,
             },
             effect: Box::new(inner),
             uses_tracked_set: false,
