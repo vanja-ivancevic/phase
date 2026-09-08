@@ -665,7 +665,7 @@ fn apply_pending_counter_post_action(
             // `TokenCreated` on the authority's own `None` verdict, which is the same predicate
             // that keeps `restrictions::record_token_created` above from writing a row. See that
             // function's doc for the wrong-trigger-fire measurement this prevents.
-            super::token::push_committed_token_entry_events_with_putter(
+            super::token::push_committed_token_entry_events(
                 state,
                 object_id,
                 name,
@@ -752,7 +752,7 @@ fn apply_pending_counter_post_action(
             // because `push_committed_token_entry_events` gates `TokenCreated` on the authority's
             // `None` verdict, so it never disagrees with the existence-guarded
             // `record_token_created` ledger write immediately above it.
-            super::token::push_committed_token_entry_events_with_putter(
+            super::token::push_committed_token_entry_events(
                 state,
                 object_id,
                 name,

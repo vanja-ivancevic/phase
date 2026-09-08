@@ -198,7 +198,7 @@ fn create_gift_token(
     // zone-change index instead of the `0` placeholder. The authority performs the CR 608.2i
     // battlefield-entry bookkeeping itself, so the co-located `record_battlefield_entry` call is
     // deleted — keeping it would double-count `battlefield_entries_this_turn`.
-    super::token::push_committed_token_entry_events_with_putter(
+    super::token::push_committed_token_entry_events(
         state,
         obj_id,
         name.to_string(),

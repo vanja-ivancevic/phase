@@ -1068,7 +1068,7 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
         // event is emitted for token-specific consumers (animation, logging,
         // `LastCreated` target filters). Single authority for both, and for the
         // CR 400.7 zone-change index the batched replay guard keys on.
-        push_committed_token_entry_events_with_putter(
+        push_committed_token_entry_events(
             state,
             obj_id,
             spec.characteristics.display_name.clone(),
@@ -2024,7 +2024,7 @@ pub(crate) fn finalize_committed_liminal_token_entry_from_action(
     // state at the moment of the move" from a pre-copy 0/0 Shapeshifter.
     match entry_events {
         TokenEntryEventEmission::Emit => {
-            push_committed_token_entry_events_with_putter(
+            push_committed_token_entry_events(
                 state,
                 object_id,
                 name,
@@ -2179,7 +2179,7 @@ pub(crate) fn finalize_committed_liminal_token_entry_from_action(
 /// CR 110.2a + CR 305.1: emit a token's battlefield entry and retain the
 /// effect actor on the event-time zone-change record. Callers that cannot prove
 /// the actor pass `None`, which fails the active-voice trigger match closed.
-pub(crate) fn push_committed_token_entry_events_with_putter(
+pub(crate) fn push_committed_token_entry_events(
     state: &mut GameState,
     object_id: ObjectId,
     name: String,
@@ -2358,7 +2358,7 @@ pub(crate) fn flush_pending_token_battlefield_entry(
     else {
         return false;
     };
-    push_committed_token_entry_events_with_putter(
+    push_committed_token_entry_events(
         state,
         pending.object_id,
         pending.name,
