@@ -5,7 +5,7 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::{multispace0, one_of};
 use nom::combinator::{all_consuming, opt, value};
-use nom::sequence::terminated;
+use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use super::oracle_nom::condition as nom_condition;
@@ -60,6 +60,17 @@ fn scan_source_zone_filter(text: &str) -> Option<Zone> {
 /// `RequiresCondition { condition: None }`.
 pub fn parse_restriction_condition(text: &str) -> Option<ParsedCondition> {
     let lower = text.trim().trim_end_matches('.').to_lowercase();
+    // CR 301.5 + CR 303.4 + CR 602.5b: an activation restriction may inspect
+    // the permanent an Aura or Equipment is attached to (Nature's Chosen:
+    // "Activate only if enchanted creature is white and untapped"). The
+    // attached-subject grammar already produces the exact relationship-aware
+    // filter; a restriction has no recipient slot, so lower its host predicate
+    // to an ObjectCount against that source-relative filter. This is exact:
+    // `EnchantedBy`/`EquippedBy` matches only the source's host, and the
+    // `GE 1` presence test is false when the source is unattached.
+    if let Some(condition) = parse_attached_subject_restriction(&lower) {
+        return Some(condition);
+    }
     // Preserve the restriction-only source-power vocabulary for the named
     // self form. The shared grammar also accepts `~'s power`, which is the
     // correct normalized shape for state triggers, but activation restrictions
@@ -79,6 +90,50 @@ pub fn parse_restriction_condition(text: &str) -> Option<ParsedCondition> {
         SharedRestrictionParse::Unsupported => None,
         SharedRestrictionParse::NoMatch => parse_restriction_only_condition(&lower),
     }
+}
+
+/// CR 301.5 + CR 303.4 + CR 602.5b: Convert an attached-subject
+/// characteristic restriction into the restriction vocabulary. The shared
+/// static grammar represents the same phrase as `RecipientMatchesFilter`, but
+/// activation evaluation has no recipient parameter; the attachment property
+/// in the filter is the stable source-relative binding we can count instead.
+///
+/// The optional bare tap-state suffix is part of the same attached host
+/// predicate ("white and untapped"), so it is appended to the filter before
+/// lowering. The parser is deliberately limited to the attached-subject
+/// grammar and full consumption; an unrelated or partially recognized phrase
+/// remains an honest gap.
+fn parse_attached_subject_restriction(text: &str) -> Option<ParsedCondition> {
+    let (rest, filter) = nom_condition::parse_attached_subject_is_filter(text).ok()?;
+    let (rest, state_prop) = opt(preceded(
+        tag::<_, _, OracleError<'_>>(" and "),
+        alt((
+            value(FilterProp::Untapped, tag("untapped")),
+            value(FilterProp::Tapped, tag("tapped")),
+        )),
+    ))
+    .parse(rest)
+    .ok()?;
+    if !rest.is_empty() {
+        return None;
+    }
+
+    let TargetFilter::Typed(mut typed) = filter else {
+        return None;
+    };
+    if let Some(property) = state_prop {
+        typed.properties.push(property);
+    }
+
+    Some(ParsedCondition::QuantityComparison {
+        lhs: QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(typed),
+            },
+        },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
+    })
 }
 
 /// Tri-state outcome of running the shared grammar over a restriction phrase.
@@ -941,6 +996,49 @@ mod tests {
             ),
             other => panic!("expected QuantityComparison(ObjectCount >= 1), got {other:?}"),
         }
+    }
+
+    /// CR 301.5 + CR 303.4 + CR 602.5b: Nature's Chosen's activation gate
+    /// names the Aura's enchanted creature and elides the subject on the
+    /// second predicate. The restriction must retain both the attachment
+    /// binding and the live color/tap properties rather than dropping the
+    /// entire `activate only if` clause.
+    #[test]
+    fn attached_subject_activation_gate_preserves_host_filter_and_state() {
+        let condition = parse_restriction_condition(
+            "enchanted creature is white and untapped",
+        )
+        .expect("attached host activation condition should parse");
+
+        let ParsedCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(filter),
+                    },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        } = condition
+        else {
+            panic!("expected an attached-host presence condition, got {condition:?}");
+        };
+
+        assert!(filter.type_filters.contains(&TypeFilter::Creature));
+        assert!(filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::EnchantedBy
+        )));
+        assert!(filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::HasColor {
+                color: ManaColor::White
+            }
+        )));
+        assert!(filter
+            .properties
+            .iter()
+            .any(|property| matches!(property, FilterProp::Untapped)));
     }
 
     /// CR 205.4a: a supertype adjective decomposes into `HasSupertype` + the core type,

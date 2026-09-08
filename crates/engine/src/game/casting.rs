@@ -1114,6 +1114,7 @@ pub(crate) fn is_blocked_by_cant_play_lands(
                         // not a deferred triggered-source read.
                         trigger_source: None,
                         recipient_id: None,
+                        event_target_id: None,
                         scoped_iteration_player: None,
                     },
                 ),
@@ -18291,6 +18292,7 @@ fn apply_mana_spell_grants(
                 // operation, not a delayed triggered source.
                 trigger_source: None,
                 recipient_id: None,
+                event_target_id: None,
                 scoped_iteration_player: None,
             };
             if !crate::game::filter::matches_target_filter(state, spell_id, filter, &filter_ctx) {

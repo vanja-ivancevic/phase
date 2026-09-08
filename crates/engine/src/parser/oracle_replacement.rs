@@ -43,7 +43,7 @@ use crate::types::ability::{
     PerPlayerScope, PermissionGrantee, PlayerFilter, PreventionAmount, QuantityExpr, QuantityModification,
     QuantityRef, RedirectionLifetime, ReplacementCondition, ReplacementDefinition, ReplacementMode,
     ReplacementPaymentRecord, ReplacementPlayerScope, SourceExclusion, StaticCondition,
-    StaticDefinition, TapStateChange,
+    StaticDefinition, SharedQuality, SharedQualityRelation, TapStateChange,
     TargetFilter, TriggerDefinition, TypeFilter, TypedFilter, ZoneOwner, EXILE_COST_ANY_NUMBER,
 };
 use crate::types::ability::{CardPlayMode, CastingPermission};
@@ -7589,7 +7589,8 @@ fn parse_oneshot_next_n_damage_to_target_redirect(norm_lower: &str) -> Option<Ef
 /// redirection — the "… is dealt to `<recipient>` instead" tail of
 /// [`parse_continuous_all_damage_redirect`].
 ///
-/// Two recipient identities, and only two:
+/// Recipient identities are resolved from the shield host or ability context,
+/// rather than declared as a second target:
 /// * a CHOSEN-PERMANENT anaphor ("the chosen creature" / "the chosen permanent")
 ///   naming the permanent the SAME spell's preceding instruction already chose
 ///   (Heroic Sacrifice's "Choose target creature you control.", Gideon's
@@ -7600,6 +7601,10 @@ fn parse_oneshot_next_n_damage_to_target_redirect(norm_lower: &str) -> Option<Ef
 /// * the ATTACHMENT HOST ("enchanted creature" / "equipped creature" — Saving
 ///   Grace), delegated to `parse_attached_host_subject`, the module's single
 ///   authority for that noun phrase.
+/// * the SOURCE OBJECT ("~" — Oracle's Attendants), resolved from the shield
+///   host at damage-apply time.
+/// * THE CONTROLLER ("you" — Sivvi's Valor), resolved from the ability
+///   controller at damage-apply time.
 ///
 /// DELIBERATELY NOT HERE: "that creature" (Ascent of the Worthy). Its victim
 /// scope is the bare "creatures you control" with no player leg, which has no
@@ -7615,6 +7620,13 @@ fn parse_continuous_redirect_recipient(input: &str) -> OracleResult<'_, DamageRe
                 tag("the chosen permanent"),
             )),
         ),
+        // CR 614.9: "~" is the source object itself (Oracle's Attendants).
+        // This is resolved from the shield host at damage-apply time and does
+        // not declare a second object target.
+        value(DamageRedirectTarget::SourceObject, tag("~")),
+        // CR 602.2a: "you" is the controller of the resolving ability (Sivvi's
+        // Valor), not a player target declared by the replacement clause.
+        value(DamageRedirectTarget::Controller, tag("you")),
         value(
             DamageRedirectTarget::AttachedToSource,
             parse_attached_host_subject,
@@ -7692,14 +7704,17 @@ fn parse_continuous_source_all_damage_redirect(norm_lower: &str) -> Option<Effec
 ///
 /// ```text
 /// "all " <damage-noun> " that would be dealt " ["this turn "] <victim>
-///        " is dealt to " <recipient> " instead" ["."]  EOF
+///        ["this turn "] [" by " <source>] " is dealt to " <recipient>
+///        [" instead"] ["."]  EOF
 /// ```
 ///
 /// This is the "one-shot path" sibling of [`parse_redirection_spine`] (the
 /// printed, object-hosted static). The two are distinguished by *who creates the
 /// effect*, which the grammar shows in two places: this one always leads with
 /// "all " and its recipient is a chosen-permanent anaphor or an attachment host
-/// with a stated duration, never the printed static's "~".
+/// with a stated duration. Targeted original recipients, source-scoped damage,
+/// and the printed static's "~" recipient are also supported here when the
+/// complete effect-created grammar makes their ownership unambiguous.
 ///
 /// CR 611.2a is what makes the resulting shield `RedirectionLifetime::Continuous`
 /// rather than a CR 614.5 one-opportunity shield: "all damage that would be dealt
@@ -7724,9 +7739,9 @@ fn parse_continuous_source_all_damage_redirect(norm_lower: &str) -> Option<Effec
 ///   emitting a recipient-less shield would be a CR 615 prevention that DELETES
 ///   the damage (CR 615.1a: prevention effects "use the word 'prevent'", and this
 ///   grammar never says it);
-/// * a "by `<source>`" scope clause, a trailing sentence, or any other residue
-///   breaks the required `tag(" is dealt to ")` / end-of-input anchor. No corpus
-///   card in this class carries one, so no speculative slot is parsed for it.
+/// * a "by `<source>`" scope clause is parsed only when its source subject is
+///   understood; an unrecognized clause, a trailing sentence, or any other
+///   residue breaks the required end-of-input anchor.
 fn parse_continuous_all_damage_redirect(norm_lower: &str) -> Option<Effect> {
     let (rest, _) = tag::<_, _, OracleError<'_>>("all ")
         .parse(norm_lower)
@@ -7741,12 +7756,51 @@ fn parse_continuous_all_damage_redirect(norm_lower: &str) -> Option<Effect> {
     let (rest, _) = opt(tag::<_, _, OracleError<'_>>("this turn "))
         .parse(rest)
         .ok()?;
-    let (rest, victim) = parse_damage_target_phrase(rest).ok()?;
+    // CR 115.1: "to target creature" names the ORIGINAL damage recipient,
+    // not a broad creature scope. It must consume the first declared object
+    // target so the resolver can host the shield on that creature. Oracle's
+    // Attendants and Sivvi's Valor use this form; the older scope parser must
+    // remain responsible for phrases such as "to you" and "to a creature".
+    let (rest, target_filter, recipient_object_filter) =
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("to target creature").parse(rest) {
+            (
+                rest,
+                None,
+                Some(TargetFilter::Typed(
+                    TypedFilter::default().with_type(TypeFilter::Creature),
+                )),
+            )
+        } else {
+            let (rest, victim) = parse_damage_target_phrase(rest).ok()?;
+            (rest, Some(victim), None)
+        };
+    // The inline duration/source order is Oracle's Attendants' wording:
+    // "to target creature this turn by a source of your choice". The duration
+    // before the victim remains supported for Gideon's Sacrifice/Saving Grace.
+    let (rest, _) = opt(preceded(
+        multispace0,
+        tag::<_, _, OracleError<'_>>("this turn"),
+    ))
+    .parse(rest)
+    .ok()?;
+    let (rest, source_filter) = opt(preceded(
+        multispace0,
+        parse_continuous_damage_source_slot,
+    ))
+        .parse(rest)
+        .ok()?;
     let (rest, _) = tag::<_, _, OracleError<'_>>(" is dealt to ")
         .parse(rest)
         .ok()?;
     let (rest, redirect_to) = parse_continuous_redirect_recipient(rest).ok()?;
-    let (rest, _) = tag::<_, _, OracleError<'_>>(" instead").parse(rest).ok()?;
+    // `oracle::strip_instead_clause` removes a trailing `instead` from a
+    // single-sentence spell ability before this effect parser runs. Keep the
+    // suffix optional here so the parser accepts both the raw Oracle clause and
+    // the normalized effect body, while the anchored "is dealt to" spine still
+    // prevents a partial or unrelated line from being claimed.
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(" instead"))
+        .parse(rest)
+        .ok()?;
     // `strip_reminder_text` can leave " ." where the "(if it's still on the
     // battlefield)" parenthetical stood, so the final period may be detached.
     let (rest, _) = opt(preceded(multispace0, char::<_, OracleError<'_>>('.')))
@@ -7757,18 +7811,19 @@ fn parse_continuous_all_damage_redirect(norm_lower: &str) -> Option<Effect> {
     }
 
     Some(Effect::CreateDamageReplacement {
-        source_filter: None,
+        source_filter,
         combat_scope,
-        target_filter: Some(victim),
+        target_filter,
         modification: None,
         redirect_to: Some(redirect_to),
         // `None` → `PreventionAmount::All`: the whole event moves, every time.
         redirect_amount: None,
-        // CR 115.1: no NEW target slot. A chosen-permanent recipient reuses the
-        // slot the parent "Choose …" instruction already declared; an attachment
-        // host is read from the shield host's live `attached_to`.
+        // CR 115.1: a targeted original recipient consumes the first object
+        // slot and hosts the shield there. Chosen-permanent recipients reuse the
+        // slot the parent "Choose …" instruction already declared; attachment
+        // hosts are read from the shield host's live `attached_to`.
         redirect_object_filter: None,
-        recipient_object_filter: None,
+        recipient_object_filter,
         redirect_lifetime: RedirectionLifetime::Continuous,
     })
 }
@@ -7979,6 +8034,27 @@ pub(crate) fn parse_choose_damage_source_candidate(input: &str) -> Option<Target
 fn finish_damage_source_subject(subject: &str) -> Option<TargetFilter> {
     let subject = subject.trim();
 
+    // CR 120.1 + CR 105.2: Well-Laid Plans' "another creature if they share
+    // a color" relates the damage source to the damage recipient, not to the
+    // replacement's enchantment source. Lower the relationship into the same
+    // typed filter vocabulary used by Radiance and other shared-quality
+    // effects; replacement matching supplies the event recipient explicitly.
+    if let Some(creature_subject) = subject.strip_suffix(" if they share a color") {
+        let base = parse_damage_source_subject_filter(creature_subject.trim())?;
+        let TargetFilter::Typed(mut typed) = base else {
+            return None;
+        };
+        typed.properties.push(FilterProp::DistinctFrom {
+            reference: Box::new(TargetFilter::EventTarget),
+        });
+        typed.properties.push(FilterProp::SharesQuality {
+            quality: SharedQuality::Color,
+            reference: Some(Box::new(TargetFilter::EventTarget)),
+            relation: SharedQualityRelation::Shares,
+        });
+        return Some(TargetFilter::Typed(typed));
+    }
+
     // Handle ability word prefixes ("Revolt — ..., if a source you control")
     // by finding the last "if " clause, which contains the actual replacement condition.
     // Use split_once_on to extract the last "if " clause (for ability word prefixes).
@@ -8070,11 +8146,11 @@ fn parse_damage_source_filter_active(norm_lower: &str) -> Option<TargetFilter> {
 /// Parse the damage source filter from passive-voice phrasing — "...would be
 /// dealt ... by <subject>" (Candletrap, Defang) — where the source subject
 /// trails the verb, unlike the active-voice "<subject> would deal ...".
-/// Anchored at "dealt by " (mirrors the existing recipient-side "dealt to "
-/// scan in `parse_damage_recipient_after_prefix`), isolating the subject
-/// clause at the shared clause-boundary terminator before handing it to
-/// `finish_damage_source_subject` — the same postprocessing authority the
-/// active-voice extraction uses.
+/// Anchored at either "dealt by " or the source-side "by " that follows an
+/// intervening recipient ("dealt to a creature by another creature"),
+/// isolating the subject clause at the shared clause-boundary terminator before
+/// handing it to `finish_damage_source_subject` — the same postprocessing
+/// authority the active-voice extraction uses.
 fn parse_damage_source_filter_passive(norm_lower: &str) -> Option<TargetFilter> {
     // Bail out entirely when the text carries a "doesn't affect .../does not
     // affect ..." exception clause (Undergrowth: "Prevent all combat damage
@@ -8096,10 +8172,13 @@ fn parse_damage_source_filter_passive(norm_lower: &str) -> Option<TargetFilter> 
         return None;
     }
     let subject = nom_primitives::scan_at_word_boundaries(norm_lower, |input| {
-        preceded(
-            tag::<_, _, OracleError<'_>>("dealt by "),
-            take_damage_source_subject_clause,
-        )
+        alt((
+            preceded(
+                tag::<_, _, OracleError<'_>>("dealt by "),
+                take_damage_source_subject_clause,
+            ),
+            preceded(tag("by "), take_damage_source_subject_clause),
+        ))
         .parse(input)
     })?;
     finish_damage_source_subject(subject)
@@ -10786,6 +10865,28 @@ fn parse_damage_redirection_source_slot(input: &str) -> OracleResult<'_, TargetF
         map_opt(
             terminated(take_until(" is dealt to"), peek(tag(" is dealt to"))),
             |subject: &str| parse_damage_source_subject_filter(subject.trim()),
+        ),
+    )
+    .parse(input)
+}
+
+/// CR 609.7a: Parse the effect-created source-choice slot used by Oracle's
+/// Attendants. A source choice is meaningful here because the resolving
+/// ability can prompt for it before installing the continuous shield; the
+/// printed static redirection spine deliberately does not accept this form.
+fn parse_continuous_damage_source_slot(input: &str) -> OracleResult<'_, TargetFilter> {
+    preceded(
+        tag::<_, _, OracleError<'_>>("by "),
+        map_opt(
+            terminated(take_until(" is dealt to"), peek(tag(" is dealt to"))),
+            |subject: &str| {
+                let subject = subject.trim();
+                if subject == "a source of your choice" {
+                    Some(TargetFilter::ChosenDamageSource { filter: None })
+                } else {
+                    parse_damage_source_subject_filter(subject)
+                }
+            },
         ),
     )
     .parse(input)
@@ -16141,6 +16242,43 @@ mod tests {
         ));
         assert!(def.combat_scope.is_none()); // all damage, not just combat
         assert_eq!(def.damage_target_filter, Some(damage_target_controller()));
+    }
+
+    #[test]
+    fn replacement_well_laid_plans_relates_source_to_damage_recipient() {
+        let def = parse_replacement_line(
+            "Prevent all damage that would be dealt to a creature by another creature if they share a color.",
+            "Well-Laid Plans",
+        )
+        .expect("Well-Laid Plans replacement should parse");
+
+        assert!(matches!(
+            def.shield_kind,
+            ShieldKind::Prevention {
+                amount: PreventionAmount::All
+            }
+        ));
+        assert_eq!(def.damage_target_filter, Some(DamageTargetFilter::CreatureOnly));
+
+        let Some(TargetFilter::Typed(source_filter)) = def.damage_source_filter.as_ref() else {
+            panic!("expected typed source filter, got {:?}", def.damage_source_filter);
+        };
+        assert!(source_filter
+            .type_filters
+            .contains(&TypeFilter::Creature));
+        assert!(source_filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::DistinctFrom { reference }
+                if matches!(reference.as_ref(), TargetFilter::EventTarget)
+        )));
+        assert!(source_filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::SharesQuality {
+                quality: SharedQuality::Color,
+                reference: Some(reference),
+                relation: SharedQualityRelation::Shares,
+            } if matches!(reference.as_ref(), TargetFilter::EventTarget)
+        )));
     }
 
     #[test]
@@ -21890,6 +22028,72 @@ mod tests {
     }
 
     #[test]
+    fn targeted_continuous_redirects_preserve_target_source_and_recipient() {
+        // CR 614.9 + CR 115.1: these two old-border cards share the less common
+        // ordering "to target creature this turn". The original damage recipient
+        // is a declared object target and must host the continuous shield; it is
+        // not a broad CreatureOnly damage scope.
+        let attendants = parse_oneshot_damage_replacement(
+            "all damage that would be dealt to target creature this turn by a source of your choice is dealt to ~ instead",
+            &ParseContext::default(),
+        )
+        .expect("Oracle's Attendants' redirection must parse");
+        let Effect::CreateDamageReplacement {
+            source_filter,
+            target_filter,
+            redirect_to,
+            redirect_object_filter,
+            recipient_object_filter,
+            redirect_lifetime,
+            ..
+        } = attendants
+        else {
+            panic!("expected Oracle's Attendants damage replacement");
+        };
+        assert_eq!(
+            source_filter,
+            Some(TargetFilter::ChosenDamageSource { filter: None })
+        );
+        assert_eq!(target_filter, None);
+        assert_eq!(redirect_to, Some(DamageRedirectTarget::SourceObject));
+        assert_eq!(redirect_object_filter, None);
+        assert_eq!(
+            recipient_object_filter,
+            Some(TargetFilter::Typed(
+                TypedFilter::default().with_type(TypeFilter::Creature),
+            ))
+        );
+        assert_eq!(redirect_lifetime, RedirectionLifetime::Continuous);
+
+        let valor = parse_oneshot_damage_replacement(
+            "all damage that would be dealt to target creature this turn is dealt to you instead",
+            &ParseContext::default(),
+        )
+        .expect("Sivvi's Valor's redirection must parse");
+        let Effect::CreateDamageReplacement {
+            source_filter,
+            target_filter,
+            redirect_to,
+            recipient_object_filter,
+            redirect_lifetime,
+            ..
+        } = valor
+        else {
+            panic!("expected Sivvi's Valor damage replacement");
+        };
+        assert_eq!(source_filter, None);
+        assert_eq!(target_filter, None);
+        assert_eq!(redirect_to, Some(DamageRedirectTarget::Controller));
+        assert_eq!(
+            recipient_object_filter,
+            Some(TargetFilter::Typed(
+                TypedFilter::default().with_type(TypeFilter::Creature),
+            ))
+        );
+        assert_eq!(redirect_lifetime, RedirectionLifetime::Continuous);
+    }
+
+    #[test]
     fn reverberation_captures_target_sorcery_as_continuous_damage_source() {
         let effect = parse_oneshot_damage_replacement(
             "all damage that would be dealt this turn by target sorcery spell is dealt to that spell's controller instead",
@@ -21964,11 +22168,12 @@ mod tests {
                 "trailing sentence",
                 "all damage that would be dealt to you is dealt to the chosen creature instead. draw a card.",
             ),
-            // A "by <source>" scope clause: no corpus card in this class has one,
-            // and silently dropping it would widen the shield to all sources.
+            // An unsupported "by <source>" scope clause: recognized source scopes
+            // are intentionally supported, but silently dropping an unrecognized
+            // clause would widen the shield to all sources.
             (
-                "unparsed by-source clause",
-                "all damage that would be dealt to you by unblocked creatures is dealt to the chosen creature instead",
+                "unsupported by-source clause",
+                "all damage that would be dealt to you by sources that are upside down is dealt to the chosen creature instead",
             ),
         ] {
             assert!(

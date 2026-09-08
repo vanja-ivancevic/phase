@@ -3322,6 +3322,28 @@ fn parse_for_each_one_life_changed(input: &str) -> OracleResult<'_, QuantityRef>
     .parse(rest)
 }
 
+/// CR 120.1 + CR 120.9 + CR 603.4: "for each 1 damage dealt to you this
+/// turn" counts the amount of damage dealt to the source controller, rather
+/// than the number of damage events. `DamageDealtThisTurn` already carries the
+/// exact historical amount and keeps the recipient bound to the ability's
+/// controller through `ControllerRef::You`.
+fn parse_for_each_one_damage_dealt_to_you(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, _) = tag("1 damage dealt to you this turn").parse(input)?;
+    Ok((
+        rest,
+        QuantityRef::DamageDealtThisTurn {
+            source: Box::new(TargetFilter::Any),
+            target: Box::new(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::You),
+            )),
+            aggregate: AggregateFunction::Sum,
+            group_by: None,
+            damage_kind: DamageKindFilter::Any,
+            channel: DamageChannel::Total,
+        },
+    ))
+}
+
 /// Parse "your life total".
 fn parse_life_total_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     value(
@@ -4844,6 +4866,7 @@ fn parse_for_each_clause_ref_with_they_controller(
         parse_for_each_card_drawn_this_way,
         parse_for_each_recipient_attack_count,
         parse_for_each_spells_before_triggering_spell,
+        parse_for_each_one_damage_dealt_to_you,
         alt((
             parse_for_each_one_life_changed,
             alt((
@@ -8369,6 +8392,34 @@ mod tests {
             }
         );
         assert_eq!(rest, "");
+    }
+
+    /// CR 120.1 + CR 120.9: Discordant Spirit's counter amount is the total
+    /// damage dealt to its controller this turn, not the number of damage
+    /// records. The dynamic quantity must therefore lower to the historical
+    /// damage aggregate used by the resolver.
+    #[test]
+    fn parse_for_each_one_damage_dealt_to_you_uses_damage_amount() {
+        use crate::parser::oracle_quantity::{parse_for_each_clause, parse_for_each_clause_expr};
+
+        let expected = QuantityRef::DamageDealtThisTurn {
+            source: Box::new(TargetFilter::Any),
+            target: Box::new(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::You),
+            )),
+            aggregate: AggregateFunction::Sum,
+            group_by: None,
+            damage_kind: DamageKindFilter::Any,
+            channel: DamageChannel::Total,
+        };
+        assert_eq!(
+            parse_for_each_clause("1 damage dealt to you this turn"),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            parse_for_each_clause_expr("1 damage dealt to you this turn"),
+            Some(QuantityExpr::Ref { qty: expected })
+        );
     }
 
     #[test]

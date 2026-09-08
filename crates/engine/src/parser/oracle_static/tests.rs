@@ -7,8 +7,8 @@ use super::*;
 use crate::types::ability::{
     ActivationRestriction, AggregateFunction, CardTypeSetSource, Comparator, CountScope,
     DamageKindFilter, Duration, Effect, FilterProp, ObjectProperty, ObjectScope, PlayerFilter,
-    PlayerRelation, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, SharedQuality,
-    SharedQualityRelation, SubtypeExclusion, TypeFilter, ZoneRef,
+    ParsedCondition, PlayerRelation, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef,
+    SharedQuality, SharedQualityRelation, SubtypeExclusion, TypeFilter, ZoneRef,
 };
 use crate::types::counter::CounterType;
 use crate::types::keywords::Keyword;
@@ -23055,6 +23055,38 @@ fn static_chosen_color_pump() {
     }
 }
 
+/// CR 105.4 + CR 508.1c: Teferi's Moat's subject has two independent quality
+/// axes — the source's chosen color and the absence of flying. The shared
+/// chosen-qualifier parser must retain both instead of silently dropping the
+/// trailing "without flying" clause.
+#[test]
+fn teferis_moat_retains_chosen_color_and_without_flying_filter() {
+    let def = parse_static_line("Creatures of the chosen color without flying can't attack you.")
+        .expect("Teferi's Moat should lower to a combat static");
+    assert_eq!(def.mode, StaticMode::CantAttack);
+    assert_eq!(
+        def.attack_defended,
+        Some(crate::types::triggers::AttackTargetFilter::Player)
+    );
+    match &def.affected {
+        Some(TargetFilter::Typed(tf)) => {
+            assert!(
+                tf.properties.contains(&FilterProp::IsChosenColor),
+                "chosen-color axis was lost: {:?}",
+                tf.properties
+            );
+            assert!(
+                tf.properties.contains(&FilterProp::WithoutKeyword {
+                    value: Keyword::Flying
+                }),
+                "without-flying axis was lost: {:?}",
+                tf.properties
+            );
+        }
+        other => panic!("expected a typed creature filter, got {other:?}"),
+    }
+}
+
 #[test]
 fn static_chosen_type_pump() {
     // "Creatures of the chosen type your opponents control get -1/-1."
@@ -35192,4 +35224,104 @@ fn top_of_graveyard_full_text_copy_is_live_layer_one_static() {
                 if matches!(*definition.effect, Effect::Discard { .. })
         )));
     }
+}
+
+/// CR 301.5 + CR 303.4 + CR 602.5b: Nature's Chosen's real Oracle-text
+/// pipeline must retain the attached-creature activation gate as a typed
+/// `RequiresCondition`, rather than swallowing "Activate only if ..." after
+/// parsing the untap effect.
+#[test]
+fn natures_chosen_retains_attached_creature_activation_gate() {
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        "Enchant creature you control\n\
+         {0}: Untap enchanted creature. Activate only during your turn and only once each turn.\n\
+         Tap enchanted creature: Untap target artifact, creature, or land. Activate only if enchanted creature is white and untapped and only once each turn.",
+        "Nature's Chosen",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+
+    assert!(
+        parsed.abilities.iter().any(|ability| {
+            ability.activation_restrictions.iter().any(|restriction| {
+                matches!(
+                    restriction,
+                    ActivationRestriction::RequiresCondition {
+                        condition: Some(ParsedCondition::QuantityComparison {
+                            lhs: QuantityExpr::Ref {
+                                qty: QuantityRef::ObjectCount { filter: TargetFilter::Typed(typed) }
+                            },
+                            comparator: crate::types::ability::Comparator::GE,
+                            rhs: QuantityExpr::Fixed { value: 1 },
+                        })
+                    } if typed.type_filters.contains(&TypeFilter::Creature)
+                        && typed.properties.contains(&FilterProp::EnchantedBy)
+                        && typed.properties.contains(&FilterProp::Untapped)
+                )
+            })
+        }),
+        "Nature's Chosen must retain a typed attached-creature activation gate, got {:?}",
+        parsed.abilities
+    );
+}
+
+/// CR 120.1 + CR 120.9: Discordant Spirit's full Oracle-text pipeline must
+/// retain the damage-total quantity inside its first triggered PutCounter
+/// effect. A parser-only quantity test is insufficient here because the
+/// static lowering path historically swallowed this exact DynamicQty clause.
+#[test]
+fn discordant_spirit_retains_damage_total_counter_quantity() {
+    use crate::types::ability::AbilityDefinition;
+
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        "At the beginning of each end step, if it's an opponent's turn, put a +1/+1 counter on this creature for each 1 damage dealt to you this turn.\n\
+         At the beginning of your end step, remove all +1/+1 counters from this creature.",
+        "Discordant Spirit",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+
+    fn collect_quantities(ability: &AbilityDefinition, out: &mut Vec<QuantityExpr>) {
+        ability
+            .effect
+            .for_each_quantity_expr(&mut |quantity| out.push(quantity.clone()));
+        if let Some(sub) = &ability.sub_ability {
+            collect_quantities(sub, out);
+        }
+        if let Some(else_ability) = &ability.else_ability {
+            collect_quantities(else_ability, out);
+        }
+    }
+
+    let mut quantities = Vec::new();
+    for ability in &parsed.abilities {
+        collect_quantities(ability, &mut quantities);
+    }
+    for trigger in &parsed.triggers {
+        if let Some(execute) = trigger.execute.as_deref() {
+            collect_quantities(execute, &mut quantities);
+        }
+    }
+
+    assert!(
+        quantities.iter().any(|quantity| {
+            matches!(
+                quantity,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::DamageDealtThisTurn {
+                        aggregate: AggregateFunction::Sum,
+                        target,
+                        ..
+                    }
+                } if matches!(
+                    target.as_ref(),
+                    TargetFilter::Typed(filter)
+                        if filter.controller == Some(ControllerRef::You)
+                )
+            )
+        }),
+        "Discordant Spirit must retain a summed damage-to-you quantity, got {quantities:?}"
+    );
 }

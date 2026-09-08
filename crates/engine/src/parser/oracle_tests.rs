@@ -4508,6 +4508,72 @@ fn dark_sphere_full_parse_preserves_half_prevention() {
     ), "unexpected Dark Sphere effect: {effect:?}");
 }
 
+#[test]
+fn targeted_continuous_damage_redirects_parse_through_full_cards() {
+    fn find_damage_replacement(def: &AbilityDefinition) -> Option<&Effect> {
+        if matches!(def.effect.as_ref(), Effect::CreateDamageReplacement { .. }) {
+            return Some(def.effect.as_ref());
+        }
+        def.sub_ability
+            .as_deref()
+            .and_then(find_damage_replacement)
+    }
+
+    let attendants = parse(
+        "{T}: All damage that would be dealt to target creature this turn by a source of your choice is dealt to this creature instead.",
+        "Oracle's Attendants",
+        &[],
+        &["Creature"],
+        &[],
+    );
+    assert!(
+        !parsed_has_unimplemented(&attendants),
+        "Oracle's Attendants must parse fully: {attendants:#?}"
+    );
+    let Some(Effect::CreateDamageReplacement {
+        source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
+        target_filter: None,
+        redirect_to: Some(DamageRedirectTarget::SourceObject),
+        recipient_object_filter: Some(TargetFilter::Typed(recipient)),
+        redirect_lifetime: RedirectionLifetime::Continuous,
+        ..
+    }) = attendants.abilities.iter().find_map(find_damage_replacement)
+    else {
+        panic!(
+            "Oracle's Attendants must preserve its chosen source, target creature, and self redirect: {:#?}",
+            attendants.abilities
+        );
+    };
+    assert_eq!(recipient.type_filters, vec![TypeFilter::Creature]);
+
+    let valor = parse(
+        "If you control a Plains, you may tap an untapped creature you control rather than pay this spell's mana cost.\nAll damage that would be dealt to target creature this turn is dealt to you instead.",
+        "Sivvi's Valor",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    assert!(
+        !parsed_has_unimplemented(&valor),
+        "Sivvi's Valor must parse fully: {valor:#?}"
+    );
+    let Some(Effect::CreateDamageReplacement {
+        source_filter: None,
+        target_filter: None,
+        redirect_to: Some(DamageRedirectTarget::Controller),
+        recipient_object_filter: Some(TargetFilter::Typed(recipient)),
+        redirect_lifetime: RedirectionLifetime::Continuous,
+        ..
+    }) = valor.abilities.iter().find_map(find_damage_replacement)
+    else {
+        panic!(
+            "Sivvi's Valor must preserve its target creature and controller redirect: {:#?}",
+            valor.abilities
+        );
+    };
+    assert_eq!(recipient.type_filters, vec![TypeFilter::Creature]);
+}
+
 /// Issue #1696 — Myrkul, Lord of Bones end-to-end: the death trigger exiles
 /// the dying creature and creates an enchantment token copy of it. Verifies
 /// the full parse pipeline produces (a) an exile effect (which publishes the
@@ -9903,6 +9969,23 @@ fn any_player_may_activate_but_only_records_timing_restriction() {
         restrictions.contains(&ActivationRestriction::DuringYourTurn),
         "expected DuringYourTurn, got {:?}",
         restrictions
+    );
+
+    // Mana Cache's compound window: "during their turn before the end step."
+    // The role and phase-boundary restrictions must both survive parsing.
+    let activation = activation_for(
+        "{T}: Draw a card. Any player may activate this ability but only during their turn before the end step.",
+        "Mana Cache",
+    );
+    assert_eq!(activation.activator_filter, Some(PlayerFilter::All));
+    assert_eq!(
+        activation.activation_restrictions,
+        vec![
+            ActivationRestriction::DuringYourTurn,
+            ActivationRestriction::BeforeEndStep,
+        ],
+        "expected both turn-role and end-step boundary gates, got {:?}",
+        activation.activation_restrictions
     );
 
     // "during their upkeep" form maps to the activator's upkeep restriction.

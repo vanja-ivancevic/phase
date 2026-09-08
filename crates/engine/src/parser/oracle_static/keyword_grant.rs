@@ -823,17 +823,34 @@ pub(crate) fn parse_chosen_qualifier_subject(tp: &TextPair<'_>) -> Option<Target
         return None;
     }
 
-    // Check controller/qualifiers after the qualifier
-    let remaining = after_chosen;
-    if nom_tag_lower(remaining, remaining, "your opponents control").is_some() {
+    // Check controller/qualifiers after the chosen qualifier. Keep the
+    // unconsumed tail: Teferi's Moat continues with "without flying" after
+    // the chosen-color and controller axes, and dropping that tail changes
+    // the affected set from the printed non-fliers to every creature of the
+    // chosen color.
+    let mut remaining = after_chosen.trim();
+    if let Some(rest) = nom_tag_lower(remaining, remaining, "your opponents control") {
         controller = Some(ControllerRef::Opponent);
-    } else if nom_tag_lower(remaining, remaining, "you control").is_some() {
+        remaining = rest.trim();
+    } else if let Some(rest) = nom_tag_lower(remaining, remaining, "you control") {
         controller = Some(ControllerRef::You);
+        remaining = rest.trim();
     }
 
     // Check for "other than" suffix (e.g., "other than this Vehicle")
     if nom_primitives::scan_contains(remaining, "other than") {
         extra_props.push(FilterProp::Another);
+    } else if let Some(without) = remaining.strip_prefix("without ") {
+        // CR 702: "without flying" is the negative keyword-quality axis. It
+        // composes with the chosen-color reference rather than becoming a
+        // second, untyped subject parser.
+        let keyword: Keyword = without.trim().parse().ok()?;
+        extra_props.push(FilterProp::WithoutKeyword { value: keyword });
+    } else if !remaining.is_empty() {
+        // Full-consumption guard: a new trailing qualifier must be modeled
+        // explicitly, or the chosen-color parser would silently widen the
+        // affected set by ignoring it.
+        return None;
     }
 
     let mut typed = TypedFilter::creature().properties(extra_props);

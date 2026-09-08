@@ -8514,6 +8514,18 @@ fn parse_activation_after_window_gate(i: &str) -> OracleResult<'_, ActivationRes
     .parse(i)
 }
 
+/// CR 512.1: the ending phase begins with the end step, so "before the end
+/// step" is a phase boundary rather than an end-step-only condition. Keep it
+/// as its own timing restriction so it composes with a separate turn-role gate
+/// (`during their turn`) without inventing a role×window enum matrix.
+fn parse_activation_before_end_step_gate(i: &str) -> OracleResult<'_, ActivationRestriction> {
+    value(
+        ActivationRestriction::BeforeEndStep,
+        tag("before the end step"),
+    )
+    .parse(i)
+}
+
 fn parse_activation_timing_restriction(phrase: &str) -> Option<Vec<ActivationRestriction>> {
     let phrase = phrase.trim().trim_end_matches('.').trim();
     let lower = phrase.to_lowercase();
@@ -8558,6 +8570,19 @@ fn parse_activation_timing_restriction(phrase: &str) -> Option<Vec<ActivationRes
                 return Some(vec![restr, window]);
             }
         }
+        // CR 512.1: Mana Cache's "during their turn before the end step" has
+        // no conjunction or comma between the two timing axes. Parse the
+        // boundary directly after the role gate and retain both restrictions.
+        if let Ok((tail, window)) = preceded(
+            tag::<_, _, OracleError<'_>>(" "),
+            parse_activation_before_end_step_gate,
+        )
+        .parse(rest)
+        {
+            if tail.trim().is_empty() {
+                return Some(vec![restr, window]);
+            }
+        }
     }
     // CR 508.1: a STANDALONE combat-window gate with no "during <role>" first
     // half — "Activate only before attackers are declared" / "before combat"
@@ -8594,6 +8619,13 @@ fn parse_activation_timing_restriction(phrase: &str) -> Option<Vec<ActivationRes
     // Oracle usually combines it with "during combat", but retaining the
     // standalone form keeps this combinator complete and safely enforceable.
     if let Ok((tail, window)) = parse_activation_after_window_gate(lower.as_str()) {
+        if tail.trim().is_empty() {
+            return Some(vec![window]);
+        }
+    }
+    // CR 512.1: retain the standalone form for future cards whose activation
+    // text names only the phase boundary.
+    if let Ok((tail, window)) = parse_activation_before_end_step_gate(lower.as_str()) {
         if tail.trim().is_empty() {
             return Some(vec![window]);
         }

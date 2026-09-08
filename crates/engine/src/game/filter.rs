@@ -1142,6 +1142,11 @@ pub struct FilterContext<'a> {
     /// type with it"). The pronoun "it" refers to the per-id recipient in
     /// `apply_continuous_effect`'s loop, not necessarily the static's source.
     pub recipient_id: Option<ObjectId>,
+    /// CR 614.1a: Object bound as the recipient of the damage event currently
+    /// being tested by a replacement filter. This is separate from
+    /// `recipient_id`, which is the layer-evaluation binding for dynamic
+    /// continuous effects.
+    pub event_target_id: Option<ObjectId>,
     /// CR 120.3: Per-player iteration binding for `DamageEachPlayer` quantity
     /// resolution. Distinct from `source_controller`, which remains the
     /// ability's controller for `ControllerRef::You` ("creatures you control").
@@ -1188,6 +1193,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             trigger_source: None,
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1206,6 +1212,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             trigger_source: None,
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1220,6 +1227,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             trigger_source: None,
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1234,6 +1242,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             trigger_source: Some(source),
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1251,6 +1260,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             trigger_source: Some(source),
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1270,6 +1280,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             trigger_source: None,
             recipient_id: Some(recipient_id),
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1284,6 +1295,7 @@ impl<'a> FilterContext<'a> {
             ability: Some(ability),
             trigger_source: ability.trigger_source.as_ref(),
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1300,6 +1312,7 @@ impl<'a> FilterContext<'a> {
             ability: Some(ability),
             trigger_source: ability.trigger_source.as_ref(),
             recipient_id: Some(recipient_id),
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1319,6 +1332,7 @@ impl<'a> FilterContext<'a> {
             ability: Some(ability),
             trigger_source: ability.trigger_source.as_ref(),
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -2013,6 +2027,7 @@ fn stack_entry_controller_matches(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
     );
     match controller {
         None => true,
@@ -2087,6 +2102,7 @@ pub fn matches_target_filter_including_phased_out(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOnly,
     )
@@ -2423,6 +2439,7 @@ pub fn matches_target_filter_in_owner_zone(
             ctx.ability,
             ctx.trigger_source,
             ctx.recipient_id,
+            ctx.event_target_id,
             ctx.scoped_iteration_player,
             ControllerLookup::LiveOnly,
         );
@@ -2440,6 +2457,7 @@ pub fn matches_target_filter_in_owner_zone(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOnly,
     )
@@ -2547,6 +2565,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.ability,
                     ctx.trigger_source,
                     ctx.recipient_id,
+                    ctx.event_target_id,
                     ctx.scoped_iteration_player,
                     ControllerLookup::LiveOrLki,
                 );
@@ -2572,6 +2591,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.ability,
                     ctx.trigger_source,
                     ctx.recipient_id,
+                    ctx.event_target_id,
                     ctx.scoped_iteration_player,
                     ControllerLookup::LiveOrLki,
                 )
@@ -2586,6 +2606,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.ability,
                     ctx.trigger_source,
                     ctx.recipient_id,
+                    ctx.event_target_id,
                     ctx.scoped_iteration_player,
                     ControllerLookup::LiveOrLki,
                 )
@@ -2605,6 +2626,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.ability,
                     ctx.trigger_source,
                     ctx.recipient_id,
+                    ctx.event_target_id,
                     ctx.scoped_iteration_player,
                     ControllerLookup::LiveOrLki,
                 )
@@ -2627,6 +2649,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                 ctx.ability,
                 ctx.trigger_source,
                 ctx.recipient_id,
+                ctx.event_target_id,
                 ctx.scoped_iteration_player,
                 ControllerLookup::LiveOrLki,
             )
@@ -2695,6 +2718,7 @@ pub fn matches_target_filter_on_counter_added_record(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOrLki,
     )
@@ -2740,6 +2764,7 @@ pub fn matches_target_filter_on_attack_declaration_record(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOrLki,
     )
@@ -2789,6 +2814,7 @@ pub fn matches_target_filter_on_damage_record_source(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOrLki,
     )
@@ -2974,6 +3000,7 @@ pub(crate) fn matches_target_filter_on_event_snapshot(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOnly,
     )
@@ -3079,6 +3106,7 @@ fn filter_inner(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOrLki,
     )
@@ -3095,6 +3123,7 @@ fn filter_inner_for_object(
     ability: Option<&ResolvedAbility>,
     trigger_source: Option<&TriggerSourceContext>,
     recipient_id: Option<ObjectId>,
+    event_target_id: Option<ObjectId>,
     scoped_iteration_player: Option<PlayerId>,
     controller_lookup: ControllerLookup,
 ) -> bool {
@@ -3247,6 +3276,7 @@ fn filter_inner_for_object(
                             ability,
                             trigger_source,
                             recipient_id,
+                            event_target_id,
                         );
                         match source_defending_player(state, &source_ctx) {
                             Some(pid) if pid == obj_ctrl => {}
@@ -3263,6 +3293,7 @@ fn filter_inner_for_object(
                             ability,
                             trigger_source,
                             recipient_id,
+                            event_target_id,
                         );
                         match source_chosen_player(&source_ctx) {
                             Some(pid) if pid == obj_ctrl => {}
@@ -3334,6 +3365,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                event_target_id,
             );
             properties
                 .iter()
@@ -3349,6 +3381,7 @@ fn filter_inner_for_object(
             ability,
             trigger_source,
             recipient_id,
+            event_target_id,
             scoped_iteration_player,
             controller_lookup,
         ),
@@ -3363,6 +3396,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                event_target_id,
                 scoped_iteration_player,
                 controller_lookup,
             )
@@ -3378,6 +3412,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                event_target_id,
                 scoped_iteration_player,
                 controller_lookup,
             )
@@ -3395,6 +3430,7 @@ fn filter_inner_for_object(
                     ability,
                     trigger_source,
                     recipient_id,
+                    event_target_id,
                     scoped_iteration_player,
                 },
             )
@@ -3472,6 +3508,7 @@ fn filter_inner_for_object(
                     ability,
                     trigger_source,
                     recipient_id,
+                    None,
                 )
                 .chosen_attributes
                 .iter()
@@ -3566,6 +3603,7 @@ fn filter_inner_for_object(
                     ability,
                     trigger_source,
                     recipient_id,
+                    event_target_id,
                     scoped_iteration_player,
                     controller_lookup,
                 )
@@ -3581,6 +3619,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                event_target_id,
             );
             let linked = if trigger_source.is_some() {
                 source_ctx.linked_exile_snapshot
@@ -3618,7 +3657,8 @@ fn filter_inner_for_object(
         // intervening-`if` never fires from an unrelated event. Resolves through
         // the same event-extraction authority as `ObjectScope::EventTarget`;
         // inert (matches nothing) outside a trigger.
-        TargetFilter::EventTarget => crate::game::quantity::triggering_event_target_object(state)
+        TargetFilter::EventTarget => event_target_id
+            .or_else(|| crate::game::quantity::triggering_event_target_object(state))
             .is_some_and(|damaged| damaged == object_id),
         // CR 400.7 + CR 603.7c: a parent object can be the member predicate of
         // a tracked-set continuation. In that one scan-based path, match the
@@ -3667,6 +3707,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                event_target_id,
             );
             chosen_name_matches(state, &source_ctx, &obj.name)
         }
@@ -3679,6 +3720,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                event_target_id,
                 scoped_iteration_player,
             };
             state
@@ -3816,6 +3858,7 @@ fn zone_change_filter_inner(
                 ability,
                 trigger_source,
                 None,
+                None,
             );
 
             if let Some(ctrl) = controller {
@@ -3930,6 +3973,7 @@ fn zone_change_filter_inner(
                 source_controller,
                 ability,
                 trigger_source,
+                None,
                 None,
             );
             chosen_name_matches(state, &source_ctx, &record.name)
@@ -5033,6 +5077,11 @@ struct SourceContext<'a> {
     /// nothing, while a non-attachment source triggers "has any" fallback semantics.
     source_is_aura: bool,
     source_is_equipment: bool,
+    /// CR 614.1a: Explicit recipient binding supplied while a damage
+    /// replacement filter is matched. This is kept distinct from the ambient
+    /// trigger event because replacement matching happens before the damage
+    /// event is emitted as a `GameEvent`.
+    event_target_id: Option<ObjectId>,
     saddled_by: Vec<ObjectId>,
     convoked_creatures: Vec<ObjectId>,
     linked_exile_snapshot: Vec<crate::types::game_state::LinkedExileSnapshot>,
@@ -5085,7 +5134,8 @@ pub(crate) fn source_defending_player_for_test(
     source_id: ObjectId,
     trigger_source: Option<&TriggerSourceContext>,
 ) -> Option<PlayerId> {
-    let context = source_context_from_filter(state, source_id, None, None, trigger_source, None);
+    let context =
+        source_context_from_filter(state, source_id, None, None, trigger_source, None, None);
     source_defending_player(state, &context)
 }
 
@@ -5161,6 +5211,7 @@ fn source_context_from_filter<'a>(
     ability: Option<&'a ResolvedAbility>,
     trigger_source: Option<&'a TriggerSourceContext>,
     recipient_id: Option<ObjectId>,
+    event_target_id: Option<ObjectId>,
 ) -> SourceContext<'a> {
     let (lki, attached_to, saddled_by, convoked_creatures, linked_exile_snapshot) =
         if let Some(source) = trigger_source {
@@ -5231,6 +5282,7 @@ fn source_context_from_filter<'a>(
         attached_to,
         source_is_aura,
         source_is_equipment,
+        event_target_id,
         saddled_by,
         convoked_creatures,
         linked_exile_snapshot,
@@ -5416,6 +5468,7 @@ fn aura_can_enchant_referenced_target(
                 ability: source.ability,
                 trigger_source: source.trigger_source,
                 recipient_id: source.recipient_id,
+                event_target_id: source.event_target_id,
                 scoped_iteration_player: None,
             };
             filter_inner(state, *target_id, enchant_filter, &ctx)
@@ -6266,7 +6319,7 @@ fn matches_filter_prop(
                         .any(|t| matches!(t, TargetRef::Object(id) if *id == object_id))
                 })
             } else {
-                crate::game::targeting::resolve_event_context_targets(state, reference, source.id)
+                event_context_target_refs(state, reference, source)
                     .into_iter()
                     .any(|t| matches!(t, TargetRef::Object(id) if id == object_id))
             };
@@ -7357,6 +7410,7 @@ fn source_context_from_spell_filter(context: SpellFilterContext<'_>) -> SourceCo
             .is_some_and(|o| o.card_types.subtypes.iter().any(|s| s == "Aura")),
         source_is_equipment: source_obj
             .is_some_and(|o| o.card_types.subtypes.iter().any(|s| s == "Equipment")),
+        event_target_id: None,
         saddled_by: source_obj.map_or_else(Vec::new, |o| o.saddled_by.clone()),
         convoked_creatures: source_obj.map_or_else(Vec::new, |o| o.convoked_creatures.clone()),
         linked_exile_snapshot: Vec::new(),
@@ -7386,8 +7440,7 @@ fn object_shares_quality_with_reference_filter(
         });
     }
 
-    let event_context_references =
-        crate::game::targeting::resolve_event_context_targets(state, reference_filter, source.id);
+    let event_context_references = event_context_target_refs(state, reference_filter, source);
     if !event_context_references.is_empty() {
         return event_context_references
             .into_iter()
@@ -7422,6 +7475,7 @@ fn object_shares_quality_with_reference_filter(
         ability: source.ability,
         trigger_source: source.trigger_source,
         recipient_id: source.recipient_id,
+        event_target_id: source.event_target_id,
         scoped_iteration_player: None,
     };
     // CR 109.2 + CR 205.3m: a bare type reference such as "a creature you
@@ -7459,6 +7513,25 @@ fn object_shares_quality_with_reference_filter(
                     }
             })
     })
+}
+
+/// CR 614.1a: Replacement matching happens before a damage event is emitted as
+/// a `GameEvent`, so the event recipient is carried explicitly by the filter
+/// source context. Other event-context filters retain the ordinary trigger
+/// resolution path.
+fn event_context_target_refs(
+    state: &GameState,
+    filter: &TargetFilter,
+    source: &SourceContext<'_>,
+) -> Vec<TargetRef> {
+    if matches!(filter, TargetFilter::EventTarget) {
+        return source
+            .event_target_id
+            .map(TargetRef::Object)
+            .into_iter()
+            .collect();
+    }
+    crate::game::targeting::resolve_event_context_targets(state, filter, source.id)
 }
 
 /// CR 205.3m: Compute the creature subtypes tied for highest
@@ -8009,7 +8082,15 @@ mod tests {
         ));
 
         let source_ctx =
-            source_context_from_filter(&state, source, Some(PlayerId(0)), Some(&child), None, None);
+            source_context_from_filter(
+                &state,
+                source,
+                Some(PlayerId(0)),
+                Some(&child),
+                None,
+                None,
+                None,
+            );
         assert!(attachment_controller_matches(
             Some(&ControllerRef::TargetOpponent),
             PlayerId(1),
@@ -13359,7 +13440,15 @@ mod tests {
 
         let state = GameState::default();
         let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                ObjectId(1),
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
 
         // Leg 1: legendary creature (Arbaaz Mir, In Garruk's Wake-style ETB).
         let legendary_record = ZoneChangeRecord {
@@ -13430,7 +13519,15 @@ mod tests {
 
         let mut state = GameState::default();
         let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                ObjectId(1),
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
 
         let lki = |tapped: bool| LKISnapshot {
             name: "Tap Probe".to_string(),
@@ -13525,7 +13622,15 @@ mod tests {
 
         let state = GameState::default();
         let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                ObjectId(1),
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
 
         // base 1/1, current 2/2 (had a +1/+1 counter when it left the battlefield).
         let record = ZoneChangeRecord {
@@ -13656,7 +13761,15 @@ mod tests {
         assert_eq!(record.toughness, Some(2));
 
         let source_ctx =
-            source_context_from_filter(&state, id, Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                id,
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
         let pt_filter = |scope| FilterProp::PtComparison {
             stat: PtStat::Power,
             scope,
@@ -13791,7 +13904,15 @@ mod tests {
     fn zone_change_record_token_property_matches_snapshot() {
         let state = GameState::default();
         let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                ObjectId(1),
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
 
         let token_record = ZoneChangeRecord {
             core_types: vec![CoreType::Creature],
@@ -13867,7 +13988,15 @@ mod tests {
 
         let state = GameState::default();
         let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                ObjectId(1),
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
         let attacking_record = ZoneChangeRecord {
             combat_status: ZoneChangeCombatStatus {
                 attacking: true,
@@ -13996,7 +14125,15 @@ mod tests {
             .push(ChosenAttribute::Player(PlayerId(1)));
 
         let source_ctx =
-            source_context_from_filter(&state, src, Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                src,
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
 
         assert!(
             attacking_defender_matches(

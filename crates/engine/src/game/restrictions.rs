@@ -1094,6 +1094,14 @@ fn activation_restriction_applies(
             state.phase,
             Phase::DeclareBlockers | Phase::CombatDamage | Phase::EndCombat
         ),
+        // CR 512.1: "before the end step" admits every phase and step before
+        // the ending phase, but not the end step itself or the cleanup step
+        // that follows it. The latter is included explicitly because a
+        // triggered ability or state-based action can create a priority window
+        // during cleanup; that is still not "before the end step."
+        ActivationRestriction::BeforeEndStep => {
+            !matches!(state.phase, Phase::End | Phase::Cleanup)
+        }
         // CR 602.5b: Per-turn activation limit tracked via ability activation counter.
         // CR 702.142b: ModifyActivationLimit statics may raise the limit for tagged abilities.
         ActivationRestriction::OnlyOnceEachTurn => {
@@ -5151,6 +5159,60 @@ mod tests {
             ],
             Phase::DeclareBlockers,
             Phase::DeclareAttackers,
+        );
+    }
+
+    #[test]
+    fn before_end_step_activation_window_is_enforced() {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            "{T}: Add {C}. Activate only during your turn before the end step.",
+            "Mana Cache",
+            &[],
+            &["Artifact".to_string()],
+            &[],
+        );
+        let restrictions = &parsed.abilities[0].activation_restrictions;
+        assert_eq!(
+            restrictions,
+            &[
+                ActivationRestriction::DuringYourTurn,
+                ActivationRestriction::BeforeEndStep,
+            ]
+        );
+
+        let mut state = crate::types::game_state::GameState::new_two_player(42);
+        let player = PlayerId(0);
+        state.active_player = player;
+        state.priority_player = player;
+        state.waiting_for = WaitingFor::Priority { player };
+
+        for phase in [
+            Phase::Untap,
+            Phase::Upkeep,
+            Phase::PreCombatMain,
+            Phase::EndCombat,
+        ] {
+            state.phase = phase;
+            assert!(
+                check_activation_restrictions(&state, player, ObjectId(10), 0, restrictions)
+                    .is_ok(),
+                "activation must be legal before the end step in {phase:?}"
+            );
+        }
+        for phase in [Phase::End, Phase::Cleanup] {
+            state.phase = phase;
+            assert!(
+                check_activation_restrictions(&state, player, ObjectId(10), 0, restrictions)
+                    .is_err(),
+                "activation must be illegal at or after the end step in {phase:?}"
+            );
+        }
+
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(1);
+        assert!(
+            check_activation_restrictions(&state, player, ObjectId(10), 0, restrictions).is_err(),
+            "DuringYourTurn must remain an independent gate"
         );
     }
 

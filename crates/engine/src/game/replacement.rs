@@ -6827,12 +6827,23 @@ fn object_replacement_candidate_applies(
     }
     if let Some(ref sf) = repl_def.damage_source_filter {
         // CR 614.1a: damage-source filters match the damage source object.
-        if let ProposedEvent::Damage { source_id, .. } = event {
+        if let ProposedEvent::Damage {
+            source_id,
+            target,
+            ..
+        } = event
+        {
             if !matches_target_filter(
                 state,
                 *source_id,
                 sf,
-                &FilterContext::from_source_with_controller(obj.id, replacement_player),
+                &FilterContext {
+                    event_target_id: match target {
+                        TargetRef::Object(id) => Some(*id),
+                        TargetRef::Player(_) => None,
+                    },
+                    ..FilterContext::from_source_with_controller(obj.id, replacement_player)
+                },
             ) {
                 return false;
             }
@@ -7506,7 +7517,12 @@ pub fn find_applicable_replacements(
                     let source_controller =
                         repl_def.source_controller.unwrap_or(state.active_player);
                     if let Some(ref sf) = repl_def.damage_source_filter {
-                        if let ProposedEvent::Damage { source_id, .. } = event {
+                        if let ProposedEvent::Damage {
+                            source_id,
+                            target,
+                            ..
+                        } = event
+                        {
                             // CR 109.4 + CR 614.1a: The pending replacement lives under
                             // the sentinel `ObjectId(0)`, which has no entry in
                             // `state.objects`, so `from_source` cannot derive a
@@ -7514,11 +7530,15 @@ pub fn find_applicable_replacements(
                             // install time (`source_controller`), use it so a
                             // controller-relative source filter ("a source you control")
                             // resolves; otherwise fall back to the bare source context.
-                            let ctx = match repl_def.source_controller {
+                            let mut ctx = match repl_def.source_controller {
                                 Some(pid) => {
                                     FilterContext::from_source_with_controller(ObjectId(0), pid)
                                 }
                                 None => FilterContext::from_source(state, ObjectId(0)),
+                            };
+                            ctx.event_target_id = match target {
+                                TargetRef::Object(id) => Some(*id),
+                                TargetRef::Player(_) => None,
                             };
                             if !matches_target_filter(state, *source_id, sf, &ctx) {
                                 continue;
@@ -16231,6 +16251,95 @@ mod tests {
         assert!(
             !candidates.is_empty(),
             "Should match: source controller matches"
+        );
+    }
+
+    #[test]
+    fn damage_source_filter_can_compare_source_and_recipient_color() {
+        use crate::types::ability::{SharedQuality, SharedQualityRelation, TypedFilter};
+        use crate::types::card_type::CoreType;
+        use crate::types::mana::ManaColor;
+
+        let source_filter = TargetFilter::Typed(
+            TypedFilter::default()
+                .with_type(crate::types::ability::TypeFilter::Creature)
+                .properties(vec![
+                    crate::types::ability::FilterProp::DistinctFrom {
+                        reference: Box::new(TargetFilter::EventTarget),
+                    },
+                    crate::types::ability::FilterProp::SharesQuality {
+                        quality: SharedQuality::Color,
+                        reference: Some(Box::new(TargetFilter::EventTarget)),
+                        relation: SharedQualityRelation::Shares,
+                    },
+                ]),
+        );
+        let repl = ReplacementDefinition::new(ReplacementEvent::DamageDone)
+            .prevention_shield(PreventionAmount::All)
+            .damage_source_filter(source_filter)
+            .damage_target_filter(DamageTargetFilter::CreatureOnly);
+        let mut state = test_state_with_damage_repl(ObjectId(10), PlayerId(0), vec![repl]);
+
+        let mut source = GameObject::new(
+            ObjectId(50),
+            CardId(2),
+            PlayerId(0),
+            "Red Source".to_string(),
+            Zone::Battlefield,
+        );
+        source.card_types.core_types.push(CoreType::Creature);
+        source.color.push(ManaColor::Red);
+        state.objects.insert(ObjectId(50), source);
+        state.battlefield.push_back(ObjectId(50));
+
+        let mut target = GameObject::new(
+            ObjectId(60),
+            CardId(3),
+            PlayerId(1),
+            "Red Target".to_string(),
+            Zone::Battlefield,
+        );
+        target.card_types.core_types.push(CoreType::Creature);
+        target.color.push(ManaColor::Red);
+        state.objects.insert(ObjectId(60), target);
+        state.battlefield.push_back(ObjectId(60));
+
+        let registry = build_replacement_registry();
+        let matching_damage = ProposedEvent::Damage {
+            source_id: ObjectId(50),
+            target: TargetRef::Object(ObjectId(60)),
+            amount: 3,
+            is_combat: false,
+            applied: HashSet::new(),
+        };
+        assert!(
+            !find_applicable_replacements(&state, &matching_damage, &registry).is_empty(),
+            "same-color source and creature recipient should match"
+        );
+
+        state.objects.get_mut(&ObjectId(50)).unwrap().color = vec![ManaColor::Blue];
+        let different_color = ProposedEvent::Damage {
+            source_id: ObjectId(50),
+            target: TargetRef::Object(ObjectId(60)),
+            amount: 3,
+            is_combat: false,
+            applied: HashSet::new(),
+        };
+        assert!(
+            find_applicable_replacements(&state, &different_color, &registry).is_empty(),
+            "different-color source and recipient should not match"
+        );
+
+        let self_damage = ProposedEvent::Damage {
+            source_id: ObjectId(60),
+            target: TargetRef::Object(ObjectId(60)),
+            amount: 3,
+            is_combat: false,
+            applied: HashSet::new(),
+        };
+        assert!(
+            find_applicable_replacements(&state, &self_damage, &registry).is_empty(),
+            "the source must be distinct from the recipient"
         );
     }
 

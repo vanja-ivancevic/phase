@@ -5991,6 +5991,17 @@ pub(crate) fn parse_rule_static_subject_filter(subject: &str) -> Option<TargetFi
         ));
     }
 
+    // CR 105.4 + CR 508.1c: subject-scoped combat restrictions use the same
+    // chosen-attribute grammar as continuous grants. Keep the typed
+    // `without flying`/chosen-color combination intact instead of letting the
+    // legacy type parser widen the subject or reject the line.
+    if let Some(filter) = parse_chosen_qualifier_subject(&tp) {
+        return Some(match attachment_prop {
+            Some(prop) => merge_filter_prop(filter, prop),
+            None => filter,
+        });
+    }
+
     let (filter, rest) = parse_type_phrase(subject);
     if rest.trim().is_empty() {
         return Some(match attachment_prop {

@@ -21765,6 +21765,11 @@ pub enum ActivationRestriction {
     /// CR 509.1 + CR 510.1 + CR 511.1: the ability can be activated after
     /// blockers are declared, through combat damage and end of combat.
     AfterBlockersDeclared,
+    /// CR 602.5b + CR 512.1: the ability can be activated before the ending
+    /// phase's end step begins. This is a timing window, not a turn-role gate;
+    /// cards that say "during their turn before the end step" carry this
+    /// restriction alongside `DuringYourTurn`.
+    BeforeEndStep,
     OnlyOnceEachTurn,
     OnlyOnce,
     MaxTimesEachTurn {
