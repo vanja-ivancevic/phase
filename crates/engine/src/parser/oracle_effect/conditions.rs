@@ -5528,6 +5528,59 @@ fn keyword_presence_kind(keyword: &Keyword) -> Option<crate::types::keywords::Ke
     keyword.kind_identifies_ability().then(|| keyword.kind())
 }
 
+/// CR 115.1 + CR 115.9a/c + CR 608.2c: a targeted spell has exactly one
+/// target, and that target is this ability's source. The target spell remains
+/// a normal announced target; this is deliberately a resolution-time rider so
+/// a response may make the condition true or false after the ability is
+/// activated (Quicksilver Dragon).
+///
+/// The target-side constraints reuse the generic stack-entry filter machinery:
+/// `HasSingleTarget` counts declared target instances, while `TargetsOnly`
+/// evaluates every one against `SelfRef` in the resolving ability's context.
+fn parse_target_spell_single_targeting_source_condition(
+    input: &str,
+) -> OracleResult<'_, AbilityCondition> {
+    let (input, _) = tag("target spell has only one target and that target is ").parse(input)?;
+    // `parse_oracle_ir` canonicalizes source references before activated-ability
+    // routing, while this parser is also used directly by unnormalized callers.
+    // Both spellings name the same source object; accept either at this shared
+    // condition boundary rather than forcing individual callers to special-case
+    // Quicksilver Dragon's resolution-time guard.
+    let (input, _) = alt((tag("this creature"), tag("~"))).parse(input)?;
+    Ok((
+        input,
+        AbilityCondition::TargetMatchesFilter {
+            filter: TargetFilter::And {
+                filters: vec![
+                    TargetFilter::StackSpell,
+                    TargetFilter::Typed(TypedFilter {
+                        properties: vec![
+                            FilterProp::HasSingleTarget,
+                            FilterProp::TargetsOnly {
+                                filter: Box::new(TargetFilter::SelfRef),
+                            },
+                        ],
+                        ..Default::default()
+                    }),
+                ],
+            },
+            use_lki: false,
+            subject_slot: None,
+        },
+    ))
+}
+
+fn parse_target_spell_single_targeting_source_condition_text(
+    text: &str,
+) -> Option<AbilityCondition> {
+    let lower = text.trim().trim_end_matches('.').to_ascii_lowercase();
+    let parsed = all_consuming(parse_target_spell_single_targeting_source_condition)
+        .parse(lower.as_str())
+        .ok()
+        .map(|(_, condition)| condition);
+    parsed
+}
+
 pub(super) fn try_nom_condition_as_ability_condition(
     text: &str,
     ctx: &mut ParseContext,
@@ -5535,6 +5588,12 @@ pub(super) fn try_nom_condition_as_ability_condition(
     use crate::parser::oracle_nom::condition::parse_inner_condition;
 
     let lower = text.to_lowercase();
+
+    if let Some(condition) =
+        parse_target_spell_single_targeting_source_condition_text(lower.as_str())
+    {
+        return Some(condition);
+    }
 
     // CR 508.4 + CR 608.2c + CR 701.42: attacking meld-pair conditions are
     // resolution-time leading conditions. Keep them in the shared condition
