@@ -18531,22 +18531,30 @@ fn parse_counter_type_prefix(prefix: &str) -> Option<CounterTriggerFilter> {
     })
 }
 
-/// CR 122.1: Parse "a [type] counter is removed from [subject]" patterns.
-/// Also handles zone constraints like "while it's exiled" (e.g. suspend cards).
+/// CR 122.1: Parse "a [type] counter is removed from [subject]" and "the
+/// last [type] counter is removed from [subject]" patterns. Also handles zone
+/// constraints like "while it's exiled" (e.g. suspend cards).
 fn try_parse_counter_removed(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
-    // Pattern: "a [type] counter is removed from [subject] [while ...]"
+    // Pattern: "[a|the last] [type] counter is removed from [subject] [while ...]".
     let (after_prefix, _) = opt(alt((
         tag::<_, _, OracleError<'_>>("whenever "),
         tag("when "),
     )))
     .parse(lower)
     .ok()?;
-    let (after_a, ()) = value((), tag::<_, _, OracleError<'_>>("a "))
-        .parse(after_prefix)
-        .ok()?;
+    let (after_article, last_counter) = if let Ok((rest, ())) =
+        value((), tag::<_, _, OracleError<'_>>("the last ")).parse(after_prefix)
+    {
+        (rest, true)
+    } else {
+        let (rest, ()) = value((), tag::<_, _, OracleError<'_>>("a "))
+            .parse(after_prefix)
+            .ok()?;
+        (rest, false)
+    };
 
     let (_, (counter_type, subject_rest)) =
-        nom_primitives::split_once_on(after_a, " counter is removed from ").ok()?;
+        nom_primitives::split_once_on(after_article, " counter is removed from ").ok()?;
     let counter_type = counter_type.trim();
     let subject_rest = subject_rest.trim();
 
@@ -18571,10 +18579,16 @@ fn try_parse_counter_removed(lower: &str) -> Option<(TriggerMode, TriggerDefinit
         def.valid_card = Some(filter);
     }
 
-    // Set counter type as description metadata (the counter_filter field could be extended
-    // but for now the type info is captured in the description)
+    // CR 122.1 + CR 603.2: retain the counter kind in the typed filter so the
+    // matcher does not fire on an unrelated counter. A "last" trigger also
+    // carries threshold 0, which the removal matcher interprets as the
+    // post-removal count crossing to zero.
     if !counter_type.is_empty() {
         def.description = Some(format!("{counter_type} counter"));
+        def = def.counter_filter(CounterTriggerFilter {
+            counter_type: crate::types::counter::parse_counter_type(counter_type),
+            threshold: last_counter.then_some(0),
+        });
     }
 
     // CR 122.1: Zone constraint for cards that trigger from exile (e.g. suspend)

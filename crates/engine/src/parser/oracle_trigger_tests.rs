@@ -21428,6 +21428,40 @@ fn trigger_counter_removed_no_zone_constraint() {
     assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
     // No zone constraint — fires from default zones
     assert_eq!(def.trigger_zones, vec![Zone::Battlefield]);
+    assert_eq!(
+        def.counter_filter
+            .as_ref()
+            .map(|filter| &filter.counter_type),
+        Some(&crate::types::counter::CounterType::Time)
+    );
+    assert_eq!(
+        def.counter_filter
+            .as_ref()
+            .and_then(|filter| filter.threshold),
+        None
+    );
+}
+
+#[test]
+fn trigger_last_ore_counter_removed_is_zero_thresholded() {
+    let def = parse_trigger_line(
+        "When the last ore counter is removed from this Aura, destroy enchanted land and this Aura deals 2 damage to that land's controller.",
+        "Orcish Mine",
+    );
+    assert_eq!(def.mode, TriggerMode::CounterRemoved);
+    assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.counter_filter
+            .as_ref()
+            .map(|filter| &filter.counter_type),
+        Some(&crate::types::counter::CounterType::Generic("ore".to_string()))
+    );
+    assert_eq!(
+        def.counter_filter
+            .as_ref()
+            .and_then(|filter| filter.threshold),
+        Some(0)
+    );
 }
 
 // -----------------------------------------------------------------------
