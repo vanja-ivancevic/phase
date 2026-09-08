@@ -6791,6 +6791,9 @@ pub(crate) fn parse_oneshot_damage_replacement(
     // leading "all " is disjoint from both "the next N damage" forms above and
     // from the "the next time" spine below, so ordering here is for readability,
     // not for disambiguation.
+    if let Some(effect) = parse_continuous_source_all_damage_redirect(norm_lower) {
+        return Some(effect);
+    }
     if let Some(effect) = parse_continuous_all_damage_redirect(norm_lower) {
         return Some(effect);
     }
@@ -7618,6 +7621,70 @@ fn parse_continuous_redirect_recipient(input: &str) -> OracleResult<'_, DamageRe
         ),
     ))
     .parse(input)
+}
+
+/// CR 609.7a + CR 614.9: Parse the source-scoped continuous redirection used
+/// by Reverberation — "all damage that would be dealt this turn by target
+/// sorcery spell is dealt to that spell's controller instead".
+///
+/// The target spell is a declared target of the resolving spell, but it must
+/// become a durable damage-source filter after the target spell leaves the
+/// stack. `ParentTargetSlot` captures that target at resolution and the
+/// `StackSpell`/typed conjunct rechecks its kind when damage is applied.
+/// `that spell's controller` is the controller of the damage source, not the
+/// controller of Reverberation, so it uses `SourceController`.
+fn parse_continuous_source_all_damage_redirect(norm_lower: &str) -> Option<Effect> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("all ")
+        .parse(norm_lower)
+        .ok()?;
+    let (rest, combat_scope) = parse_damage_noun_with_scope(rest).ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" that would be dealt this turn by ")
+        .parse(rest)
+        .ok()?;
+    let (rest, source_phrase) = take_until::<_, _, OracleError<'_>>(" is dealt to ")
+        .parse(rest)
+        .ok()?;
+
+    crate::parser::oracle_nom::target::parse_declared_target_prefix(source_phrase).ok()?;
+    // Keep the `target ` prefix in the slice passed to `parse_target`: its
+    // stack-spell scoping uses the complete noun phrase (`sorcery spell`), and
+    // stripping the prefix first would lose the phrase boundary used by that
+    // normalizer.
+    let (source_type_filter, source_tail) = parse_target(source_phrase);
+    if !source_tail.trim().is_empty() {
+        return None;
+    }
+
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" is dealt to ")
+        .parse(rest)
+        .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>("that spell's controller")
+        .parse(rest)
+        .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" instead").parse(rest).ok()?;
+    let (rest, _) = opt(preceded(multispace0, char::<_, OracleError<'_>>('.')))
+        .parse(rest)
+        .ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    Some(Effect::CreateDamageReplacement {
+        source_filter: Some(TargetFilter::And {
+            filters: vec![
+                TargetFilter::ParentTargetSlot { index: 0 },
+                source_type_filter,
+            ],
+        }),
+        combat_scope,
+        target_filter: None,
+        modification: None,
+        redirect_to: Some(DamageRedirectTarget::SourceController),
+        redirect_amount: None,
+        redirect_object_filter: None,
+        recipient_object_filter: None,
+        redirect_lifetime: RedirectionLifetime::Continuous,
+    })
 }
 
 /// CR 611.2a + CR 614.9: the CONTINUOUS damage redirection created by a
@@ -21816,6 +21883,51 @@ mod tests {
         );
         assert_eq!(*redirect_to, Some(DamageRedirectTarget::ChosenObjectTarget));
         assert_eq!(*redirect_lifetime, RedirectionLifetime::Continuous);
+    }
+
+    #[test]
+    fn reverberation_captures_target_sorcery_as_continuous_damage_source() {
+        let effect = parse_oneshot_damage_replacement(
+            "all damage that would be dealt this turn by target sorcery spell is dealt to that spell's controller instead",
+            &ParseContext::default(),
+        )
+        .expect("Reverberation's source-scoped redirection must parse");
+
+        let Effect::CreateDamageReplacement {
+            source_filter: Some(TargetFilter::And { filters }),
+            target_filter,
+            redirect_to,
+            redirect_lifetime,
+            ..
+        } = effect
+        else {
+            panic!("expected source-scoped continuous damage replacement, got {effect:?}");
+        };
+        assert_eq!(
+            target_filter, None,
+            "the source spell is not a damage recipient filter"
+        );
+        assert_eq!(redirect_to, Some(DamageRedirectTarget::SourceController));
+        assert_eq!(redirect_lifetime, RedirectionLifetime::Continuous);
+        assert!(
+            filters
+                .iter()
+                .any(|filter| matches!(filter, TargetFilter::ParentTargetSlot { index: 0 })),
+            "the chosen sorcery must be captured as source slot 0: {filters:?}"
+        );
+        let Some(TargetFilter::And {
+            filters: source_leaf,
+        }) = filters
+            .iter()
+            .find(|filter| !matches!(filter, TargetFilter::ParentTargetSlot { .. }))
+        else {
+            panic!("expected StackSpell + Sorcery source leaf: {filters:?}");
+        };
+        assert!(source_leaf.contains(&TargetFilter::StackSpell));
+        assert!(source_leaf.iter().any(|filter| matches!(
+            filter,
+            TargetFilter::Typed(typed) if typed.type_filters == [TypeFilter::Sorcery]
+        )));
     }
 
     #[test]

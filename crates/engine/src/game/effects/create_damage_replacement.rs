@@ -137,7 +137,13 @@ pub fn resolve(
                 }
             }
         }
-        other => other.clone(),
+        // CR 609.7a: source-scoped targets such as Reverberation's
+        // `ParentTargetSlot` must be concretized before the shield outlives the
+        // resolving spell. Keep the ordinary SelfRef/typed filters unchanged;
+        // `resolve_source_filter` is deliberately identity-preserving for them.
+        other => other.as_ref().map(|filter| {
+            resolve_source_filter(filter, state, ability.source_id, &ability.targets)
+        }),
     };
 
     // CR 614.5 vs CR 611.2a: label the shield by its actual lifetime.
@@ -479,6 +485,122 @@ mod tests {
 
         assert_eq!(state.players[0].life, 20, "the original recipient is untouched");
         assert_eq!(state.players[1].life, 17, "the damage source's controller is hit");
+    }
+
+    #[test]
+    fn source_scoped_continuous_redirect_captures_target_sorcery() {
+        let mut state = GameState::new_two_player(42);
+        let reverberation = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Reverberation".to_string(),
+            Zone::Stack,
+        );
+        let sorcery = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Target Sorcery".to_string(),
+            Zone::Stack,
+        );
+        state.stack.push_back(crate::types::game_state::StackEntry {
+            id: sorcery,
+            source_id: sorcery,
+            controller: PlayerId(1),
+            kind: crate::types::game_state::StackEntryKind::Spell {
+                card_id: CardId(2),
+                ability: None,
+                casting_variant: crate::types::game_state::CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        state
+            .objects
+            .get_mut(&sorcery)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Sorcery];
+
+        let ability = ResolvedAbility::new(
+            Effect::CreateDamageReplacement {
+                redirect_lifetime: RedirectionLifetime::Continuous,
+                source_filter: Some(TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::ParentTargetSlot { index: 0 },
+                        TargetFilter::And {
+                            filters: vec![
+                                TargetFilter::StackSpell,
+                                TargetFilter::Typed(crate::types::ability::TypedFilter::new(
+                                    crate::types::ability::TypeFilter::Sorcery,
+                                )),
+                            ],
+                        },
+                    ],
+                }),
+                combat_scope: None,
+                target_filter: None,
+                modification: None,
+                redirect_to: Some(DamageRedirectTarget::SourceController),
+                redirect_amount: None,
+                redirect_object_filter: None,
+                recipient_object_filter: None,
+            },
+            vec![TargetRef::Object(sorcery)],
+            reverberation,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+
+        assert_eq!(state.pending_damage_replacements.len(), 1);
+        assert_eq!(
+            state.pending_damage_replacements[0].damage_source_filter,
+            Some(TargetFilter::And {
+                filters: vec![
+                    TargetFilter::SpecificObject { id: sorcery },
+                    TargetFilter::Typed(crate::types::ability::TypedFilter::new(
+                        crate::types::ability::TypeFilter::Sorcery,
+                    )),
+                ],
+            })
+        );
+
+        let ctx = deal_damage::DamageContext::from_source(&state, sorcery).unwrap();
+        let mut events = Vec::new();
+        deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Player(PlayerId(0)),
+            3,
+            false,
+            &mut events,
+        )
+        .unwrap();
+        assert_eq!(
+            state.players[0].life, 20,
+            "the original recipient is untouched"
+        );
+        assert_eq!(
+            state.players[1].life, 17,
+            "the target sorcery's controller is hit"
+        );
+
+        let mut events = Vec::new();
+        deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Player(PlayerId(0)),
+            2,
+            false,
+            &mut events,
+        )
+        .unwrap();
+        assert_eq!(
+            state.players[0].life, 20,
+            "continuous replacement remains active"
+        );
+        assert_eq!(state.players[1].life, 15);
+        assert!(!state.pending_damage_replacements[0].is_consumed);
     }
 
     fn amount_oneshot_ability(source: ObjectId, controller: PlayerId) -> ResolvedAbility {

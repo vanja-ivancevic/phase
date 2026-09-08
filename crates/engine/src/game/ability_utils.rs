@@ -2355,15 +2355,20 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
 /// SIBLING leaf — the actual "instant or sorcery spell" filter that
 /// `targeting.rs::filter_targets_stack_spells` can enumerate on the stack.
 ///
-/// Returns `None` for recipient-scoped or `ChosenDamageSource`/`IsChosenColor`
-/// ("by …" Arachnogenesis) prevents, so those are NOT diverted into a source
-/// target slot.
+/// The helper is shared by source-scoped `PreventDamage` and
+/// `CreateDamageReplacement` effects. Returns `None` for recipient-scoped or
+/// `ChosenDamageSource`/`IsChosenColor` ("by …" Arachnogenesis) effects, so
+/// those are NOT diverted into a source target slot.
 fn prevent_damage_source_slot_filter(effect: &Effect) -> Option<&TargetFilter> {
-    let Effect::PreventDamage {
-        damage_source_filter: Some(TargetFilter::And { filters }),
-        ..
-    } = effect
-    else {
+    let source_filter = match effect {
+        Effect::PreventDamage {
+            damage_source_filter,
+            ..
+        } => damage_source_filter.as_ref(),
+        Effect::CreateDamageReplacement { source_filter, .. } => source_filter.as_ref(),
+        _ => None,
+    }?;
+    let TargetFilter::And { filters } = source_filter else {
         return None;
     };
     // Only an `And` that carries the `ParentTargetSlot` sentinel is a
@@ -2638,14 +2643,13 @@ fn collect_target_slots_inner(
         return Err(TargetSlotBuildError::RequiresChosenX);
     }
 
-    // CR 609.7 + CR 601.2c: A source-scoped `PreventDamage` ("prevent all damage
-    // target instant or sorcery spell would deal this turn") surfaces the
-    // choosable source spell as a target slot. Declared FIRST (CR 601.2c
-    // declaration order). The generic path below cannot reach it —
-    // `target_filter()` returns the `Any` recipient and short-circuits to `None`
-    // — so we surface it here, mirroring the `CreateDamageReplacement` arm. We
-    // do NOT `return`: the generic recipient logic still runs, but for the
-    // source-scoped form `target == Any` so it adds nothing.
+    // CR 609.7 + CR 601.2c: A source-scoped damage effect (PreventDamage or
+    // CreateDamageReplacement) surfaces the choosable source spell as a target
+    // slot. Declared FIRST (CR 601.2c declaration order). The generic path
+    // below cannot reach it — `target_filter()` returns the `Any` recipient and
+    // short-circuits to `None` — so we surface it here. We do NOT `return`: the
+    // generic recipient logic still runs, but for the source-scoped form
+    // `target == Any` so it adds nothing.
     if ability.target_choice_timing == TargetChoiceTiming::Stack {
         if let Some(src_leaf) = prevent_damage_source_slot_filter(&ability.effect) {
             let legal_targets =
@@ -4869,7 +4873,7 @@ fn collect_target_slot_specs(
         }
     }
 
-    // CR 609.7 + CR 601.2c: Mirror the source-scoped `PreventDamage` slot from
+    // CR 609.7 + CR 601.2c: Mirror the source-scoped damage-effect slot from
     // `collect_target_slots` one-for-one so per-slot specs line up with the
     // surfaced TargetSelectionSlots (the choosable source spell, declared first).
     if ability.target_choice_timing == TargetChoiceTiming::Stack {
@@ -7069,7 +7073,7 @@ fn assign_targets_recursive(
         return Ok(());
     }
 
-    // CR 609.7 + CR 601.2c: Mirror the source-scoped `PreventDamage` slot pushed
+    // CR 609.7 + CR 601.2c: Mirror the source-scoped damage-effect slot pushed
     // by `collect_target_slots`. The chosen source spell is consumed into THIS
     // node's `targets` (the PreventDamage HEAD node) BEFORE descending into the
     // sub-chain, so the modal sub (mode 3's PutCounter) consumes its own target
@@ -7403,7 +7407,7 @@ fn assign_selected_slots_recursive(
         return Ok(());
     }
 
-    // CR 609.7 + CR 601.2c: Mirror the source-scoped `PreventDamage` slot — the
+    // CR 609.7 + CR 601.2c: Mirror the source-scoped damage-effect slot — the
     // modal cast pipeline drives the slots path, so the chosen source spell must
     // be consumed into THIS node's `targets` here too, BEFORE descending into the
     // (modal) sub-chain. Slot order matches `collect_target_slots`: source first.
@@ -7802,7 +7806,7 @@ fn chain_has_target_sink(ability: &ResolvedAbility) -> bool {
         return true;
     }
 
-    // CR 609.7 + CR 601.2c: A source-scoped `PreventDamage` head node consumes
+    // CR 609.7 + CR 601.2c: A source-scoped damage-effect head node consumes
     // the chosen source spell into its own `targets[0]` — `collect_target_slots`
     // pushes a source slot for it, and `assign_targets_recursive` consumes one
     // target into this node BEFORE descending into the (modal) sub-chain.
@@ -17029,6 +17033,81 @@ mod tests {
             slots[0].legal_targets.contains(&TargetRef::Object(spell)),
             "the stack spell must be a legal source target, got {:?}",
             slots[0].legal_targets
+        );
+    }
+
+    #[test]
+    fn build_target_slots_surfaces_source_scoped_damage_replacement_spell_slot() {
+        use crate::types::ability::{DamageRedirectTarget, RedirectionLifetime};
+        use crate::types::game_state::CastingVariant;
+        let mut state = GameState::new_two_player(42);
+        let host = create_object(
+            &mut state,
+            crate::types::identifiers::CardId(1),
+            PlayerId(0),
+            "Reverberation".into(),
+            Zone::Stack,
+        );
+        let sorcery = create_object(
+            &mut state,
+            crate::types::identifiers::CardId(2),
+            PlayerId(1),
+            "Target Sorcery".into(),
+            Zone::Stack,
+        );
+        state.stack.push_back(crate::types::game_state::StackEntry {
+            id: sorcery,
+            source_id: sorcery,
+            controller: PlayerId(1),
+            kind: crate::types::game_state::StackEntryKind::Spell {
+                card_id: crate::types::identifiers::CardId(2),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        state
+            .objects
+            .get_mut(&sorcery)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Sorcery];
+
+        let ability = ResolvedAbility::new(
+            Effect::CreateDamageReplacement {
+                redirect_lifetime: RedirectionLifetime::Continuous,
+                source_filter: Some(TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::ParentTargetSlot { index: 0 },
+                        TargetFilter::And {
+                            filters: vec![
+                                TargetFilter::StackSpell,
+                                TargetFilter::Typed(
+                                    TypedFilter::default().with_type(TypeFilter::Sorcery),
+                                ),
+                            ],
+                        },
+                    ],
+                }),
+                combat_scope: None,
+                target_filter: None,
+                modification: None,
+                redirect_to: Some(DamageRedirectTarget::SourceController),
+                redirect_amount: None,
+                redirect_object_filter: None,
+                recipient_object_filter: None,
+            },
+            vec![],
+            host,
+            PlayerId(0),
+        );
+
+        let slots = build_target_slots(&state, &ability).expect("source slot must build");
+        assert_eq!(slots.len(), 1, "exactly one source-scope slot");
+        assert_eq!(
+            slots[0].legal_targets,
+            vec![TargetRef::Object(sorcery)],
+            "only the target sorcery on the stack should be legal"
         );
     }
 

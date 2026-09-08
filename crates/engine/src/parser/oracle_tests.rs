@@ -7,8 +7,9 @@ use crate::parser::oracle_ir::doc::{
 use crate::parser::oracle_ir::static_ir::StaticIr;
 use crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
 use crate::types::ability::{
-    AdditionalCostOrigin, AdditionalCostPaymentSource, CountScope, CounterAdjustment, DoorLockOp,
-    DamageRedirectTarget, PlayerRelation, SpellStackToGraveyardReplacement,
+    AdditionalCostOrigin, AdditionalCostPaymentSource, CountScope, CounterAdjustment,
+    DamageRedirectTarget, DoorLockOp, PlayerRelation, RedirectionLifetime,
+    SpellStackToGraveyardReplacement,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::triggers::AttackTargetFilter;
@@ -4404,6 +4405,46 @@ fn aegis_of_honor_full_parse_preserves_source_controller_redirection() {
         panic!("expected source-controller damage replacement: {:#?}", definition.effect);
     };
     assert_eq!(filters.len(), 2, "instant/sorcery source must have two OR legs");
+}
+
+#[test]
+fn reverberation_full_parse_preserves_target_sorcery_source_scope() {
+    let r = parse(
+        "All damage that would be dealt this turn by target sorcery spell is dealt to that spell's controller instead.",
+        "Reverberation",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+    assert!(
+        !parsed_has_unimplemented(&r),
+        "Reverberation must parse fully: {r:#?}"
+    );
+
+    let Some(effect) = r.abilities.iter().find_map(|ability| {
+        matches!(
+            ability.effect.as_ref(),
+            Effect::CreateDamageReplacement { .. }
+        )
+        .then_some(ability.effect.as_ref())
+    }) else {
+        panic!("expected Reverberation's damage replacement: {r:#?}");
+    };
+    let Effect::CreateDamageReplacement {
+        source_filter: Some(TargetFilter::And { filters }),
+        redirect_to: Some(DamageRedirectTarget::SourceController),
+        redirect_lifetime: RedirectionLifetime::Continuous,
+        ..
+    } = effect
+    else {
+        panic!("expected target-sorcery source scope: {effect:?}");
+    };
+    assert!(
+        filters
+            .iter()
+            .any(|filter| matches!(filter, TargetFilter::ParentTargetSlot { index: 0 })),
+        "target sorcery must be captured as source slot 0: {filters:?}"
+    );
 }
 
 /// Issue #1696 — Myrkul, Lord of Bones end-to-end: the death trigger exiles
