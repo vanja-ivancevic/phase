@@ -8478,9 +8478,7 @@ fn parse_activation_during_role_gate(i: &str) -> OracleResult<'_, ActivationRest
 /// pre-modern activation wording. These are deliberately not lowered to the
 /// broader combat gates: an ability restricted to the declare blockers step
 /// must not be activatable in beginning of combat or during combat damage.
-fn parse_activation_during_step_gate(
-    i: &str,
-) -> OracleResult<'_, ActivationRestriction> {
+fn parse_activation_during_step_gate(i: &str) -> OracleResult<'_, ActivationRestriction> {
     value(
         ActivationRestriction::DuringPhase {
             phase: Phase::DeclareAttackers,
@@ -8575,14 +8573,19 @@ fn parse_activation_timing_restriction(phrase: &str) -> Option<Vec<ActivationRes
     // step" for the activating player's own draw step. Keep the player-role
     // gate separate from the exact phase gate so shared-team turns do not
     // widen this to a teammate's draw step.
-    if matches!(lower.as_str(), "during your draw step" | "during their draw step") {
+    if matches!(
+        lower.as_str(),
+        "during your draw step" | "during their draw step"
+    ) {
         return Some(vec![
             ActivationRestriction::DuringYourTurn,
             ActivationRestriction::DuringPhase { phase: Phase::Draw },
         ]);
     }
     if lower == "during the draw step" {
-        return Some(vec![ActivationRestriction::DuringPhase { phase: Phase::Draw }]);
+        return Some(vec![ActivationRestriction::DuringPhase {
+            phase: Phase::Draw,
+        }]);
     }
     // CR 602.5b + CR 503.1: "during any upkeep step" has no player-turn
     // axis. Reuse the existing unscoped upkeep condition instead of inventing
@@ -8950,6 +8953,25 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
             }
         }
 
+        // CR 602.5b: legacy timing clauses may separate the condition with a
+        // comma — "Activate only during the declare blockers step, only if
+        // ...". Keep this distinct from the ordinary "activate only if"
+        // form: the guard requires that the left side already contains the
+        // activation-timing prefix, so an effect sentence's incidental
+        // "only if" is never consumed here.
+        if let Some((before, after)) = tp.rsplit_around(" only if ") {
+            if before.lower.contains("activate only ") && !before.lower.ends_with("activate") {
+                if !commit_requires_condition(after.original, &mut constraints.restrictions) {
+                    break;
+                }
+                remaining = before
+                    .original
+                    .trim_end_matches(|c: char| c == ',' || c == '.' || c.is_whitespace())
+                    .to_string();
+                continue;
+            }
+        }
+
         // CR 602.2 + CR 602.5: "Any player may activate this ability but only
         // <restriction>" combines the any-player permission with an activation
         // timing restriction (Endbringer's Revel "as a sorcery", Volrath's Dungeon
@@ -9000,9 +9022,7 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
         // same restriction as the modern "Activate only <timing>" form; keep
         // the wrapper separate so the timing parser remains the single
         // authority for the actual gate.
-        if let Some((before, restriction)) =
-            tp.rsplit_around("activate this ability but only ")
-        {
+        if let Some((before, restriction)) = tp.rsplit_around("activate this ability but only ") {
             if let Some(parsed) = parse_activation_timing_restriction(restriction.original) {
                 constraints.restrictions.extend(parsed);
                 remaining = before
@@ -9182,6 +9202,30 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
                 break;
             }
             continue;
+        }
+
+        // CR 602.5b: older Oracle also expresses an activation cap as a
+        // quantity comparison. Keep the quantity typed so the cap is read at
+        // activation time, not frozen during card-data generation.
+        const DYNAMIC_LIMIT_PREFIX: &str = "activate no more times each turn than ";
+        if let Some(idx) = tp.rfind(DYNAMIC_LIMIT_PREFIX) {
+            if idx == 0 || lower[..idx].ends_with(". ") {
+                let count_text = lower[idx + DYNAMIC_LIMIT_PREFIX.len()..].trim();
+                if let Some(count) = super::oracle_quantity::parse_quantity_ref(count_text) {
+                    constraints
+                        .restrictions
+                        .push(ActivationRestriction::MaxTimesEachTurnDynamic {
+                            count: QuantityExpr::Ref { qty: count },
+                        });
+                    remaining = remaining[..idx]
+                        .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
+                        .to_string();
+                    if remaining.is_empty() {
+                        break;
+                    }
+                    continue;
+                }
+            }
         }
 
         if let Some(idx) = tp.rfind("activate only if ") {

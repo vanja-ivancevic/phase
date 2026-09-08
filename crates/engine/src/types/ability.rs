@@ -10496,6 +10496,17 @@ pub enum ParsedCondition {
     SourceIsAttackingOrBlocking,
     /// CR 509.1h: The source creature is blocked.
     SourceIsBlocked,
+    /// CR 404.1 + CR 602.5b: At least `minimum` creature cards occur above the
+    /// source in its owner's graveyard. Ashen Ghoul's printed rider uses the
+    /// graveyard's ordered layout rather than a plain graveyard count.
+    SourceHasCreatureCardsAbove {
+        minimum: usize,
+    },
+    /// CR 509.1h + CR 603.4: The source was blocked this turn, or was blocked
+    /// by a creature of the specified color this turn.
+    SourceWasBlockedOrBlockedByColorThisTurn {
+        color: ManaColor,
+    },
     SourcePowerAtLeast {
         minimum: i32,
     },
@@ -15653,10 +15664,10 @@ pub enum Effect {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         redirect_amount: Option<PreventionAmount>,
         /// CR 115.1: The redirect recipient's target filter for the
-    /// chosen-target forms ("...deals that damage to target creature" or "any
-    /// target instead" — Soltari Guerrillas / Zhalfirin Crusader). `None` for
-    /// the `Controller` / `SourceObject` redirect forms, which need no target
-    /// slot.
+        /// chosen-target forms ("...deals that damage to target creature" or "any
+        /// target instead" — Soltari Guerrillas / Zhalfirin Crusader). `None` for
+        /// the `Controller` / `SourceObject` redirect forms, which need no target
+        /// slot.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         redirect_object_filter: Option<TargetFilter>,
         /// CR 115.1 + CR 614.9: The *original-recipient* target filter when the
@@ -21793,6 +21804,12 @@ pub enum ActivationRestriction {
     OnlyOnce,
     MaxTimesEachTurn {
         count: u8,
+    },
+    /// CR 602.5b: a per-turn activation cap whose value is read from the
+    /// current game state, such as "no more times each turn than the number
+    /// of snow Swamps you control" (Withering Wisps).
+    MaxTimesEachTurnDynamic {
+        count: QuantityExpr,
     },
     RequiresCondition {
         condition: Option<ParsedCondition>,

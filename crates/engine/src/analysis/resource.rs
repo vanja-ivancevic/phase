@@ -7323,6 +7323,7 @@ fn ability_has_per_turn_activation_gate(state: &GameState, key: &(ObjectId, usiz
                     r,
                     ActivationRestriction::OnlyOnceEachTurn
                         | ActivationRestriction::MaxTimesEachTurn { .. }
+                        | ActivationRestriction::MaxTimesEachTurnDynamic { .. }
                 )
             })
         })

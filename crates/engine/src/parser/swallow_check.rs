@@ -2201,7 +2201,8 @@ fn restriction_is_activation_limit(restriction: &ActivationRestriction) -> bool 
         // CR 602.5b: usage caps — the only things that are limits.
         ActivationRestriction::OnlyOnceEachTurn
         | ActivationRestriction::OnlyOnce
-        | ActivationRestriction::MaxTimesEachTurn { .. } => true,
+        | ActivationRestriction::MaxTimesEachTurn { .. }
+        | ActivationRestriction::MaxTimesEachTurnDynamic { .. } => true,
         // CR 602.5d + CR 602.5e: timing windows — WHEN it may be activated, not how often.
         ActivationRestriction::AsSorcery
         | ActivationRestriction::AsInstant

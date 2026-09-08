@@ -2759,8 +2759,8 @@ fn try_parse_regeneration_this_way_rider(
         return None;
     }
 
-    let trigger = TriggerDefinition::new(TriggerMode::Regenerated)
-        .valid_card(TargetFilter::ParentTarget);
+    let trigger =
+        TriggerDefinition::new(TriggerMode::Regenerated).valid_card(TargetFilter::ParentTarget);
     let inner = AbilityDefinition::new(
         kind,
         Effect::GainControl {
@@ -32040,8 +32040,136 @@ pub(crate) fn finalize_effect_chain(def: &mut AbilityDefinition) {
     sequence::promote_labeled_card_predicate_choices_for_chosen_kind(def);
     sequence::rewrite_reorder_dig_backref_reveal_to_top(def);
     fold_speed_floor_sentences(def);
+    fold_counter_total_caps(def);
     rewrite_choose_tracked_set_exclusion(def);
     fold_additional_combat_attacker_restriction(def);
+}
+
+/// CR 122.1 + CR 608.2c: Fold the legacy counter-total rider that follows a
+/// self-targeted counter placement, for example Clockwork Beast's
+/// "This ability can't cause the total number of +1/+0 counters on this
+/// creature to be greater than seven."
+///
+/// The ordinary clause parser deliberately leaves this sentence visible as an
+/// `unbound_subject` gap because it is not an independent effect. At the whole
+/// chain boundary it has enough context to be interpreted correctly: the
+/// immediately preceding effect is the self-targeted placement it limits. The
+/// rider becomes a generic quantity cap, so the same mechanism applies to any
+/// card with the same Oracle grammar and does not name the Clockwork cycle.
+fn fold_counter_total_caps(def: &mut AbilityDefinition) {
+    let Some(mut child) = def.sub_ability.take() else {
+        return;
+    };
+
+    let cap = match child.effect.as_ref() {
+        Effect::Unimplemented {
+            name,
+            description: Some(description),
+        } if name == "unbound_subject" => parse_counter_total_cap(description),
+        _ => None,
+    };
+
+    if let Some((counter_type, maximum)) = cap {
+        let child_is_terminal = child.sub_ability.is_none();
+        if child_is_terminal {
+            let target = match def.effect.as_ref() {
+                Effect::PutCounter { target, .. } | Effect::PutCounterAll { target, .. } => {
+                    Some(target)
+                }
+                _ => None,
+            };
+            if matches!(target, Some(TargetFilter::SelfRef)) {
+                if let Some(count) = match def.effect.as_mut() {
+                    Effect::PutCounter {
+                        counter_type: placed_type,
+                        count,
+                        ..
+                    }
+                    | Effect::PutCounterAll {
+                        counter_type: placed_type,
+                        count,
+                        ..
+                    } if *placed_type == counter_type => Some(count),
+                    _ => None,
+                } {
+                    let capacity = QuantityExpr::ClampMin {
+                        inner: Box::new(QuantityExpr::Offset {
+                            inner: Box::new(QuantityExpr::Multiply {
+                                factor: -1,
+                                inner: Box::new(QuantityExpr::Ref {
+                                    qty: QuantityRef::CountersOn {
+                                        scope: ObjectScope::Source,
+                                        counter_type: Some(counter_type),
+                                    },
+                                }),
+                            }),
+                            offset: maximum as i32,
+                        }),
+                        minimum: 0,
+                    };
+                    let existing = std::mem::replace(count, QuantityExpr::Fixed { value: 0 });
+                    *count = match existing {
+                        QuantityExpr::UpTo { max } => QuantityExpr::UpTo {
+                            max: Box::new(cap_quantity_at(*max, capacity)),
+                        },
+                        other => cap_quantity_at(other, capacity),
+                    };
+                    return;
+                }
+            }
+        }
+    }
+
+    fold_counter_total_caps(&mut child);
+    def.sub_ability = Some(child);
+}
+
+/// Parse the exact self-relative legacy counter-cap sentence. The target
+/// phrase is checked here, while the preceding effect's `SelfRef` is checked by
+/// [`fold_counter_total_caps`], so a superficially similar rider cannot cap an
+/// unrelated target.
+fn parse_counter_total_cap(text: &str) -> Option<(CounterType, u32)> {
+    let lower = text.trim().trim_end_matches('.').to_ascii_lowercase();
+    let rest = lower.strip_prefix("this ability can't cause the total number of ")?;
+    let (rest, counter_type) = nom_primitives::parse_counter_type_typed(rest).ok()?;
+    let rest = rest.strip_prefix(" counters on ")?;
+    let (target, maximum_text) = rest.split_once(" to be greater than ")?;
+    if !matches!(
+        target.trim(),
+        "this creature" | "this artifact" | "this permanent" | "~"
+    ) {
+        return None;
+    }
+    let (maximum, remainder) = parse_number(maximum_text.trim())?;
+    remainder
+        .trim()
+        .is_empty()
+        .then_some((counter_type, maximum))
+}
+
+/// `min(left, right)` expressed entirely in the existing quantity algebra:
+/// `(left + right - abs(left - right)) / 2`. Both operands used for the
+/// counter-total cap are non-negative, and `DivideRounded::Down` is exact for
+/// this identity, so no new quantity variant or resolver branch is needed.
+fn cap_quantity_at(left: QuantityExpr, right: QuantityExpr) -> QuantityExpr {
+    let difference = QuantityExpr::Difference {
+        left: Box::new(left.clone()),
+        right: Box::new(right.clone()),
+    };
+    QuantityExpr::DivideRounded {
+        inner: Box::new(QuantityExpr::Sum {
+            exprs: vec![
+                left,
+                right,
+                QuantityExpr::Multiply {
+                    factor: -1,
+                    inner: Box::new(difference),
+                },
+            ],
+        }),
+        divisor: 2,
+        rounding: RoundingMode::Down,
+    }
 }
 
 fn apply_owner_library_reveal_anchor_from_text(def: &mut AbilityDefinition, text: &str) {
@@ -33602,8 +33730,7 @@ pub(crate) fn parse_effect_chain_ir(
             .find(|clause| !matches!(clause.disposition, ClauseDisposition::Continue { .. }))
             .is_some_and(|clause| matches!(&clause.parsed.effect, Effect::Regenerate { .. }))
         {
-            if let Some(rider_def) =
-                try_parse_regeneration_this_way_rider(rider_lower.trim(), kind)
+            if let Some(rider_def) = try_parse_regeneration_this_way_rider(rider_lower.trim(), kind)
             {
                 builder
                     .clause(

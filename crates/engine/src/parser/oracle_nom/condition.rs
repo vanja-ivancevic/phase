@@ -193,6 +193,11 @@ fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondit
         // distinctive "the top card of your library is " prefix, so ordering
         // relative to the other filter conditions is not sensitive.
         parse_top_of_library_condition,
+        // CR 509.1g: this source-relative existential must precede the
+        // generic combat-presence arms, which can otherwise claim the
+        // beginning of "at least one creature is blocking this creature" and
+        // leave the source-relative tail unconsumed.
+        parse_at_least_one_creature_blocking_source,
         parse_source_state_conditions,
         parse_player_state_conditions,
         // CR 402.1 + CR 602.5: existential "a player has <hand-size predicate>".
@@ -2018,7 +2023,22 @@ fn parse_source_is_equipped(input: &str) -> OracleResult<'_, StaticCondition> {
 /// no-quantifier idiom.
 fn parse_source_is_enchanted(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = parse_source_subject(input)?;
-    value(StaticCondition::SourceIsEnchanted, tag("is enchanted")).parse(rest)
+    let (rest, negated) = alt((
+        value(true, alt((tag("isn't "), tag("is not ")))),
+        value(false, tag("is ")),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag("enchanted").parse(rest)?;
+    if negated {
+        Ok((
+            rest,
+            StaticCondition::Not {
+                condition: Box::new(StaticCondition::SourceIsEnchanted),
+            },
+        ))
+    } else {
+        Ok((rest, StaticCondition::SourceIsEnchanted))
+    }
 }
 
 /// CR 700.9: "<subject> is modified" → SourceMatchesFilter on a creature filter
@@ -4037,8 +4057,8 @@ pub(crate) fn parse_control_conditions(input: &str) -> OracleResult<'_, StaticCo
         parse_filtered_creature_is_attacking,
         // CR 508.1 + CR 509.1: "a/an <type> is attacking [or blocking]" → IsPresent(type + combat
         // state). Retained for the "[or blocking]" predicate that the attacking-only filtered form
-        // above does not cover; tried after it so filtered owns the attacking/defender form (the
-        // attacking case here yields the identical IsPresent, so filtered simply reaches it first).
+        // above does not cover; tried after the source-relative form so a longer phrase cannot be
+        // claimed by a partial generic combat parse.
         parse_a_type_is_in_combat,
         // "you don't control a/an [type]" → Not(IsPresent)
         parse_you_dont_control_a,
@@ -4056,6 +4076,27 @@ pub(crate) fn parse_control_conditions(input: &str) -> OracleResult<'_, StaticCo
         parse_creature_has_keyword,
     ))
     .parse(input)
+}
+
+/// CR 509.1g + CR 602.5: Parse "at least one creature is blocking ~" (and the
+/// equivalent "this creature" form) as a source-relative presence condition.
+/// `BlockingSource` is evaluated against the source object's live blocker
+/// assignments, so a blocker elsewhere in combat cannot satisfy the gate.
+fn parse_at_least_one_creature_blocking_source(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("at least one ").parse(input)?;
+    let (filter, rest) = parse_type_phrase(rest);
+    let TargetFilter::Typed(mut filter) = filter else {
+        return Err(oracle_err(input));
+    };
+    let (rest, _) = tag("is blocking ").parse(rest.trim_start())?;
+    let (rest, _) = alt((tag("~"), tag("this creature"))).parse(rest)?;
+    filter.properties.push(FilterProp::BlockingSource);
+    Ok((
+        rest,
+        StaticCondition::IsPresent {
+            filter: Some(TargetFilter::Typed(filter)),
+        },
+    ))
 }
 
 /// Parse a "≥ N" threshold prefix: either `"N or more "` or `"at least N "`.
@@ -7189,6 +7230,27 @@ fn parse_combat_context_conditions(input: &str) -> OracleResult<'_, StaticCondit
 /// CR 509.1b: "defending player controls a/an [type]" → DefendingPlayerControls.
 fn parse_defending_player_controls(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("defending player controls ").parse(input)?;
+    // CR 509.1b: the old-border negative form "defending player controls no
+    // snow lands" is the zero-count sibling of the article form below. Lower
+    // it through the same typed quantity vocabulary used by all other control
+    // counts so activation restrictions can retain the exact no-land gate.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("no ").parse(rest) {
+        let (filter, remainder) = parse_type_phrase(rest);
+        let TargetFilter::Typed(filter) = filter else {
+            return Err(oracle_err(input));
+        };
+        let filter = inject_controller(TargetFilter::Typed(filter), ControllerRef::DefendingPlayer);
+        return Ok((
+            remainder,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 0 },
+            },
+        ));
+    }
     let (rest, _) = parse_article(rest)?;
     // parse_type_phrase returns (filter, remaining_str) — bridge to nom remainder
     let (filter, type_rest) = parse_type_phrase(rest);
@@ -8209,9 +8271,10 @@ fn make_source_controlled_continuously_this_turn() -> StaticCondition {
                 filter: TargetFilter::And {
                     filters: vec![
                         TargetFilter::SelfRef,
-                        TargetFilter::Typed(TypedFilter::default().properties(vec![
-                            FilterProp::ControlledContinuouslySinceTurnBegan,
-                        ])),
+                        TargetFilter::Typed(
+                            TypedFilter::default()
+                                .properties(vec![FilterProp::ControlledContinuouslySinceTurnBegan]),
+                        ),
                     ],
                 },
             },
@@ -10842,6 +10905,39 @@ mod tests {
             "inject_controller must add InZone{{Battlefield}}, got {:?}",
             tf.properties
         );
+    }
+
+    /// CR 509.1b: negative defending-player control gates use an exact zero
+    /// comparison, not a dropped condition or a permissive "controls no
+    /// permanent" fallback.
+    #[test]
+    fn parse_defending_player_controls_no_snow_lands() {
+        let text = "defending player controls no snow lands";
+        let (rest, cond) = parse_inner_condition(text)
+            .unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::ObjectCount {
+                            filter: TargetFilter::Typed(filter),
+                        },
+                },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Fixed { value: 0 },
+        } = cond
+        else {
+            panic!("expected defending-player zero count, got {cond:?}");
+        };
+        assert_eq!(filter.controller, Some(ControllerRef::DefendingPlayer));
+        assert!(filter.type_filters.contains(&TypeFilter::Land));
+        assert!(filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::HasSupertype {
+                value: Supertype::Snow
+            }
+        )));
     }
 
     /// CR 508.5 + CR 509.1b + CR 205.3m: Graxiplon's printed gate — the
@@ -14089,6 +14185,28 @@ mod tests {
                 ],
             }
         );
+    }
+
+    /// CR 509.1g: the source-relative blocker phrase must preserve the
+    /// `BlockingSource` relation rather than degrade to a board-wide blocker
+    /// presence check.
+    #[test]
+    fn test_at_least_one_creature_is_blocking_source() {
+        for text in [
+            "at least one creature is blocking ~",
+            "at least one creature is blocking this creature",
+        ] {
+            let (rest, c) = parse_inner_condition(text).unwrap();
+            assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+            let StaticCondition::IsPresent {
+                filter: Some(TargetFilter::Typed(filter)),
+            } = c
+            else {
+                panic!("expected typed blocker presence for {text:?}, got {c:?}");
+            };
+            assert!(filter.type_filters.contains(&TypeFilter::Creature));
+            assert!(filter.properties.contains(&FilterProp::BlockingSource));
+        }
     }
 
     #[test]

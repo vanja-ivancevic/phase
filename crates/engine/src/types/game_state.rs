@@ -1786,6 +1786,19 @@ pub struct AttackDeclarationRecord {
     pub is_commander: bool,
 }
 
+/// CR 509.1h + CR 603.4: A declaration-time attacker/blocker relation that
+/// remains queryable after combat ends. The blocker colors are captured at the
+/// declaration, so a later color-changing effect cannot rewrite a historical
+/// "was blocked by a blue creature" condition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CombatBlockDeclarationRecord {
+    pub attacker: ObjectIncarnationRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<ObjectIncarnationRef>,
+    #[serde(default)]
+    pub blocker_colors: Vec<ManaColor>,
+}
+
 /// CR 603.10a: Snapshot of a single attachment on a leaving-battlefield object
 /// at the instant before the zone change. Controller/kind are captured so that
 /// post-LTB resolvers can filter ("each Aura you controlled") without chasing
@@ -18371,6 +18384,11 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub creatures_blocked_this_turn: HashSet<ObjectId>,
+    /// CR 509.1h + CR 603.4: declaration-time attacker/blocker relations for
+    /// post-combat source restrictions such as Sea Troll's "was blocked by a
+    /// blue creature" rider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub combat_block_declarations_this_turn: Vec<CombatBlockDeclarationRecord>,
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub players_who_created_token_this_turn: HashSet<PlayerId>,
@@ -23402,6 +23420,7 @@ impl GameState {
             creatures_attacked_this_turn: HashSet::new(),
             attacker_declarations_this_turn: Vec::new(),
             creatures_blocked_this_turn: HashSet::new(),
+            combat_block_declarations_this_turn: Vec::new(),
             players_who_created_token_this_turn: HashSet::new(),
             created_tokens_this_turn: im::Vector::new(),
             counter_added_this_turn: Vec::new(),
@@ -25436,6 +25455,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         creatures_attacked_this_turn: _,
         attacker_declarations_this_turn: _,
         creatures_blocked_this_turn: _,
+        combat_block_declarations_this_turn: _,
         players_who_created_token_this_turn: _,
         created_tokens_this_turn: _,
         counter_added_this_turn: _,
@@ -25769,6 +25789,8 @@ impl PartialEq for GameState {
             && self.creatures_attacked_this_turn == other.creatures_attacked_this_turn
             && self.attacker_declarations_this_turn == other.attacker_declarations_this_turn
             && self.creatures_blocked_this_turn == other.creatures_blocked_this_turn
+            && self.combat_block_declarations_this_turn
+                == other.combat_block_declarations_this_turn
             && self.players_who_created_token_this_turn == other.players_who_created_token_this_turn
             && self.created_tokens_this_turn == other.created_tokens_this_turn
             && self.counter_added_this_turn == other.counter_added_this_turn

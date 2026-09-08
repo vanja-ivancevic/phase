@@ -9,9 +9,9 @@ use crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
 use crate::types::ability::{
     AdditionalCostOrigin, AdditionalCostPaymentSource, CountScope, CounterAdjustment,
     DamageModification, DamageRedirectTarget, DamageTargetFilter, DamageTargetPlayerScope,
-    DoorLockOp, PlayerRelation, RedirectionLifetime,
-    SpellStackToGraveyardReplacement,
+    DoorLockOp, PlayerRelation, RedirectionLifetime, SpellStackToGraveyardReplacement,
 };
+use crate::types::card_type::Supertype;
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::triggers::AttackTargetFilter;
 
@@ -936,6 +936,251 @@ fn legacy_combat_step_activation_gates_preserve_exact_windows() {
         ],
         "expected own draw-step gate, got {:?}",
         r.abilities[0].activation_restrictions
+    );
+}
+
+/// CR 602.5b: a legacy dynamic activation cap must survive as a typed
+/// quantity-backed restriction rather than an unimplemented trailing sentence.
+#[test]
+fn dynamic_activation_limit_counts_the_printed_quantity() {
+    let r = parse(
+        "{B}: This enchantment deals 1 damage to each creature and each player. \
+         Activate no more times each turn than the number of snow Swamps you control.",
+        "Withering Wisps",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+    let activation = r
+        .abilities
+        .iter()
+        .find(|ability| {
+            ability.activation_restrictions.iter().any(|restriction| {
+                matches!(
+                    restriction,
+                    ActivationRestriction::MaxTimesEachTurnDynamic { .. }
+                )
+            })
+        })
+        .expect("Withering Wisps activation must retain its dynamic cap");
+    let Some(ActivationRestriction::MaxTimesEachTurnDynamic {
+        count:
+            QuantityExpr::Ref {
+                qty:
+                    QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(filter),
+                    },
+            },
+    }) = activation
+        .activation_restrictions
+        .iter()
+        .find(|restriction| {
+            matches!(
+                restriction,
+                ActivationRestriction::MaxTimesEachTurnDynamic { .. }
+            )
+        })
+    else {
+        panic!("Withering Wisps cap must count a typed battlefield population: {activation:#?}");
+    };
+    assert!(filter
+        .type_filters
+        .contains(&TypeFilter::Subtype("Swamp".into())));
+    assert!(filter.properties.contains(&FilterProp::HasSupertype {
+        value: Supertype::Snow,
+    }));
+    assert_eq!(filter.controller, Some(ControllerRef::You));
+    assert!(
+        !matches!(activation.effect.as_ref(), Effect::Unimplemented { .. }),
+        "dynamic-cap activation must not fall back to an unimplemented effect: {activation:#?}"
+    );
+}
+
+/// CR 508.1b + CR 509.1a: a legacy activation gate may allow either combat
+/// status. Preserve the exact disjunction through the full Oracle pipeline.
+#[test]
+fn sawback_manticore_attacking_or_blocking_gate_is_not_dropped() {
+    let r = parse(
+        "{1}: This creature deals 2 damage to target attacking or blocking creature. \
+         Activate only if this creature is attacking or blocking and only once each turn.",
+        "Sawback Manticore",
+        &[],
+        &["Creature"],
+        &["Manticore"],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {r:#?}");
+    assert!(
+        r.abilities[0]
+            .activation_restrictions
+            .iter()
+            .any(|restriction| {
+                matches!(
+                    restriction,
+                    ActivationRestriction::RequiresCondition {
+                        condition: Some(ParsedCondition::SourceIsAttackingOrBlocking)
+                    }
+                )
+            }),
+        "combat disjunction must survive as a typed restriction: {:?}",
+        r.abilities[0].activation_restrictions
+    );
+    assert!(
+        r.abilities[0]
+            .activation_restrictions
+            .contains(&ActivationRestriction::OnlyOnceEachTurn),
+        "the independent once-per-turn gate must survive: {:?}",
+        r.abilities[0].activation_restrictions
+    );
+    assert!(
+        !parsed_has_unimplemented(&r),
+        "Sawback Manticore must not retain an unimplemented activation rider: {r:#?}"
+    );
+}
+
+#[test]
+fn hakim_loreweaver_unenchanted_gate_is_not_dropped() {
+    let r = parse(
+        "{U}: Draw a card. Activate only during your upkeep and only if ~ isn't enchanted.",
+        "Hakim, Loreweaver",
+        &[],
+        &["Creature"],
+        &["Human", "Wizard"],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {r:#?}");
+    assert!(
+        r.abilities[0]
+            .activation_restrictions
+            .iter()
+            .any(|restriction| {
+                matches!(
+                    restriction,
+                    ActivationRestriction::RequiresCondition {
+                        condition: Some(ParsedCondition::Not { condition })
+                    } if matches!(
+                        condition.as_ref(),
+                        ParsedCondition::QuantityComparison { .. }
+                    )
+                )
+            }),
+        "source enchantment gate must survive as a typed restriction: {:?}",
+        r.abilities[0].activation_restrictions
+    );
+    assert!(
+        r.abilities[0]
+            .activation_restrictions
+            .contains(&ActivationRestriction::DuringYourUpkeep),
+        "the independent upkeep gate must survive: {:?}",
+        r.abilities[0].activation_restrictions
+    );
+    assert!(
+        !parsed_has_unimplemented(&r),
+        "Hakim's activation must not retain an unimplemented rider: {r:#?}"
+    );
+}
+
+#[test]
+fn grizzled_wolverine_blocker_gate_is_source_relative() {
+    let r = parse(
+        "{R}: This creature gets +2/+0 until end of turn. Activate only during the declare blockers step, only if at least one creature is blocking this creature, and only once each turn.",
+        "Grizzled Wolverine",
+        &[],
+        &["Creature"],
+        &["Wolverine"],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {r:#?}");
+    assert!(
+        r.abilities[0]
+            .activation_restrictions
+            .iter()
+            .any(|restriction| {
+                matches!(
+                    restriction,
+                    ActivationRestriction::RequiresCondition {
+                        condition: Some(ParsedCondition::QuantityComparison { .. })
+                    }
+                )
+            }),
+        "source-relative blocker gate must survive as a typed restriction: {:?}",
+        r.abilities[0].activation_restrictions
+    );
+    assert!(
+        r.abilities[0]
+            .activation_restrictions
+            .contains(&ActivationRestriction::OnlyOnceEachTurn),
+        "the independent once-per-turn gate must survive: {:?}",
+        r.abilities[0].activation_restrictions
+    );
+    assert!(
+        !parsed_has_unimplemented(&r),
+        "Grizzled Wolverine's activation must not retain an unimplemented rider: {r:#?}"
+    );
+}
+
+#[test]
+fn ashen_ghoul_above_source_gate_is_not_dropped() {
+    let r = parse(
+        "{B}: Return Ashen Ghoul from your graveyard to the battlefield. Activate only during your upkeep and only if three or more creature cards are above Ashen Ghoul.",
+        "Ashen Ghoul",
+        &[],
+        &["Creature"],
+        &["Zombie"],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {r:#?}");
+    assert!(
+        r.abilities[0]
+            .activation_restrictions
+            .iter()
+            .any(|restriction| {
+                matches!(
+                    restriction,
+                    ActivationRestriction::RequiresCondition {
+                        condition: Some(ParsedCondition::SourceHasCreatureCardsAbove {
+                            minimum: 3
+                        })
+                    }
+                )
+            }),
+        "graveyard-order gate must survive as a typed restriction: {:?}",
+        r.abilities[0].activation_restrictions
+    );
+    assert!(
+        !parsed_has_unimplemented(&r),
+        "Ashen Ghoul's activation must not retain an unimplemented rider: {r:#?}"
+    );
+}
+
+#[test]
+fn sea_troll_block_history_gate_is_not_dropped() {
+    let r = parse(
+        "{U}: Regenerate this creature. Activate only if this creature blocked or was blocked by a blue creature this turn.",
+        "Sea Troll",
+        &[],
+        &["Creature"],
+        &["Troll"],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {r:#?}");
+    assert!(
+        r.abilities[0]
+            .activation_restrictions
+            .iter()
+            .any(|restriction| {
+                matches!(
+                    restriction,
+                    ActivationRestriction::RequiresCondition {
+                        condition: Some(
+                            ParsedCondition::SourceWasBlockedOrBlockedByColorThisTurn {
+                                color: crate::types::mana::ManaColor::Blue
+                            }
+                        )
+                    }
+                )
+            }),
+        "combat-history gate must survive as a typed restriction: {:?}",
+        r.abilities[0].activation_restrictions
+    );
+    assert!(
+        !parsed_has_unimplemented(&r),
+        "Sea Troll's activation must not retain an unimplemented rider: {r:#?}"
     );
 }
 
@@ -4501,7 +4746,10 @@ fn aegis_of_honor_full_parse_preserves_source_controller_redirection() {
         &["Artifact"],
         &[],
     );
-    assert!(!parsed_has_unimplemented(&r), "Aegis must parse fully: {r:#?}");
+    assert!(
+        !parsed_has_unimplemented(&r),
+        "Aegis must parse fully: {r:#?}"
+    );
 
     let Some(definition) = r.abilities.first() else {
         panic!("Aegis must expose its activated ability");
@@ -4512,9 +4760,16 @@ fn aegis_of_honor_full_parse_preserves_source_controller_redirection() {
         ..
     } = definition.effect.as_ref()
     else {
-        panic!("expected source-controller damage replacement: {:#?}", definition.effect);
+        panic!(
+            "expected source-controller damage replacement: {:#?}",
+            definition.effect
+        );
     };
-    assert_eq!(filters.len(), 2, "instant/sorcery source must have two OR legs");
+    assert_eq!(
+        filters.len(),
+        2,
+        "instant/sorcery source must have two OR legs"
+    );
 }
 
 #[test]
@@ -4579,18 +4834,21 @@ fn dark_sphere_full_parse_preserves_half_prevention() {
     }) else {
         panic!("expected Dark Sphere's damage replacement: {r:#?}");
     };
-    assert!(matches!(
-        effect,
-        Effect::CreateDamageReplacement {
-            modification: Some(DamageModification::PreventionHalf),
-            source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
-            target_filter: Some(DamageTargetFilter::Player {
-                player: DamageTargetPlayerScope::Controller,
-            }),
-            redirect_lifetime: RedirectionLifetime::OneOpportunity,
-            ..
-        }
-    ), "unexpected Dark Sphere effect: {effect:?}");
+    assert!(
+        matches!(
+            effect,
+            Effect::CreateDamageReplacement {
+                modification: Some(DamageModification::PreventionHalf),
+                source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
+                target_filter: Some(DamageTargetFilter::Player {
+                    player: DamageTargetPlayerScope::Controller,
+                }),
+                redirect_lifetime: RedirectionLifetime::OneOpportunity,
+                ..
+            }
+        ),
+        "unexpected Dark Sphere effect: {effect:?}"
+    );
 }
 
 #[test]
@@ -4599,9 +4857,7 @@ fn targeted_continuous_damage_redirects_parse_through_full_cards() {
         if matches!(def.effect.as_ref(), Effect::CreateDamageReplacement { .. }) {
             return Some(def.effect.as_ref());
         }
-        def.sub_ability
-            .as_deref()
-            .and_then(find_damage_replacement)
+        def.sub_ability.as_deref().and_then(find_damage_replacement)
     }
 
     let attendants = parse(
@@ -4622,7 +4878,10 @@ fn targeted_continuous_damage_redirects_parse_through_full_cards() {
         recipient_object_filter: Some(TargetFilter::Typed(recipient)),
         redirect_lifetime: RedirectionLifetime::Continuous,
         ..
-    }) = attendants.abilities.iter().find_map(find_damage_replacement)
+    }) = attendants
+        .abilities
+        .iter()
+        .find_map(find_damage_replacement)
     else {
         panic!(
             "Oracle's Attendants must preserve its chosen source, target creature, and self redirect: {:#?}",
@@ -10106,11 +10365,11 @@ fn any_player_may_activate_but_only_records_timing_restriction() {
     );
     assert_eq!(activation.activator_filter, Some(PlayerFilter::All));
     assert!(
-        activation.activation_restrictions.contains(
-            &ActivationRestriction::RequiresCondition {
+        activation
+            .activation_restrictions
+            .contains(&ActivationRestriction::RequiresCondition {
                 condition: Some(ParsedCondition::IsDuringUpkeep),
-            }
-        ),
+            }),
         "expected unscoped IsDuringUpkeep, got {:?}",
         activation.activation_restrictions
     );
