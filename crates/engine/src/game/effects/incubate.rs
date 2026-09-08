@@ -87,7 +87,10 @@ pub fn resolve(
             state,
             EffectKind::Incubate,
             ability.source_id,
-            vec![PendingCounterPostAction::InjectPredefinedTokenAbilities { object_id: obj_id }],
+            vec![PendingCounterPostAction::InjectPredefinedTokenAbilities {
+                object_id: obj_id,
+                putter: Some(ability.controller),
+            }],
         );
         return Ok(());
     }
@@ -124,8 +127,14 @@ pub fn resolve(
     // zone-change replay guard (`triggers.rs`) dedups on `(definition_ref, turn_zone_change_index)`
     // read off the EVENT, so an unrouted record aliases this Incubator onto occurrence `0` and a
     // `batched: true` ETB trigger that already fired for another entry this turn is swallowed.
+    let entry_event_start = events.len();
     crate::game::zones::record_and_emit_entry_from_no_zone(state, obj_id, events)
         .expect("incubator token was just created");
+    crate::game::zones::stamp_zone_change_putter(
+        &mut events[entry_event_start..],
+        obj_id,
+        Some(ability.controller),
+    );
 
     super::token::inject_predefined_token_abilities(state, obj_id);
 
@@ -271,6 +280,14 @@ mod tests {
 
         assert_eq!(zone_change.1, None);
         assert_eq!(zone_change.2, Zone::Battlefield);
+        assert_eq!(
+            events.iter().find_map(|event| match event {
+                GameEvent::ZoneChanged { record, .. } => record.zone_change_putter(),
+                _ => None,
+            }),
+            Some(PlayerId(0)),
+            "the incubating ability's controller is the event-time putter"
+        );
         assert_eq!(state.zone_changes_this_turn.len(), 1);
         assert_eq!(state.zone_changes_this_turn[0].object_id, zone_change.0);
         assert_eq!(state.zone_changes_this_turn[0].from_zone, None);
@@ -377,6 +394,14 @@ mod tests {
             .expect("ZoneChanged must fire once the paused counter replacement resolves");
         assert_eq!(zone_change.1, None);
         assert_eq!(zone_change.2, Zone::Battlefield);
+        assert_eq!(
+            events.iter().find_map(|event| match event {
+                GameEvent::ZoneChanged { record, .. } => record.zone_change_putter(),
+                _ => None,
+            }),
+            Some(PlayerId(0)),
+            "the deferred incubator entry retains its actor"
+        );
 
         // The ZoneChanged snapshot must observe the token's final
         // (post-replacement) counter count, not a pre-resolution state.

@@ -1106,7 +1106,14 @@ fn finish_non_liminal_copy_token_entry(
     // CR 608.2i battlefield-entry bookkeeping itself, so the co-located
     // `record_battlefield_entry` call is deleted — keeping it would double-count
     // `battlefield_entries_this_turn`.
-    super::token::push_committed_token_entry_events(state, token_id, name, source_id, events)
+    super::token::push_committed_token_entry_events_with_putter(
+        state,
+        token_id,
+        name,
+        source_id,
+        Some(controller),
+        events,
+    )
         .expect("token just created");
     sink.publish(state, token_id);
     true
@@ -1227,7 +1234,14 @@ pub(crate) fn apply_remaining_token_modifications_after_counter_pause(
     // and this batch's `created_ids`, which `drain_pending_copy_token_resolution` assigns wholesale
     // back onto ledger 3 — because a separate buffer push republished the withheld id and clobbered
     // the guarded list on top of it.
-    super::token::push_committed_token_entry_events(state, token_id, name, source_id, events);
+    super::token::push_committed_token_entry_events_with_putter(
+        state,
+        token_id,
+        name,
+        source_id,
+        Some(controller),
+        events,
+    );
     super::token::record_last_created_copy_batch_token(state, token_id);
     true
 }

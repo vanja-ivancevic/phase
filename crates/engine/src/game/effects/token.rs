@@ -1068,11 +1068,12 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
         // event is emitted for token-specific consumers (animation, logging,
         // `LastCreated` target filters). Single authority for both, and for the
         // CR 400.7 zone-change index the batched replay guard keys on.
-        push_committed_token_entry_events(
+        push_committed_token_entry_events_with_putter(
             state,
             obj_id,
             spec.characteristics.display_name.clone(),
             spec.source_id,
+            Some(spec.controller),
             events,
         );
 
@@ -2023,7 +2024,14 @@ pub(crate) fn finalize_committed_liminal_token_entry_from_action(
     // state at the moment of the move" from a pre-copy 0/0 Shapeshifter.
     match entry_events {
         TokenEntryEventEmission::Emit => {
-            push_committed_token_entry_events(state, object_id, name, source_id, events);
+            push_committed_token_entry_events_with_putter(
+                state,
+                object_id,
+                name,
+                source_id,
+                Some(controller),
+                events,
+            );
         }
         TokenEntryEventEmission::Suppress => {
             // Overwriting a live parked entry would silently lose its CR 400.7 row AND both of its
@@ -2052,6 +2060,7 @@ pub(crate) fn finalize_committed_liminal_token_entry_from_action(
                 object_id,
                 name,
                 source_id,
+                putter: Some(controller),
             });
         }
     }
@@ -2167,15 +2176,25 @@ pub(crate) fn finalize_committed_liminal_token_entry_from_action(
 /// and `token_copy.rs`'s uninterrupted copy path only; every other caller discards it. Those two
 /// panic on `None` exactly as before — the guard changes only whether an (unobservable, because the
 /// unwinding drops `events` and no engine boundary catches it) `TokenCreated` was pushed first.
-pub(crate) fn push_committed_token_entry_events(
+/// CR 110.2a + CR 305.1: emit a token's battlefield entry and retain the
+/// effect actor on the event-time zone-change record. Callers that cannot prove
+/// the actor pass `None`, which fails the active-voice trigger match closed.
+pub(crate) fn push_committed_token_entry_events_with_putter(
     state: &mut GameState,
     object_id: ObjectId,
     name: String,
     source_id: ObjectId,
+    putter: Option<PlayerId>,
     events: &mut Vec<GameEvent>,
 ) -> Option<crate::types::game_state::ZoneChangeRecord> {
+    let entry_event_start = events.len();
     let record = crate::game::zones::record_and_emit_entry_from_no_zone(state, object_id, events);
     if record.is_some() {
+        crate::game::zones::stamp_zone_change_putter(
+            &mut events[entry_event_start..],
+            object_id,
+            putter,
+        );
         events.push(GameEvent::TokenCreated {
             object_id,
             name,
@@ -2338,11 +2357,12 @@ pub(crate) fn flush_pending_token_battlefield_entry(
     else {
         return false;
     };
-    push_committed_token_entry_events(
+    push_committed_token_entry_events_with_putter(
         state,
         pending.object_id,
         pending.name,
         pending.source_id,
+        pending.putter,
         events,
     );
     true
@@ -4715,6 +4735,7 @@ mod tests {
                 object_id,
                 name: "Record Probe".to_string(),
                 source_id: ObjectId(1),
+                putter: Some(PlayerId(0)),
             }),
             "the whole entry is parked on GameState so it survives any number of round trips"
         );
@@ -4773,6 +4794,16 @@ mod tests {
             "realization emits the entry pair exactly once; got {events:?}"
         );
         assert!(state.pending_token_battlefield_entry.is_none());
+        assert_eq!(
+            events
+                .iter()
+                .find_map(|event| match event {
+                    GameEvent::ZoneChanged { record, .. } => record.zone_change_putter(),
+                    _ => None,
+                }),
+            Some(PlayerId(0)),
+            "the liminal token retains its actor through the parked flush"
+        );
 
         let mut second = Vec::new();
         assert!(
@@ -4922,6 +4953,7 @@ mod tests {
             object_id: ObjectId(7),
             name: "Record Probe".to_string(),
             source_id: ObjectId(1),
+            putter: None,
         });
         let encoded = serde_json::to_string(&state).expect("GameState serializes");
         let decoded: GameState = serde_json::from_str(&encoded).expect("GameState deserializes");
@@ -5110,6 +5142,11 @@ mod tests {
         assert_eq!(record.from_zone, None);
         assert_eq!(record.to_zone, Zone::Battlefield);
         assert!(record.is_token, "record should reflect token identity");
+        assert_eq!(
+            record.zone_change_putter(),
+            Some(PlayerId(0)),
+            "the token effect controller is the event-time putter"
+        );
     }
 
     #[test]

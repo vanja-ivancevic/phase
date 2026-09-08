@@ -6272,6 +6272,11 @@ pub struct PendingTokenBattlefieldEntry {
     /// The `TokenCreated` display name (the token's OWN name, not the copied source's).
     pub name: String,
     pub source_id: ObjectId,
+    /// CR 110.2a + CR 305.1: the player whose effect put the token onto the
+    /// battlefield. This is retained across replacement-choice pauses rather
+    /// than inferred from the token's resulting controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub putter: Option<PlayerId>,
 }
 
 /// CR 707.2 + CR 614.1c: everything the non-liminal copy-token entry tail still
@@ -6323,6 +6328,10 @@ pub enum PendingCounterPostAction {
     },
     InjectPredefinedTokenAbilities {
         object_id: ObjectId,
+        /// CR 110.2a + CR 305.1: the incubating effect's actor, retained until
+        /// counter replacement choices finish and the entry is emitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        putter: Option<PlayerId>,
     },
     FinalizeTokenEntry {
         object_id: ObjectId,
