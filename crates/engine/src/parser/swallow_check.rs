@@ -2209,6 +2209,7 @@ fn restriction_is_activation_limit(restriction: &ActivationRestriction) -> bool 
         | ActivationRestriction::DuringCombat
         | ActivationRestriction::BeforeAttackersDeclared
         | ActivationRestriction::BeforeCombatDamage
+        | ActivationRestriction::AfterBlockersDeclared
         | ActivationRestriction::MatchesCardCastTiming => false,
         // CR 602.5: game-state gates — WHETHER it may be activated at all.
         ActivationRestriction::RequiresCondition { .. }

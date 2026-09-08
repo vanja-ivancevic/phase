@@ -21762,6 +21762,9 @@ pub enum ActivationRestriction {
     DuringCombat,
     BeforeAttackersDeclared,
     BeforeCombatDamage,
+    /// CR 509.1 + CR 510.1 + CR 511.1: the ability can be activated after
+    /// blockers are declared, through combat damage and end of combat.
+    AfterBlockersDeclared,
     OnlyOnceEachTurn,
     OnlyOnce,
     MaxTimesEachTurn {

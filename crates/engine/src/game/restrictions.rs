@@ -1088,6 +1088,12 @@ fn activation_restriction_applies(
         ActivationRestriction::DuringCombat => state.phase.is_combat(),
         ActivationRestriction::BeforeAttackersDeclared => is_before_attackers_declared(state),
         ActivationRestriction::BeforeCombatDamage => is_before_combat_damage(state.phase),
+        // CR 509.1 + CR 510.1 + CR 511.1: mirror the casting restriction's
+        // post-blockers window for activated abilities.
+        ActivationRestriction::AfterBlockersDeclared => matches!(
+            state.phase,
+            Phase::DeclareBlockers | Phase::CombatDamage | Phase::EndCombat
+        ),
         // CR 602.5b: Per-turn activation limit tracked via ability activation counter.
         // CR 702.142b: ModifyActivationLimit statics may raise the limit for tagged abilities.
         ActivationRestriction::OnlyOnceEachTurn => {
@@ -5136,6 +5142,15 @@ mod tests {
             ],
             Phase::DeclareBlockers,
             Phase::CombatDamage,
+        );
+        check_window(
+            "{2}, {T}: Tap target creature. Activate only during combat after blockers are declared.",
+            &[
+                ActivationRestriction::DuringCombat,
+                ActivationRestriction::AfterBlockersDeclared,
+            ],
+            Phase::DeclareBlockers,
+            Phase::DeclareAttackers,
         );
     }
 

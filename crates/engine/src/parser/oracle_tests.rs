@@ -913,6 +913,30 @@ fn combat_damage_window_activation_gate_maps_to_before_combat_damage() {
     );
 }
 
+/// CR 509.1 + CR 510.1 + CR 511.1: activated abilities use the same
+/// post-blockers combat window already enforced for spell casting. Trap Runner
+/// is the old-border card whose printed restriction exercises this grammar.
+#[test]
+fn after_blockers_activation_gate_maps_to_enforced_window() {
+    let r = parse(
+        "{2}, {T}: Tap target creature. Activate only during combat after blockers are declared.",
+        "Trap Runner",
+        &[],
+        &["Creature"],
+        &["Human"],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {:#?}", r.abilities);
+    let restrictions = &r.abilities[0].activation_restrictions;
+    assert_eq!(
+        restrictions,
+        &[
+            ActivationRestriction::DuringCombat,
+            ActivationRestriction::AfterBlockersDeclared,
+        ],
+        "post-blockers activation window must be preserved, got {restrictions:?}"
+    );
+}
+
 #[test]
 fn legacy_play_this_ability_as_sorcery_records_activation_restriction() {
     let r = parse(

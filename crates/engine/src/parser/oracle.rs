@@ -8502,6 +8502,18 @@ fn parse_activation_before_window_gate(i: &str) -> OracleResult<'_, ActivationRe
     .parse(i)
 }
 
+/// CR 509.1 + CR 510.1 + CR 511.1: the post-blockers combat window used by
+/// activated abilities such as Trap Runner. The parser deliberately keeps this
+/// separate from `BeforeCombatDamage`: the two windows overlap in the declare
+/// blockers step but have different boundaries on either side of it.
+fn parse_activation_after_window_gate(i: &str) -> OracleResult<'_, ActivationRestriction> {
+    value(
+        ActivationRestriction::AfterBlockersDeclared,
+        tag("after blockers are declared"),
+    )
+    .parse(i)
+}
+
 fn parse_activation_timing_restriction(phrase: &str) -> Option<Vec<ActivationRestriction>> {
     let phrase = phrase.trim().trim_end_matches('.').trim();
     let lower = phrase.to_lowercase();
@@ -8571,6 +8583,19 @@ fn parse_activation_timing_restriction(phrase: &str) -> Option<Vec<ActivationRes
             if tail.trim().is_empty() {
                 return Some(vec![ActivationRestriction::DuringCombat, window]);
             }
+        }
+        if let Ok((tail, window)) = parse_activation_after_window_gate(rest) {
+            if tail.trim().is_empty() {
+                return Some(vec![ActivationRestriction::DuringCombat, window]);
+            }
+        }
+    }
+    // CR 509.1: permit the standalone post-blockers phrase as well. Current
+    // Oracle usually combines it with "during combat", but retaining the
+    // standalone form keeps this combinator complete and safely enforceable.
+    if let Ok((tail, window)) = parse_activation_after_window_gate(lower.as_str()) {
+        if tail.trim().is_empty() {
+            return Some(vec![window]);
         }
     }
     // CR 602.5: "if <condition>" gate (Lightning Storm "if ~ is on the stack").
