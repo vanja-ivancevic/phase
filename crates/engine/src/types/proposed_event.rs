@@ -480,6 +480,12 @@ pub enum ProposedEvent {
         from: Zone,
         to: Zone,
         cause: Option<ObjectId>,
+        /// CR 110.2a + CR 305.1: the player who performed the action that
+        /// puts this object onto the battlefield. This is distinct from the
+        /// resulting controller, which replacements may change. `None` is
+        /// fail-closed for callers without authoritative actor provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        putter: Option<PlayerId>,
         /// CR 303.4f: When an Aura enters the battlefield by a non-spell
         /// effect and the effect does not specify what it enchants, the
         /// controller chooses a legal object or player as it enters. The
@@ -868,6 +874,7 @@ impl ProposedEvent {
             from,
             to,
             cause,
+            putter: None,
             attach_to: None,
             enter_tapped: EtbTapState::Unspecified,
             enters_attacking: false,

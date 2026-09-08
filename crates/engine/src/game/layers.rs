@@ -20094,6 +20094,7 @@ mod tests {
                 object_id: source,
                 to: Zone::Graveyard,
                 cause: ZoneChangeCause::Effect { source },
+                putter: None,
                 mods: EntryMods::default(),
                 placement: None,
                 exile_links: ExileLinkSpec::default(),
@@ -20160,6 +20161,7 @@ mod tests {
                 cause: ZoneChangeCause::Effect {
                     source: original_source,
                 },
+                putter: None,
                 mods: EntryMods::default(),
                 placement: None,
                 exile_links: ExileLinkSpec::default(),

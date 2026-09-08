@@ -65,6 +65,7 @@ pub(crate) fn complete_discard_to_graveyard(
         from: Zone::Hand,
         to: Zone::Graveyard,
         cause: source_id,
+        putter: None,
         attach_to: None,
         enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         enters_attacking: false,

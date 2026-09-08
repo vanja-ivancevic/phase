@@ -599,6 +599,12 @@ pub struct TriggerSourceContext {
     /// trigger collection, serialization, and a later same-id reincarnation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub zone_change_cause_source_id: Option<ObjectId>,
+    /// CR 110.2a + CR 305.1: the player who performed the action that put the
+    /// object onto the battlefield. This is distinct from the entrant's
+    /// resulting controller, which replacements may change. `None` means the
+    /// producer could not prove the actor and active-voice matching fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_change_putter: Option<PlayerId>,
 }
 
 impl std::fmt::Debug for TriggerSourceContext {
@@ -680,6 +686,7 @@ impl std::fmt::Debug for TriggerSourceContext {
                 "zone_change_cause_source_id",
                 &self.zone_change_cause_source_id,
             )
+            .field("zone_change_putter", &self.zone_change_putter)
             .finish()
     }
 }
@@ -1634,6 +1641,24 @@ impl ZoneChangeRecord {
         if let Some(context) = &mut self.trigger_source_context {
             context.zone_change_cause_source_id = source_id;
         }
+    }
+
+    /// Stamps the event-time actor after authoritative delivery emits this
+    /// record. Controller is intentionally not a fallback: an ETB replacement
+    /// can make the entrant's controller differ from the player who performed
+    /// the put action.
+    pub(crate) fn stamp_zone_change_putter(&mut self, putter: Option<PlayerId>) {
+        if let Some(context) = &mut self.trigger_source_context {
+            context.zone_change_putter = putter;
+        }
+    }
+
+    /// Returns the event-time player who performed the put action, if the
+    /// delivery producer supplied authoritative provenance.
+    pub fn zone_change_putter(&self) -> Option<PlayerId> {
+        self.trigger_source_context
+            .as_ref()
+            .and_then(|context| context.zone_change_putter)
     }
 
     /// Returns the owned source context captured with this exact event record.
@@ -5439,6 +5464,10 @@ pub struct PendingBatchZoneMoveRequest {
     pub object_id: ObjectId,
     pub destination: Zone,
     pub cause: PendingBatchZoneChangeCause,
+    /// CR 110.2a + CR 305.1: event-time player who performed the put action,
+    /// preserved while a simultaneous move is paused for replacement choices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub putter: Option<PlayerId>,
     #[serde(default, skip_serializing_if = "EtbTapState::is_unspecified")]
     pub enter_tapped: EtbTapState,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]

@@ -2182,6 +2182,7 @@ impl GameObject {
                 additional_cost_payments: self.additional_cost_payments.clone(),
                 cast_cost_paid_object: self.cast_cost_paid_object.clone(),
                 zone_change_cause_source_id: None,
+                zone_change_putter: None,
             }),
             power: self.power,
             toughness: self.toughness,

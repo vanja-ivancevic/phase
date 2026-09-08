@@ -15363,10 +15363,14 @@ fn handle_play_land(
     // hard-overwrites this default unconditionally (identical safety
     // property to the stack.rs spell-cast seam this mirrors).
     if let crate::types::proposed_event::ProposedEvent::ZoneChange {
+        putter,
         controller_override,
         ..
     } = &mut proposed
     {
+        // CR 305.1: the player performing the special action is the putter,
+        // even if an ETB replacement later changes the entrant's controller.
+        *putter = Some(player);
         *controller_override = Some(player);
     }
 

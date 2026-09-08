@@ -3586,6 +3586,16 @@ fn scan_trigger_constraint(x: &TriggerConstraint, mode: ScanMode) -> Axes {
         | TriggerConstraint::AtClassLevel { level: _ }
         | TriggerConstraint::MaxTimesPerTurn { max: _ }
         | TriggerConstraint::OncePerOpponentPerTurn => Axes::NONE,
+        // CR 110.2a + CR 305.1: this gate reads event-owned actor provenance.
+        TriggerConstraint::ZoneChangePutterPresent => Axes {
+            event: true,
+            sibling: false,
+            projected: false,
+        },
+        TriggerConstraint::All { constraints } => constraints
+            .iter()
+            .map(|constraint| scan_trigger_constraint(constraint, mode))
+            .fold(Axes::NONE, Axes::or),
     }
 }
 

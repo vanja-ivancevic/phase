@@ -2306,6 +2306,10 @@ pub(super) fn handle_resolution_choice(
                         Zone::Battlefield,
                         source_id,
                     );
+                    // CR 701.20a + CR 110.2a: the player accepting the
+                    // optional put is the event-time putter, independently of
+                    // any controller override applied on entry.
+                    req.putter = Some(player);
                     req.mods.enter_tapped = enter_tapped;
                     req.mods.enters_attacking = enters_attacking;
                     match crate::game::zone_pipeline::move_object(state, req, events) {

@@ -1074,6 +1074,26 @@ pub(crate) fn stamp_zone_change_cause(
     }
 }
 
+/// CR 110.2a + CR 305.1: stamps the event-time player who performed the put
+/// action onto the just-emitted record. The entrant's controller is not a
+/// fallback because an ETB replacement may change it.
+pub(crate) fn stamp_zone_change_putter(
+    events: &mut [GameEvent],
+    object_id: ObjectId,
+    putter: Option<PlayerId>,
+) {
+    let Some(putter) = putter else {
+        return;
+    };
+    if let Some(GameEvent::ZoneChanged { record, .. }) = events
+        .iter_mut()
+        .rev()
+        .find(|event| matches!(event, GameEvent::ZoneChanged { object_id: id, .. } if *id == object_id))
+    {
+        record.stamp_zone_change_putter(Some(putter));
+    }
+}
+
 /// CR 400.7: Move an object to a new zone. An object that moves to a new zone becomes a new object.
 ///
 /// `enter_transformed` (CR 712.14a) is the transient, single-authority "enters

@@ -1148,6 +1148,18 @@ fn condition_introduces_attacking_player(cond_lower: &str) -> bool {
     false
 }
 
+/// CR 110.2a + CR 305.1: an active-voice condition of the form
+/// "a player puts ... onto the battlefield" introduces the player who
+/// performed the put action as the relative player for trailing "that player"
+/// anaphors. This is intentionally a narrow lexical gate; the object phrase
+/// itself is parsed by `parse_trigger_subject` in the trigger dispatcher.
+fn condition_introduces_zone_change_putter(cond_lower: &str) -> bool {
+    nom_primitives::scan_at_word_boundaries(cond_lower, |input| {
+        tag::<_, _, OracleError<'_>>("a player puts ").parse(input)
+    })
+    .is_some()
+}
+
 /// CR 603.2e + CR 115.1 + CR 608.2c: A "becomes the target of a spell or
 /// ability" trigger (Lethal Voice — Black Bolt, Inhuman King; Scalelord
 /// Reckoner) fires on the "becomes the target" event (CR 603.2e). The targeting
@@ -1328,6 +1340,12 @@ pub(crate) fn relative_player_scope_for_condition(cond_lower: &str) -> Option<Co
         // player for "that player" anaphors in the effect body (Total War:
         // "...destroy all untapped non-Wall creatures that player controls...").
         Some(ControllerRef::TriggeringPlayer)
+    } else if condition_introduces_zone_change_putter(cond_lower) {
+        // CR 608.2c: active-voice "a player puts" binds a body-level
+        // "that player" to the event-time putter. ScopedPlayer is stamped on
+        // the resolved triggered ability from the authoritative event record;
+        // generic zone-change TriggeringPlayer remains controller-based.
+        Some(ControllerRef::ScopedPlayer)
     } else if condition_introduces_becomes_target_source_player(cond_lower)
         || try_parse_opponent_controlled_destroy_trigger(cond_lower).is_some()
     {
@@ -2142,8 +2160,19 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
         }
     }
 
-    // Text-based constraints take precedence; fall back to condition-parser constraint.
-    def.constraint = modifiers.constraint.clone().or(def.constraint.take());
+    // Text-based constraints normally take precedence over the condition-parser
+    // constraint. Active-voice put triggers are the exception: their event-time
+    // provenance gate is independent of a timing/frequency gate, so preserve
+    // both instead of silently dropping one (CR 603.2).
+    def.constraint = match (modifiers.constraint.clone(), def.constraint.take()) {
+        (Some(text_constraint), Some(parsed_constraint @ TriggerConstraint::ZoneChangePutterPresent)) => {
+            Some(TriggerConstraint::All {
+                constraints: vec![parsed_constraint, text_constraint],
+            })
+        }
+        (Some(text_constraint), _) => Some(text_constraint),
+        (None, parsed_constraint) => parsed_constraint,
+    };
 
     // CR 603.2: Apply trigger-event frequency limits as a fallback.
     if let (Some(limit), None) = (modifiers.first_time_limit, def.constraint.as_ref()) {
@@ -16139,6 +16168,13 @@ fn try_parse_bend_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefinition
 
 /// Parse player-centric triggers: "you gain life", "you cast a/an ...", "you draw a card"
 fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
+    // CR 110.2a + CR 305.1: active-voice battlefield-entry triggers must be
+    // recognized before the generic player-action grammar, because their
+    // subject is the object being put while their actor is a player.
+    if let Some(result) = try_parse_player_puts_onto_battlefield_trigger(lower) {
+        return Some(result);
+    }
+
     // Avatar crossover: bending-verb triggers ("whenever you waterbend, …") must
     // run before the generic player-action dispatch, which does not recognize the
     // bend verbs and would fall through to `TriggerMode::Unknown`.
@@ -17185,6 +17221,35 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
     }
 
     None
+}
+
+/// CR 110.2a + CR 305.1: Parse
+/// "Whenever a player puts [object-filter] onto the battlefield".
+///
+/// The resulting trigger keeps the ordinary `ChangesZone` matcher for the
+/// object/destination axes and adds an event-time putter constraint. The
+/// latter is separate from the entrant's controller because ETB replacements
+/// can change control.
+fn try_parse_player_puts_onto_battlefield_trigger(
+    lower: &str,
+) -> Option<(TriggerMode, TriggerDefinition)> {
+    let after_keyword = lower
+        .strip_prefix("whenever ")
+        .or_else(|| lower.strip_prefix("when "))
+        .unwrap_or(lower);
+    let subject_text = after_keyword.strip_prefix("a player puts ")?;
+    let mut ctx = ParseContext::default();
+    let (subject, tail) = parse_trigger_subject(subject_text, &mut ctx);
+    if tail.trim() != "onto the battlefield" {
+        return None;
+    }
+
+    let mut def = make_base();
+    def.mode = TriggerMode::ChangesZone;
+    def.valid_card = Some(subject);
+    def.destination = Some(Zone::Battlefield);
+    def.constraint = Some(TriggerConstraint::ZoneChangePutterPresent);
+    Some((TriggerMode::ChangesZone, def))
 }
 
 fn try_parse_player_action_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {

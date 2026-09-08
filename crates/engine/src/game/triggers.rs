@@ -2443,6 +2443,7 @@ fn collect_matching_triggers_inner(
                 &source_context,
                 definition_ref.as_ref(),
             );
+            stamp_zone_change_putter_scope(&mut ability, trig_def, event);
             // CR 603.4: Stamp the printed-trigger index so per-turn resolution
             // tracking (`AbilityCondition::NthResolutionThisTurn`) can identify
             // "this ability" at resolution time.
@@ -3939,6 +3940,7 @@ fn collect_latched_batched_zone_triggers(
             source_context,
             Some(&latched.definition_ref),
         );
+        stamp_zone_change_putter_scope(&mut ability, &latched.definition, first_event);
         ability.ability_index = Some(trig_idx);
         let (modal, mode_abilities) = latched
             .definition
@@ -12804,6 +12806,18 @@ fn check_trigger_constraint_with_ref(
     };
 
     match constraint {
+        TriggerConstraint::All { constraints } => constraints.iter().all(|nested| {
+            let mut nested_definition = trig_def.clone();
+            nested_definition.constraint = Some(nested.clone());
+            check_trigger_constraint_with_ref(
+                state,
+                &nested_definition,
+                definition_ref,
+                source_context,
+                controller,
+                event,
+            )
+        }),
         // A legacy synthetic off-zone trigger has no ledger identity until the
         // occurrence reconciler materializes it. That limits only the
         // identity-keyed "once" bookkeeping; all semantic constraints below
@@ -12885,6 +12899,14 @@ fn check_trigger_constraint_with_ref(
                 _ => false,
             }
         }
+        // CR 110.2a + CR 305.1: active-voice put triggers require the
+        // record-owned event-time actor. Never infer this from controller or
+        // cause-source provenance.
+        TriggerConstraint::ZoneChangePutterPresent => matches!(
+            event,
+            Some(GameEvent::ZoneChanged { record, .. })
+                if record.zone_change_putter().is_some()
+        ),
         // CR 603.2: Per-caster spell count. The caster is extracted from the SpellCast
         // event; the count comes from the per-player map (not the global counter).
         // When `filter` contains `TypeFilter::Non(Creature)`, use the noncreature counter.
@@ -14966,6 +14988,17 @@ fn record_trigger_fired_with_ref(
     };
 
     match constraint {
+        TriggerConstraint::All { constraints } => {
+            for nested in constraints {
+                record_trigger_fired_with_ref(
+                    state,
+                    Some(nested),
+                    source_context,
+                    definition_ref,
+                    event,
+                );
+            }
+        }
         TriggerConstraint::OncePerTurn => {
             crate::game::ledger::record_trigger_fired(
                 state,
@@ -15012,7 +15045,8 @@ fn record_trigger_fired_with_ref(
         | TriggerConstraint::NthSpellThisTurn { .. }
         | TriggerConstraint::NthDrawThisTurn { .. }
         | TriggerConstraint::EventSourceControlledBy { .. }
-        | TriggerConstraint::AtClassLevel { .. } => {
+        | TriggerConstraint::AtClassLevel { .. }
+        | TriggerConstraint::ZoneChangePutterPresent => {
             // No tracking needed — checked at fire time via game/object/event state
         }
         // Increment the captured fire count for MaxTimesPerTurn tracking.
@@ -15392,6 +15426,42 @@ fn ability_condition_refs_cost_paid_object(condition: &AbilityCondition) -> bool
 /// matched it. The only live reads below are documented game-global event
 /// channels (`announced_source_x` and `active_player`), never a rebind of the
 /// source object by storage id.
+fn trigger_constraint_contains_zone_change_putter(
+    constraint: &crate::types::ability::TriggerConstraint,
+) -> bool {
+    match constraint {
+        crate::types::ability::TriggerConstraint::ZoneChangePutterPresent => true,
+        crate::types::ability::TriggerConstraint::All { constraints } => constraints
+            .iter()
+            .any(trigger_constraint_contains_zone_change_putter),
+        _ => false,
+    }
+}
+
+fn stamp_zone_change_putter_scope(
+    ability: &mut ResolvedAbility,
+    trigger: &TriggerDefinition,
+    event: &GameEvent,
+) {
+    if !trigger
+        .constraint
+        .as_ref()
+        .is_some_and(trigger_constraint_contains_zone_change_putter)
+    {
+        return;
+    }
+    let GameEvent::ZoneChanged { record, .. } = event else {
+        return;
+    };
+    let Some(putter) = record.zone_change_putter() else {
+        return;
+    };
+    // CR 608.2c: effect-body "that player" was lowered to ScopedPlayer by
+    // the active-voice parser. Bind it from the immutable event record at
+    // trigger creation, not from the entrant's post-replacement controller.
+    ability.set_scoped_player_recursive(putter);
+}
+
 pub(super) fn build_triggered_ability_from_context(
     state: &GameState,
     trig_def: &TriggerDefinition,
@@ -17447,6 +17517,107 @@ pub mod tests {
             !check_trigger_constraint(&state, &def, source, 0, PlayerId(0), &no_cause),
             "a discard with no recorded cause must NOT satisfy the constraint"
         );
+    }
+
+    /// CR 110.2a + CR 305.1: active-voice put triggers must fail closed when
+    /// the delivery did not carry actor provenance, and must not use the
+    /// entrant controller as an implicit substitute.
+    #[test]
+    fn zone_change_putter_constraint_requires_record_owned_provenance() {
+        use crate::types::ability::TriggerConstraint;
+
+        let mut state = setup();
+        let source = make_creature(&mut state, PlayerId(0), "Putter watcher", 1, 1);
+        let mut def = make_trigger(TriggerMode::ChangesZone);
+        def.constraint = Some(TriggerConstraint::ZoneChangePutterPresent);
+
+        let mut record = ZoneChangeRecord::test_minimal(
+            source,
+            Some(Zone::Hand),
+            Zone::Battlefield,
+        );
+        record.trigger_source_context = Some(trigger_source_context_for_latch(
+            &state,
+            state.objects.get(&source).expect("watcher exists"),
+        ));
+        let event_without_putter = GameEvent::ZoneChanged {
+            object_id: source,
+            from: Some(Zone::Hand),
+            to: Zone::Battlefield,
+            record: Box::new(record.clone()),
+        };
+        assert!(!check_trigger_constraint(
+            &state,
+            &def,
+            source,
+            0,
+            PlayerId(0),
+            &event_without_putter,
+        ));
+
+        record.stamp_zone_change_putter(Some(PlayerId(1)));
+        let event_with_putter = GameEvent::ZoneChanged {
+            object_id: source,
+            from: Some(Zone::Hand),
+            to: Zone::Battlefield,
+            record: Box::new(record),
+        };
+        assert!(check_trigger_constraint(
+            &state,
+            &def,
+            source,
+            0,
+            PlayerId(0),
+            &event_with_putter,
+        ));
+    }
+
+    /// CR 608.2c: active-voice "that player" is bound when the trigger is
+    /// instantiated, so a later controller change cannot rebind the effect.
+    #[test]
+    fn zone_change_putter_scope_binds_triggered_ability_from_event_record() {
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, Effect, QuantityExpr, TargetFilter,
+            TriggerConstraint,
+        };
+
+        let mut state = setup();
+        let source = make_creature(&mut state, PlayerId(0), "Putter watcher", 1, 1);
+        let mut def = make_trigger(TriggerMode::ChangesZone);
+        def.constraint = Some(TriggerConstraint::All {
+            constraints: vec![
+                TriggerConstraint::ZoneChangePutterPresent,
+                TriggerConstraint::OncePerTurn,
+            ],
+        });
+        def.execute = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Database,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::ScopedPlayer,
+            },
+        )));
+
+        let mut record = ZoneChangeRecord::test_minimal(
+            source,
+            Some(Zone::Hand),
+            Zone::Battlefield,
+        );
+        record.trigger_source_context = Some(trigger_source_context_for_latch(
+            &state,
+            state.objects.get(&source).expect("watcher exists"),
+        ));
+        record.stamp_zone_change_putter(Some(PlayerId(1)));
+        let event = GameEvent::ZoneChanged {
+            object_id: source,
+            from: Some(Zone::Hand),
+            to: Zone::Battlefield,
+            record: Box::new(record),
+        };
+
+        let mut ability = build_triggered_ability(&state, &def, source, PlayerId(0));
+        stamp_zone_change_putter_scope(&mut ability, &def, &event);
+        assert_eq!(ability.scoped_player, Some(PlayerId(1)));
     }
 
     /// CR 701.8a + CR 603.2: Karmic Justice-class destruction triggers reuse

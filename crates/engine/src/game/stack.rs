@@ -1843,10 +1843,16 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             // in replace_event below, and hard-overwrites this default
             // unconditionally.
             if let crate::types::proposed_event::ProposedEvent::ZoneChange {
+                putter,
                 controller_override,
                 ..
             } = &mut proposed
             {
+                // CR 601.2a + CR 110.2a: the caster is the player who puts a
+                // permanent spell onto the battlefield. Keep this separate
+                // from the resulting controller, which ETB replacements may
+                // change later in the pipeline.
+                *putter = Some(entry.controller);
                 *controller_override = Some(entry.controller);
             }
             // CR 702.190b: Sneak-cast permanent enters the battlefield tapped.
@@ -5565,6 +5571,20 @@ mod tests {
 
         let obj = &state.objects[&spell_id];
         assert_eq!(obj.zone, Zone::Battlefield);
+        let entry = events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    object_id, record, ..
+                } if *object_id == spell_id => Some(record),
+                _ => None,
+            })
+            .expect("permanent spell resolution must emit its battlefield entry");
+        assert_eq!(
+            entry.zone_change_putter(),
+            Some(PlayerId(0)),
+            "the caster is the event-time putter even when entry replacements may change control"
+        );
         assert_eq!(
             obj.kickers_paid,
             vec![KickerVariant::First],

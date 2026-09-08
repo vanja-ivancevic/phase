@@ -25010,6 +25010,14 @@ pub enum TriggerConstraint {
     /// causes you to discard this card, …" (Guerrilla Tactics, Sand Golem). The
     /// event must carry the cause's source id (e.g. `GameEvent::Discarded.source_id`).
     EventSourceControlledBy { controller: ControllerRef },
+    /// CR 110.2a + CR 305.1: the trigger listens to the active-voice event
+    /// "a player puts [object] onto the battlefield". Matching requires an
+    /// authoritative event-time putter; records without one fail closed.
+    ZoneChangePutterPresent,
+    /// CR 603.2: multiple independent fire-time gates on one trigger. The
+    /// parser uses this only when an active-voice putter gate must coexist
+    /// with a textual timing/frequency constraint.
+    All { constraints: Vec<TriggerConstraint> },
 }
 
 /// CR 603.6c: source-zone constraint for one clause of a zone-change trigger.

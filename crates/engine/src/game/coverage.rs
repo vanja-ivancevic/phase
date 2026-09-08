@@ -4589,6 +4589,12 @@ fn fmt_trigger_constraint(c: &crate::types::ability::TriggerConstraint) -> Strin
         TC::EventSourceControlledBy { controller } => {
             format!("event source controlled by {}", fmt_controller(controller))
         }
+        TC::ZoneChangePutterPresent => "zone-change putter present".into(),
+        TC::All { constraints } => constraints
+            .iter()
+            .map(fmt_trigger_constraint)
+            .collect::<Vec<_>>()
+            .join(" and "),
     }
 }
 

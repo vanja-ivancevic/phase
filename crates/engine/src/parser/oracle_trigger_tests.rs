@@ -16388,6 +16388,50 @@ fn trigger_opponent_causes_land_to_enter_your_graveyard() {
     ));
 }
 
+/// CR 110.2a + CR 305.1: active-voice battlefield-entry triggers retain the
+/// object filter and separately require event-time putter provenance.
+#[test]
+fn trigger_player_puts_onto_battlefield_has_putter_constraint() {
+    for condition in [
+        "a player puts an Island or blue permanent onto the battlefield",
+        "a player puts a nontoken creature onto the battlefield",
+        "a player puts a Swamp onto the battlefield",
+        "a player puts a Forest onto the battlefield",
+    ] {
+        let mut ctx = ParseContext::default();
+        let (mode, def) = super::parse_trigger_condition(condition, &mut ctx);
+        assert_eq!(mode, TriggerMode::ChangesZone, "condition: {condition}");
+        assert_eq!(def.destination, Some(Zone::Battlefield));
+        assert!(def.valid_card.is_some(), "object filter was dropped: {condition}");
+        assert_eq!(
+            def.constraint,
+            Some(crate::types::ability::TriggerConstraint::ZoneChangePutterPresent),
+            "condition: {condition}"
+        );
+        assert_eq!(
+            super::relative_player_scope_for_condition(condition),
+            Some(ControllerRef::ScopedPlayer),
+            "that-player scope was not introduced: {condition}"
+        );
+    }
+}
+
+/// CR 603.2: preserve independent event provenance and frequency gates when
+/// lowering one active-voice trigger.
+#[test]
+fn trigger_player_puts_onto_battlefield_composes_with_once_each_turn() {
+    let def = parse_trigger_line(
+        "Whenever a player puts a Swamp onto the battlefield, draw a card. This ability triggers only once each turn.",
+        "Synthetic",
+    );
+    let Some(crate::types::ability::TriggerConstraint::All { constraints }) = def.constraint
+    else {
+        panic!("expected composed putter and frequency constraints");
+    };
+    assert!(constraints.contains(&crate::types::ability::TriggerConstraint::ZoneChangePutterPresent));
+    assert!(constraints.contains(&crate::types::ability::TriggerConstraint::OncePerTurn));
+}
+
 /// CR 701.8a + CR 603.2: Karmic Justice binds both the destroyed permanent
 /// and the opponent-controlled spell/ability that destroyed it. The active
 /// voice must not fall through to the passive "is destroyed" grammar, which
