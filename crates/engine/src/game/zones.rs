@@ -1058,6 +1058,7 @@ pub fn move_to_zone(
 /// The caller supplies only the event slice produced by one delivery, avoiding
 /// any chance of rebinding a same-id zone change from an earlier instruction.
 pub(crate) fn stamp_zone_change_cause(
+    state: &mut GameState,
     events: &mut [GameEvent],
     object_id: ObjectId,
     source_id: Option<ObjectId>,
@@ -1071,6 +1072,7 @@ pub(crate) fn stamp_zone_change_cause(
         .find(|event| matches!(event, GameEvent::ZoneChanged { object_id: id, .. } if *id == object_id))
     {
         record.stamp_cause_source_id(Some(source_id));
+        stamp_zone_change_ledger_cause(state, record);
     }
 }
 
@@ -1078,6 +1080,7 @@ pub(crate) fn stamp_zone_change_cause(
 /// action onto the just-emitted record. The entrant's controller is not a
 /// fallback because an ETB replacement may change it.
 pub(crate) fn stamp_zone_change_putter(
+    state: &mut GameState,
     events: &mut [GameEvent],
     object_id: ObjectId,
     putter: Option<PlayerId>,
@@ -1091,6 +1094,38 @@ pub(crate) fn stamp_zone_change_putter(
         .find(|event| matches!(event, GameEvent::ZoneChanged { object_id: id, .. } if *id == object_id))
     {
         record.stamp_zone_change_putter(Some(putter));
+        stamp_zone_change_ledger_putter(state, record);
+    }
+}
+
+/// Keep the per-turn occurrence ledger byte-equivalent to the event carrier.
+/// The ledger row is cloned before post-delivery provenance is known, so every
+/// late event stamp must be mirrored by its already-assigned occurrence index.
+fn stamp_zone_change_ledger_cause(
+    state: &mut GameState,
+    record: &crate::types::game_state::ZoneChangeRecord,
+) {
+    if record.recorded_turn_number == state.turn_number {
+        if let Some(ledger_record) = state
+            .zone_changes_this_turn
+            .get_mut(record.turn_zone_change_index)
+        {
+            ledger_record.stamp_cause_source_id(record.cause_source_id());
+        }
+    }
+}
+
+fn stamp_zone_change_ledger_putter(
+    state: &mut GameState,
+    record: &crate::types::game_state::ZoneChangeRecord,
+) {
+    if record.recorded_turn_number == state.turn_number {
+        if let Some(ledger_record) = state
+            .zone_changes_this_turn
+            .get_mut(record.turn_zone_change_index)
+        {
+            ledger_record.stamp_zone_change_putter(record.zone_change_putter());
+        }
     }
 }
 

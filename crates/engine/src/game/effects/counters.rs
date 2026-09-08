@@ -619,6 +619,7 @@ fn apply_pending_counter_post_action(
             let entry_event_start = events.len();
             crate::game::zones::record_and_emit_entry_from_no_zone(state, object_id, events);
             crate::game::zones::stamp_zone_change_putter(
+                state,
                 &mut events[entry_event_start..],
                 object_id,
                 putter,

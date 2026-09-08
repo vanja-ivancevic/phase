@@ -3639,6 +3639,7 @@ pub(crate) fn deliver_replaced_zone_change(
         // to this delivery's event slice so repeated moves of one ObjectId cannot
         // rebind an earlier record.
         zones::stamp_zone_change_cause(
+            state,
             &mut events[zone_event_start..],
             object_id,
             cause.or(source_id),
@@ -3648,7 +3649,12 @@ pub(crate) fn deliver_replaced_zone_change(
         // stamp is scoped to this delivery for the same reason as the causal
         // source stamp: repeated moves of one ObjectId must not rebind an
         // earlier event.
-        zones::stamp_zone_change_putter(&mut events[zone_event_start..], object_id, putter);
+        zones::stamp_zone_change_putter(
+            state,
+            &mut events[zone_event_start..],
+            object_id,
+            putter,
+        );
         // CR 614.1d: determine whether the object actually entered the battlefield.
         // `move_to_zone` rejects a battlefield entry without moving the object when
         // a `CantEnterBattlefieldFrom` static (e.g. Grafdigger's Cage) matches, so

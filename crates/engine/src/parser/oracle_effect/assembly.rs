@@ -27,8 +27,8 @@ use crate::parser::oracle_nom::primitives as nom_primitives;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction,
     CastFromZoneDriver, CastingPermission, ChoiceType, Comparator, ControllerRef, DamageChannel,
-    Effect, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, StaticCondition, SubAbilityLink,
-    TapStateChange, TargetFilter,
+    Effect, EffectScope, PlayerFilter, PlayerScope, QuantityExpr, QuantityRef, StaticCondition,
+    SubAbilityLink, TapStateChange, TargetChoiceTiming, TargetFilter,
 };
 use crate::types::game_state::TargetSelectionConstraint;
 use crate::types::zones::Zone;
@@ -2626,6 +2626,31 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
             } else if let Some(ref spec) = clause_ir.parsed.multi_target {
                 def = def.multi_target(spec.clone());
             }
+        }
+        // CR 701.26a/b + CR 115.10a: counted tap instructions are assembled
+        // with their multi-target cardinality after the initial timing pass.
+        // Reconcile that late-discovered count here so an untargeted
+        // "... taps ... for each [counter]" choice is made on resolution,
+        // not when the ability is announced. Explicit "target" wording still
+        // remains stack-time targeting.
+        if def.multi_target.is_some()
+            && matches!(
+                &*def.effect,
+                Effect::SetTapState {
+                    scope: EffectScope::Single,
+                    ..
+                }
+            )
+            && !nom_primitives::scan_contains(
+                &clause_ir
+                    .source
+                    .fragment()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+                "target ",
+            )
+        {
+            def.target_choice_timing = TargetChoiceTiming::Resolution;
         }
         // CR 601.2c + CR 608.2c: A conjugated continuation after an "any
         // number of target players/opponents each" head shares the targets

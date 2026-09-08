@@ -35449,11 +35449,17 @@ pub(crate) fn parse_effect_chain_ir(
             } else if suffix_repeat_for.is_some()
                 && trailing_for_each_repeat_is_supported(&stripped_clause.effect)
             {
-                // CR 608.2c: keyword-action bodies such as Tangle Wire's Tap
-                // are complete once the suffix is removed, so attach the
-                // parsed quantity to this definition and let the common
-                // resolver repeat the one-choice action.
-                (stripped_clause, repeat_for.or(suffix_repeat_for))
+                // CR 608.2c + CR 115.1d: keyword-action bodies such as Tangle
+                // Wire's Tap are complete once the suffix is removed. Preserve
+                // the count as an exact multi-target selection, matching the
+                // dedicated for-each parser and the resolution-time tap picker;
+                // storing it as `repeat_for` would run the count through a
+                // second, independent repetition mechanism.
+                let mut stripped_clause = stripped_clause;
+                stripped_clause.multi_target = suffix_repeat_for
+                    .as_ref()
+                    .map(|quantity| MultiTargetSpec::exact(quantity.clone()));
+                (stripped_clause, repeat_for)
             } else if let Some((fanout_clause, fanout_spec, fanout_ctx)) =
                 parse_for_each_opponent_target_fanout_clause(
                     &text_no_qty,

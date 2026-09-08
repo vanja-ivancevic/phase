@@ -2191,6 +2191,7 @@ pub(crate) fn push_committed_token_entry_events_with_putter(
     let record = crate::game::zones::record_and_emit_entry_from_no_zone(state, object_id, events);
     if record.is_some() {
         crate::game::zones::stamp_zone_change_putter(
+            state,
             &mut events[entry_event_start..],
             object_id,
             putter,

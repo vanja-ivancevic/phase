@@ -863,14 +863,10 @@ fn has_missing_required_stack_targets(state: &GameState, ability: &ResolvedAbili
 }
 
 fn has_no_legal_required_stack_targets(state: &GameState, ability: &ResolvedAbility) -> bool {
-    if !flatten_targets_in_chain(ability).is_empty() {
-        return false;
-    }
-
     match build_target_slots(state, ability) {
-        Ok(slots) => slots
-            .iter()
-            .any(|slot| !slot.optional && slot.legal_targets.is_empty()),
+        // An empty slot set means there is no unresolved target choice. Any
+        // live legal slot still represents construction that must not resolve.
+        Ok(slots) => slots.iter().all(|slot| slot.legal_targets.is_empty()),
         Err(_) => true,
     }
 }
@@ -879,6 +875,23 @@ fn top_pending_trigger_has_no_legal_required_targets(
     state: &mut GameState,
     pending_id: ObjectId,
 ) -> bool {
+    // CR 603.3d: `pending_trigger_entry` is the construction cursor, while
+    // `pending_trigger` is the live construction payload.  A few non-target
+    // delayed-trigger paths can finish with the cursor still set after the
+    // payload has already been consumed.  There is no choice left to wait for
+    // in that state, so let the resolver clear the stale cursor below.
+    if state.pending_trigger.is_none() {
+        return true;
+    }
+    // A non-priority waiting state is an active mode/target/division prompt;
+    // only a priority checkpoint may use the target-slot probe below to
+    // distinguish a completed non-target construction from a live choice.
+    if !matches!(
+        state.waiting_for,
+        crate::types::game_state::WaitingFor::Priority { .. }
+    ) {
+        return false;
+    }
     let Some((ability, trigger_event, trigger_events, subject_match_count)) = state
         .stack
         .back()
@@ -910,7 +923,11 @@ fn top_pending_trigger_has_no_legal_required_targets(
         &trigger_events,
         subject_match_count,
     );
-    let missing_required_targets = has_no_legal_required_stack_targets(state, &ability);
+    // A pre-populated target vector means the construction pass already
+    // supplied the target context; a stale cursor must not re-open a prompt
+    // for a context-ref effect that merely reads that target at resolution.
+    let missing_required_targets = !flatten_targets_in_chain(&ability).is_empty()
+        || has_no_legal_required_stack_targets(state, &ability);
     super::triggers::restore_trigger_event_context(state, context_snapshot);
     missing_required_targets
 }

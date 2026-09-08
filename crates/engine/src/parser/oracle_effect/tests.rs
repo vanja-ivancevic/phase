@@ -11114,15 +11114,20 @@ fn tangle_wire_taps_once_per_fade_counter() {
             ..
         }
     ));
-    assert!(matches!(
-        def.repeat_for,
-        Some(QuantityExpr::Ref {
+    assert_eq!(
+        def.target_choice_timing,
+        TargetChoiceTiming::Resolution,
+        "counted untargeted taps choose their permanents at resolution"
+    );
+    assert_eq!(
+        def.multi_target,
+        Some(MultiTargetSpec::exact(QuantityExpr::Ref {
             qty: QuantityRef::CountersOn {
                 scope: ObjectScope::Source,
                 counter_type: Some(CounterType::Fade),
             }
-        })
-    ));
+        }))
+    );
 }
 
 #[test]

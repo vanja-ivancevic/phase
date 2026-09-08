@@ -131,6 +131,7 @@ pub fn resolve(
     crate::game::zones::record_and_emit_entry_from_no_zone(state, obj_id, events)
         .expect("incubator token was just created");
     crate::game::zones::stamp_zone_change_putter(
+        state,
         &mut events[entry_event_start..],
         obj_id,
         Some(ability.controller),

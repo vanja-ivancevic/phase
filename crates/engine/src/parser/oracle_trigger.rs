@@ -380,6 +380,33 @@ fn stamp_self_return_origin_from_trigger_condition(def: &mut TriggerDefinition) 
     }
 }
 
+/// CR 603.10a + CR 400.7: A zone-change trigger that watches an object enter
+/// the graveyard and then returns that event object by an anaphoric
+/// `TriggeringSource` (or its pre-lift `ParentTarget`) target must read it from
+/// the graveyard. Special event
+/// parsers (such as Sacred Ground's opponent-caused form) have no intervening
+/// source-zone condition for `stamp_self_return_origin_from_trigger_condition`
+/// to inspect, so carry the event destination across this seam explicitly.
+fn stamp_event_destination_origin(def: &mut TriggerDefinition) {
+    if def.destination != Some(Zone::Graveyard) {
+        return;
+    }
+    let Some(execute) = def.execute.as_deref_mut() else {
+        return;
+    };
+    if let Effect::ChangeZone {
+        origin,
+        destination,
+        target: TargetFilter::TriggeringSource | TargetFilter::ParentTarget,
+        ..
+    } = execute.effect.as_mut()
+    {
+        if origin.is_none() && matches!(destination, Zone::Battlefield | Zone::Hand) {
+            *origin = Some(Zone::Graveyard);
+        }
+    }
+}
+
 fn stamp_self_return_origin_in_effect(effect: &mut Effect, origin: Zone) {
     match effect {
         Effect::ChangeZone {
@@ -2234,6 +2261,7 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     }
 
     stamp_self_return_origin_from_trigger_condition(&mut def);
+    stamp_event_destination_origin(&mut def);
 
     // CR 107.3a + CR 107.3i + CR 601.2f: Rewrite X in ETB-self triggers.
     if trigger_should_rewrite_cost_x(&def) {
