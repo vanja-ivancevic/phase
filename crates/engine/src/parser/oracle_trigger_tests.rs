@@ -3213,6 +3213,50 @@ fn trigger_intervening_if_source_didnt_attack_this_turn_attaches_condition() {
     ));
 }
 
+#[test]
+fn mad_dog_intervening_if_preserves_attack_and_control_history() {
+    let def = parse_trigger_line(
+        "At the beginning of your end step, if this creature didn't attack or come under your control this turn, sacrifice it.",
+        "Mad Dog",
+    );
+    let Some(TriggerCondition::And { conditions }) = def.condition else {
+        panic!("expected both Mad Dog intervening-if predicates");
+    };
+    assert_eq!(conditions.len(), 2);
+    assert!(conditions.iter().any(|condition| matches!(
+        condition,
+        TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::And { filters },
+                },
+            },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Fixed { value: 0 },
+        } if filters.iter().any(|filter| matches!(
+            filter,
+            TargetFilter::Typed(TypedFilter { properties, .. })
+                if properties.contains(&FilterProp::AttackedThisTurn { defender: None })
+        ))
+    )));
+    assert!(conditions.iter().any(|condition| matches!(
+        condition,
+        TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::And { filters },
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        } if filters.iter().any(|filter| matches!(
+            filter,
+            TargetFilter::Typed(TypedFilter { properties, .. })
+                if properties.contains(&FilterProp::ControlledContinuouslySinceTurnBegan)
+        ))
+    )));
+}
+
 /// CR 506.2 + CR 508.6 + CR 603.4 (issue #2924): Suppressor Skyguard's
 /// attack-trigger intervening-if must hoist to `def.condition` as a
 /// `PlayerCount(OpponentOfTriggeringPlayerNotAttacked) >= 1` comparison.

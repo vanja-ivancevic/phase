@@ -8926,6 +8926,25 @@ mod tests {
         );
     }
 
+    /// CR 302.6 + CR 508.1a: the raw continuity property distinguishes a
+    /// permanent controlled since the turn began from one that entered under
+    /// the controller's control this turn. Haste must not satisfy this
+    /// property; it is relevant only to the separate enlist eligibility arm.
+    #[test]
+    fn controlled_continuously_since_turn_began_matches_control_history() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Source");
+        let established = add_creature(&mut state, PlayerId(0), "Established");
+        let fresh = add_creature(&mut state, PlayerId(0), "Fresh");
+        state.objects.get_mut(&fresh).unwrap().summoning_sick = true;
+
+        let filter = TargetFilter::Typed(TypedFilter::default().properties(vec![
+            FilterProp::ControlledContinuouslySinceTurnBegan,
+        ]));
+        assert!(matches_target_filter(&state, established, &filter, source));
+        assert!(!matches_target_filter(&state, fresh, &filter, source));
+    }
+
     /// CR 120.6 + CR 120.9 (audit H2): "Was dealt damage this turn" must consult
     /// the damage-event history, not `damage_marked`. Per CR 120.6 marked damage
     /// is removed when the permanent regenerates, but the historical fact (CR 120.9)

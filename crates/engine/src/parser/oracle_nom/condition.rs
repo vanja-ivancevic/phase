@@ -8134,6 +8134,18 @@ fn parse_you_didnt_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
 fn parse_source_didnt_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = alt((tag("~ didn't "), tag("this creature didn't "))).parse(input)?;
     alt((
+        // CR 302.6 + CR 508.1a: Mad Dog's intervening-if checks two
+        // independent histories. Keep this longer arm before the bare attack
+        // form so the connective remains part of one source-bound condition.
+        value(
+            StaticCondition::And {
+                conditions: vec![
+                    make_source_history_absence(FilterProp::AttackedThisTurn { defender: None }),
+                    make_source_controlled_continuously_this_turn(),
+                ],
+            },
+            tag("attack or come under your control this turn"),
+        ),
         value(
             make_source_history_absence(FilterProp::AttackedThisTurn { defender: None }),
             tag("attack this turn"),
@@ -8160,6 +8172,28 @@ fn make_source_history_absence(prop: FilterProp) -> StaticCondition {
         },
         comparator: Comparator::EQ,
         rhs: QuantityExpr::Fixed { value: 0 },
+    }
+}
+
+/// CR 302.6 + CR 508.1a: the source has remained under its controller's
+/// control continuously since that player's turn began. This is the positive
+/// form of "didn't come under your control this turn".
+fn make_source_controlled_continuously_this_turn() -> StaticCondition {
+    StaticCondition::QuantityComparison {
+        lhs: QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::SelfRef,
+                        TargetFilter::Typed(TypedFilter::default().properties(vec![
+                            FilterProp::ControlledContinuouslySinceTurnBegan,
+                        ])),
+                    ],
+                },
+            },
+        },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
     }
 }
 
@@ -17639,6 +17673,39 @@ mod tests {
             parse_inner_condition("this creature didn't enter the battlefield this turn").unwrap();
         assert_eq!(rest, "");
         assert_source_history_absence(c, FilterProp::EnteredThisTurn);
+    }
+
+    #[test]
+    fn source_didnt_attack_or_come_under_control_preserves_both_histories() {
+        let (rest, c) = parse_inner_condition(
+            "this creature didn't attack or come under your control this turn",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::And { conditions } = c else {
+            panic!("expected compound source history condition");
+        };
+        assert_eq!(conditions.len(), 2);
+        assert_source_history_absence(
+            conditions[0].clone(),
+            FilterProp::AttackedThisTurn { defender: None },
+        );
+        assert!(matches!(
+            &conditions[1],
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::And { filters },
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } if filters.iter().any(|filter| matches!(
+                filter,
+                TargetFilter::Typed(TypedFilter { properties, .. })
+                    if properties.contains(&FilterProp::ControlledContinuouslySinceTurnBegan)
+            ))
+        ));
     }
 
     fn assert_source_history_absence(c: StaticCondition, prop: FilterProp) {
