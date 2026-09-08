@@ -6874,6 +6874,7 @@ pub(crate) fn parse_oneshot_damage_replacement(
             // `parse_continuous_all_damage_redirect` is where that recipient
             // lives, and it likewise declares no slot.
             DamageRedirectTarget::Controller
+            | DamageRedirectTarget::SourceController
             | DamageRedirectTarget::SourceObject
             | DamageRedirectTarget::AttachedToSource => None,
         };
@@ -7841,6 +7842,10 @@ fn parse_redirect_recipient_phrase(
     .parse(input)?;
     alt((
         value(DamageRedirectTarget::Controller, tag("you")),
+        value(
+            DamageRedirectTarget::SourceController,
+            tag("its controller"),
+        ),
         value(DamageRedirectTarget::SourceObject, tag("~")),
         value(
             DamageRedirectTarget::ChosenObjectTarget,
@@ -25108,6 +25113,28 @@ mod snapshot_tests {
             } => {}
             other => panic!("expected redirect-to-controller, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oneshot_redirect_from_instant_or_sorcery_spell() {
+        let effect = parse_oneshot_damage_replacement(
+            "the next time an instant or sorcery spell would deal damage to you this turn, that spell deals that damage to its controller instead",
+            &ParseContext::default(),
+        )
+        .expect("Aegis of Honor one-shot redirection must parse");
+
+        let Effect::CreateDamageReplacement {
+            source_filter: Some(source_filter),
+            redirect_to: Some(DamageRedirectTarget::SourceController),
+            ..
+        } = effect
+        else {
+            panic!("expected Aegis one-shot redirection, got {effect:?}");
+        };
+        assert!(
+            matches!(source_filter, TargetFilter::Or { .. }),
+            "instant-or-sorcery source must remain a disjunction, got {source_filter:?}"
+        );
     }
 
     #[test]

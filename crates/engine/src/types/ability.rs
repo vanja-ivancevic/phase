@@ -1479,6 +1479,10 @@ pub enum DamageRedirectTarget {
     /// "...to you instead" — the replacement source's controller (Jade Monolith,
     /// Goblin Psychopath).
     Controller,
+    /// "...to its controller instead" — the controller of the object that dealt
+    /// the replaced damage (Aegis of Honor). This is distinct from `Controller`,
+    /// which resolves to the controller of the replacement ability's source.
+    SourceController,
     /// "...to ~ instead" / "...dealt to this creature instead" — the replacement
     /// source object itself (Beacon of Destiny).
     SourceObject,

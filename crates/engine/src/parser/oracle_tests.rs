@@ -8,7 +8,7 @@ use crate::parser::oracle_ir::static_ir::StaticIr;
 use crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
 use crate::types::ability::{
     AdditionalCostOrigin, AdditionalCostPaymentSource, CountScope, CounterAdjustment, DoorLockOp,
-    PlayerRelation, SpellStackToGraveyardReplacement,
+    DamageRedirectTarget, PlayerRelation, SpellStackToGraveyardReplacement,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::triggers::AttackTargetFilter;
@@ -4379,6 +4379,31 @@ fn lightning_bolt_spell_effect() {
     );
     assert_eq!(r.abilities.len(), 1);
     assert_eq!(r.abilities[0].kind, AbilityKind::Spell);
+}
+
+#[test]
+fn aegis_of_honor_full_parse_preserves_source_controller_redirection() {
+    let r = parse(
+        "{1}: The next time an instant or sorcery spell would deal damage to you this turn, that spell deals that damage to its controller instead.",
+        "Aegis of Honor",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    assert!(!parsed_has_unimplemented(&r), "Aegis must parse fully: {r:#?}");
+
+    let Some(definition) = r.abilities.first() else {
+        panic!("Aegis must expose its activated ability");
+    };
+    let Effect::CreateDamageReplacement {
+        source_filter: Some(TargetFilter::Or { filters }),
+        redirect_to: Some(DamageRedirectTarget::SourceController),
+        ..
+    } = definition.effect.as_ref()
+    else {
+        panic!("expected source-controller damage replacement: {:#?}", definition.effect);
+    };
+    assert_eq!(filters.len(), 2, "instant/sorcery source must have two OR legs");
 }
 
 /// Issue #1696 — Myrkul, Lord of Bones end-to-end: the death trigger exiles

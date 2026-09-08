@@ -320,6 +320,7 @@ fn chosen_redirect_target(
 /// CR 614.9: Resolve a redirection recipient to a concrete `TargetRef` against
 /// the live game state, at damage-apply time. `Controller` → the replacement
 /// source's controller; `SourceObject` → the source object itself;
+/// `SourceController` → the damage source's controller;
 /// `ChosenObjectTarget` → its chosen object and `ChosenTarget` → its chosen
 /// object or player, captured at resolution time into the
 /// shield's `redirect_target` field (the shield host does not retain the
@@ -331,15 +332,20 @@ fn chosen_redirect_target(
 pub(crate) fn resolve_redirect_recipient(
     state: &GameState,
     recipient: DamageRedirectTarget,
-    source_id: ObjectId,
+    replacement_source_id: ObjectId,
+    damage_source_id: ObjectId,
     chosen_target: Option<TargetRef>,
 ) -> Option<TargetRef> {
     match recipient {
         DamageRedirectTarget::Controller => state
             .objects
-            .get(&source_id)
+            .get(&replacement_source_id)
             .map(|obj| TargetRef::Player(obj.controller)),
-        DamageRedirectTarget::SourceObject => Some(TargetRef::Object(source_id)),
+        DamageRedirectTarget::SourceController => state
+            .objects
+            .get(&damage_source_id)
+            .map(|obj| TargetRef::Player(obj.controller)),
+        DamageRedirectTarget::SourceObject => Some(TargetRef::Object(replacement_source_id)),
         DamageRedirectTarget::ChosenObjectTarget => match chosen_target {
             Some(TargetRef::Object(id)) => Some(TargetRef::Object(id)),
             Some(TargetRef::Player(_)) | None => None,
@@ -365,7 +371,7 @@ pub(crate) fn resolve_redirect_recipient(
         // the CR 614.9 "left the game" clause is checked there.)
         DamageRedirectTarget::AttachedToSource => state
             .objects
-            .get(&source_id)
+            .get(&replacement_source_id)
             .and_then(|obj| obj.attached_to.as_ref())
             .and_then(AttachTarget::as_object)
             .map(TargetRef::Object),
@@ -407,6 +413,72 @@ mod tests {
         let id = create_object(state, CardId(1), owner, name.to_string(), Zone::Battlefield);
         state.objects.get_mut(&id).unwrap().card_types.core_types = vec![CoreType::Creature];
         id
+    }
+
+    #[test]
+    fn source_controller_redirect_resolves_from_damage_source() {
+        let mut state = GameState::new_two_player(42);
+        let replacement_source = create_creature(&mut state, PlayerId(0), "Aegis of Honor");
+        let damage_source = create_creature(&mut state, PlayerId(1), "Damage Source");
+
+        assert_eq!(
+            resolve_redirect_recipient(
+                &state,
+                DamageRedirectTarget::SourceController,
+                replacement_source,
+                damage_source,
+                None,
+            ),
+            Some(TargetRef::Player(PlayerId(1)))
+        );
+        assert_eq!(
+            resolve_redirect_recipient(
+                &state,
+                DamageRedirectTarget::Controller,
+                replacement_source,
+                damage_source,
+                None,
+            ),
+            Some(TargetRef::Player(PlayerId(0)))
+        );
+    }
+
+    #[test]
+    fn source_controller_redirect_moves_damage_to_live_source_controller() {
+        let mut state = GameState::new_two_player(42);
+        let replacement_source = create_creature(&mut state, PlayerId(0), "Aegis of Honor");
+        let damage_source = create_creature(&mut state, PlayerId(1), "Damage Source");
+        let ability = ResolvedAbility::new(
+            Effect::CreateDamageReplacement {
+                redirect_lifetime: RedirectionLifetime::OneOpportunity,
+                source_filter: None,
+                combat_scope: None,
+                target_filter: None,
+                modification: None,
+                redirect_to: Some(DamageRedirectTarget::SourceController),
+                redirect_amount: None,
+                redirect_object_filter: None,
+                recipient_object_filter: None,
+            },
+            vec![],
+            replacement_source,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+
+        let ctx = deal_damage::DamageContext::from_source(&state, damage_source).unwrap();
+        deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Player(PlayerId(0)),
+            3,
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(state.players[0].life, 20, "the original recipient is untouched");
+        assert_eq!(state.players[1].life, 17, "the damage source's controller is hit");
     }
 
     fn amount_oneshot_ability(source: ObjectId, controller: PlayerId) -> ResolvedAbility {
