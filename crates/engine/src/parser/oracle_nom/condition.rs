@@ -413,6 +413,7 @@ fn parse_event_history_conditions(input: &str) -> OracleResult<'_, StaticConditi
     alt((
         parse_damage_dealt_this_turn_conditions,
         parse_source_damage_threshold_this_turn,
+        parse_source_was_blocked_this_turn,
         parse_source_didnt_this_turn,
         parse_was_cast_condition,
         parse_entered_this_turn,
@@ -426,6 +427,29 @@ fn parse_event_history_conditions(input: &str) -> OracleResult<'_, StaticConditi
         parse_event_state_conditions,
     ))
     .parse(input)
+}
+
+/// CR 509.1a + CR 603.4: a source that has left combat can still be identified
+/// by the turn-scoped blocker ledger. This covers Fyndhorn Druid's
+/// "if it was blocked this turn" intervening-if without confusing it with the
+/// live-combat `SourceIsBlocked` predicate.
+fn parse_source_was_blocked_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = alt((
+        tag("it was "),
+        tag("~ was "),
+        tag("this creature was "),
+        tag("this permanent was "),
+    ))
+    .parse(input)?;
+    value(
+        StaticCondition::SourceMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::BlockedThisTurn]),
+            ),
+        },
+        tag("blocked this turn"),
+    )
+    .parse(rest)
 }
 
 /// CR 601.2 + CR 611.3a: "as long as it was cast" — cast-origin gate for
@@ -17706,6 +17730,20 @@ mod tests {
                     if properties.contains(&FilterProp::ControlledContinuouslySinceTurnBegan)
             ))
         ));
+    }
+
+    #[test]
+    fn source_was_blocked_this_turn_uses_turn_history_filter() {
+        let (rest, c) = parse_inner_condition("it was blocked this turn").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            c,
+            StaticCondition::SourceMatchesFilter {
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::BlockedThisTurn]),
+                ),
+            }
+        );
     }
 
     fn assert_source_history_absence(c: StaticCondition, prop: FilterProp) {

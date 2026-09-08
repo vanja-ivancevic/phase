@@ -3257,6 +3257,24 @@ fn mad_dog_intervening_if_preserves_attack_and_control_history() {
     )));
 }
 
+#[test]
+fn fyndhorn_druid_intervening_if_preserves_blocked_history() {
+    let def = parse_trigger_line(
+        "When this creature dies, if it was blocked this turn, you gain 4 life.",
+        "Fyndhorn Druid",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::SourceMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::BlockedThisTurn]),
+            ),
+        })
+    );
+    assert!(def.execute.is_some());
+}
+
 /// CR 506.2 + CR 508.6 + CR 603.4 (issue #2924): Suppressor Skyguard's
 /// attack-trigger intervening-if must hoist to `def.condition` as a
 /// `PlayerCount(OpponentOfTriggeringPlayerNotAttacked) >= 1` comparison.
