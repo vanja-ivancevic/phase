@@ -7608,16 +7608,22 @@ fn parse_oneshot_next_n_damage_to_target_redirect(norm_lower: &str) -> Option<Ef
 ///   host at damage-apply time.
 /// * THE CONTROLLER ("you" — Sivvi's Valor), resolved from the ability
 ///   controller at damage-apply time.
+/// * THE SOURCE CONTROLLER ("its controller" — Mirror Strike), resolved from
+///   the object that would deal the redirected damage.
+/// * A TARGETED RECIPIENT ("target attacking creature" — Turn the Tables),
+///   surfaced as the replacement's destination target slot.
 ///
 /// DELIBERATELY NOT HERE: "that creature" (Ascent of the Worthy). Its victim
 /// scope is the bare "creatures you control" with no player leg, which has no
 /// `DamageTargetFilter` representation, so the card fails closed at the victim
 /// slot regardless; adding the anaphor without the victim would be an
 /// unreachable arm kept alive by nothing.
-fn parse_continuous_redirect_recipient(input: &str) -> OracleResult<'_, DamageRedirectTarget> {
+fn parse_continuous_redirect_recipient(
+    input: &str,
+) -> OracleResult<'_, (DamageRedirectTarget, Option<TargetFilter>)> {
     alt((
         value(
-            DamageRedirectTarget::ChosenObjectTarget,
+            (DamageRedirectTarget::ChosenObjectTarget, None),
             alt((
                 tag::<_, _, OracleError<'_>>("the chosen creature"),
                 tag("the chosen permanent"),
@@ -7626,13 +7632,53 @@ fn parse_continuous_redirect_recipient(input: &str) -> OracleResult<'_, DamageRe
         // CR 614.9: "~" is the source object itself (Oracle's Attendants).
         // This is resolved from the shield host at damage-apply time and does
         // not declare a second object target.
-        value(DamageRedirectTarget::SourceObject, tag("~")),
+        value(
+            (DamageRedirectTarget::SourceObject, None),
+            alt((tag("~"), tag("this creature"))),
+        ),
         // CR 602.2a: "you" is the controller of the resolving ability (Sivvi's
         // Valor), not a player target declared by the replacement clause.
-        value(DamageRedirectTarget::Controller, tag("you")),
+        value((DamageRedirectTarget::Controller, None), tag("you")),
+        // CR 614.9: "its controller" follows the damage source, not the
+        // replacement ability's controller. This is the old-border Mirror
+        // Strike shape and must remain distinct from the "you" arm above.
         value(
-            DamageRedirectTarget::AttachedToSource,
+            (DamageRedirectTarget::SourceController, None),
+            tag("its controller"),
+        ),
+        value(
+            (DamageRedirectTarget::AttachedToSource, None),
             parse_attached_host_subject,
+        ),
+        // CR 115.1: a resolving redirection may choose its destination target
+        // in the same instruction (Turn the Tables and its relatives). The
+        // target slot is surfaced by `redirect_object_filter`; the effect
+        // remains continuous because this parser owns the "all damage" form.
+        map_opt(
+            rest,
+            |input: &str| {
+                // The line router may already have stripped the terminal
+                // "instead" before this effect parser runs. Consume the
+                // complete recipient tail here and accept either raw Oracle
+                // text or that normalized form, including its final period.
+                let phrase = input.trim().trim_end_matches('.').trim();
+                let phrase = phrase.strip_suffix(" instead").unwrap_or(phrase).trim();
+                let (filter, remainder) = parse_target(phrase);
+                if !remainder.trim().is_empty() {
+                    return None;
+                }
+                match filter {
+                    TargetFilter::Any | TargetFilter::Typed(_) => {
+                        let redirect = if matches!(filter, TargetFilter::Any) {
+                            DamageRedirectTarget::ChosenTarget
+                        } else {
+                            DamageRedirectTarget::ChosenObjectTarget
+                        };
+                        Some((redirect, Some(filter)))
+                    }
+                    _ => None,
+                }
+            },
         ),
     ))
     .parse(input)
@@ -7795,7 +7841,8 @@ fn parse_continuous_all_damage_redirect(norm_lower: &str) -> Option<Effect> {
     let (rest, _) = tag::<_, _, OracleError<'_>>(" is dealt to ")
         .parse(rest)
         .ok()?;
-    let (rest, redirect_to) = parse_continuous_redirect_recipient(rest).ok()?;
+    let (rest, (redirect_to, redirect_object_filter)) =
+        parse_continuous_redirect_recipient(rest).ok()?;
     // `oracle::strip_instead_clause` removes a trailing `instead` from a
     // single-sentence spell ability before this effect parser runs. Keep the
     // suffix optional here so the parser accepts both the raw Oracle clause and
@@ -7825,7 +7872,7 @@ fn parse_continuous_all_damage_redirect(norm_lower: &str) -> Option<Effect> {
         // slot and hosts the shield there. Chosen-permanent recipients reuse the
         // slot the parent "Choose …" instruction already declared; attachment
         // hosts are read from the shield host's live `attached_to`.
-        redirect_object_filter: None,
+        redirect_object_filter,
         recipient_object_filter,
         redirect_lifetime: RedirectionLifetime::Continuous,
     })
@@ -10883,9 +10930,31 @@ fn parse_continuous_damage_source_slot(input: &str) -> OracleResult<'_, TargetFi
         map_opt(
             terminated(take_until(" is dealt to"), peek(tag(" is dealt to"))),
             |subject: &str| {
-                let subject = subject.trim();
+                // CR 514.2: old Oracle also places the duration after the
+                // source phrase ("by unblocked creatures this turn"), while
+                // newer wording places it before "by". The surrounding spine
+                // handles the latter; remove only this terminal duration here
+                // so it cannot become part of the source-quality filter.
+                let subject = subject
+                    .trim()
+                    .strip_suffix(" this turn")
+                    .unwrap_or(subject.trim())
+                    .trim();
                 if subject == "a source of your choice" {
                     Some(TargetFilter::ChosenDamageSource { filter: None })
+                } else if subject.starts_with("target ") {
+                    // CR 609.7a + CR 601.2c: a targeted damage source is a
+                    // declared target, not merely a source-quality filter.
+                    // Keep the selected object pinned through resolution and
+                    // retain the typed/combat restriction as the CR 609.7b
+                    // recheck.
+                    let (filter, rest) = parse_target(subject);
+                    if !rest.trim().is_empty() {
+                        return None;
+                    }
+                    Some(TargetFilter::And {
+                        filters: vec![TargetFilter::ParentTargetSlot { index: 0 }, filter],
+                    })
                 } else {
                     parse_damage_source_subject_filter(subject)
                 }
@@ -22164,6 +22233,104 @@ mod tests {
             ))
         );
         assert_eq!(redirect_lifetime, RedirectionLifetime::Continuous);
+    }
+
+    #[test]
+    fn old_border_targeted_continuous_redirects_capture_both_target_roles() {
+        // CR 609.7a + CR 614.9: these old-border effects use a declared target
+        // in the SOURCE clause (Mirror Strike / Shimian Night Stalker), or in
+        // the REDIRECT destination clause (Turn the Tables). Both target roles
+        // must survive as typed slots; otherwise the parser either drops the
+        // restriction or leaves the card as an Unimplemented effect.
+        let mirror = parse_oneshot_damage_replacement(
+            "all combat damage that would be dealt to you this turn by target unblocked creature is dealt to its controller instead",
+            &ParseContext::default(),
+        )
+        .expect("Mirror Strike's targeted source redirect must parse");
+        let Effect::CreateDamageReplacement {
+            source_filter,
+            redirect_to,
+            redirect_object_filter,
+            redirect_lifetime,
+            ..
+        } = mirror
+        else {
+            panic!("expected Mirror Strike damage replacement");
+        };
+        assert!(matches!(
+            source_filter,
+            Some(TargetFilter::And { ref filters })
+                if filters.iter().any(|filter| matches!(
+                    filter,
+                    TargetFilter::ParentTargetSlot { index: 0 }
+                ))
+        ));
+        assert_eq!(redirect_to, Some(DamageRedirectTarget::SourceController));
+        assert_eq!(redirect_object_filter, None);
+        assert_eq!(redirect_lifetime, RedirectionLifetime::Continuous);
+
+        let turn_the_tables = parse_oneshot_damage_replacement(
+            "all combat damage that would be dealt to you this turn is dealt to target attacking creature instead",
+            &ParseContext::default(),
+        )
+        .expect("Turn the Tables' targeted redirect must parse");
+        let Effect::CreateDamageReplacement {
+            redirect_to,
+            redirect_object_filter,
+            redirect_lifetime,
+            ..
+        } = turn_the_tables
+        else {
+            panic!("expected Turn the Tables damage replacement");
+        };
+        assert_eq!(redirect_to, Some(DamageRedirectTarget::ChosenObjectTarget));
+        assert!(matches!(
+            redirect_object_filter,
+            Some(TargetFilter::Typed(_))
+        ));
+        assert_eq!(redirect_lifetime, RedirectionLifetime::Continuous);
+    }
+
+    #[test]
+    fn old_border_continuous_redirects_survive_full_oracle_routing() {
+        // The direct grammar test above is not enough: the document router
+        // strips a terminal "instead" before dispatching an effect chain.
+        // These are the published card shapes that previously exposed that
+        // boundary, including the self-reference normalization used by the
+        // full-card parser.
+        let turn_the_tables = parse_oracle_text(
+            "All combat damage that would be dealt to you this turn is dealt to target attacking creature instead.",
+            "Turn the Tables",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        );
+        assert!(turn_the_tables.abilities.iter().any(|ability| {
+            matches!(
+                ability.effect.as_ref(),
+                Effect::CreateDamageReplacement {
+                    redirect_object_filter: Some(TargetFilter::Typed(_)),
+                    ..
+                }
+            )
+        }));
+
+        let royal_guard = parse_oracle_text(
+            "{T}: All combat damage that would be dealt to you by unblocked creatures this turn is dealt to this creature instead.",
+            "Kjeldoran Royal Guard",
+            &[],
+            &["Creature".to_string()],
+            &["Soldier".to_string()],
+        );
+        assert!(royal_guard.abilities.iter().any(|ability| {
+            matches!(
+                ability.effect.as_ref(),
+                Effect::CreateDamageReplacement {
+                    redirect_to: Some(DamageRedirectTarget::SourceObject),
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]
