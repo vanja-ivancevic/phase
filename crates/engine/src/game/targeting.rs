@@ -1793,6 +1793,12 @@ pub(crate) fn extract_target_object_from_event(
             target: TargetRef::Object(id),
             ..
         } => Some(*id),
+        // CR 509.3d: a filtered block event has two named object roles.  The
+        // blocker is the TriggeringSource; the attacker is its EventTarget.
+        // Keeping this orientation here lets an effect body refer to either
+        // "the blocking creature" or "the attacking creature" without
+        // guessing from a generic BlockersDeclared assignment.
+        GameEvent::AttackerBecameBlockedByFilteredBlocker { attacker, .. } => Some(*attacker),
         GameEvent::DamageDealt {
             target: TargetRef::Player(_),
             ..
@@ -1860,7 +1866,6 @@ pub(crate) fn extract_target_object_from_event(
         | GameEvent::AttackersDeclared { .. }
         | GameEvent::BlockersDeclared { .. }
         | GameEvent::AttackerBecameBlockedByEffect { .. }
-        | GameEvent::AttackerBecameBlockedByFilteredBlocker { .. }
         | GameEvent::CombatTaxPaid { .. }
         | GameEvent::CombatTaxDeclined { .. }
         | GameEvent::VehicleCrewed { .. }
@@ -2898,6 +2903,19 @@ mod tests {
             Some(object)
         );
         assert_eq!(extract_target_object_from_event(&player_event), None);
+
+        let attacker = ObjectId(52);
+        let blocker = ObjectId(53);
+        let filtered_block_event =
+            GameEvent::AttackerBecameBlockedByFilteredBlocker { attacker, blocker };
+        assert_eq!(
+            extract_source_from_event(&filtered_block_event),
+            Some(blocker)
+        );
+        assert_eq!(
+            extract_target_object_from_event(&filtered_block_event),
+            Some(attacker)
+        );
     }
 
     /// A `SpecificPlayer` controller scope matches a stack ability by comparing

@@ -287,6 +287,14 @@ pub fn parse_event_context_ref(text: &str) -> Option<(TargetFilter, &str)> {
             value(TargetFilter::ParentTargetOwner, tag("their owner")),
             value(TargetFilter::TriggeringPlayer, tag("that player")),
             value(TargetFilter::TriggeringSource, tag("that source")),
+            // CR 509.3d: on a per-blocker filtered block event, the blocker is
+            // the event source.  This is the definite-article spelling used by
+            // No Quarter's "destroy the blocking creature" body.
+            value(TargetFilter::TriggeringSource, tag("the blocking creature")),
+            // CR 509.3d: the matching attacker's counterpart is carried by the
+            // filtered block event as its event target.  Keep this distinct from
+            // TriggeringSource: the same event must support both orientations.
+            value(TargetFilter::EventTarget, tag("the attacking creature")),
             value(
                 TargetFilter::TriggeringSource,
                 terminated(
@@ -537,6 +545,37 @@ pub fn parse_target_with_syntax<'a>(
     let mut syntax = TargetSyntax::Descriptor;
     let text = text.trim_start();
     let lower = text.to_lowercase();
+
+    // CR 509.3d: filtered block triggers carry two distinct object roles. The
+    // ordinary target grammar cannot classify these definite-article phrases,
+    // but destroy/exile/etc. all route through this entry point, so bind them
+    // here rather than teaching each imperative parser a card-specific escape.
+    // Keep the arm deliberately narrow: generic "that creature" and "that
+    // player" remain subject/context-sensitive through their existing paths.
+    if let Some((_, rest)) = nom_on_lower(text, &lower, |input| {
+        alt((
+            value(
+                TargetFilter::TriggeringSource,
+                tag::<_, _, OracleError<'_>>("the blocking creature"),
+            ),
+            value(
+                TargetFilter::EventTarget,
+                tag::<_, _, OracleError<'_>>("the attacking creature"),
+            ),
+        ))
+        .parse(input)
+    }) {
+        let consumed = text.len() - rest.len();
+        return (
+            if text[..consumed].eq_ignore_ascii_case("the blocking creature") {
+                TargetFilter::TriggeringSource
+            } else {
+                TargetFilter::EventTarget
+            },
+            rest,
+            syntax,
+        );
+    }
 
     // CR 115.1 + CR 701.9b: Trailing " chosen at random" suffix on a noun-phrase
     // target (e.g. Zaffai, Thunder Conductor — "an opponent chosen at random").
@@ -13211,6 +13250,17 @@ mod tests {
     fn parse_event_context_that_source() {
         let (filter, rem) = parse_event_context_ref("that source").unwrap();
         assert_eq!(filter, TargetFilter::TriggeringSource);
+        assert_eq!(rem, "");
+    }
+
+    #[test]
+    fn parse_event_context_filtered_block_pair() {
+        let (filter, rem) = parse_event_context_ref("the blocking creature").unwrap();
+        assert_eq!(filter, TargetFilter::TriggeringSource);
+        assert_eq!(rem, "");
+
+        let (filter, rem) = parse_event_context_ref("the attacking creature").unwrap();
+        assert_eq!(filter, TargetFilter::EventTarget);
         assert_eq!(rem, "");
     }
 

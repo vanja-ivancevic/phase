@@ -3175,6 +3175,39 @@ fn oracle_face_for(
     crate::database::synthesis::build_oracle_face(&card, None)
 }
 
+/// CR 509.3d: No Quarter's two filtered block triggers name opposite members
+/// of the same `(attacker, blocker)` event.  The parser must retain both event
+/// roles so the first body destroys the blocker and the second destroys the
+/// attacker; falling back to `Any` would make the card falsely supported while
+/// destroying an arbitrary permanent.
+#[test]
+fn no_quarter_filtered_block_triggers_bind_both_event_objects() {
+    let face = oracle_face_for(
+        "No Quarter",
+        "Whenever a creature becomes blocked by a creature with lesser power, destroy the blocking creature.\nWhenever a creature blocks a creature with lesser power, destroy the attacking creature.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "No Quarter must be fully supported: {gaps:?}"
+    );
+
+    let destroy_targets = face
+        .triggers
+        .iter()
+        .filter_map(|trigger| trigger.execute.as_deref())
+        .filter_map(|ability| match ability.effect.as_ref() {
+            Effect::Destroy { target, .. } => Some(target),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(destroy_targets.len(), 2);
+    assert_eq!(destroy_targets[0], &TargetFilter::TriggeringSource);
+    assert_eq!(destroy_targets[1], &TargetFilter::EventTarget);
+}
+
 /// CR 708.5: Found Footage's "You may look at face-down creatures your
 /// opponents control any time" lowers to a `MayLookAtFaceDown` static whose
 /// affected filter carries the FaceDown property and the opponent scope. The
