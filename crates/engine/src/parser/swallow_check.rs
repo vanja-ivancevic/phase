@@ -36,7 +36,7 @@ use crate::types::ability::{
     ModalSelectionConstraint, OpponentMayScope, ParsedCondition, PlayerFilter, QuantityExpr,
     QuantityRef, ReplacementCondition, ReplacementDefinition, ReplacementMode, RestrictionExpiry,
     StaticCondition, StaticDefinition, TargetFilter, TriggerCondition, TriggerConstraint,
-    TriggerDefinition, UnlessPayScaling,
+    TriggerDefinition, TypeFilter, UnlessPayScaling,
 };
 use crate::types::ability_visit::{
     visit_ability_def, visit_replacement, visit_static, visit_trigger,
@@ -1629,6 +1629,56 @@ fn effect_is_replacement_carrier(effect: &Effect) -> bool {
     }
 }
 
+/// CR 701.6a + CR 614.1a: Desertion's countered artifact/creature spell rider
+/// is represented as a conditional sequel to `Effect::Counter`, rather than as
+/// `countered_spell_zone` (the field used by Memory Lapse / Remand). The
+/// counter resolver moves the spell to its graveyard first; the gated
+/// `ChangeZone` then replaces that destination with the battlefield under the
+/// resolving player's control. Match the complete parent/child shape so an
+/// unrelated conditional zone change cannot silence the audit.
+fn def_is_countered_spell_battlefield_rider(def: &AbilityDefinition) -> bool {
+    let Effect::Counter { .. } = &*def.effect else {
+        return false;
+    };
+    let Some(rider) = def.sub_ability.as_deref() else {
+        return false;
+    };
+    let Some(AbilityCondition::ZoneChangedThisWay {
+        filter,
+        destination: None | Some(Zone::Battlefield),
+    }) = rider.condition.as_ref()
+    else {
+        return false;
+    };
+    let Effect::ChangeZone {
+        origin: Some(Zone::Graveyard),
+        destination: Zone::Battlefield,
+        target: TargetFilter::ParentTarget,
+        enters_under: Some(crate::types::ability::ControllerRef::You),
+        ..
+    } = &*rider.effect
+    else {
+        return false;
+    };
+    let TargetFilter::Or { filters } = filter else {
+        return false;
+    };
+    filters.len() == 2
+        && filters.iter().all(|filter| {
+            matches!(
+                filter,
+                TargetFilter::Typed(typed)
+                    if typed.controller.is_none()
+                        && typed.properties.is_empty()
+                        && typed.type_filters.len() == 1
+                        && matches!(
+                            typed.type_filters[0],
+                            TypeFilter::Artifact | TypeFilter::Creature
+                        )
+            )
+        })
+}
+
 /// CR 614.1a: a def that carries BOTH a `condition` and an `else_ability` has modelled a
 /// two-way alternative — "if C, do B **instead of** A" is exactly `A.condition = C` with
 /// `A.else_ability = B`. The branch IS the "instead", so the clause is represented.
@@ -1671,6 +1721,7 @@ fn def_is_conditional_mana_instead_branch(def: &AbilityDefinition) -> bool {
 
 fn def_tree_has_replacement_carrier(def: &AbilityDefinition) -> bool {
     if effect_is_replacement_carrier(&def.effect)
+        || def_is_countered_spell_battlefield_rider(def)
         || def_is_represented_instead_branch(def)
         || def_is_conditional_mana_instead_branch(def)
     {
@@ -6931,6 +6982,20 @@ mod tests {
         let parsed = parse_named(
             "Counter target spell. If that spell is countered this way, put it on top of its owner's library instead of into that player's graveyard.",
             "Memory Lapse",
+            &["Instant"],
+        );
+
+        assert!(!has_swallowed_detector(&parsed, "Replacement_Instead"));
+    }
+
+    /// CR 701.6a + CR 614.1a: Desertion's artifact/creature rider is a
+    /// conditional battlefield move chained after `Counter`, not the typed
+    /// `countered_spell_zone` carrier used by Memory Lapse.
+    #[test]
+    fn replacement_instead_accepts_desertion_battlefield_rider() {
+        let parsed = parse_named(
+            "Counter target spell. If an artifact or creature spell is countered this way, put that card onto the battlefield under your control instead of into its owner's graveyard.",
+            "Desertion",
             &["Instant"],
         );
 
