@@ -105,6 +105,66 @@ fn is_multi_target_player_subject_definition(def: &AbilityDefinition) -> bool {
             })
 }
 
+/// CR 608.2c + CR 701.21a: `the other` after a resolution-time choice from
+/// an announced two-object set means the unchosen member of that original set,
+/// not the selected tracked set itself. The parser intentionally lowers the
+/// bare anaphor to `TrackedSet(0)`; at this assembly seam the choose/sacrifice
+/// chain is complete and the complement can be expressed without a new effect
+/// or resolver.
+fn rewrite_chosen_object_complement(def: &mut AbilityDefinition) {
+    let is_parent_target_pick = matches!(
+        def.effect.as_ref(),
+        Effect::ChooseObjectsIntoTrackedSet {
+            chooser: TargetFilter::ParentTargetController,
+            filter: TargetFilter::ParentTarget,
+            min: 1,
+            max: Some(1),
+        }
+    );
+
+    if is_parent_target_pick {
+        if let Some(sacrifice) = def.sub_ability.as_deref_mut() {
+            let is_selected_sacrifice = matches!(
+                sacrifice.effect.as_ref(),
+                Effect::Sacrifice {
+                    target: TargetFilter::TrackedSet {
+                        id: crate::types::identifiers::TrackedSetId(0),
+                    },
+                    count: QuantityExpr::Fixed { value: 1 },
+                    min_count: 1,
+                }
+            );
+            if is_selected_sacrifice {
+                if let Some(counter) = sacrifice.sub_ability.as_deref_mut() {
+                    if let Effect::PutCounter { target, .. } = counter.effect.as_mut() {
+                        if matches!(
+                            target,
+                            TargetFilter::TrackedSet {
+                                id: crate::types::identifiers::TrackedSetId(0)
+                            }
+                        ) {
+                            *target = TargetFilter::And {
+                                filters: vec![
+                                    TargetFilter::ParentTarget,
+                                    TargetFilter::Not {
+                                        filter: Box::new(TargetFilter::TrackedSet {
+                                            id: crate::types::identifiers::TrackedSetId(0),
+                                        }),
+                                    },
+                                ],
+                            };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(sub) = def.sub_ability.as_deref_mut() {
+        rewrite_chosen_object_complement(sub);
+    }
+}
+
 /// CR 701.3a + CR 303.4f: Stamp `forward_result` on a ChangeZone→Battlefield that
 /// nests Attach, including when that return sits under TargetOnly (Necrotic Plague).
 fn stamp_forward_result_on_battlefield_attach_return(def: &mut AbilityDefinition) {
@@ -3247,6 +3307,8 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
             )
         })
     };
+
+    rewrite_chosen_object_complement(&mut result);
 
     // CR 608.2 + CR 107.2: Ordinary parsed clauses rewrite target-scoped refs
     // ("their life", "their hand") to their per-iterating-player equivalents.

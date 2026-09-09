@@ -1483,6 +1483,11 @@ pub(crate) enum ChooseImperativeAst {
     TargetOnly {
         target: TargetFilter,
     },
+    /// CR 608.2d + CR 701.21a: "that player chooses and sacrifices one of
+    /// those creatures" after a previously announced creature set. The
+    /// selection is resolution-time, not a second target announcement; the
+    /// lowering uses the parent target set as the candidate pool.
+    ChooseAndSacrificeOneOfThoseCreatures,
     Reparse {
         text: String,
     },

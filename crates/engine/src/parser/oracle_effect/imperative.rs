@@ -4310,6 +4310,24 @@ pub(super) fn parse_choose_ast(
             return Some(ast);
         }
 
+        // CR 608.2d + CR 701.21a: "choose and sacrifice one of those
+        // creatures" is a resolution-time choice from the already-announced
+        // parent target set. It is not ordinary target syntax, and routing it
+        // through the generic target fallback would turn the choice into a
+        // mandatory first target or leave the sacrifice unrepresented.
+        if all_consuming(terminated(
+            alt((
+                tag::<_, _, OracleError<'_>>("choose and sacrifices one of those creatures"),
+                tag("choose and sacrifice one of those creatures"),
+            )),
+            opt(tag(".")),
+        ))
+        .parse(lower.trim())
+        .is_ok()
+        {
+            return Some(ChooseImperativeAst::ChooseAndSacrificeOneOfThoseCreatures);
+        }
+
         if super::is_choose_as_targeting(rest_lower) {
             // CR 115.1c + CR 601.2c: "Choose target X and target Y" declares
             // two independent target slots on the same activated/triggered
@@ -5619,6 +5637,14 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
             Effect::ChooseDamageSource { source_filter }
         }
         ChooseImperativeAst::TargetOnly { target } => Effect::TargetOnly { target },
+        ChooseImperativeAst::ChooseAndSacrificeOneOfThoseCreatures => {
+            Effect::ChooseObjectsIntoTrackedSet {
+                chooser: TargetFilter::ParentTargetController,
+                filter: TargetFilter::ParentTarget,
+                min: 1,
+                max: Some(1),
+            }
+        }
         ChooseImperativeAst::Reparse { text } => super::parse_effect(&text),
         ChooseImperativeAst::NamedChoice {
             choice_type,
@@ -12892,6 +12918,33 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
             clause.sub_ability = Some(Box::new(target_b_clause));
             clause
         }
+        // CR 608.2d + CR 701.21a: resolution-time choice from the parent
+        // target set, followed by sacrificing the selected object. The
+        // tracked-set result remains available to the sacrifice step and the
+        // existing "the other" continuation is rewritten to the parent
+        // target complement.
+        ImperativeFamilyAst::Structured(ImperativeAst::Choose(
+            ChooseImperativeAst::ChooseAndSacrificeOneOfThoseCreatures,
+        )) => {
+            let mut clause = parsed_clause(Effect::ChooseObjectsIntoTrackedSet {
+                chooser: TargetFilter::ParentTargetController,
+                filter: TargetFilter::ParentTarget,
+                min: 1,
+                max: Some(1),
+            });
+            let sacrifice = AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Sacrifice {
+                    target: TargetFilter::TrackedSet {
+                        id: crate::types::identifiers::TrackedSetId(0),
+                    },
+                    count: QuantityExpr::Fixed { value: 1 },
+                    min_count: 1,
+                },
+            );
+            clause.sub_ability = Some(Box::new(sacrifice));
+            clause
+        }
         // CR 701.23a + CR 107.1: Dual/N-way search ("a X card and a Y card") lowers
         // to a chain of independent `SearchLibrary` effects linked via sub_ability,
         // mirroring `lower_put_counter_list`. Intercepted here because the bare
@@ -14698,6 +14751,7 @@ fn try_parse_bolster(lower: &str) -> Option<Effect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::oracle_effect::parse_effect_chain;
     use crate::types::ability::ParitySource;
 
     #[test]
@@ -23176,6 +23230,67 @@ mod tests {
             Effect::AssembleContraptions {
                 count: QuantityExpr::Fixed { value: 1 }
             }
+        ));
+    }
+
+    #[test]
+    fn retribution_chooses_sacrifices_and_counters_the_other_target() {
+        let def = parse_effect_chain(
+            "Choose two target creatures controlled by the same opponent. That player chooses and sacrifices one of those creatures. Put a -1/-1 counter on the other.",
+            AbilityKind::Spell,
+        );
+
+        assert!(matches!(def.effect.as_ref(), Effect::TargetOnly { .. }));
+        let choose = def
+            .sub_ability
+            .as_deref()
+            .expect("targeting must continue into the resolution-time choice");
+        assert!(matches!(
+            choose.effect.as_ref(),
+            Effect::ChooseObjectsIntoTrackedSet {
+                chooser: TargetFilter::ParentTargetController,
+                filter: TargetFilter::ParentTarget,
+                min: 1,
+                max: Some(1),
+            }
+        ));
+
+        let sacrifice = choose
+            .sub_ability
+            .as_deref()
+            .expect("choice must continue into sacrifice");
+        assert!(matches!(
+            sacrifice.effect.as_ref(),
+            Effect::Sacrifice {
+                target: TargetFilter::TrackedSet { .. },
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 1,
+            }
+        ));
+
+        let counter = sacrifice
+            .sub_ability
+            .as_deref()
+            .expect("sacrifice must continue into the counter instruction");
+        let Effect::PutCounter { target, .. } = counter.effect.as_ref() else {
+            panic!(
+                "expected the other target to receive a counter, got {:?}",
+                counter.effect
+            );
+        };
+        assert!(matches!(
+            target,
+            TargetFilter::And { filters }
+                if filters.len() == 2
+                    && matches!(filters[0], TargetFilter::ParentTarget)
+                    && matches!(
+                        &filters[1],
+                        TargetFilter::Not { filter }
+                            if matches!(
+                                filter.as_ref(),
+                                TargetFilter::TrackedSet { id: crate::types::identifiers::TrackedSetId(0) }
+                            )
+                    )
         ));
     }
 
