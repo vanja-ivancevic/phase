@@ -12655,6 +12655,39 @@ fn essence_vortex_pays_target_toughness_to_prevent_destruction() {
     );
 }
 
+/// CR 702.24a + CR 122.1: Cyclone's colored upkeep cost is paid once for
+/// each wind counter on the source, rather than as one flat green mana.
+#[test]
+fn cyclone_preserves_colored_per_counter_unless_cost() {
+    let r = parse(
+        "At the beginning of your upkeep, put a wind counter on this enchantment, then sacrifice this enchantment unless you pay {G} for each wind counter on it. If you pay, this enchantment deals damage equal to the number of wind counters on it to each creature and each player.",
+        "Cyclone",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+    assert!(r.parse_warnings.is_empty(), "Cyclone: {r:#?}");
+
+    let Some(unless_pay) = r.triggers[0].unless_pay.as_ref() else {
+        panic!("Cyclone trigger lost unless-pay: {:#?}", r.triggers[0]);
+    };
+    assert_eq!(unless_pay.payer, TargetFilter::Controller);
+    assert!(matches!(
+        &unless_pay.cost,
+        AbilityCost::PerCounter {
+            counter: CounterType::Generic(name),
+            target: TargetFilter::SelfRef,
+            base,
+        } if name == "wind"
+            && matches!(
+                base.as_ref(),
+                AbilityCost::Mana {
+                    cost: ManaCost::Cost { generic: 0, shards }
+                } if shards.as_slice() == [crate::types::mana::ManaCostShard::Green]
+            )
+    ), "expected colored wind-counter cost, got {:?}", unless_pay.cost);
+}
+
 #[test]
 fn enchanted_player_cast_trigger_scopes_caster_to_enchanted_player() {
     // CR 303.4m + CR 702.5a: Maddening Hex — "Whenever enchanted player casts a

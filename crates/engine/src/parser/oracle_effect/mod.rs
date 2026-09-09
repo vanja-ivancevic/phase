@@ -38031,6 +38031,29 @@ pub(crate) fn parse_unless_for_each_payment(
         return None;
     };
     if !shards.is_empty() || *generic == 0 {
+        // CR 702.24a + CR 122.1: a colored or otherwise non-generic cost can
+        // still be paid once for each counter on the source (Cyclone's "pay
+        // {G} for each wind counter on it"). The generic-only path below
+        // cannot represent that shape as `ManaDynamic`, while the runtime
+        // already expands `PerCounter` into repeated base costs.
+        let (_, clause) = preceded(
+            tag::<_, _, OracleError<'_>>(" for each "),
+            nom::combinator::rest,
+        )
+        .parse(after_cost)
+        .ok()?;
+        let qty = parse_for_each_clause(clause.trim())?;
+        if let QuantityRef::CountersOn {
+            scope: ObjectScope::Source,
+            counter_type: Some(counter),
+        } = qty
+        {
+            return Some(AbilityCost::PerCounter {
+                counter,
+                target: TargetFilter::SelfRef,
+                base: Box::new(AbilityCost::Mana { cost: cost.clone() }),
+            });
+        }
         return None;
     }
 

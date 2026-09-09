@@ -1524,7 +1524,13 @@ pub(crate) fn parse_trigger_line_with_index_ir(
     let effect_final = strip_constraint_sentences(&effect_without_if);
 
     // CR 118.12: Detect "unless [player] pays {cost}" in effect text.
-    let (effect_for_parse, unless_pay) = extract_unless_pay_modifier(&effect_final, &cond_lower);
+    let (effect_without_unless, unless_pay) =
+        extract_unless_pay_modifier(&effect_final, &cond_lower);
+    let effect_for_parse = if unless_pay.is_some() {
+        append_payment_rider(&effect_final, effect_without_unless)
+    } else {
+        effect_without_unless
+    };
 
     // CR 107.4 + CR 202.1 + CR 603.4: Stage the cast-trigger's colored-mana-symbol
     // qualifier color (Namor) so a "create that many tokens" effect clause can
@@ -1747,6 +1753,28 @@ fn has_later_sentence_if(lower: &str) -> bool {
             .parse(sentence.trim_start())
             .is_ok()
     })
+}
+
+/// CR 118.12a + CR 608.2c: preserve Cyclone-style "If you pay" text after a
+/// successfully extracted unless cost. The extractor owns only the payment
+/// modifier, so the rider is normalized here into the existing optional-outcome
+/// continuation grammar instead of being silently discarded with the clause.
+fn append_payment_rider(original: &str, mut cleaned: String) -> String {
+    let lower = original.to_lowercase();
+    let Some(unless_pos) = lower.find(" unless ") else {
+        return cleaned;
+    };
+    let Some(relative_start) = lower[unless_pos..].find(". if you pay, ") else {
+        return cleaned;
+    };
+    let body_start = unless_pos + relative_start + ". if you pay, ".len();
+    let body = original.get(body_start..).map(str::trim).unwrap_or_default();
+    if body.is_empty() {
+        return cleaned;
+    }
+    cleaned.push_str(". If you do, ");
+    cleaned.push_str(body);
+    cleaned
 }
 
 /// True when a resolution-time optional cast names a player-chosen target that

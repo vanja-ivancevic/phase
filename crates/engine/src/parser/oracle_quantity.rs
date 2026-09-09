@@ -2291,6 +2291,13 @@ fn parse_possessive_participle(input: &str) -> OracleResult<'_, ()> {
 fn parse_possessive_object_type(input: &str) -> OracleResult<'_, ()> {
     // Optional supertype prefix consumes a trailing space.
     let (rest, _) = opt(nom_target::parse_supertype_prefix).parse(input)?;
+    // CR 109.1 / CR 110.5: tokens are objects but are not card types, so the
+    // shared card-type parser intentionally does not recognize the bare noun.
+    // Keep it in this object-referent grammar without widening ordinary type
+    // filters elsewhere.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("token").parse(rest) {
+        return Ok((rest, ()));
+    }
     nom_target::parse_type_filter_word(rest).map(|(rest, _)| (rest, ()))
 }
 
@@ -6390,17 +6397,17 @@ mod tests {
     }
 
     /// Negative guard for `classify_possessive_referent`'s `bare_types`
-    /// allowlist — an unknown type word ("wizard") must NOT silently classify
+    /// allowlist — an unknown type word ("artifactoid") must NOT silently classify
     /// as anaphoric just because it follows a `"that "` / `"the "` determiner.
     /// Pairs with the positive `parse_event_context_possessive_that_card_*`
     /// tests to lock both sides of the classifier.
     #[test]
     fn parse_event_context_possessive_unknown_type_returns_none() {
         assert_eq!(
-            parse_event_context_quantity("that wizard's mana value"),
+            parse_event_context_quantity("that artifactoid's mana value"),
             None
         );
-        assert_eq!(parse_event_context_quantity("the wizard's power"), None);
+        assert_eq!(parse_event_context_quantity("the artifactoid's power"), None);
     }
 
     /// Negative guard for the participle word-boundary fix: a prefix like
