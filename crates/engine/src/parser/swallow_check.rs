@@ -2552,6 +2552,32 @@ fn dynamic_markers_are_all_recorded_unrecognized(
     })
 }
 
+/// CR 705.2: `FlipCoinUntilLose` already runs its `win_effect` once for every
+/// won flip. The printed "for each flip you won" is therefore a redundant
+/// quantifier, not a dropped `QuantityExpr`. Keep this suppression tied to one
+/// and only one `for each` occurrence plus the typed coin-loop carrier so a
+/// second dynamic clause remains visible.
+fn dynamic_qty_is_redundant_flip_win_iteration(
+    cleaned: &str,
+    markers: &[&'static str],
+    evidence: &UnitEvidence,
+) -> bool {
+    if markers != ["for each "] || cleaned.matches("for each ").count() != 1 {
+        return false;
+    }
+    let flip_win_phrase_count = [
+        "for each flip you won",
+        "for each flips you won",
+        "for each flip you win",
+        "for each flips you win",
+    ]
+    .iter()
+    .map(|phrase| cleaned.matches(phrase).count())
+    .sum::<usize>();
+    flip_win_phrase_count == 1
+        && evidence.any_effect(|effect| matches!(effect, Effect::FlipCoinUntilLose { .. }))
+}
+
 /// Oracle text contains dynamic-quantity grammar ("equal to", "for each",
 /// "twice", "where x is", "the number of", "half [poss]") but the parsed
 /// AST contains no dynamic carrier (Ref, Multiply, DivideRounded, Offset,
@@ -2573,6 +2599,9 @@ fn detect_dynamic_qty(
     // because it is a claim about REPORTING (the defect is already on the card),
     // not about representation.
     if dynamic_markers_are_all_recorded_unrecognized(cleaned, &markers, evidence) {
+        return;
+    }
+    if dynamic_qty_is_redundant_flip_win_iteration(cleaned, &markers, evidence) {
         return;
     }
     // CR 122.1 + CR 614.1a: Rock Hydra's "for each 1 damage" is not a
@@ -9024,6 +9053,32 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         );
 
         assert!(!has_swallowed_detector(&parsed, "DynamicQty"));
+    }
+
+    /// CR 705.2: the flip-until-lose resolver already repeats its win effect
+    /// once per won flip, so the explicit quantifier on these old-border cards
+    /// must not be reported as a swallowed dynamic quantity.
+    #[test]
+    fn dynamic_qty_accepts_redundant_flip_win_iteration() {
+        for (name, text, types) in [
+            (
+                "Crazed Firecat",
+                "When this creature enters, flip a coin until you lose a flip. Put a +1/+1 counter on this creature for each flip you won.",
+                vec!["Creature"],
+            ),
+            (
+                "Mirror March",
+                "Whenever a nontoken creature you control enters, flip a coin until you lose a flip. For each flip you won, create a token that's a copy of that creature. Those tokens gain haste. Exile them at the beginning of the next end step.",
+                vec!["Enchantment"],
+            ),
+        ] {
+            let parsed = parse_named(text, name, &types);
+            assert!(
+                !has_swallowed_detector(&parsed, "DynamicQty"),
+                "{name} must treat the flip loop as the dynamic carrier: {:?}",
+                parsed.parse_warnings
+            );
+        }
     }
 
     #[test]
