@@ -2523,6 +2523,28 @@ fn detect_dynamic_qty(
     if dynamic_markers_are_all_recorded_unrecognized(cleaned, &markers, evidence) {
         return;
     }
+    // CR 122.1 + CR 614.1a: Rock Hydra's "for each 1 damage" is not a
+    // quantity expression. It is a per-event replacement whose typed counter
+    // resource is consumed once for each prevented damage point. The resource
+    // field is the semantic carrier; without this leg the audit mistakes the
+    // deliberately non-QuantityExpr representation for a swallowed dynamic
+    // quantity and leaves the card red despite having a complete replacement.
+    if evidence.any_at::<ReplacementDefinition>(&["replacements"], |replacement| {
+        matches!(
+            (
+                &replacement.event,
+                &replacement.condition,
+                &replacement.damage_counter_removal,
+            ),
+            (
+                ReplacementEvent::DamageDone,
+                Some(ReplacementCondition::SourceHasCounterAtLeast { .. }),
+                Some(_),
+            )
+        )
+    }) {
+        return;
+    }
     // ── Typed dynamic-quantity carriers ─────────────────────────────────
     //
     // CR 107.1a + CR 107.3 + CR 119.1. The engine has exactly ONE dynamic-quantity
@@ -5273,9 +5295,10 @@ mod tests {
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
     use crate::types::ability::{
         AbilityDefinition, AbilityKind, ContinuousModification, DamageModification, Effect,
-        OutsideGameSourcePool, PlayerFilter, QuantityExpr, StaticCondition, StaticDefinition,
-        TargetFilter, TriggerCondition,
+        OutsideGameSourcePool, PlayerFilter, QuantityExpr, ReplacementCondition,
+        StaticCondition, StaticDefinition, TargetFilter, TriggerCondition,
     };
+    use crate::types::counter::CounterType;
     use crate::types::identifiers::TrackedSetId;
     use crate::types::keywords::Keyword;
     use crate::types::mana::ManaCost;
@@ -8814,6 +8837,44 @@ this spell's mana cost.\nAttacking creatures get -3/-0 until end of turn.",
         );
 
         assert!(!has_swallowed_detector(&parsed, "DynamicQty"));
+    }
+
+    /// CR 122.1 + CR 614.1a: Rock Hydra's per-damage counter replacement is a
+    /// dynamic resource loop, not a `QuantityExpr`. The typed replacement
+    /// resource must discharge the DynamicQty audit without hiding unrelated
+    /// dynamic-quantity text.
+    #[test]
+    fn dynamic_qty_accepts_counter_gated_damage_replacement() {
+        let parsed = parse_named(
+            "This creature enters with X +1/+1 counters on it.\n\
+             For each 1 damage that would be dealt to this creature, if it has a +1/+1 counter on it, remove a +1/+1 counter from it and prevent that 1 damage.",
+            "Rock Hydra",
+            &["Creature"],
+        );
+
+        assert!(
+            parsed.replacements.iter().any(|replacement| {
+                matches!(
+                    (
+                        &replacement.event,
+                        &replacement.condition,
+                        &replacement.damage_counter_removal,
+                    ),
+                    (
+                        crate::types::replacements::ReplacementEvent::DamageDone,
+                        Some(ReplacementCondition::SourceHasCounterAtLeast { .. }),
+                        Some(CounterType::Plus1Plus1),
+                    )
+                )
+            }),
+            "Rock Hydra must lower to a typed counter-gated damage replacement: {:?}",
+            parsed.replacements
+        );
+        assert!(
+            !has_swallowed_detector(&parsed, "DynamicQty"),
+            "the typed counter resource must represent the per-damage quantity: {:?}",
+            parsed.parse_warnings
+        );
     }
 
     #[test]

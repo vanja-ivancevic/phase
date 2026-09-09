@@ -4800,6 +4800,68 @@ mod tests {
         );
     }
 
+    /// CR 122.1 + CR 614.1a: Rock Hydra — one +1/+1 counter prevents one
+    /// damage, and excess damage still lands once the counters are exhausted.
+    #[test]
+    fn rock_hydra_prevention_spends_one_counter_per_damage() {
+        use crate::types::ability::{
+            DamageModification, ReplacementCondition, ReplacementDefinition,
+        };
+        use crate::types::counter::CounterType;
+        use crate::types::replacements::ReplacementEvent;
+
+        let mut state = GameState::new_two_player(42);
+        let hydra = create_object(
+            &mut state,
+            CardId(42),
+            PlayerId(1),
+            "Rock Hydra".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&hydra).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.counters.insert(CounterType::Plus1Plus1, 2);
+            obj.replacement_definitions.push(
+                ReplacementDefinition::new(ReplacementEvent::DamageDone)
+                    .damage_modification(DamageModification::PreventionMinus {
+                        value: u32::MAX,
+                    })
+                    .damage_counter_removal(CounterType::Plus1Plus1)
+                    .valid_card(TargetFilter::SelfRef)
+                    .condition(ReplacementCondition::SourceHasCounterAtLeast {
+                        counter_type: CounterType::Plus1Plus1,
+                        count: 1,
+                    })
+                    .description("Rock Hydra prevention".to_string()),
+            );
+        }
+
+        let ability = make_ability(3, vec![TargetRef::Object(hydra)]);
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let hydra_obj = state.objects.get(&hydra).unwrap();
+        assert_eq!(
+            hydra_obj
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "two counters should prevent exactly two damage points"
+        );
+        assert_eq!(
+            hydra_obj.damage_marked, 1,
+            "damage beyond the available counters must still be marked"
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, GameEvent::DamagePrevented { amount: 2, .. })));
+    }
+
     /// CR 615.5: Crumbling Sanctuary-class prevention follow-ups resolve "that
     /// player" from the prevented damage event's target and "that many" from
     /// the prevented damage amount.

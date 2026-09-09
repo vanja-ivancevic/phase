@@ -24883,6 +24883,14 @@ pub enum ReplacementCondition {
     /// "as long as ~ is tapped/untapped" — replacement applies only while the
     /// source object is in the required tapped state.
     SourceTappedState { tapped: bool },
+    /// CR 122.1 + CR 614.1a: the replacement applies while its source carries
+    /// at least the named counter. Used by Rock Hydra's per-damage prevention
+    /// replacement; unlike a static condition, this is evaluated against the
+    /// replacement source while a damage event is being replaced.
+    SourceHasCounterAtLeast {
+        counter_type: CounterType,
+        count: u32,
+    },
     /// CR 120.1 + CR 614.1a: Replacement applies only to objects that were
     /// dealt damage this turn by a source matching the filter. Covers
     /// source-controller gates and source-object gates such as "this creature"
@@ -26920,6 +26928,12 @@ pub struct ReplacementDefinition {
     /// CR 614.1a: Damage modification formula (Double, Triple, Plus, Minus).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub damage_modification: Option<DamageModification>,
+    /// CR 122.1 + CR 614.1a: for a counter-gated prevention replacement,
+    /// remove one counter from the replacement source for each damage point it
+    /// prevents. This is intentionally separate from `execute`: one damage
+    /// event may carry several points.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub damage_counter_removal: Option<CounterType>,
     /// CR 614.1a: Restricts which damage source this replacement matches.
     /// Reuses existing TargetFilter infrastructure (SelfRef, Typed with ControllerRef/FilterProp).
     /// None = any source.
@@ -27164,6 +27178,7 @@ impl ReplacementDefinition {
             condition: None,
             destination_zone: None,
             damage_modification: None,
+            damage_counter_removal: None,
             damage_source_filter: None,
             damage_target_filter: None,
             combat_scope: None,
@@ -27230,6 +27245,13 @@ impl ReplacementDefinition {
 
     pub fn damage_modification(mut self, modification: DamageModification) -> Self {
         self.damage_modification = Some(modification);
+        self
+    }
+
+    /// CR 122.1 + CR 614.1a: make a damage prevention replacement consume one
+    /// counter from its source for each damage point prevented.
+    pub fn damage_counter_removal(mut self, counter_type: CounterType) -> Self {
+        self.damage_counter_removal = Some(counter_type);
         self
     }
 

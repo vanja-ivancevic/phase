@@ -15,7 +15,8 @@ use crate::types::ability::{
     CastingRestriction, ChoiceType, ChosenSubtypeKind, ContinuousModification, ControllerRef,
     CostReduction, DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp,
     ManaProduction, ModalChoice, ParsedCondition, PlayerFilter, QuantityExpr, QuantityRef,
-    ReplacementDefinition, SolveCondition, SpellCastingOption, StaticCondition, StaticDefinition,
+    ReplacementCondition, ReplacementDefinition, SolveCondition, SpellCastingOption,
+    StaticCondition, StaticDefinition,
     TapStateChange, TargetFilter, TriggerCondition, TriggerDefinition, TypedFilter,
 };
 use crate::types::ability_visit::{visit_ability_def_scoped, ResolutionScope};
@@ -5798,6 +5799,24 @@ pub(crate) fn parse_oracle_ir(
             if result.strive_cost.is_some() && parse_strive_cost_line(&line).is_some() {
                 i += 1;
                 continue;
+            }
+            // CR 122.1 + CR 614.1a: counter-gated per-damage prevention lines
+            // (Rock Hydra class) are static-shaped but are replacements. Route
+            // only the fully typed condition through the replacement parser so
+            // an unrelated static line cannot be claimed by a partial parse.
+            if let Some(replacement_ir) = parse_replacement_line_ir(&line, card_name) {
+                let definition = &replacement_ir.definition;
+                if matches!(
+                    (&definition.event, &definition.condition),
+                    (
+                        ReplacementEvent::DamageDone,
+                        Some(ReplacementCondition::SourceHasCounterAtLeast { .. })
+                    )
+                ) {
+                    emitter.replacement_ir_at(item_line, replacement_ir);
+                    i += 1;
+                    continue;
+                }
             }
             // CR 614.1c / CR 707.9: Lines that are both static-shaped (e.g.
             // trailing "doesn't untap during…" from a reflexive "When you do"

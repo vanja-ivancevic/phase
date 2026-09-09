@@ -381,6 +381,9 @@ fn parse_replacement_line_inner(text: &str, card_name: &str) -> Option<Replaceme
     if let Some(def) = parse_damage_to_self_instead_followup(&norm_lower, &normalized, &text) {
         return Some(def);
     }
+    if let Some(def) = parse_counter_gated_damage_prevention_replacement(&norm_lower, &text) {
+        return Some(def);
+    }
     if let Some(def) = parse_damage_prevention_replacement(&norm_lower, &text) {
         return Some(def);
     }
@@ -11697,6 +11700,46 @@ fn sentence_carrying_anchor<'a>(clause_lower: &'a str, anchor: &str) -> Option<&
     }
 }
 
+/// CR 122.1 + CR 614.1a: Parse the Rock Hydra class — "For each 1 damage
+/// that would be dealt to ~, if it has a +1/+1 counter on it, remove a +1/+1
+/// counter from it and prevent that 1 damage."
+///
+/// The counter removal is stored on the replacement definition rather than as
+/// a post-replacement execute effect. One damage event may contain multiple
+/// damage points, and the counter must be spent once per point prevented.
+fn parse_counter_gated_damage_prevention_replacement(
+    norm_lower: &str,
+    original_text: &str,
+) -> Option<ReplacementDefinition> {
+    let mut rest = norm_lower.trim().trim_end_matches('.').trim_end();
+    for phrase in [
+        "for each 1 damage that would be dealt to ~, ",
+        "if it has a +1/+1 counter on it, ",
+        "remove a +1/+1 counter from it and ",
+        "prevent that 1 damage",
+    ] {
+        let (next, _) = tag::<_, _, OracleError<'_>>(phrase).parse(rest).ok()?;
+        rest = next;
+    }
+    if !rest.is_empty() {
+        return None;
+    }
+
+    Some(
+        ReplacementDefinition::new(ReplacementEvent::DamageDone)
+            .damage_modification(DamageModification::PreventionMinus {
+                value: u32::MAX,
+            })
+            .damage_counter_removal(CounterType::Plus1Plus1)
+            .valid_card(TargetFilter::SelfRef)
+            .condition(ReplacementCondition::SourceHasCounterAtLeast {
+                counter_type: CounterType::Plus1Plus1,
+                count: 1,
+            })
+            .description(original_text.to_string()),
+    )
+}
+
 /// CR 615: Parse damage prevention replacement effects.
 /// Handles:
 /// - "prevent all combat damage that would be dealt [this turn]" (Fog, Moments Peace)
@@ -13879,6 +13922,36 @@ mod tests {
             }
             other => panic!("expected Effect::RemoveCounter, got {other:?}"),
         }
+    }
+
+    /// CR 122.1 + CR 614.1a: Rock Hydra spends one +1/+1 counter for each
+    /// damage point prevented, including when one damage event contains more
+    /// points than the creature currently has counters.
+    #[test]
+    fn rock_hydra_per_damage_counter_replacement() {
+        let def = parse_replacement_line(
+            "For each 1 damage that would be dealt to this creature, if it has a +1/+1 counter on it, remove a +1/+1 counter from it and prevent that 1 damage.",
+            "Rock Hydra",
+        )
+        .expect("Rock Hydra should parse as a counter-gated damage replacement");
+
+        assert_eq!(def.event, ReplacementEvent::DamageDone);
+        assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+        assert_eq!(
+            def.damage_modification,
+            Some(DamageModification::PreventionMinus { value: u32::MAX })
+        );
+        assert_eq!(
+            def.damage_counter_removal,
+            Some(CounterType::Plus1Plus1)
+        );
+        assert!(matches!(
+            def.condition,
+            Some(ReplacementCondition::SourceHasCounterAtLeast {
+                counter_type: CounterType::Plus1Plus1,
+                count: 1,
+            })
+        ));
     }
 
     #[test]

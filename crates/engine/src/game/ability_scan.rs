@@ -4722,6 +4722,17 @@ fn scan_replacement_condition(x: &ReplacementCondition, mode: ScanMode) -> Axes 
             kicker_cost: _,
         } => Axes::NONE,
         ReplacementCondition::SourceTappedState { tapped: _ } => Axes::NONE,
+        // CR 122.1: reads the source object's live counter map. It is a
+        // sibling-mutable board resource because the replacement's own damage
+        // payment changes the counter count while the event is processed.
+        ReplacementCondition::SourceHasCounterAtLeast {
+            counter_type: _,
+            count: _,
+        } => Axes {
+            event: false,
+            sibling: true,
+            projected: false,
+        },
         ReplacementCondition::DealtDamageThisTurnBySource { source } => {
             let mut acc = Axes {
                 event: false,

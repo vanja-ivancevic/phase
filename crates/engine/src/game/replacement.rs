@@ -1772,6 +1772,28 @@ fn damage_modification_for_rid(
         .clone()
 }
 
+/// CR 122.1 + CR 614.1a: Read the counter resource consumed by a per-damage
+/// prevention replacement (Rock Hydra class).
+fn damage_counter_removal_for_rid(
+    state: &GameState,
+    rid: ReplacementId,
+) -> Option<crate::types::counter::CounterType> {
+    if rid.source == ObjectId(0) {
+        return state
+            .pending_damage_replacements
+            .get(rid.index)?
+            .damage_counter_removal
+            .clone();
+    }
+    state
+        .objects
+        .get(&rid.source)?
+        .replacement_definitions
+        .get(rid.index)?
+        .damage_counter_removal
+        .clone()
+}
+
 /// Look up the `ShieldKind` of the matched replacement (object-hosted or pending
 /// registry), using the same `rid.source == ObjectId(0)` sentinel discriminator
 /// as `damage_modification_for_rid`.
@@ -2181,6 +2203,7 @@ fn damage_done_applier(
 ) -> ApplyResult {
     // Branch 1: Damage modification (Double, Triple, Plus, Minus)
     if let Some(modification) = damage_modification_for_rid(state, rid) {
+        let counter_removal = damage_counter_removal_for_rid(state, rid);
         // CR 510.2: identity for the combat-damage-batch prevention tally, taken
         // before the event is destructured (mirrors the Branch 2 shield path).
         let applied_key = AppliedReplacementKey::for_event(&event, rid);
@@ -2253,8 +2276,26 @@ fn damage_done_applier(
                 // prevent-all sentinel — yields 0 for any amount and is not
                 // consumed; continuous, not shield-style). Only the prevention
                 // provenance does the `DamagePrevented` bookkeeping below.
-                DamageModification::Minus { value }
-                | DamageModification::PreventionMinus { value } => amount.saturating_sub(value),
+                DamageModification::Minus { value } => amount.saturating_sub(value),
+                DamageModification::PreventionMinus { value } => {
+                    if let Some(counter_type) = counter_removal.as_ref() {
+                        // CR 122.1 + CR 614.1a: Rock Hydra's replacement
+                        // prevents one damage per counter, capped by both the
+                        // event amount and the live counter total. The parser
+                        // uses `u32::MAX` as the ordinary subtraction sentinel;
+                        // this typed resource field supplies the real cap.
+                        let available = state
+                            .objects
+                            .get(&rid.source)
+                            .and_then(|obj| obj.counters.get(counter_type))
+                            .copied()
+                            .unwrap_or(0);
+                        let prevented = amount.min(available);
+                        amount.saturating_sub(prevented)
+                    } else {
+                        amount.saturating_sub(value)
+                    }
+                }
                 // CR 614.1a: Conditional — if amount < source's power, set to power.
                 // References the replacement source's (rid.source) post-layer power.
                 DamageModification::SetToSourcePower => {
@@ -2295,6 +2336,18 @@ fn damage_done_applier(
                     }
                 }
             };
+            if let Some(counter_type) = counter_removal {
+                let prevented = amount.saturating_sub(new_amount);
+                if prevented > 0 {
+                    super::effects::counters::apply_counter_removal(
+                        state,
+                        rid.source,
+                        counter_type,
+                        prevented,
+                        events,
+                    );
+                }
+            }
             // CR 614.5: A one-shot effect-created amount replacement (Desperate
             // Gambit) gets a single opportunity, then is consumed. Continuous
             // statics (Furnace of Rath) keep `ShieldKind::None` and are never
@@ -6195,6 +6248,16 @@ fn evaluate_replacement_condition(
             .objects
             .get(&source_id)
             .is_some_and(|obj| obj.tapped == *tapped),
+        ReplacementCondition::SourceHasCounterAtLeast {
+            counter_type,
+            count,
+        } => state
+            .objects
+            .get(&source_id)
+            .and_then(|obj| obj.counters.get(counter_type))
+            .copied()
+            .unwrap_or(0)
+            >= *count,
         // CR 120.1 + CR 614.1a: Check whether the affected object was dealt
         // damage this turn by a source matching the replacement's source
         // filter. The filter is evaluated relative to the replacement source,
