@@ -4601,6 +4601,24 @@ fn parse_unless_they_discard_cost(input: &str) -> Option<(AbilityCost, &str)> {
 /// CR 119.4 + CR 118.12: Parse the tail of "they pay N life" preserving
 /// the unconsumed remainder.
 fn parse_unless_they_pay_life(input: &str) -> Option<(AbilityCost, &str)> {
+    // CR 119.4 + CR 115.1: in "that creature's controller pays life equal
+    // to its toughness", `its` names the object targeted by the surrounding
+    // effect, not the source ability. Preserve the target-relative quantity
+    // for the shared resolution payment path.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("life equal to its toughness")
+        .parse(input)
+    {
+        return Some((
+            AbilityCost::PayLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::Toughness {
+                        scope: ObjectScope::Target,
+                    },
+                },
+            },
+            rest,
+        ));
+    }
     let (amount, after_num) = parse_number(input)?;
     let trimmed = after_num.trim_start();
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("life").parse(trimmed) {

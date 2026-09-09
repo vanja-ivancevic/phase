@@ -12622,6 +12622,39 @@ fn cabal_conditioning_uses_greatest_mana_value_as_discard_count() {
     );
 }
 
+/// CR 119.4 + CR 115.1: Essence Vortex's unless cost reads the targeted
+/// creature's current toughness at resolution time.
+#[test]
+fn essence_vortex_pays_target_toughness_to_prevent_destruction() {
+    let r = parse(
+        "Destroy target creature unless its controller pays life equal to its toughness. A creature destroyed this way can't be regenerated.",
+        "Essence Vortex",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    assert!(r.parse_warnings.is_empty(), "Essence Vortex: {r:#?}");
+
+    let Some(unless_pay) = r.abilities[0].unless_pay.as_ref() else {
+        panic!("expected Essence Vortex unless-pay cost, got {:#?}", r.abilities[0]);
+    };
+    assert_eq!(unless_pay.payer, TargetFilter::ParentTargetController);
+    assert!(
+        matches!(
+            &unless_pay.cost,
+            AbilityCost::PayLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::Toughness {
+                        scope: ObjectScope::Target
+                    }
+                }
+            }
+        ),
+        "expected target-toughness life cost, got {:?}",
+        unless_pay.cost
+    );
+}
+
 #[test]
 fn enchanted_player_cast_trigger_scopes_caster_to_enchanted_player() {
     // CR 303.4m + CR 702.5a: Maddening Hex — "Whenever enchanted player casts a

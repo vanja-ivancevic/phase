@@ -37899,6 +37899,19 @@ fn parse_resolution_unless_payer(input: &str) -> OracleResult<'_, TargetFilter> 
 }
 
 fn parse_resolution_unless_cost(cost_text: &str) -> Option<AbilityCost> {
+    // CR 119.4 + CR 115.1: "its controller pays life equal to its
+    // toughness" reads the toughness of the targeted creature, not the spell
+    // source. The resolution cost quantity is target-aware, so bind this
+    // exact legacy wording to ObjectScope::Target before the fixed-life arm.
+    if cost_text.trim().trim_end_matches('.').trim() == "life equal to its toughness" {
+        return Some(AbilityCost::PayLife {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::Toughness {
+                    scope: ObjectScope::Target,
+                },
+            },
+        });
+    }
     // CR 107.14 + CR 202.3: dynamic energy unless-cost ("an amount of {e}
     // equal to <quantity>"). `cost_text` arrives untruncated here, so this
     // check precedes the fixed-energy brace-run path.
