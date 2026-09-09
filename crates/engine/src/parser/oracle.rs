@@ -9092,6 +9092,35 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
             continue 'parse_constraints;
         }
 
+        // CR 602.2a: "Only this creature's owner may activate this ability."
+        // Older Oracle data also omits the apostrophe in "creatures owner".
+        // This is a permission rider, not an effect sentence: preserve the
+        // owner-vs-controller distinction when the permanent is stolen.
+        const SOURCE_OWNER_ACTIVATE_SUFFIX: &str =
+            "only this creature's owner may activate this ability";
+        const SOURCE_OWNER_ACTIVATE_LEGACY_SUFFIX: &str =
+            "only this creatures owner may activate this ability";
+        let source_owner_suffix = if lower.ends_with(SOURCE_OWNER_ACTIVATE_SUFFIX) {
+            Some(SOURCE_OWNER_ACTIVATE_SUFFIX)
+        } else if lower.ends_with(SOURCE_OWNER_ACTIVATE_LEGACY_SUFFIX) {
+            Some(SOURCE_OWNER_ACTIVATE_LEGACY_SUFFIX)
+        } else {
+            None
+        };
+        if let Some(suffix) = source_owner_suffix {
+            let end = remaining.len() - suffix.len();
+            remaining = remaining[..end]
+                .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
+                .to_string();
+            constraints
+                .restrictions
+                .push(ActivationRestriction::OnlySourceOwner);
+            if remaining.is_empty() {
+                break 'parse_constraints;
+            }
+            continue 'parse_constraints;
+        }
+
         // CR 602.2: "Any player may activate this ability." — strip as a recognized
         // annotation. This appears as a trailing sentence on activated abilities.
         const ANY_PLAYER_ACTIVATE_SUFFIX: &str = "any player may activate this ability";

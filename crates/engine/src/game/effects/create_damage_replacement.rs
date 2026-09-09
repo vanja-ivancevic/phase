@@ -331,6 +331,7 @@ fn chosen_redirect_target(
 /// object or player, captured at resolution time into the
 /// shield's `redirect_target` field (the shield host does not retain the
 /// creating ability's targets, so the applier reads them back from there);
+/// `SourceOwner` → the replacement source object's owner;
 /// `AttachedToSource` → the permanent the source is attached to.
 ///
 /// Used by `replacement::damage_done_applier` to rewrite the damage event's
@@ -351,6 +352,10 @@ pub(crate) fn resolve_redirect_recipient(
             .objects
             .get(&damage_source_id)
             .map(|obj| TargetRef::Player(obj.controller)),
+        DamageRedirectTarget::SourceOwner => state
+            .objects
+            .get(&replacement_source_id)
+            .map(|obj| TargetRef::Player(obj.owner)),
         DamageRedirectTarget::SourceObject => Some(TargetRef::Object(replacement_source_id)),
         DamageRedirectTarget::ChosenObjectTarget => match chosen_target {
             Some(TargetRef::Object(id)) => Some(TargetRef::Object(id)),
@@ -446,6 +451,24 @@ mod tests {
                 None,
             ),
             Some(TargetRef::Player(PlayerId(0)))
+        );
+    }
+
+    #[test]
+    fn source_owner_redirect_resolves_from_replacement_source() {
+        let mut state = GameState::new_two_player(42);
+        let replacement_source = create_creature(&mut state, PlayerId(1), "Personal Incarnation");
+        let damage_source = create_creature(&mut state, PlayerId(0), "Damage Source");
+
+        assert_eq!(
+            resolve_redirect_recipient(
+                &state,
+                DamageRedirectTarget::SourceOwner,
+                replacement_source,
+                damage_source,
+                None,
+            ),
+            Some(TargetRef::Player(PlayerId(1)))
         );
     }
 

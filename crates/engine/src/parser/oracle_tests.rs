@@ -5146,6 +5146,40 @@ fn aegis_of_honor_full_parse_preserves_source_controller_redirection() {
 }
 
 #[test]
+fn personal_incarnation_full_parse_preserves_owner_redirection_and_permission() {
+    let r = parse(
+        "{0}: The next 1 damage that would be dealt to this creature this turn is dealt to its owner instead. Only this creatures owner may activate this ability.\nWhen this creature dies, its owner loses half their life, rounded up.",
+        "Personal Incarnation",
+        &[],
+        &["Creature"],
+        &["Avatar"],
+    );
+    assert!(r.parse_warnings.is_empty(), "Personal Incarnation: {r:#?}");
+
+    let activation = r
+        .abilities
+        .iter()
+        .find(|ability| ability.kind == AbilityKind::Activated)
+        .expect("Personal Incarnation must expose its activated ability");
+    assert!(activation.sub_ability.is_none());
+    assert!(activation
+        .activation_restrictions
+        .contains(&ActivationRestriction::OnlySourceOwner));
+    let Effect::CreateDamageReplacement {
+        redirect_to: Some(DamageRedirectTarget::SourceOwner),
+        redirect_amount: Some(PreventionAmount::Next(1)),
+        recipient_object_filter: Some(TargetFilter::SelfRef),
+        redirect_lifetime: RedirectionLifetime::OneOpportunity,
+        ..
+    } = activation.effect.as_ref()
+    else {
+        panic!(
+            "Personal Incarnation must preserve its one-shot owner redirection: {activation:#?}"
+        );
+    };
+}
+
+#[test]
 fn reverberation_full_parse_preserves_target_sorcery_source_scope() {
     let r = parse(
         "All damage that would be dealt this turn by target sorcery spell is dealt to that spell's controller instead.",

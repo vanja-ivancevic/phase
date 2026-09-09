@@ -1156,6 +1156,10 @@ fn activation_restriction_applies(
                 .unwrap_or(0)
                 < limit
         }
+        ActivationRestriction::OnlySourceOwner => state
+            .objects
+            .get(&source_id)
+            .is_some_and(|object| object.owner == player),
         ActivationRestriction::RequiresCondition { condition } => condition
             .as_ref()
             .is_none_or(|cond| evaluate_condition(state, player, source_id, cond)),

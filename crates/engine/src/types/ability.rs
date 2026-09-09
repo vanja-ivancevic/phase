@@ -1483,6 +1483,10 @@ pub enum DamageRedirectTarget {
     /// the replaced damage (Aegis of Honor). This is distinct from `Controller`,
     /// which resolves to the controller of the replacement ability's source.
     SourceController,
+    /// "...to its owner instead" when the replacement's source object is the
+    /// original recipient (Personal Incarnation). This follows the source
+    /// object's owner, not its controller and not the source of the damage.
+    SourceOwner,
     /// "...to ~ instead" / "...dealt to this creature instead" — the replacement
     /// source object itself (Beacon of Destiny).
     SourceObject,
@@ -21825,6 +21829,11 @@ pub enum ActivationRestriction {
     MaxTimesEachTurnDynamic {
         count: QuantityExpr,
     },
+    /// CR 602.2a: only the owner of the activated ability's source object may
+    /// activate it (Personal Incarnation's "this creature's owner"). This is
+    /// distinct from the default controller permission because the permanent
+    /// may have changed controllers.
+    OnlySourceOwner,
     RequiresCondition {
         condition: Option<ParsedCondition>,
     },

@@ -6881,6 +6881,7 @@ pub(crate) fn parse_oneshot_damage_replacement(
             // lives, and it likewise declares no slot.
             DamageRedirectTarget::Controller
             | DamageRedirectTarget::SourceController
+            | DamageRedirectTarget::SourceOwner
             | DamageRedirectTarget::SourceObject
             | DamageRedirectTarget::AttachedToSource => None,
         };
@@ -7464,6 +7465,10 @@ fn parse_oneshot_next_n_damage_to_self_redirect(norm_lower: &str) -> Option<Effe
             ),
             tag("target creature"),
         ),
+        value(
+            (DamageRedirectTarget::SourceOwner, TargetFilter::SelfRef),
+            tag("its owner"),
+        ),
     ))
     .parse(rest)
     .ok()?;
@@ -8018,6 +8023,7 @@ fn parse_redirect_recipient_phrase(
             DamageRedirectTarget::SourceController,
             tag("its controller"),
         ),
+        value(DamageRedirectTarget::SourceOwner, tag("its owner")),
         value(DamageRedirectTarget::SourceObject, tag("~")),
         value(
             DamageRedirectTarget::ChosenObjectTarget,
@@ -22401,7 +22407,7 @@ mod tests {
             // Unsupported recipient — must not degrade into a recipient-less shield.
             (
                 "unsupported recipient",
-                "all damage that would be dealt to you and creatures you control is dealt to any target instead",
+                "all damage that would be dealt to you and creatures you control is dealt to the moon instead",
             ),
             // Trailing text after the clause.
             (
