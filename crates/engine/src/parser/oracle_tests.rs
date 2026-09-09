@@ -3293,6 +3293,41 @@ fn whipkeeper_damage_history_amount_is_supported() {
     assert!(matches!(target, TargetFilter::Typed(_)));
 }
 
+/// CR 205.3a + CR 603.2e: Royal Decree's tapped trigger has an Oxford-comma
+/// subject list whose final leg is followed by the shared `becomes tapped`
+/// event. The condition/effect splitter must keep all four subject legs in the
+/// trigger rather than treating `or red permanent` as the effect boundary.
+#[test]
+fn royal_decree_tapped_type_list_is_supported() {
+    let face = oracle_face_for(
+        "Royal Decree",
+        "Cumulative upkeep {W}.\nWhenever a Swamp, Mountain, black permanent, or red permanent becomes tapped, this enchantment deals 1 damage to that permanent's controller.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Royal Decree must be fully supported: {gaps:?}"
+    );
+
+    let trigger = face
+        .triggers
+        .iter()
+        .find(|trigger| matches!(trigger.mode, TriggerMode::Taps))
+        .expect("Royal Decree must retain its tapped trigger");
+    let Some(TargetFilter::Or { filters }) = trigger.valid_card.as_ref() else {
+        panic!(
+            "Royal Decree tapped trigger must retain four subject filters: {:?}",
+            trigger.valid_card
+        );
+    };
+    assert_eq!(filters.len(), 4);
+    assert!(filters
+        .iter()
+        .all(|filter| matches!(filter, TargetFilter::Typed(_))));
+}
+
 /// CR 708.5: Found Footage's "You may look at face-down creatures your
 /// opponents control any time" lowers to a `MayLookAtFaceDown` static whose
 /// affected filter carries the FaceDown property and the opponent scope. The

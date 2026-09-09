@@ -10103,15 +10103,25 @@ fn continues_player_action_list(after_comma: &str) -> bool {
     // sentence (the effect body), not a type list continuation.
     // E.g. "creatures you control get +1/+1" starts with "creatures" (type word) but
     // has "get" (predicate verb) — this is the effect, not a continuation.
-    let after_conjunction = alt((
+    let (after_conjunction, had_conjunction) = alt((
         value((), tag::<_, _, OracleError<'_>>("and/or ")),
         value((), tag::<_, _, OracleError<'_>>("or ")),
         value((), tag("and ")),
     ))
     .parse(trimmed)
-    .map(|(rest, _)| rest)
-    .unwrap_or(trimmed);
+    .map(|(rest, _)| (rest, true))
+    .unwrap_or((trimmed, false));
     if type_phrase_continues_to_combat_damage_player_event(after_conjunction) {
+        return true;
+    }
+    // CR 603.1 + CR 603.2e: the final leg of a comma-separated trigger subject
+    // list is followed by the event head, not by another type word.  Without
+    // this bridge, `Swamp, Mountain, black permanent, or red permanent becomes
+    // tapped` is mistaken for a condition/effect boundary at the comma before
+    // `or red permanent`: the predicate-verb heuristic below quite reasonably
+    // classifies `becomes` as a new sentence, but here it is the shared trigger
+    // event for every subject leg.
+    if had_conjunction && type_phrase_continues_to_event_head(after_conjunction) {
         return true;
     }
     if !starts_with_type_word(after_conjunction) {
@@ -10130,6 +10140,19 @@ fn type_phrase_continues_to_combat_damage_player_event(text: &str) -> bool {
     }
     let rest = rest.trim_start();
     parse_combat_damage_to_player(rest).is_ok()
+}
+
+/// CR 603.1 + CR 603.2e: Recognize the final type-list leg when its shared
+/// trigger event follows immediately after the type phrase (for example,
+/// `or red permanent becomes tapped`).  This is deliberately narrower than
+/// `is_new_sentence_not_type_continuation`: an effect sentence such as
+/// `creatures you control get +1/+1` does not begin with a recognized event
+/// head and remains a real boundary.
+fn type_phrase_continues_to_event_head(text: &str) -> bool {
+    let (filter, rest) = parse_type_phrase(text);
+    !matches!(filter, TargetFilter::Any)
+        && rest.len() < text.len()
+        && parse_event_head_start(rest.trim_start()).is_ok()
 }
 
 fn parse_combat_damage_to_player(input: &str) -> OracleResult<'_, ()> {
