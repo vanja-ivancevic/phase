@@ -79,10 +79,21 @@ pub(crate) fn translate_effect(
             name: "forge:Charm".to_string(),
             description: None,
         }),
-        // Cleanup — internal Forge bookkeeping, not a real effect
-        "Cleanup" => Ok(Effect::Unimplemented {
-            name: "forge:Cleanup".to_string(),
-            description: None,
+        // Cleanup — clear the source-scoped transient choices that the Forge
+        // SVar chain has finished consuming.  This is bookkeeping rather than
+        // a player-visible instruction, but phase.rs has a typed Cleanup
+        // effect and its resolver owns the same lifecycle boundary.  Keeping
+        // it typed is important: returning an Unimplemented stub here makes
+        // otherwise complete replacement/choice effects fail coverage.
+        "Cleanup" => Ok(Effect::Cleanup {
+            clear_remembered: forge_flag(params, "ClearRemembered"),
+            clear_chosen_player: forge_flag(params, "ClearChosenPlayer"),
+            clear_chosen_color: forge_flag(params, "ClearChosenColor"),
+            clear_chosen_type: forge_flag(params, "ClearChosenType"),
+            clear_chosen_card: forge_flag(params, "ClearChosenCard"),
+            clear_imprinted: forge_flag(params, "ClearImprinted"),
+            clear_triggers: forge_flag(params, "ClearTriggers"),
+            clear_coin_flips: forge_flag(params, "ClearCoinFlips"),
         }),
         // RepeatEach — iteration pattern
         "RepeatEach" => Ok(Effect::Unimplemented {
@@ -102,6 +113,13 @@ pub(crate) fn translate_effect(
             effect_type.to_string(),
         )),
     }
+}
+
+/// Forge encodes boolean SVar parameters as `True`/`False` strings.
+fn forge_flag(params: &ForgeParams, key: &str) -> bool {
+    params
+        .get(key)
+        .is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
 fn resolve_quantity(params: &ForgeParams, key: &str, resolver: &mut SvarResolver) -> QuantityExpr {
@@ -693,5 +711,28 @@ mod tests {
         let mut resolver = make_resolver();
         let result = translate_effect(&params, &mut resolver);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cleanup_translates_to_typed_lifecycle_effect() {
+        let params = parse_params(
+            "DB$ Cleanup | ClearRemembered$ True | ClearChosenCard$ True | ClearImprinted$ False",
+        );
+        let mut resolver = make_resolver();
+        let effect = translate_effect(&params, &mut resolver).unwrap();
+
+        assert!(matches!(
+            effect,
+            Effect::Cleanup {
+                clear_remembered: true,
+                clear_chosen_card: true,
+                clear_imprinted: false,
+                clear_chosen_player: false,
+                clear_chosen_color: false,
+                clear_chosen_type: false,
+                clear_triggers: false,
+                clear_coin_flips: false,
+            }
+        ));
     }
 }
