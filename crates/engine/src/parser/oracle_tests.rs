@@ -3208,6 +3208,49 @@ fn no_quarter_filtered_block_triggers_bind_both_event_objects() {
     assert_eq!(destroy_targets[1], &TargetFilter::EventTarget);
 }
 
+/// CR 608.2c + CR 120.1 + CR 202.3: old-border subtype possessives are
+/// anaphoric references to the earlier target, not unsupported free text.
+#[test]
+fn word_of_blasting_subtype_possessive_damage_is_supported() {
+    let face = oracle_face_for(
+        "Word of Blasting",
+        "Destroy target Wall. It can't be regenerated. Word of Blasting deals damage equal to that Wall's mana value to the Wall's controller.",
+        &["Sorcery"],
+        &["Wall"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Word of Blasting must be fully supported: {gaps:?}"
+    );
+
+    let damage = face
+        .abilities
+        .iter()
+        .flat_map(|ability| {
+            let mut effects = Vec::new();
+            let mut current = Some(ability);
+            while let Some(definition) = current {
+                if let Effect::DealDamage { amount, target, .. } = definition.effect.as_ref() {
+                    effects.push((amount, target));
+                }
+                current = definition.sub_ability.as_deref();
+            }
+            effects
+        })
+        .next()
+        .expect("Word of Blasting must retain its damage continuation");
+    assert!(matches!(
+        damage.0,
+        QuantityExpr::Ref {
+            qty: QuantityRef::ObjectManaValue {
+                scope: ObjectScope::Demonstrative
+            }
+        }
+    ));
+    assert_eq!(damage.1, &TargetFilter::ParentTargetController);
+}
+
 /// CR 708.5: Found Footage's "You may look at face-down creatures your
 /// opponents control any time" lowers to a `MayLookAtFaceDown` static whose
 /// affected filter carries the FaceDown property and the opponent scope. The

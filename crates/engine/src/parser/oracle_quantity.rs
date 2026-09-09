@@ -2283,43 +2283,15 @@ fn parse_possessive_participle(input: &str) -> OracleResult<'_, ()> {
 /// (`"legendary creature"`, `"snow land"`, `"basic land"`) without
 /// enumerating verbatim multi-word strings.
 ///
-/// The bare type word is a *singular* card type or the `token` referent:
-///
-/// - Card types per CR 205.2/205.3: `creature`, `artifact`, `enchantment`,
-///   `card`, `spell`, `permanent`, `planeswalker`, `land`, `battle`,
-///   `instant`, `sorcery`.
-/// - Token referent per CR 109.1 / CR 110.5: a non-card object that can still
-///   anchor a possessive reference. Not a CR 205 type, so listed explicitly.
-///
-/// Plural forms (`creatures'`) are rejected — Oracle text possessives are
-/// always singular (`the sacrificed creature's`). Plurals also cannot reach
-/// this combinator through `parse_event_context_quantity` because the caller
-/// splits on `"'s "` (apostrophe + s + space), and `creatures' power` has
-/// `s' ` (no `'s ` substring) — but listing only singular forms here pins the
-/// invariant at the parser layer, not the caller.
+/// The bare type word is parsed by the shared type-word grammar. That includes
+/// singular card types, supertypes, and creature subtypes such as `Wall`, all
+/// of which can appear in old Oracle possessives ("that Wall's mana value").
+/// The caller still splits on `"'s "`, so ordinary plural possessives
+/// (`creatures' power`) cannot reach this helper.
 fn parse_possessive_object_type(input: &str) -> OracleResult<'_, ()> {
     // Optional supertype prefix consumes a trailing space.
     let (rest, _) = opt(nom_target::parse_supertype_prefix).parse(input)?;
-    // Singular object-type words. Order matters where one is a prefix of
-    // another: none of these share a prefix, so any order works.
-    value(
-        (),
-        alt((
-            tag("creature"),
-            tag("artifact"),
-            tag("enchantment"),
-            tag("planeswalker"),
-            tag("permanent"),
-            tag("battle"),
-            tag("instant"),
-            tag("sorcery"),
-            tag("land"),
-            tag("spell"),
-            tag("card"),
-            tag("token"),
-        )),
-    )
-    .parse(rest)
+    nom_target::parse_type_filter_word(rest).map(|(rest, _)| (rest, ()))
 }
 
 /// CR 400.7 + CR 608.2c: Match "<noun> exiled from <possessive> hand this way"
