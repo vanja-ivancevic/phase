@@ -16,10 +16,11 @@ use super::lower::BOUNDED_TARGET_CARDINALITIES;
 use super::{resolve_it_pronoun, ParseContext};
 use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, AggregateFunction, ChosenSubtypeKind, ColorChangeMode,
-    ContinuousModification, ControllerRef, Duration, EachDamageRecipient, Effect, EffectScope,
-    FilterProp, MultiTargetSpec, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PtValue,
-    QuantityExpr, QuantityRef, StaticCondition, StaticDefinition, TargetFilter, TypedFilter,
+    AbilityDefinition, AbilityKind, AggregateFunction, ChoiceType, ChosenSubtypeKind,
+    ColorChangeMode, ContinuousModification, ControllerRef, Duration, EachDamageRecipient, Effect,
+    EffectScope, FilterProp, MultiTargetSpec, ObjectScope, PlayerFilter, PlayerRelation,
+    PlayerScope, PtValue, QuantityExpr, QuantityRef, StaticCondition, StaticDefinition,
+    TargetFilter, TargetSelectionMode, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -4304,6 +4305,18 @@ fn build_continuous_clause(
         return Some(clause);
     }
 
+    // CR 608.2d + CR 613.1f: "target creature loses first strike or
+    // swampwalk until end of turn" (Urborg) is a resolving keyword choice,
+    // not a pair of simultaneous RemoveKeyword modifications.  The source
+    // must retain the selected keyword so the downstream Layer-6
+    // `RemoveChosenKeyword` modification can remove exactly that ability from
+    // the targeted creature.  Keep this beside the additive keyword-choice
+    // builder so both modal keyword directions share the same typed option
+    // grammar and target binding.
+    if let Some(clause) = build_keyword_choice_loss_clause(&application, &normalized) {
+        return Some(clause);
+    }
+
     // Strip "where X is..." and "for each..." suffixes before extracting duration,
     // so "until end of turn" is found even when followed by these clauses.
     // The full normalized text is still passed to parse_continuous_modifications
@@ -4458,6 +4471,68 @@ fn build_continuous_clause(
         sub_ability: None,
         distribute: None,
         multi_target: None,
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    })
+}
+
+/// CR 608.2d + CR 613.1f: Build the "lose X or Y" keyword-choice class.
+///
+/// The wording is an ordinary subject predicate, so `application.target`
+/// already owns the declared target slot.  The choice itself resolves first;
+/// its sub-ability installs a transient static on that target, reading the
+/// typed keyword persisted on the source by `Effect::Choose`.
+fn build_keyword_choice_loss_clause(
+    application: &SubjectApplication,
+    predicate: &str,
+) -> Option<ParsedEffectClause> {
+    let (predicate_without_duration, duration) = super::strip_trailing_duration(predicate);
+    let lower = predicate_without_duration.to_lowercase();
+    let (choice_text, _) = tag::<_, _, OracleError<'_>>("lose ")
+        .parse(lower.as_str())
+        .ok()?;
+    // A conjunction names every keyword to remove. Only the disjunctive
+    // wording presents a one-of choice (CR 608.2d); routing "lose X and Y"
+    // through the chooser would remove neither fixed keyword unless a player
+    // happened to select an option that was never offered.
+    if !choice_text.contains(" or ") {
+        return None;
+    }
+    let items = super::split_choice_list_items(choice_text.trim())?;
+    if items.len() < 2 {
+        return None;
+    }
+    let options = items
+        .into_iter()
+        .map(parse_granted_keyword_fragment)
+        .collect::<Option<Vec<Keyword>>>()?;
+
+    let duration = duration.or(Some(Duration::UntilEndOfTurn));
+    let affected = static_affected_for_application(application);
+    let apply_effect = Effect::GenericEffect {
+        static_abilities: vec![StaticDefinition::continuous()
+            .affected(affected)
+            .modifications(vec![ContinuousModification::RemoveChosenKeyword])
+            .description(predicate.to_string())],
+        duration: duration.clone(),
+        target: application.target.clone(),
+        end_cost: None,
+    };
+
+    Some(ParsedEffectClause {
+        effect: Effect::Choose {
+            choice_type: ChoiceType::Keyword { options, count: 1 },
+            persist: true,
+            selection: TargetSelectionMode::Chosen,
+        },
+        duration: duration.clone(),
+        sub_ability: Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            apply_effect,
+        ))),
+        distribute: None,
+        multi_target: application.multi_target.clone(),
         condition: None,
         optional: false,
         unless_pay: None,
@@ -7224,6 +7299,30 @@ mod tests {
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::statics::BlockExceptionKind;
+
+    #[test]
+    fn keyword_choice_loss_builder_handles_urborg_predicate() {
+        let application =
+            parse_subject_application("target creature", &mut ParseContext::default())
+                .expect("target creature should bind");
+        let clause = build_continuous_clause(
+            application,
+            "loses first strike or swampwalk until end of turn",
+            &ParseContext::default(),
+        )
+        .expect("Urborg loss predicate should lower");
+        assert!(matches!(
+            clause.effect,
+            Effect::Choose {
+                choice_type: ChoiceType::Keyword { options, count: 1 },
+                persist: true,
+                ..
+            } if options == [
+                Keyword::FirstStrike,
+                Keyword::Landwalk("Swamp".to_string())
+            ]
+        ));
+    }
 
     #[test]
     fn they_ignores_controllerless_empty_typed_target_slot() {

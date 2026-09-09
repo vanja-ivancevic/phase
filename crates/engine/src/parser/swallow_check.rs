@@ -3778,6 +3778,24 @@ fn detect_condition_if(
     parsed: &ParsedAbilities,
     diagnostics: &mut Vec<OracleDiagnostic>,
 ) {
+    // CR 603.4: an intervening-if on a triggered ability is stored on the
+    // TriggerDefinition, not on the executed AbilityDefinition.  The generic
+    // evidence probe intentionally treats the two condition enums separately,
+    // so a trigger whose condition is fully parsed could otherwise still look
+    // like a swallowed resolution-time `if`.  Restrict this exemption to an
+    // `if` before the first sentence boundary: a later `if` belongs to the
+    // trigger's effect body and still needs its own audit.
+    let lower_original = original.to_ascii_lowercase();
+    let first_if = lower_original.find("if ");
+    let first_sentence_end = lower_original.find(". ").unwrap_or(lower_original.len());
+    if first_if.is_some_and(|index| index < first_sentence_end)
+        && parsed
+            .triggers
+            .iter()
+            .any(|trigger| trigger.condition.is_some())
+    {
+        return;
+    }
     // CR 614.1a / CR 701.5: cast-then-exile and counter-then-exile riders
     // are encoded as a sub_ability `ChangeZone { destination: Exile,
     // target: ParentTarget }` chained off the primary effect. Snapcaster,
@@ -5351,6 +5369,25 @@ mod tests {
     }
 
     #[test]
+    fn clockwork_beast_combat_condition_is_structured_not_swallowed() {
+        // CR 603.4: the printed intervening-if belongs to the trigger, so the
+        // audit must not report it as an unrepresented conditional clause.
+        let parsed = parse_named(
+            "At end of combat, if ~ attacked or blocked this combat, remove a +1/+0 counter from it.",
+            "Clockwork Beast",
+            &["Artifact", "Creature"],
+        );
+        assert!(parsed.triggers.iter().any(|trigger| {
+            trigger.condition == Some(TriggerCondition::SourceAttackedOrBlockedThisCombat)
+        }));
+        assert!(
+            !has_swallowed_detector(&parsed, "Condition_If"),
+            "the trigger-level combat condition must not be reported as swallowed: {:?}",
+            parsed.parse_warnings
+        );
+    }
+
+    #[test]
     fn condition_as_long_as_accepts_ordered_zone_top_copy() {
         let parsed = parse_named(
             "As long as the top card of your graveyard is a creature card, this creature has the full text of that card and has the text \"{2}: Discard a card.\"\n{2}: Discard a card.",
@@ -5402,10 +5439,12 @@ mod tests {
 
     /// THE COLLAPSE, PINNED BY NAME.
     ///
-    /// Aether Revolt raises TWO swallowed semantics from ONE physical source line: an
-    /// `as long as` revolt condition and an `if … would … instead` replacement condition.
-    /// They are genuinely distinct clauses — and their diagnostics carry the SAME
-    /// `unit_span`, so a consumer cannot locate them separately.
+    /// One source line raises TWO swallowed semantics: an `as long as` condition and
+    /// an `if … would … instead` replacement condition. They are genuinely distinct
+    /// clauses — and their diagnostics carry the SAME `unit_span`, so a consumer
+    /// cannot locate them separately. The fixture deliberately leaves both clauses
+    /// unsupported; the real Aether Revolt wording is now parsed as a typed static
+    /// condition and therefore no longer exercises this audit path.
     ///
     /// That is NOT a defect in this payload. It is the line-granularity ceiling of the
     /// span SUBSTRATE: `DocEmitter::exact_span` hands every item on a line the whole
@@ -5417,11 +5456,11 @@ mod tests {
     /// test, rather than leave a silently stale collapse behind.
     #[test]
     fn same_line_clauses_share_the_unit_span_until_subline_item_spans_exist() {
-        let text = "Revolt — As long as a permanent left the battlefield under your control \
-                    this turn, if a source you control would deal noncombat damage to an \
-                    opponent or a permanent an opponent controls, it deals that much damage \
-                    plus 2 instead.\nWhenever you get one or more {E}, this enchantment deals \
-                    that much damage to any target.";
+        let text =
+            "As long as a permanent left the battlefield under your control this turn, if a \
+                    source you control would deal noncombat damage to an opponent or a permanent \
+                    an opponent controls, it deals that much damage plus 2 instead.\nWhenever you \
+                    get one or more {E}, this enchantment deals that much damage to any target.";
         let parsed = parse_named(text, "Aether Revolt", &["Enchantment"]);
 
         let found = swallows(&parsed);
@@ -5490,11 +5529,11 @@ mod tests {
     /// A finding names every item the audit consulted — never one hand-picked id.
     #[test]
     fn findings_carry_the_units_pooled_evidence_items() {
-        let text = "Revolt — As long as a permanent left the battlefield under your control \
-                    this turn, if a source you control would deal noncombat damage to an \
-                    opponent or a permanent an opponent controls, it deals that much damage \
-                    plus 2 instead.\nWhenever you get one or more {E}, this enchantment deals \
-                    that much damage to any target.";
+        let text =
+            "As long as a permanent left the battlefield under your control this turn, if a \
+                    source you control would deal noncombat damage to an opponent or a permanent \
+                    an opponent controls, it deals that much damage plus 2 instead.\nWhenever you \
+                    get one or more {E}, this enchantment deals that much damage to any target.";
         let parsed = parse_named(text, "Aether Revolt", &["Enchantment"]);
 
         let items: Vec<_> = parsed

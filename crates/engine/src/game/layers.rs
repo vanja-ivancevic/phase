@@ -4491,6 +4491,7 @@ fn modification_characteristic_writes_at(
         // ---- CR 613.1f (layer 6): abilities. ----
         ContinuousModification::AddKeyword { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::AddChosenKeyword
         | ContinuousModification::RemoveChosenKeyword
         | ContinuousModification::AddDynamicKeyword { .. }
@@ -6920,6 +6921,7 @@ fn depends_on(a: &ActiveContinuousEffect, b: &ActiveContinuousEffect, _state: &G
         &b.modification,
         ContinuousModification::AddKeyword { .. }
             | ContinuousModification::RemoveKeyword { .. }
+            | ContinuousModification::RemoveAllLandwalk
             | ContinuousModification::RemoveChosenKeyword
             | ContinuousModification::AddDynamicKeyword { .. }
             | ContinuousModification::AddKeywordWithDerivedCost { .. }
@@ -8178,6 +8180,15 @@ fn apply_continuous_effect_filtered(
                         entry.definition(),
                         keyword,
                     )
+                });
+            }
+            // CR 702.14 + CR 613.1f: "lose all landwalk abilities" removes
+            // every parameterized landwalk keyword, not just one discriminant
+            // instance. Landwalk has no companion trigger, so keyword storage
+            // is the complete runtime surface for this operation.
+            ContinuousModification::RemoveAllLandwalk => {
+                obj.keywords.retain(|keyword| {
+                    !matches!(keyword, crate::types::keywords::Keyword::Landwalk(_))
                 });
             }
             // CR 608.2d + CR 613.1f + CR 702.14: Strip the *exact* keyword
@@ -13715,6 +13726,49 @@ mod tests {
             !obj.keywords.contains(&Keyword::FirstStrike),
             "RemoveChosenKeyword should strip First Strike from the target"
         );
+    }
+
+    // CR 702.14 + CR 613.1f: Hammerheim's family-level removal strips every
+    // landwalk variant while leaving unrelated keyword abilities untouched.
+    #[test]
+    fn test_remove_all_landwalk_strips_every_landwalk_variant() {
+        use crate::types::keywords::Keyword;
+
+        let mut state = setup();
+        let hammerheim = create_object(
+            &mut state,
+            CardId(0),
+            PlayerId(0),
+            "Hammerheim".to_string(),
+            Zone::Battlefield,
+        );
+        let target = make_creature(&mut state, "Landwalker", 2, 2, PlayerId(0));
+        {
+            let obj = state.objects.get_mut(&target).unwrap();
+            obj.base_keywords.extend([
+                Keyword::Landwalk("Swamp".to_string()),
+                Keyword::Landwalk("Island".to_string()),
+                Keyword::Flying,
+            ]);
+            obj.keywords = obj.base_keywords.clone();
+        }
+        {
+            let obj = state.objects.get_mut(&hammerheim).unwrap();
+            obj.static_definitions.push(
+                StaticDefinition::continuous()
+                    .affected(TargetFilter::SpecificObject { id: target })
+                    .modifications(vec![ContinuousModification::RemoveAllLandwalk]),
+            );
+        }
+
+        state.layers_dirty.mark_full();
+        evaluate_layers(&mut state);
+
+        let keywords = &state.objects.get(&target).unwrap().keywords;
+        assert!(!keywords
+            .iter()
+            .any(|keyword| matches!(keyword, Keyword::Landwalk(_))));
+        assert!(keywords.contains(&Keyword::Flying));
     }
 
     // CR 608.2d + CR 613.1f + CR 702.14: Swampwalk is `Landwalk("Swamp")`

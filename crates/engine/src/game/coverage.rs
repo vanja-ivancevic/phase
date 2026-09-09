@@ -4429,6 +4429,7 @@ fn fmt_trigger_condition(cond: &crate::types::ability::TriggerCondition) -> Stri
         TC::ControlsNone { filter } => format!("you control no {}", fmt_target(filter)),
         TC::AttackedThisTurn => "attacked this turn".into(),
         TC::SourceAttackedThisCombat => "source attacked this combat".into(),
+        TC::SourceAttackedOrBlockedThisCombat => "source attacked or blocked this combat".into(),
         TC::FirstCombatPhaseOfTurn => "first combat phase of the turn".into(),
         TC::CastSpellThisTurn { filter } => match filter {
             Some(f) => format!("cast a {} spell this turn", fmt_target(f)),
@@ -4779,6 +4780,7 @@ fn fmt_modification(m: &crate::types::ability::ContinuousModification) -> String
         ContinuousModification::RemoveKeyword { keyword } => {
             format!("remove {}", keyword_label(keyword))
         }
+        ContinuousModification::RemoveAllLandwalk => "remove all landwalk".into(),
         ContinuousModification::GrantAbility { .. } => "grant ability".into(),
         ContinuousModification::GrantAllActivatedAbilitiesOf { source, cap } => {
             // Blind spot (same class as #5492/#5495/#5501/#5507): this rendered

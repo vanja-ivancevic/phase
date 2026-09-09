@@ -3640,13 +3640,13 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
             acc = acc.or(scan_player_filter(player, mode));
             acc
         }
-        TriggerCondition::SourceEnteredThisTurn | TriggerCondition::SourceAttackedThisCombat => {
-            Axes {
-                event: false,
-                sibling: false,
-                projected: true,
-            }
-        }
+        TriggerCondition::SourceEnteredThisTurn
+        | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAttackedOrBlockedThisCombat => Axes {
+            event: false,
+            sibling: false,
+            projected: true,
+        },
         TriggerCondition::EchoDue => Axes::NONE,
         TriggerCondition::MinCoAttackers { filter, minimum: _ } => {
             let mut acc = Axes::NONE;
@@ -5806,6 +5806,7 @@ fn scan_continuous_modification(m: &ContinuousModification, mode: ScanMode) -> A
         | ContinuousModification::AddToughness { .. }
         | ContinuousModification::SetPower { .. }
         | ContinuousModification::SetToughness { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::RemoveAllAbilities
         | ContinuousModification::AddType { .. }
         | ContinuousModification::RemoveType { .. }

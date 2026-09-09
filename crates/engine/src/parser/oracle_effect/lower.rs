@@ -10423,6 +10423,7 @@ fn apply_where_x_continuous_modification(
         | ContinuousModification::AddKeyword { .. }
         | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::GrantAbility { .. }
         | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
         | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
@@ -10526,6 +10527,7 @@ fn rebind_target_anaphor_continuous_modification(modification: &mut ContinuousMo
         | ContinuousModification::AddKeyword { .. }
         | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::GrantAbility { .. }
         | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
         | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }

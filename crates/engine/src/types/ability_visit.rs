@@ -429,6 +429,7 @@ where
         | ContinuousModification::AddKeyword { .. }
         | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::RemoveAllAbilities
         | ContinuousModification::AddType { .. }
         | ContinuousModification::RemoveType { .. }

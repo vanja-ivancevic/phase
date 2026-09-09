@@ -6,8 +6,8 @@ use super::support::*;
 use super::*;
 use crate::types::ability::{
     ActivationRestriction, AggregateFunction, CardTypeSetSource, Comparator, CountScope,
-    DamageKindFilter, Duration, Effect, FilterProp, ObjectProperty, ObjectScope, PlayerFilter,
-    ParsedCondition, PlayerRelation, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef,
+    DamageKindFilter, Duration, Effect, FilterProp, ObjectProperty, ObjectScope, ParsedCondition,
+    PlayerFilter, PlayerRelation, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef,
     SharedQuality, SharedQualityRelation, SubtypeExclusion, TypeFilter, ZoneRef,
 };
 use crate::types::counter::CounterType;
@@ -19712,6 +19712,18 @@ fn map_keyword_all_creature_types_returns_changeling() {
     // CR 702.73a: "all creature types" is the Changeling CDA effect.
     assert_eq!(map_keyword("all creature types"), Some(Keyword::Changeling));
     assert_eq!(map_keyword("All Creature Types"), Some(Keyword::Changeling));
+}
+
+/// CR 702.14 + CR 613.1f: Hammerheim's "all landwalk abilities" must be
+/// represented as a keyword-family removal, not as an unqualified landwalk
+/// keyword that could accidentally remove only one variant.
+#[test]
+fn lose_all_landwalk_abilities_emits_family_removal() {
+    let modifications = parse_continuous_modifications("lose all landwalk abilities");
+    assert_eq!(
+        modifications,
+        vec![ContinuousModification::RemoveAllLandwalk]
+    );
 }
 
 #[test]

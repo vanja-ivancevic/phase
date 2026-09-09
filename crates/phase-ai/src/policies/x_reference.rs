@@ -195,6 +195,7 @@ fn continuous_modification_references_x(modification: &ContinuousModification) -
         | ContinuousModification::SetToughness { .. }
         | ContinuousModification::AddKeyword { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
         | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
         | ContinuousModification::RemoveAllAbilities

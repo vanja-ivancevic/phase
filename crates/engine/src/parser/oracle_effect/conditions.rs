@@ -2297,6 +2297,49 @@ fn parse_target_possessive_pt_comparison_text(text: &str) -> Option<AbilityCondi
     parsed
 }
 
+/// CR 115.1 + CR 208.1 + CR 608.2c: target-scoped P/T comparison in the
+/// definite-target form — "target creature has toughness 5 or greater".
+/// Unlike the possessive anaphor above, this wording appears as the leading
+/// condition of a conditional effect (Blood Lust), so the target's creature
+/// filter must be retained alongside the P/T property.
+fn parse_target_has_pt_comparison(input: &str) -> OracleResult<'_, AbilityCondition> {
+    let (rest, _) = tag("target ").parse(input)?;
+    let (filter, remainder) = parse_type_phrase(rest);
+    let rest = remainder.trim_start();
+    let (rest, _) = tag("has ").parse(rest)?;
+    let (rest, stat) = parse_reflexive_pt_stat(rest)?;
+    let (rest, (comparator, value)) = parse_threshold_with_exactly(rest)?;
+    let TargetFilter::Typed(mut typed) = filter else {
+        return Err(nom::Err::Error(OracleError::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    };
+    typed.properties.push(FilterProp::PtComparison {
+        stat,
+        scope: PtValueScope::Current,
+        comparator,
+        value: QuantityExpr::Fixed { value },
+    });
+    Ok((
+        rest,
+        AbilityCondition::TargetMatchesFilter {
+            filter: TargetFilter::Typed(typed),
+            use_lki: false,
+            subject_slot: None,
+        },
+    ))
+}
+
+fn parse_target_has_pt_comparison_text(text: &str) -> Option<AbilityCondition> {
+    let lower = text.trim().trim_end_matches('.').to_ascii_lowercase();
+    let parsed = all_consuming(parse_target_has_pt_comparison)
+        .parse(lower.as_str())
+        .ok()
+        .map(|(_, condition)| condition);
+    parsed
+}
+
 /// CR 201.5 + CR 208.1 + CR 608.2c: source-referential "if its/her/his power or
 /// toughness is exactly N" — the possessive subject names the ability's own
 /// source (Amalia Benavides Aguirre: "destroy all other creatures if its power is
@@ -2398,14 +2441,17 @@ pub(super) fn strip_property_conditional(
         if let Some((before, after)) = tp.rsplit_around(&pattern) {
             let after = after.lower.trim_end_matches('.');
 
-            if let Some((comparator, value)) = parse_comparison_suffix(after) {
+            if let Some((comparator, value)) = parse_quantity_comparison(after).or_else(|| {
+                parse_comparison_suffix(after)
+                    .map(|(comparator, value)| (comparator, QuantityExpr::Fixed { value }))
+            }) {
                 return (
                     Some(AbilityCondition::QuantityCheck {
                         lhs: QuantityExpr::Ref {
                             qty: qty_ref.clone(),
                         },
                         comparator,
-                        rhs: QuantityExpr::Fixed { value },
+                        rhs: value,
                     }),
                     before.original.to_string(),
                 );
@@ -5669,6 +5715,13 @@ pub(super) fn try_nom_condition_as_ability_condition(
         return Some(condition);
     }
 
+    // CR 115.1 + CR 208.1 + CR 608.2c: definite-target P/T comparison —
+    // "target creature has toughness 5 or greater". This must run before the
+    // generic quantity parser, which cannot preserve the target object scope.
+    if let Some(condition) = parse_target_has_pt_comparison_text(lower.as_str()) {
+        return Some(condition);
+    }
+
     // CR 115.1 + CR 208.1 + CR 608.2c: target-anaphoric possessive P/T comparison —
     // "that creature's power is 2 or less" / "that permanent's toughness is
     // exactly N" (Depressurize, Gore Vassal, Reptilian disjunct A). Placed right
@@ -8235,6 +8288,33 @@ mod tests {
         assert!(
             parse_target_possessive_pt_comparison_text("that creature had power 2 or less")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn target_has_pt_comparison_binds_definite_target_scope() {
+        let expected = AbilityCondition::TargetMatchesFilter {
+            filter: TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                FilterProp::PtComparison {
+                    stat: PtStat::Toughness,
+                    scope: PtValueScope::Current,
+                    comparator: Comparator::GE,
+                    value: QuantityExpr::Fixed { value: 5 },
+                },
+            ])),
+            use_lki: false,
+            subject_slot: None,
+        };
+        assert_eq!(
+            parse_target_has_pt_comparison_text("target creature has toughness 5 or greater"),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            try_nom_condition_as_ability_condition(
+                "target creature has toughness 5 or greater",
+                &mut ParseContext::default()
+            ),
+            Some(expected)
         );
     }
 

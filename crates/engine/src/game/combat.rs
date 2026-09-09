@@ -282,6 +282,15 @@ pub struct CombatState {
         serialize_with = "crate::types::deterministic_serde::hash_set"
     )]
     pub attacking_incarnations_this_combat: HashSet<ObjectIncarnationRef>,
+    /// CR 400.7 + CR 509.1: exact current-combat blocker ledger for source
+    /// intervening-if conditions. A blocker is recorded by its incarnation so
+    /// a same-id object re-entering the battlefield cannot satisfy the old
+    /// object's condition.
+    #[serde(
+        default,
+        serialize_with = "crate::types::deterministic_serde::hash_set"
+    )]
+    pub blocking_incarnations_this_combat: HashSet<ObjectIncarnationRef>,
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub damage_assignments: HashMap<ObjectId, Vec<DamageAssignment>>,
     pub first_strike_done: bool,
@@ -312,6 +321,7 @@ impl PartialEq for CombatState {
             && self.creature_attacked_defenders_this_combat
                 == other.creature_attacked_defenders_this_combat
             && self.attacking_incarnations_this_combat == other.attacking_incarnations_this_combat
+            && self.blocking_incarnations_this_combat == other.blocking_incarnations_this_combat
             && self.first_strike_done == other.first_strike_done
             && self.first_strike_participants == other.first_strike_participants
     }
@@ -772,6 +782,7 @@ pub fn place_blocking(state: &mut GameState, blocker_id: ObjectId, attacker_id: 
     // The bit is sticky, so its prior value is recorded rather than recomputed.
     let expected_attacker_blocked = info.blocked;
     info.blocked = true;
+    combat.blocking_incarnations_this_combat.insert(reference);
     // CR 509.1g: the creature becomes a blocking creature for the chosen attacker.
     combat
         .blocker_to_attacker
@@ -935,6 +946,9 @@ pub fn apply_resolved_combat_membership(
                 .entry(object_id)
                 .or_default()
                 .push(*resulting_attacker);
+            combat
+                .blocking_incarnations_this_combat
+                .insert(command.object);
             combat
                 .blocker_assignments
                 .entry(*resulting_attacker)
@@ -5103,6 +5117,7 @@ pub(super) fn commit_attack_declaration(
         .map(|attacker| (attacker.object_id, attacker.defending_player))
         .collect();
     combat.attacking_incarnations_this_combat = attacking_incarnations_this_combat;
+    combat.blocking_incarnations_this_combat.clear();
     combat.attacked_defenders_this_combat.clear();
     combat.creature_attacked_defenders_this_combat.clear();
     for (attacker_id, defending_player) in &creature_attacked_defenders {

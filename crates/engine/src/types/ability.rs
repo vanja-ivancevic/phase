@@ -24128,6 +24128,9 @@ pub enum TriggerCondition {
     /// CR 400.7 + CR 508.1 + CR 603.4: True only when this exact source
     /// incarnation attacked during the current combat.
     SourceAttackedThisCombat,
+    /// CR 400.7 + CR 508.1 + CR 509.1 + CR 603.4: True only when this exact
+    /// source incarnation attacked or blocked during the current combat.
+    SourceAttackedOrBlockedThisCombat,
     /// CR 701.54a/d + CR 603.4: "if you chose a creature other than ~ as your
     /// Ring-bearer" (Aragorn, Company Leader). True when the triggering
     /// `GameEvent::RingTemptsYou` event's immutable `chosen_bearer` snapshot
@@ -24626,6 +24629,7 @@ impl TriggerCondition {
             | TriggerCondition::DuringPlayersTurn { .. }
             | TriggerCondition::SourceEnteredThisTurn
             | TriggerCondition::SourceAttackedThisCombat
+            | TriggerCondition::SourceAttackedOrBlockedThisCombat
             | TriggerCondition::EchoDue
             | TriggerCondition::MinCoAttackers { .. }
             | TriggerCondition::SolveConditionMet
@@ -27659,6 +27663,11 @@ pub enum ContinuousModification {
     RemoveKeyword {
         keyword: Keyword,
     },
+    /// CR 702.14 + CR 613.1f: Remove every landwalk ability from the affected
+    /// object. Unlike `RemoveKeyword`, this is intentionally a keyword-family
+    /// operation because Oracle's "all landwalk abilities" has no single
+    /// concrete `Keyword` value to use as its discriminant (Hammerheim).
+    RemoveAllLandwalk,
     GrantAbility {
         definition: Box<AbilityDefinition>,
     },

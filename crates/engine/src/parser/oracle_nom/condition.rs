@@ -5554,7 +5554,7 @@ fn parse_source_self_token(input: &str) -> OracleResult<'_, ()> {
 ///
 /// CR-correct qualifier mapping (printed Oracle text always uses exactly one
 /// of these forms per zone):
-///   - " on the <Z>"  — only Battlefield (CR 400.1).
+///   - " on the <Z>"  — Battlefield (CR 400.1) and Stack (CR 405.1).
 ///   - " in the <Z>"  — shared zones with definite article (CR 408 command).
 ///   - " in your <Z>" — player-specific zones (CR 401 / 402 / 403).
 ///   - " in <Z>"      — Exile (shared zone with no possessive; CR 406).
@@ -5579,9 +5579,10 @@ fn parse_zone_phrase(input: &str) -> OracleResult<'_, Zone> {
     }
 
     alt((
-        // " on the <Z>" — CR 400.1: only the battlefield uses "on".
+        // " on the battlefield" / "on the stack" — CR 400.1 + CR 405.1.
+        // Both zones use the printed "on the" form.
         preceded(tag(" on the "), |i| {
-            zone_in(i, |z| matches!(z, Zone::Battlefield))
+            zone_in(i, |z| matches!(z, Zone::Battlefield | Zone::Stack))
         }),
         // " in the <Z>" — CR 408: shared zones (command zone) take "the".
         // Bare-word player zones (graveyard/hand/library) print "in your <Z>",

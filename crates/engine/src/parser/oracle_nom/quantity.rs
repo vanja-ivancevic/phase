@@ -962,9 +962,7 @@ pub(crate) fn parse_extreme_chosen_number_ref(input: &str) -> OracleResult<'_, Q
 /// A singular number chosen earlier while resolving this ability. The caller
 /// supplies the provenance gate: without a preceding `NumberRange` choice,
 /// these ordinary anaphors have no resolution-local meaning.
-pub(crate) fn parse_resolution_chosen_number_ref(
-    input: &str,
-) -> OracleResult<'_, QuantityRef> {
+pub(crate) fn parse_resolution_chosen_number_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     value(
         QuantityRef::PlayerChosenNumber {
             player: crate::types::ability::PlayerScope::Controller,
@@ -4971,6 +4969,7 @@ fn parse_for_each_clause_ref_with_they_controller(
         // Gagglemaster, Aerial Assault, Alert Heedbonder, Overgrown Battlement).
         parse_for_each_controlled_type_with_keyword,
         parse_for_each_object_spell_could_target,
+        parse_for_each_type_of_chosen_color,
         parse_for_each_controlled_type,
         // CR 201.2: "for each [other] <type> named <CardName> you control"
         // (Seven Dwarves). The `named X` qualifier sits between the type word
@@ -6277,6 +6276,25 @@ fn parse_for_each_battlefield_type(input: &str) -> OracleResult<'_, QuantityRef>
     ))
 }
 
+/// CR 105.4: Parse a battlefield-wide population narrowed by a chosen color,
+/// such as Rith and Treva's "for each permanent of that color". The absence
+/// of a controller qualifier means the count includes every player's
+/// permanents, while `IsChosenColor` defers the selected color to resolution.
+fn parse_for_each_type_of_chosen_color(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, tf) = parse_type_filter_word(input)?;
+    let (rest, chosen_color) = parse_pre_controller_chosen_filter_suffix(rest)?;
+    Ok((
+        rest,
+        QuantityRef::ObjectCount {
+            filter: TargetFilter::Typed(TypedFilter {
+                type_filters: vec![tf],
+                controller: None,
+                properties: vec![chosen_color],
+            }),
+        },
+    ))
+}
+
 /// CR 604.1 + CR 611.3a + CR 613.4c: Parse "[other] <type> on the
 /// battlefield with <keyword>" in a "for each" clause -> a battlefield-wide
 /// (any-controller) population count of permanents of the given type that
@@ -6565,6 +6583,12 @@ fn parse_for_each_controlled_type(input: &str) -> OracleResult<'_, QuantityRef> 
     let (rest, chosen_type_prop) = opt(alt((
         value(FilterProp::IsChosenCreatureType, tag(" of that type")),
         value(FilterProp::IsChosenCreatureType, tag(" of the chosen type")),
+        // CR 105.4: "<type> you control of that color" scopes the
+        // population to the color chosen earlier in the same resolving
+        // ability (Rith, the Awakener and the old-border color-count class).
+        // Keep this on the controller-scoped quantity path so the resulting
+        // ObjectCount is evaluated against the source controller's permanents.
+        parse_pre_controller_chosen_filter_suffix,
     )))
     .parse(rest)?;
     let mut properties = Vec::new();
@@ -7792,6 +7816,42 @@ mod tests {
                 }
                 other => panic!("{clause:?}: expected ObjectCount, got {other:?}"),
             }
+        }
+    }
+
+    /// CR 105.4 + CR 109.4: a controller-scoped "for each" count can narrow
+    /// the chosen population by the color selected earlier in the ability.
+    #[test]
+    fn parse_for_each_controlled_type_of_chosen_color() {
+        let (rest, q) = parse_for_each_clause_ref("permanent you control of that color")
+            .expect("chosen-color population should parse");
+        assert_eq!(rest, "");
+        match q {
+            QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(tf),
+            } => {
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert!(tf.type_filters.contains(&TypeFilter::Permanent));
+                assert!(tf.properties.contains(&FilterProp::IsChosenColor));
+            }
+            other => panic!("expected chosen-color ObjectCount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_for_each_type_of_chosen_color_is_battlefield_wide() {
+        let (rest, q) = parse_for_each_clause_ref("permanent of that color")
+            .expect("battlefield-wide chosen-color population should parse");
+        assert_eq!(rest, "");
+        match q {
+            QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(tf),
+            } => {
+                assert_eq!(tf.controller, None);
+                assert!(tf.type_filters.contains(&TypeFilter::Permanent));
+                assert!(tf.properties.contains(&FilterProp::IsChosenColor));
+            }
+            other => panic!("expected battlefield-wide chosen-color ObjectCount, got {other:?}"),
         }
     }
 

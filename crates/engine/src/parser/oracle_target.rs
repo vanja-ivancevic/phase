@@ -6430,11 +6430,12 @@ pub(crate) fn parse_mana_value_suffix(
                 .ok()?;
         let mut parse_value = |phrase: &str| -> Option<QuantityExpr> {
             let phrase = phrase.trim();
-            crate::parser::oracle_quantity::parse_cda_quantity_with_context(phrase, ctx)
-                .or_else(|| {
+            crate::parser::oracle_quantity::parse_cda_quantity_with_context(phrase, ctx).or_else(
+                || {
                     parse_mana_value_reference_expr(phrase)
                         .and_then(|(value, after)| after.trim().is_empty().then_some(value))
-                })
+                },
+            )
         };
         // CR 119.3 + CR 400.1 + CR 108.3: Resolve the dynamic quantity, preferring
         // the FULL phrase first. A quantity whose own grammar already includes a
@@ -9312,6 +9313,9 @@ pub(crate) fn parse_zone_word(i: &str) -> super::oracle_nom::error::OracleResult
         // bare-word arms because it has no shared prefix with them and the
         // longest-prefix-first convention keeps additions ordered by length.
         value(Zone::Command, tag("command zone")),
+        // CR 405.1: the stack is a zone and Oracle source conditions print
+        // it as "on the stack".
+        value(Zone::Stack, tag("stack")),
         value(Zone::Graveyard, alt((tag("graveyards"), tag("graveyard")))),
         value(Zone::Exile, alt((tag("exiles"), tag("exile")))),
         value(Zone::Hand, alt((tag("hands"), tag("hand")))),
@@ -9337,7 +9341,9 @@ mod tests {
     use super::*;
     use crate::parser::oracle_ir::context::ParseContext;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
-    use crate::types::ability::{ChoiceType, NumberDistinctness, PlayerScope, PtStat, PtValueScope};
+    use crate::types::ability::{
+        ChoiceType, NumberDistinctness, PlayerScope, PtStat, PtValueScope,
+    };
     use crate::types::counter::CounterType;
 
     fn typed_leg(filter: &TargetFilter) -> Option<&TypedFilter> {

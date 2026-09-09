@@ -1644,9 +1644,16 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
 
     // CR 702: "lose [keyword]" / "loses [keyword]" — keyword removal.
     if let Some(keyword_text) = extract_lose_keyword_clause(&unquoted_text) {
-        for part in split_keyword_list(keyword_text.trim().trim_end_matches('.')) {
-            if let Some(kw) = map_keyword(part.trim().trim_end_matches('.')) {
-                modifications.push(ContinuousModification::RemoveKeyword { keyword: kw });
+        let keyword_text = keyword_text.trim().trim_end_matches('.').trim();
+        if keyword_text.eq_ignore_ascii_case("all landwalk abilities")
+            || keyword_text.eq_ignore_ascii_case("all landwalk")
+        {
+            modifications.push(ContinuousModification::RemoveAllLandwalk);
+        } else {
+            for part in split_keyword_list(keyword_text) {
+                if let Some(kw) = map_keyword(part.trim().trim_end_matches('.')) {
+                    modifications.push(ContinuousModification::RemoveKeyword { keyword: kw });
+                }
             }
         }
     }

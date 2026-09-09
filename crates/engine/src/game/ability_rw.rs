@@ -1906,6 +1906,7 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
         | TriggerCondition::SpellCastWithVariantThisTurn { .. }
         | TriggerCondition::SourceEnteredThisTurn
         | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAttackedOrBlockedThisCombat
         | TriggerCondition::SourceIsHarnessed
         | TriggerCondition::SourceIsAttacking
         | TriggerCondition::SourceIsTransformed
@@ -2900,6 +2901,7 @@ fn legacy_continuous_modification(m: &ContinuousModification) -> bool {
         | ContinuousModification::AddKeyword { .. }
         | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::RemoveAllAbilities
         | ContinuousModification::AddType { .. }
         | ContinuousModification::RemoveType { .. }
@@ -6704,6 +6706,7 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         TriggerCondition::DuringPlayersTurn { player } => rw_player_filter(player),
         TriggerCondition::SourceEnteredThisTurn
         | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAttackedOrBlockedThisCombat
         | TriggerCondition::SourceIsHarnessed
         | TriggerCondition::SourceIsAttacking
         | TriggerCondition::SourceIsTransformed

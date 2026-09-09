@@ -5782,7 +5782,19 @@ pub(crate) fn parse_oracle_ir(
         } else {
             std::borrow::Cow::Borrowed(lower.as_str())
         };
-        if is_static_pattern(&static_classify_view) {
+        // CR 207.2c + CR 611.3a: the ability-word label is semantically
+        // transparent, but the classifier sees the unstripped line.  Some
+        // valid static bodies (notably Threshold's conditional anthem) do not
+        // match the broad heuristic even though the authoritative static
+        // parser can consume them exactly.  Probe only the known-label body;
+        // this keeps arbitrary spell/effect prose on the existing path.
+        let ability_word_static =
+            strip_ability_word_with_name(&line).is_some_and(|(_, effect_text)| {
+                let effect_static = normalize_self_refs_for_static(&effect_text, card_name);
+                !parse_static_line_with_graveyard_keyword_continuation(&effect_static, None, None)
+                    .is_empty()
+            });
+        if is_static_pattern(&static_classify_view) || ability_word_static {
             if result.strive_cost.is_some() && parse_strive_cost_line(&line).is_some() {
                 i += 1;
                 continue;
@@ -7809,6 +7821,7 @@ pub(crate) fn render_modification_descriptions(
         | ContinuousModification::AddKeyword { .. }
         | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::RemoveAllAbilities
         | ContinuousModification::AddType { .. }
         | ContinuousModification::RemoveType { .. }

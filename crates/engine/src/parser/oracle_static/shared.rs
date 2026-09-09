@@ -938,6 +938,7 @@ fn continuous_modification_dynamic_quantity_mut(
         | ContinuousModification::AddKeyword { .. }
         | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::GrantAbility { .. }
         | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
         | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }

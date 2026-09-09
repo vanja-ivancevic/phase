@@ -130,6 +130,7 @@ impl ContinuousModification {
             | ContinuousModification::SetDynamicToughness { .. } => Layer::CharDef,
             ContinuousModification::AddKeyword { .. }
             | ContinuousModification::RemoveKeyword { .. }
+            | ContinuousModification::RemoveAllLandwalk
             | ContinuousModification::RemoveChosenKeyword
             | ContinuousModification::AddChosenKeyword
             | ContinuousModification::AddDynamicKeyword { .. }

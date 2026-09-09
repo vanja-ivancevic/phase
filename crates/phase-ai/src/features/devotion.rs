@@ -413,6 +413,7 @@ fn continuous_modification_quantity(
         | CM::AddKeyword { .. }
         | CM::AddKeywordWithDerivedCost { .. }
         | CM::RemoveKeyword { .. }
+        | CM::RemoveAllLandwalk
         | CM::GrantAbility { .. }
         | CM::GrantAllActivatedAbilitiesOf { .. }
         | CM::GrantAllTriggeredAbilitiesOf { .. }

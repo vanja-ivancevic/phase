@@ -1,7 +1,8 @@
 use crate::types::ability::{
-    ControllerRef, Effect, EffectScope, ManaProduction, PtValue, QuantityExpr, TapStateChange,
-    TargetFilter, TypedFilter,
+    ControllerRef, Effect, EffectScope, ManaContribution, ManaProduction, PtValue, QuantityExpr,
+    TapStateChange, TargetFilter, TypedFilter,
 };
+use crate::types::counter::parse_counter_type;
 use crate::types::mana::ManaColor;
 use crate::types::Zone;
 
@@ -177,7 +178,10 @@ fn translate_draw(
     resolver: &mut SvarResolver,
 ) -> Result<Effect, ForgeTranslateError> {
     let count = resolve_quantity(params, "NumCards", resolver);
-    Ok(Effect::Draw { count })
+    Ok(Effect::Draw {
+        count,
+        target: resolve_defined(params),
+    })
 }
 
 // CR 119.1: Gain life.
@@ -261,7 +265,7 @@ fn translate_put_counter(
     let count = resolve_quantity(params, "CounterNum", resolver);
     let target = resolve_target(params, "ValidTgts");
     Ok(Effect::PutCounter {
-        counter_type,
+        counter_type: parse_counter_type(&counter_type),
         count,
         target,
     })
@@ -317,6 +321,9 @@ fn translate_token(
         owner: TargetFilter::Controller,
         attach_to: None,
         enters_attacking: false,
+        supertypes: Vec::new(),
+        static_abilities: Vec::new(),
+        enter_with_counters: Vec::new(),
     })
 }
 
@@ -379,6 +386,11 @@ fn translate_change_zone(params: &ForgeParams) -> Result<Effect, ForgeTranslateE
         enters_under: None,
         enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         enters_attacking: false,
+        up_to: false,
+        enter_with_counters: Vec::new(),
+        conditional_enter_with_counters: Vec::new(),
+        face_down_profile: None,
+        enters_modified_if: None,
     })
 }
 
@@ -408,6 +420,7 @@ fn translate_mana(
         ManaProduction::AnyOneColor {
             count: amount,
             color_options: ManaColor::ALL.to_vec(),
+            contribution: ManaContribution::Base,
         }
     } else if colors.len() == 1 {
         // Single color with amount: repeat the color N times.
@@ -416,21 +429,29 @@ fn translate_mana(
         match amount {
             QuantityExpr::Fixed { value } => {
                 let repeated = vec![colors[0]; value as usize];
-                ManaProduction::Fixed { colors: repeated }
+                ManaProduction::Fixed {
+                    colors: repeated,
+                    contribution: ManaContribution::Base,
+                }
             }
             _ => ManaProduction::AnyOneColor {
                 count: amount,
                 color_options: colors,
+                contribution: ManaContribution::Base,
             },
         }
     } else {
         // Multiple colors: the full set is produced once (Amount$ is unusual here).
-        ManaProduction::Fixed { colors }
+        ManaProduction::Fixed {
+            colors,
+            contribution: ManaContribution::Base,
+        }
     };
 
     Ok(Effect::Mana {
         produced,
         restrictions: Vec::new(),
+        grants: Vec::new(),
         expiry: None,
         target: None,
     })
@@ -447,7 +468,11 @@ fn translate_discard(
     Ok(Effect::Discard {
         count,
         target,
-        random,
+        selection: if random {
+            crate::types::ability::CardSelectionMode::Random
+        } else {
+            crate::types::ability::CardSelectionMode::Chosen
+        },
         unless_filter: None,
         filter: None,
     })
@@ -463,6 +488,7 @@ fn translate_sacrifice(params: &ForgeParams) -> Result<Effect, ForgeTranslateErr
     Ok(Effect::Sacrifice {
         target,
         count: crate::types::ability::QuantityExpr::Fixed { value: 1 },
+        min_count: 0,
     })
 }
 
@@ -527,6 +553,11 @@ fn translate_bounce(params: &ForgeParams) -> Result<Effect, ForgeTranslateError>
         enters_under: None,
         enter_tapped: crate::types::zones::EtbTapState::Unspecified,
         enters_attacking: false,
+        up_to: false,
+        enter_with_counters: Vec::new(),
+        conditional_enter_with_counters: Vec::new(),
+        face_down_profile: None,
+        enters_modified_if: None,
     })
 }
 
@@ -605,7 +636,7 @@ mod tests {
         let mut resolver = make_resolver();
         let effect = translate_effect(&params, &mut resolver).unwrap();
         match effect {
-            Effect::Draw { count } => {
+            Effect::Draw { count, .. } => {
                 assert_eq!(count, QuantityExpr::Fixed { value: 2 });
             }
             other => panic!("expected Draw, got {other:?}"),

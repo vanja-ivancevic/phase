@@ -1221,6 +1221,7 @@ pub(crate) fn continuous_modification_dynamic_quantity(
         // mana cost, not a `QuantityExpr` magnitude — no dynamic value here.
         | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::GrantAbility { .. }
         | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
         | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
@@ -16903,11 +16904,10 @@ mod tests {
                 attachments: Vec::new(),
             },
         );
-        state.current_trigger_event =
-            Some(crate::types::events::GameEvent::CreatureDestroyed {
-                object_id: dead_id,
-                source_id: None,
-            });
+        state.current_trigger_event = Some(crate::types::events::GameEvent::CreatureDestroyed {
+            object_id: dead_id,
+            source_id: None,
+        });
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::Power {
                 scope: ObjectScope::CostPaidObject,

@@ -13432,6 +13432,18 @@ fn evaluate_trigger_condition_with_source(
                     .contains(&source.identity.reference)
             })
         }),
+        TriggerCondition::SourceAttackedOrBlockedThisCombat => {
+            source_context.is_some_and(|source| {
+                state.combat.as_ref().is_some_and(|combat| {
+                    combat
+                        .attacking_incarnations_this_combat
+                        .contains(&source.identity.reference)
+                        || combat
+                            .blocking_incarnations_this_combat
+                            .contains(&source.identity.reference)
+                })
+            })
+        }
         TriggerCondition::EchoDue => {
             source_context.is_some_and(|source| source.source_read(state).echo_due())
         }
@@ -13712,12 +13724,7 @@ fn evaluate_trigger_condition_with_source(
         // therefore fails closed.
         TriggerCondition::SourceAbilityAddedManaThisTurn => source_context
             .and_then(|source| {
-                ability_index.map(|index| {
-                    (
-                        source.identity.reference.object_id,
-                        index,
-                    )
-                })
+                ability_index.map(|index| (source.identity.reference.object_id, index))
             })
             .is_some_and(|key| state.mana_added_by_abilities_this_turn.contains(&key)),
         // CR 700.4 + CR 120.1: True when the dying creature was dealt damage by the
@@ -17531,11 +17538,8 @@ pub mod tests {
         let mut def = make_trigger(TriggerMode::ChangesZone);
         def.constraint = Some(TriggerConstraint::ZoneChangePutterPresent);
 
-        let mut record = ZoneChangeRecord::test_minimal(
-            source,
-            Some(Zone::Hand),
-            Zone::Battlefield,
-        );
+        let mut record =
+            ZoneChangeRecord::test_minimal(source, Some(Zone::Hand), Zone::Battlefield);
         record.trigger_source_context = Some(trigger_source_context_for_latch(
             &state,
             state.objects.get(&source).expect("watcher exists"),
@@ -17577,8 +17581,7 @@ pub mod tests {
     #[test]
     fn zone_change_putter_scope_binds_triggered_ability_from_event_record() {
         use crate::types::ability::{
-            AbilityDefinition, AbilityKind, Effect, QuantityExpr, TargetFilter,
-            TriggerConstraint,
+            AbilityDefinition, AbilityKind, Effect, QuantityExpr, TargetFilter, TriggerConstraint,
         };
 
         let mut state = setup();
@@ -17598,11 +17601,8 @@ pub mod tests {
             },
         )));
 
-        let mut record = ZoneChangeRecord::test_minimal(
-            source,
-            Some(Zone::Hand),
-            Zone::Battlefield,
-        );
+        let mut record =
+            ZoneChangeRecord::test_minimal(source, Some(Zone::Hand), Zone::Battlefield);
         record.trigger_source_context = Some(trigger_source_context_for_latch(
             &state,
             state.objects.get(&source).expect("watcher exists"),
@@ -18655,6 +18655,32 @@ pub mod tests {
             ),
             "Tolsimir's observed incarnation attacked during this combat"
         );
+        // A blocker-only source must satisfy the new combined condition while
+        // remaining false for the attacked-only sibling.
+        let mut blocked_only = state.clone();
+        let tolsimir_reference =
+            ObjectIncarnationRef::from_object(&blocked_only.objects[&tolsimir]);
+        let combat = blocked_only.combat.as_mut().expect("combat exists");
+        combat
+            .attacking_incarnations_this_combat
+            .remove(&tolsimir_reference);
+        combat
+            .blocking_incarnations_this_combat
+            .insert(tolsimir_reference);
+        assert!(!check_trigger_condition(
+            &blocked_only,
+            &TriggerCondition::SourceAttackedThisCombat,
+            PlayerId(0),
+            Some(tolsimir),
+            Some(&attack_event),
+        ));
+        assert!(check_trigger_condition(
+            &blocked_only,
+            &TriggerCondition::SourceAttackedOrBlockedThisCombat,
+            PlayerId(0),
+            Some(tolsimir),
+            Some(&attack_event),
+        ));
         let pending = collect_pending_triggers(&mut state, std::slice::from_ref(&attack_event));
         assert_eq!(
             pending.len(),
@@ -29911,9 +29937,7 @@ pub mod tests {
 
         // A successful activation of a different printed ability must not close
         // Carpet's gate ("with this ability" is not source-wide).
-        state
-            .mana_added_by_abilities_this_turn
-            .insert((source, 1));
+        state.mana_added_by_abilities_this_turn.insert((source, 1));
         assert!(check_trigger_condition_with_source_and_ability_index(
             &state,
             &condition,
@@ -29924,9 +29948,7 @@ pub mod tests {
         ));
 
         // Once this exact printed ability adds mana, its intervening-if fails.
-        state
-            .mana_added_by_abilities_this_turn
-            .insert((source, 0));
+        state.mana_added_by_abilities_this_turn.insert((source, 0));
         assert!(!check_trigger_condition_with_source_and_ability_index(
             &state,
             &condition,

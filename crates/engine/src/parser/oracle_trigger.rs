@@ -2192,11 +2192,12 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     // provenance gate is independent of a timing/frequency gate, so preserve
     // both instead of silently dropping one (CR 603.2).
     def.constraint = match (modifiers.constraint.clone(), def.constraint.take()) {
-        (Some(text_constraint), Some(parsed_constraint @ TriggerConstraint::ZoneChangePutterPresent)) => {
-            Some(TriggerConstraint::All {
-                constraints: vec![parsed_constraint, text_constraint],
-            })
-        }
+        (
+            Some(text_constraint),
+            Some(parsed_constraint @ TriggerConstraint::ZoneChangePutterPresent),
+        ) => Some(TriggerConstraint::All {
+            constraints: vec![parsed_constraint, text_constraint],
+        }),
         (Some(text_constraint), _) => Some(text_constraint),
         (None, parsed_constraint) => parsed_constraint,
     };
@@ -6425,6 +6426,15 @@ fn extract_if_condition_with_card_name(
     // nom production at word boundaries so a leading intervening-if is retained
     // while later sentence-local conditionals remain outside this function.
     if let Some((prefix, _, rest)) = scan_preceded(&lower, |i| {
+        tag::<_, _, OracleError<'_>>("if ~ attacked or blocked this combat").parse(i)
+    }) {
+        let clause_len = lower.len() - prefix.len() - rest.len();
+        return (
+            strip_condition_clause(text, prefix.len(), clause_len),
+            Some(TriggerCondition::SourceAttackedOrBlockedThisCombat),
+        );
+    }
+    if let Some((prefix, _, rest)) = scan_preceded(&lower, |i| {
         tag::<_, _, OracleError<'_>>("if ~ attacked this combat").parse(i)
     }) {
         let clause_len = lower.len() - prefix.len() - rest.len();
@@ -6602,11 +6612,9 @@ fn extract_if_condition_with_card_name(
     // predicate, so it cannot be lowered through `parse_inner_condition`.
     // Keep the grammar generic for any future ability using the same Oracle
     // wording; the runtime binds the exact printed ability index at collection.
-    if let Some((before, _, rest)) = scan_preceded(
-        &lower,
-        parse_source_ability_added_mana_intervening_if,
-    )
-    .filter(|(before, _, _)| before.trim().is_empty())
+    if let Some((before, _, rest)) =
+        scan_preceded(&lower, parse_source_ability_added_mana_intervening_if)
+            .filter(|(before, _, _)| before.trim().is_empty())
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();
@@ -8740,14 +8748,10 @@ fn try_extract_has_counter_condition(
 /// "if you haven't added mana with this ability this turn". The leading
 /// `if` is included so `scan_preceded` can enforce that this is an
 /// intervening-if at the head of the trigger effect, not a later conditional.
-fn parse_source_ability_added_mana_intervening_if(
-    input: &str,
-) -> OracleResult<'_, ()> {
+fn parse_source_ability_added_mana_intervening_if(input: &str) -> OracleResult<'_, ()> {
     value(
         (),
-        tag::<_, _, OracleError<'_>>(
-            "if you haven't added mana with this ability this turn",
-        ),
+        tag::<_, _, OracleError<'_>>("if you haven't added mana with this ability this turn"),
     )
     .parse(input)
 }
@@ -14753,6 +14757,37 @@ fn try_parse_special_trigger_pattern(lower: &str) -> Option<(TriggerMode, Trigge
             def.valid_card = Some(TargetFilter::Typed(TypedFilter::creature()));
             def.condition = Some(TriggerCondition::DealtDamageBySourceThisTurn);
             return Some((TriggerMode::ChangesZone, def));
+        }
+    }
+
+    // CR 700.4 + CR 120.1 + CR 608.2i: the same event-embedded death
+    // trigger also accepts a non-self damage source, such as an Aura's
+    // "creature dealt damage by enchanted creature this turn dies". Reuse the
+    // shared damage-source grammar so attachment-relative sources retain
+    // their `AttachedTo` filter and are evaluated against damage snapshots.
+    let mut damaged_by_source_prefix = alt((
+        tag::<_, _, OracleError<'_>>("whenever a creature dealt damage by "),
+        tag("when a creature dealt damage by "),
+    ));
+    if let Ok((rest, _)) = damaged_by_source_prefix.parse(lower) {
+        if let Some((after_source, source)) =
+            super::oracle_replacement::parse_damage_history_source(rest)
+        {
+            if tag::<_, _, OracleError<'_>>(" this turn dies")
+                .parse(after_source)
+                .is_ok()
+            {
+                let mut def = make_base();
+                def.mode = TriggerMode::ChangesZone;
+                def.origin = Some(Zone::Battlefield);
+                def.destination = Some(Zone::Graveyard);
+                def.valid_card = Some(TargetFilter::Typed(TypedFilter::creature()));
+                def.condition = Some(match source {
+                    TargetFilter::SelfRef => TriggerCondition::DealtDamageBySourceThisTurn,
+                    source => TriggerCondition::DealtDamageThisTurnBySource { source },
+                });
+                return Some((TriggerMode::ChangesZone, def));
+            }
         }
     }
 

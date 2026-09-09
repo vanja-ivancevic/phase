@@ -1239,6 +1239,25 @@ fn tolsimir_midnights_light_preserves_combat_source_and_event_attacker_axes() {
 }
 
 #[test]
+fn intervening_if_source_attacked_or_blocked_this_combat_populates_condition() {
+    // CR 508.1 + CR 509.1 + CR 603.4: a source-scoped intervening-if must
+    // retain both sides of "attacked or blocked" and be evaluated against the
+    // exact current-combat incarnation of the source.
+    let trigger = parse_trigger_line(
+        "At end of combat, if ~ attacked or blocked this combat, remove a +1/+0 counter from it.",
+        "Clockwork Beast",
+    );
+    assert_eq!(
+        trigger.condition,
+        Some(TriggerCondition::SourceAttackedOrBlockedThisCombat)
+    );
+    assert!(matches!(
+        trigger.execute.as_deref().map(|ability| &*ability.effect),
+        Some(Effect::RemoveCounter { .. })
+    ));
+}
+
+#[test]
 fn intervening_if_source_attacked_or_blocked_this_turn_populates_condition() {
     // CR 508.1 + CR 509.1 + CR 603.4: the "attacked or blocked" sibling of the
     // attacked-only intervening-if. Gates on the source creature having attacked
@@ -16400,7 +16419,9 @@ fn trigger_opponent_causes_you_to_discard_a_card() {
     );
     assert_eq!(def.trigger_zones, vec![Zone::Battlefield]);
 
-    let execute = def.execute.expect("Spiritual Focus must retain its life gain");
+    let execute = def
+        .execute
+        .expect("Spiritual Focus must retain its life gain");
     assert!(matches!(
         execute.effect.as_ref(),
         Effect::GainLife {
@@ -16435,11 +16456,11 @@ fn trigger_opponent_causes_land_to_enter_your_graveyard() {
     assert_eq!(def.destination, Some(Zone::Graveyard));
     assert_eq!(
         def.valid_card,
-        Some(TargetFilter::Typed(
-            TypedFilter::land().properties(vec![FilterProp::Owned {
+        Some(TargetFilter::Typed(TypedFilter::land().properties(vec![
+            FilterProp::Owned {
                 controller: ControllerRef::You,
-            }])
-        ))
+            }
+        ])))
     );
     assert_eq!(
         def.constraint,
@@ -16450,7 +16471,9 @@ fn trigger_opponent_causes_land_to_enter_your_graveyard() {
         )
     );
     assert!(matches!(
-        def.execute.as_deref().map(|ability| ability.effect.as_ref()),
+        def.execute
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
         Some(Effect::ChangeZone {
             origin: Some(Zone::Graveyard),
             destination: Zone::Battlefield,
@@ -16474,7 +16497,10 @@ fn trigger_player_puts_onto_battlefield_has_putter_constraint() {
         let (mode, def) = super::parse_trigger_condition(condition, &mut ctx);
         assert_eq!(mode, TriggerMode::ChangesZone, "condition: {condition}");
         assert_eq!(def.destination, Some(Zone::Battlefield));
-        assert!(def.valid_card.is_some(), "object filter was dropped: {condition}");
+        assert!(
+            def.valid_card.is_some(),
+            "object filter was dropped: {condition}"
+        );
         assert_eq!(
             def.constraint,
             Some(crate::types::ability::TriggerConstraint::ZoneChangePutterPresent),
@@ -16496,11 +16522,12 @@ fn trigger_player_puts_onto_battlefield_composes_with_once_each_turn() {
         "Whenever a player puts a Swamp onto the battlefield, draw a card. This ability triggers only once each turn.",
         "Synthetic",
     );
-    let Some(crate::types::ability::TriggerConstraint::All { constraints }) = def.constraint
-    else {
+    let Some(crate::types::ability::TriggerConstraint::All { constraints }) = def.constraint else {
         panic!("expected composed putter and frequency constraints");
     };
-    assert!(constraints.contains(&crate::types::ability::TriggerConstraint::ZoneChangePutterPresent));
+    assert!(
+        constraints.contains(&crate::types::ability::TriggerConstraint::ZoneChangePutterPresent)
+    );
     assert!(constraints.contains(&crate::types::ability::TriggerConstraint::OncePerTurn));
 }
 
@@ -16510,7 +16537,8 @@ fn trigger_player_puts_onto_battlefield_composes_with_once_each_turn() {
 /// has no event-source controller to retain.
 #[test]
 fn trigger_opponent_controlled_spell_destroys_noncreature_permanent() {
-    let condition = "a spell or ability an opponent controls destroys a noncreature permanent you control";
+    let condition =
+        "a spell or ability an opponent controls destroys a noncreature permanent you control";
     assert_eq!(
         relative_player_scope_for_condition(condition),
         Some(ControllerRef::TriggeringPlayer),
@@ -20517,7 +20545,9 @@ fn trigger_each_of_your_main_phases_uses_main_phase_constraint() {
     );
     assert!(
         matches!(
-            def.execute.as_deref().map(|ability| ability.effect.as_ref()),
+            def.execute
+                .as_deref()
+                .map(|ability| ability.effect.as_ref()),
             Some(Effect::Mana { .. })
         ),
         "Carpet's payload must remain a mana effect"
@@ -21194,6 +21224,35 @@ fn trigger_dealt_damage_by_source_dies() {
 }
 
 #[test]
+fn trigger_enchanted_creature_damaged_dies_uses_attachment_source() {
+    // CR 301.5 + CR 120.1: "enchanted creature" names the Aura's attached
+    // host as the damage source, not the Aura itself.
+    let def = parse_trigger_line(
+        "Whenever a creature dealt damage by enchanted creature this turn dies, put a +1/+1 counter on that creature.",
+        "Vampiric Embrace",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.origin, Some(Zone::Battlefield));
+    assert_eq!(def.destination, Some(Zone::Graveyard));
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::Typed(TypedFilter::creature()))
+    );
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::DealtDamageThisTurnBySource {
+            source: TargetFilter::AttachedTo,
+        })
+    );
+    assert!(matches!(
+        def.execute
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::PutCounter { .. })
+    ));
+}
+
+#[test]
 fn trigger_another_creature_damaged_by_spider_you_controlled_dies() {
     // Issue #1206 — Shelob, Child of Ungoliant
     let def = parse_trigger_line(
@@ -21482,7 +21541,9 @@ fn trigger_last_ore_counter_removed_is_zero_thresholded() {
         def.counter_filter
             .as_ref()
             .map(|filter| &filter.counter_type),
-        Some(&crate::types::counter::CounterType::Generic("ore".to_string()))
+        Some(&crate::types::counter::CounterType::Generic(
+            "ore".to_string()
+        ))
     );
     assert_eq!(
         def.counter_filter
@@ -24278,7 +24339,11 @@ fn phyrexian_devourer_power_state_trigger_fires_and_sacrifices_self() {
     let mut runner = GameRunner::from_state(state);
     runner.advance_until_stack_empty();
     assert!(
-        !runner.state().battlefield.iter().any(|id| *id == devourer_id),
+        !runner
+            .state()
+            .battlefield
+            .iter()
+            .any(|id| *id == devourer_id),
         "Phyrexian Devourer should sacrifice itself at seven power",
     );
 }

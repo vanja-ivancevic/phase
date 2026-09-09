@@ -2108,6 +2108,118 @@ fn parse(
     parse_oracle_text(text, name, &keyword_names, &types, &subtypes)
 }
 
+/// CR 207.2c + CR 611.3a: an ability-word-prefixed static line must survive
+/// the full Oracle document router, not only the direct static-line parser.
+/// Divine Sacrament was losing its Threshold anthem here while retaining the
+/// preceding unconditional anthem.
+#[test]
+fn threshold_static_ability_word_survives_full_oracle_routing() {
+    let parsed = parse(
+        "White creatures get +1/+1.\nThreshold — White creatures get an additional +1/+1 as long as there are seven or more cards in your graveyard.",
+        "Divine Sacrament",
+        &[],
+        &["Enchantment"],
+        &[],
+    );
+
+    let threshold = parsed
+        .statics
+        .iter()
+        .find(|definition| {
+            matches!(
+                definition.condition,
+                Some(StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::GraveyardSize { .. },
+                    },
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 7 },
+                })
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!("Threshold anthem must be retained by full Oracle routing: {parsed:#?}")
+        });
+
+    assert!(threshold
+        .modifications
+        .contains(&ContinuousModification::AddPower { value: 1 }));
+    assert!(threshold
+        .modifications
+        .contains(&ContinuousModification::AddToughness { value: 1 }));
+}
+
+/// CR 405.1 + CR 601.2f: the stack is a real zone, and the printed "on the
+/// stack" source condition must gate Kaervek's Torch's targeting tax rather
+/// than degrade to an always-on unrecognized condition.
+#[test]
+fn stack_zone_condition_survives_full_oracle_routing() {
+    let parsed = parse(
+        "As long as Kaervek's Torch is on the stack, spells that target it cost {2} more to cast.\nKaervek's Torch deals X damage to any target.",
+        "Kaervek's Torch",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+
+    let tax = parsed
+        .statics
+        .iter()
+        .find(|definition| {
+            matches!(
+                definition.condition,
+                Some(StaticCondition::SourceInZone { zone: Zone::Stack })
+            )
+        })
+        .unwrap_or_else(|| panic!("stack-gated tax was not retained: {parsed:#?}"));
+    assert!(matches!(tax.mode, StaticMode::ModifyCost { .. }));
+}
+
+/// CR 701.10 + CR 201.5: a card named Exile starts with the keyword action
+/// "Exile", not a self-reference. The normalizer must preserve that imperative
+/// so the spell's zone-change effect reaches the real parser.
+#[test]
+fn keyword_action_card_name_exile_survives_full_oracle_routing() {
+    let parsed = parse(
+        "Exile target nonwhite attacking creature. You gain life equal to its toughness.",
+        "Exile",
+        &[],
+        &["Instant"],
+        &[],
+    );
+
+    assert!(parsed.parse_warnings.is_empty(), "parsed={parsed:#?}");
+    assert!(matches!(
+        parsed
+            .abilities
+            .first()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::ChangeZone { .. })
+    ));
+}
+
+/// CR 201.5c: an "of"-name's first word may itself be an imperative verb.
+/// Do not shorten Return of the Nightstalkers to `~` in its opening instruction.
+#[test]
+fn verb_first_of_name_survives_full_oracle_routing() {
+    let parsed = parse(
+        "Return all Nightstalker permanent cards from your graveyard to the battlefield. Then destroy all Swamps you control.",
+        "Return of the Nightstalkers",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+
+    assert!(parsed.parse_warnings.is_empty(), "parsed={parsed:#?}");
+    assert!(matches!(
+        parsed
+            .abilities
+            .first()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::ChangeZoneAll { .. })
+    ));
+}
+
 /// CR 614.1a: Urza's three-mana land cycle expresses its replacement branch
 /// as a conditional mana sub-ability.  The runtime already resolves this
 /// shape (and the tests in `game::mana_abilities` pin the one- vs three-mana
@@ -4162,6 +4274,114 @@ fn parse_linvala_shield_activated_choose_then_grant_chosen_keyword() {
             .iter()
             .any(|e| matches!(e, Effect::Unimplemented { .. })),
         "no clause may be Unimplemented, got {effects:?}"
+    );
+}
+
+/// CR 608.2d + CR 613.1f: Urborg's activated ability offers a typed keyword
+/// choice and removes only the selected ability from the target creature. The
+/// full Oracle router must retain both halves as a Choose → GenericEffect chain
+/// rather than lowering "or" as two simultaneous keyword removals.
+#[test]
+fn parse_urborg_activated_choose_then_remove_chosen_keyword() {
+    use crate::types::ability::{
+        ChoiceType, ContinuousModification, Duration, Effect, TargetFilter,
+    };
+
+    let result = parse(
+        "{T}: Add {B}.\n{T}: Target creature loses first strike or swampwalk until end of turn.",
+        "Urborg",
+        &[],
+        &["Land"],
+        &[],
+    );
+
+    let mut effects = Vec::new();
+    for ability in &result.abilities {
+        let mut node = Some(ability);
+        while let Some(def) = node {
+            effects.push(&*def.effect);
+            node = def.sub_ability.as_deref();
+        }
+    }
+
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::Choose {
+                choice_type: ChoiceType::Keyword { options, count: 1 },
+                persist: true,
+                ..
+            } if options.as_slice() == [Keyword::FirstStrike, Keyword::Landwalk("Swamp".to_string())]
+        )),
+        "expected Urborg's typed keyword choice, got {effects:?}"
+    );
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::GenericEffect {
+                static_abilities,
+                target: Some(TargetFilter::Typed(target)),
+                duration: Some(Duration::UntilEndOfTurn),
+                ..
+            } if target.type_filters.contains(&TypeFilter::Creature)
+                && static_abilities.iter().any(|static_def| static_def
+                    .modifications
+                    .contains(&ContinuousModification::RemoveChosenKeyword))
+        )),
+        "expected a targeted RemoveChosenKeyword effect, got {effects:?}"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Unimplemented { .. })),
+        "Urborg must have no unimplemented effect, got {effects:?}"
+    );
+}
+
+/// CR 702.14 + CR 613.1f: Hammerheim removes the whole landwalk keyword
+/// family, so the routed effect must not collapse to one concrete landwalk
+/// variant or an unimplemented residual.
+#[test]
+fn parse_hammerheim_removes_all_landwalk_abilities() {
+    use crate::types::ability::{ContinuousModification, Duration, Effect, TargetFilter};
+
+    let result = parse(
+        "{T}: Target creature loses all landwalk abilities until end of turn.",
+        "Hammerheim",
+        &[],
+        &["Land"],
+        &[],
+    );
+
+    let mut effects = Vec::new();
+    for ability in &result.abilities {
+        let mut node = Some(ability);
+        while let Some(def) = node {
+            effects.push(&*def.effect);
+            node = def.sub_ability.as_deref();
+        }
+    }
+
+    assert!(
+        effects.iter().any(|effect| matches!(
+            effect,
+            Effect::GenericEffect {
+                static_abilities,
+                target: Some(TargetFilter::Typed(target)),
+                duration: Some(Duration::UntilEndOfTurn),
+                ..
+            } if target.type_filters.contains(&TypeFilter::Creature)
+                && static_abilities.iter().any(|static_def| static_def
+                    .modifications
+                    .contains(&ContinuousModification::RemoveAllLandwalk))
+        )),
+        "expected targeted RemoveAllLandwalk effect, got {effects:?}"
+    );
+    assert!(
+        !effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::Unimplemented { .. })),
+        "Hammerheim must have no unimplemented effect, got {effects:?}"
     );
 }
 
@@ -23346,6 +23566,34 @@ fn dynamic_mana_per_color_does_not_emit_dynamic_qty_warning() {
             ..
         }
     ));
+}
+
+/// CR 105.4 + CR 109.4: Rith's post-choice token count is a controller-scoped
+/// population filtered by the chosen color. Exercise the full Oracle router so
+/// the quantity grammar is not only green in isolation.
+#[test]
+fn rith_chosen_color_population_survives_full_oracle_routing() {
+    let parsed = parse(
+        "Whenever Rith deals combat damage to a player, you may pay {2}{G}. If you do, choose a color, then create a 1/1 green Saproling creature token for each permanent of that color.",
+        "Rith, the Awakener",
+        &[],
+        &["Legendary", "Creature"],
+        &["Dragon"],
+    );
+
+    assert!(
+        parsed
+            .parse_warnings
+            .iter()
+            .all(|warning| warning.to_string().split_whitespace().next()
+                != Some("Swallow:DynamicQty")),
+        "unexpected dynamic quantity warning: {:?}",
+        parsed.parse_warnings
+    );
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Rith's chosen-color token ability must remain executable: {parsed:#?}"
+    );
 }
 
 #[test]
