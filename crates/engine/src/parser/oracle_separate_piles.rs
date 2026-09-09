@@ -24,7 +24,7 @@
 
 use nom::branch::alt;
 use nom::bytes::complete::tag_no_case;
-use nom::combinator::value;
+use nom::combinator::{eof, opt, value};
 use nom::Parser;
 
 use crate::parser::oracle_nom::error::OracleError;
@@ -61,50 +61,117 @@ pub(crate) fn parse_separate_into_piles_ir(
     ctx: &ParseContext,
 ) -> Option<PileIr> {
     // Try the reveal-from-library shape first (Fact or Fiction family).
-    let effect = try_parse_reveal_separate(text, kind).or_else(|| {
-        // Fall through to the battlefield partition shape (Make an Example family).
-        let (rest, partition_subject) = parse_separates_line(text)?;
-        let (rest, chooser) = parse_choose_line(rest)?;
-        let trailing = rest.trim_start();
-        if trailing.is_empty() {
-            return None;
-        }
-        // Parse the trailing sentence (the per-pile sub-effect) through the
-        // standard imperative chain parser. For Make an Example this yields a
-        // `Sacrifice { target: ParentTarget }` chain — the runtime resolver
-        // re-binds `controller` to each subject before applying it.
-        //
-        // CR 700.3b: the pile is not an object — the sub-effect's target is
-        // wired by the resolver per-object, not via the parsed `target_filter`.
-        let parsed = parse_effect_chain_with_context(trailing, kind, &mut ParseContext::default());
-        // Reject if the trailing sentence didn't yield a real effect (the parser
-        // returns an Unimplemented stub on failure).
-        if matches!(*parsed.effect, Effect::Unimplemented { .. }) {
-            return None;
-        }
-        // CR 700.3 + CR 608.2c: Build a sub-effect with a generic ParentTarget
-        // filter so the runtime's per-object loop in `apply_pile_effect` sets
-        // the target via `TargetRef::Object`. Force-rewrite the sub-effect's
-        // target filter to `ParentTarget` so the per-object pipeline routes
-        // through the standard sacrifice handler unambiguously.
-        let mut sub_def = parsed;
-        rewrite_sub_effect_target_to_parent(&mut sub_def.effect);
+    let effect = try_parse_reveal_separate(text, kind)
+        .or_else(|| try_parse_target_player_separate(text, kind))
+        .or_else(|| {
+            // Fall through to the battlefield partition shape (Make an Example family).
+            let (rest, partition_subject) = parse_separates_line(text)?;
+            let (rest, chooser) = parse_choose_line(rest)?;
+            let trailing = rest.trim_start();
+            if trailing.is_empty() {
+                return None;
+            }
+            // Parse the trailing sentence (the per-pile sub-effect) through the
+            // standard imperative chain parser. For Make an Example this yields a
+            // `Sacrifice { target: ParentTarget }` chain — the runtime resolver
+            // re-binds `controller` to each subject before applying it.
+            //
+            // CR 700.3b: the pile is not an object — the sub-effect's target is
+            // wired by the resolver per-object, not via the parsed `target_filter`.
+            let parsed =
+                parse_effect_chain_with_context(trailing, kind, &mut ParseContext::default());
+            // Reject if the trailing sentence didn't yield a real effect (the parser
+            // returns an Unimplemented stub on failure).
+            if matches!(*parsed.effect, Effect::Unimplemented { .. }) {
+                return None;
+            }
+            // CR 700.3 + CR 608.2c: Build a sub-effect with a generic ParentTarget
+            // filter so the runtime's per-object loop in `apply_pile_effect` sets
+            // the target via `TargetRef::Object`. Force-rewrite the sub-effect's
+            // target filter to `ParentTarget` so the per-object pipeline routes
+            // through the standard sacrifice handler unambiguously.
+            let mut sub_def = parsed;
+            rewrite_sub_effect_target_to_parent(&mut sub_def.effect);
 
-        Some(Effect::SeparateIntoPiles {
-            partition_subject,
-            // CR 700.3: Make an Example partitions creatures specifically;
-            // the Liliana −6 follow-up will pass a wider filter. Defaulting
-            // to the parsed subject filter is a future extension — for now
-            // we hardcode Creature, which is the only printed shape.
-            object_filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
-            chooser,
-            chosen_pile_effect: Box::new(sub_def),
-            pile_source: crate::types::ability::PileSource::Battlefield,
-            unchosen_pile_effect: None,
-        })
-    })?;
+            Some(Effect::SeparateIntoPiles {
+                partition_subject,
+                // CR 700.3: Make an Example partitions creatures specifically;
+                // the Liliana −6 follow-up will pass a wider filter. Defaulting
+                // to the parsed subject filter is a future extension — for now
+                // we hardcode Creature, which is the only printed shape.
+                object_filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+                chooser,
+                chosen_pile_effect: Box::new(sub_def),
+                pile_source: crate::types::ability::PileSource::Battlefield,
+                unchosen_pile_effect: None,
+            })
+        })?;
 
     Some(PileIr::new(effect).with_source(text).with_context(ctx))
+}
+
+/// CR 700.3 + CR 115.1: Parse the Do or Die family — a target player divides
+/// all creatures they control into two piles, then destroys the pile that
+/// player chooses. The pile resolver applies the returned one-object effect
+/// once per member, so the printed mass noun "destroy all creatures" lowers to
+/// `Destroy` rather than `DestroyAll`.
+fn try_parse_target_player_separate(text: &str, kind: AbilityKind) -> Option<Effect> {
+    let (rest, ()) = parse_target_player_separates_line(text)?;
+    let rest = rest.trim_start();
+    parse_target_player_pile_destruction(rest, kind).map(|chosen_pile_effect| {
+        Effect::SeparateIntoPiles {
+            partition_subject: VoterScope::TargetPlayer,
+            object_filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature)),
+            chooser: PlayerScope::Target,
+            chosen_pile_effect: Box::new(chosen_pile_effect),
+            pile_source: PileSource::Battlefield,
+            unchosen_pile_effect: None,
+        }
+    })
+}
+
+/// Consume "Separate all creatures target player controls into two piles.".
+fn parse_target_player_separates_line(input: &str) -> Option<(&str, ())> {
+    let res: nom::IResult<&str, (), OracleError<'_>> = value(
+        (),
+        (
+            tag_no_case("separate all creatures target player controls into two piles"),
+            opt(tag_no_case(".")),
+        ),
+    )
+    .parse(input);
+    let (rest, ()) = res.ok()?;
+    Some((rest, ()))
+}
+
+/// Parse the resolution rider for Do or Die, including its regeneration
+/// prohibition. This is a complete phrase parser, not a card-name branch.
+fn parse_target_player_pile_destruction(
+    input: &str,
+    kind: AbilityKind,
+) -> Option<AbilityDefinition> {
+    let input = input.trim();
+    let res: nom::IResult<&str, (), OracleError<'_>> = value(
+        (),
+        (
+            tag_no_case("destroy all creatures in the pile of that player's choice"),
+            tag_no_case("."),
+            tag_no_case(" they can't be regenerated"),
+            opt(tag_no_case(" this turn")),
+            opt(tag_no_case(".")),
+            eof,
+        ),
+    )
+    .parse(input);
+    res.ok().map(|_| {
+        AbilityDefinition::new(
+            kind,
+            Effect::Destroy {
+                target: TargetFilter::ParentTarget,
+                cant_regenerate: true,
+            },
+        )
+    })
 }
 
 /// CR 700.3 + CR 700.3a: Consume the "Each opponent separates the creatures
@@ -521,6 +588,41 @@ mod tests {
                     "expected Sacrifice sub-effect, got {:?}",
                     chosen_pile_effect.effect
                 );
+            }
+            other => panic!("expected SeparateIntoPiles, got {other:?}"),
+        }
+    }
+
+    /// CR 700.3 + CR 115.1: Do or Die targets the player who both partitions
+    /// their creatures and chooses which pile is destroyed.
+    #[test]
+    fn parses_do_or_die_target_player_piles() {
+        let text = "Separate all creatures target player controls into two piles. \
+                    Destroy all creatures in the pile of that player's choice. \
+                    They can't be regenerated.";
+        let pile = parse_separate_into_piles_ir(text, AbilityKind::Spell, &ParseContext::default())
+            .expect("Do or Die body parses");
+        let chain = pile.effect_chain(AbilityKind::Spell);
+        match &chain.clauses[0].parsed.effect {
+            Effect::SeparateIntoPiles {
+                partition_subject,
+                chooser,
+                chosen_pile_effect,
+                ..
+            } => {
+                assert!(matches!(partition_subject, VoterScope::TargetPlayer));
+                assert!(matches!(chooser, PlayerScope::Target));
+                assert_eq!(
+                    chain.clauses[0].parsed.effect.target_filter(),
+                    Some(&TargetFilter::Player)
+                );
+                assert!(matches!(
+                    &*chosen_pile_effect.effect,
+                    Effect::Destroy {
+                        target: TargetFilter::ParentTarget,
+                        cant_regenerate: true,
+                    }
+                ));
             }
             other => panic!("expected SeparateIntoPiles, got {other:?}"),
         }

@@ -168,6 +168,7 @@ pub fn resolve(
         .filter(|pid| match scope {
             VoterScope::AllPlayers => true,
             VoterScope::EachOpponent | VoterScope::AnOpponent => *pid != controller,
+            VoterScope::TargetPlayer => false,
             // CR 101.4: `ControllerLabels` cycles the SUBJECT (labeled player)
             // through every non-eliminated player in APNAP order from the
             // controller. The ACTOR is always the controller; that gets pinned
@@ -195,6 +196,9 @@ pub fn resolve(
         .into_iter()
         .map(|pid| match scope {
             VoterScope::ControllerLabels => (pid, 1),
+            VoterScope::TargetPlayer => {
+                unreachable!("TargetPlayer is only valid for pile separation")
+            }
             _ => (pid, votes_per_session_for(state, pid)),
         })
         .collect();
@@ -215,6 +219,7 @@ pub fn resolve(
         VoterScope::AllPlayers | VoterScope::EachOpponent | VoterScope::AnOpponent => {
             VoteActor::SubjectActs
         }
+        VoterScope::TargetPlayer => unreachable!("TargetPlayer is only valid for pile separation"),
     };
 
     state.waiting_for = WaitingFor::VoteChoice {

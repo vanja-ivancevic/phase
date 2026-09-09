@@ -17496,6 +17496,10 @@ pub enum VoterScope {
     /// CR 700.3 + CR 608.2d: A single opponent (chosen or determined at
     /// resolution) performs the pile separation. Used by Fact or Fiction.
     AnOpponent,
+    /// CR 700.3 + CR 115.1: The player named by the first declared player
+    /// target performs the pile separation. Used by Do or Die; the same
+    /// player is also the chooser of the selected pile.
+    TargetPlayer,
     /// CR 101.4 + CR 608.2: Battlebond's friend-or-foe keyword action has
     /// no dedicated CR section. The spell controller alone makes one choice
     /// per non-eliminated player, in APNAP order from the controller. The
@@ -18647,6 +18651,18 @@ impl Effect {
                 ..
             } => None,
 
+            // CR 700.3b: the target-player pile form declares the player who
+            // partitions as a real stack target. Ordinary pile forms remain
+            // resolution-time choices and fall through to the non-targeting
+            // group below.
+            Effect::SeparateIntoPiles {
+                partition_subject: VoterScope::TargetPlayer,
+                ..
+            } => {
+                static TARGET_PLAYER_FILTER: TargetFilter = TargetFilter::Player;
+                Some(&TARGET_PLAYER_FILTER)
+            }
+
             // --- Effects with no player-selectable target field ---
             // These use filters, zone-level operations, or have no targeting at all.
             Effect::StartYourEngines { .. }
@@ -18810,8 +18826,6 @@ impl Effect {
             // slot — `chooser` is a player ref resolved like `PayCost.payer`, and
             // `filter` constrains the interactive selection, not a targeting slot.
             | Effect::ChooseObjectsIntoTrackedSet { .. }
-            // CR 700.3b: SeparateIntoPiles has no targeting slot — partitioning
-            // is a resolution-time set computation against `object_filter`.
             | Effect::SeparateIntoPiles { .. }
             // CR 701.20a: RevealFromHand implicitly targets the controller's own hand;
             // it has no discrete `target` field for the generic targeting layer.
