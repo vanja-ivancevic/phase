@@ -12567,6 +12567,36 @@ fn spell_temporal_whenever_line_builds_delayed_trigger() {
     assert!(r.parse_warnings.is_empty());
 }
 
+/// CR 119.3 + CR 603.2c: False Cure's delayed life-loss amount is two times
+/// the amount of life gained by the triggering player, not a fixed two life.
+#[test]
+fn false_cure_scales_life_loss_by_triggering_gain() {
+    let r = parse(
+        "Until end of turn, whenever a player gains life, that player loses 2 life for each 1 life they gained.",
+        "False Cure",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    assert!(r.parse_warnings.is_empty(), "False Cure: {r:#?}");
+
+    let Effect::CreateDelayedTrigger { effect, .. } = r.abilities[0].effect.as_ref() else {
+        panic!("expected False Cure delayed trigger, got {:?}", r.abilities[0].effect);
+    };
+    let Effect::LoseLife { amount, .. } = effect.effect.as_ref() else {
+        panic!("expected False Cure LoseLife payload, got {:?}", effect.effect);
+    };
+    assert_eq!(
+        amount,
+        &QuantityExpr::Multiply {
+            factor: 2,
+            inner: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::EventContextAmount,
+            }),
+        }
+    );
+}
+
 #[test]
 fn enchanted_player_cast_trigger_scopes_caster_to_enchanted_player() {
     // CR 303.4m + CR 702.5a: Maddening Hex — "Whenever enchanted player casts a

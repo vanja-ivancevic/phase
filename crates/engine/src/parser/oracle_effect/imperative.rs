@@ -1042,6 +1042,20 @@ fn parse_numeric_imperative_ast_with_bare_card_source(
             }
             if let Some((amount, remainder)) = parse_count_expr(amount_phrase) {
                 if remainder.trim().is_empty() {
+                    // CR 119.3 + CR 603.2c: "lose N life for each 1 life
+                    // they gained" scales the fixed N by the triggering
+                    // life-change amount. The tail begins after the noun
+                    // "life", so it must be attached here rather than left
+                    // for the generic sequence parser.
+                    let tail = after_lower
+                        .split_once(" life")
+                        .map(|(_, tail)| tail.trim().trim_end_matches('.').trim())
+                        .unwrap_or("");
+                    if let Some(for_each_expr) = parse_for_each_multiplier_prefix(tail) {
+                        return Some(NumericImperativeAst::LoseLife {
+                            amount: replace_fixed_quantity(amount, for_each_expr),
+                        });
+                    }
                     return Some(NumericImperativeAst::LoseLife { amount });
                 }
             }

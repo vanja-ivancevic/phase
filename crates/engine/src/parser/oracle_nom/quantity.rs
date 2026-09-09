@@ -3312,7 +3312,13 @@ fn parse_for_each_opponents_life_change(input: &str) -> OracleResult<'_, Quantit
 /// "1 ") and from Blood Tyrant's "1 life lost or gained this way" (no "you";
 /// handled by the `TrackedSetSize` "this way" block).
 fn parse_for_each_one_life_changed(input: &str) -> OracleResult<'_, QuantityRef> {
-    let (rest, _) = alt((tag("1 life you "), tag("one life you "))).parse(input)?;
+    let (rest, _) = alt((
+        tag("1 life you "),
+        tag("one life you "),
+        tag("1 life they "),
+        tag("one life they "),
+    ))
+    .parse(input)?;
     value(
         QuantityRef::EventContextAmount,
         alt((tag("gained"), tag("lost"))),
