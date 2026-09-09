@@ -217,7 +217,10 @@ pub(crate) fn effect_polarity(effect: &Effect) -> EffectPolarity {
         | Effect::Suspect { .. }
         | Effect::GivePlayerCounter { .. }
         | Effect::ExchangeControl { .. }
-        | Effect::ExchangeLifeTotals { .. } => EffectPolarity::Contextual,
+        | Effect::ExchangeLifeTotals { .. }
+        | Effect::LoseAllUnspentMana { .. }
+        | Effect::RepeatPaidLibraryLook
+        | Effect::RevealChosenLowestManaValueCreatures => EffectPolarity::Contextual,
         // Remaining variants have no fixed polarity for target-selection purposes
         // (their benefit/harm depends on usage context). Enumerated exhaustively
         // rather than caught by `_` so a newly added `Effect` variant fails to

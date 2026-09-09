@@ -959,6 +959,7 @@ mod omo_queen_of_vesuva;
 mod onakke_oathkeeper;
 mod one_sided_fight_illegal_damage_source;
 mod oracle_parser;
+mod old_border_domain_costs;
 mod orzhov_advokist;
 mod overload_no_legal_target;
 mod oversimplify_per_player_fractal;

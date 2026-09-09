@@ -778,6 +778,7 @@ pub(crate) fn apply_copy_token_after_replacement_with_created_ids(
             let command = ResolvedTokenCreationCommand {
                 object,
                 owner: token_owner,
+                putter: Some(controller),
                 entry_timestamp,
                 entry_turn: turn_number,
                 body: ResolvedTokenBody::Copy {

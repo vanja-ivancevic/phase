@@ -248,6 +248,7 @@ pub const MIN_SUPPORTED_PROTOCOL: u32 = PROTOCOL_VERSION.saturating_sub(1);
 /// broker's window went disjoint from the shipped client's. This constant is
 /// the fix — it moves only for reasons the lobby can actually observe.
 ///
+/// ```text
 /// 3 — `FormatConfig` gained `default_deck_copy_limit` (see `PROTOCOL_VERSION`
 ///     50 for the full entry). Same three carriers as 2:
 ///     `CreateGameWithSettings` on [`LobbyClientMessage`] (client → broker),
@@ -287,6 +288,7 @@ pub const MIN_SUPPORTED_PROTOCOL: u32 = PROTOCOL_VERSION.saturating_sub(1);
 ///     that direction can reject — into one legible handshake refusal.
 /// 1 — Initial lobby-owned version, covering the `LobbyClientMessage` /
 ///     `LobbyServerMessage` variant sets, unchanged since #1880.
+/// ```
 pub const LOBBY_PROTOCOL_VERSION: u32 = 3;
 
 /// Lowest [`LOBBY_PROTOCOL_VERSION`] a broker accepts from a client.

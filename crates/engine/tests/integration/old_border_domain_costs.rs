@@ -1,7 +1,7 @@
 //! Old-border Domain cost regressions through the public parser API.
 //!
-//! Kept as a standalone integration target so card-gap work can exercise the
-//! parser without linking Phase's complete unit-test harness.
+//! Kept inside the shared integration target so card-gap work exercises the
+//! parser alongside the engine's complete integration harness.
 
 use engine::game::ability_utils::{begin_target_selection_for_ability, build_target_slots};
 use engine::parser::parse_oracle_text;

@@ -938,6 +938,7 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
             let command = ResolvedTokenCreationCommand {
                 object,
                 owner,
+                putter: Some(spec.controller),
                 entry_timestamp,
                 entry_turn: turn_number,
                 body: ResolvedTokenBody::Spec {
@@ -1252,6 +1253,11 @@ pub fn apply_resolved_token_creation(
         .get(&object_id)
         .expect("the token was materialized above")
         .snapshot_for_zone_change(object_id, None, Zone::Battlefield);
+    // CR 110.2a + CR 305.1: the live entry stamps the player who performed
+    // the put after the snapshot is emitted. Carry that authoritative actor
+    // in the birth command so replay does not silently fall back to the
+    // entrant's controller (which may differ after an ETB replacement).
+    entry_record.stamp_zone_change_putter(command.putter);
     crate::game::restrictions::record_zone_change(state, &mut entry_record);
     // CR 111.1: replay must not hand the same id out again to a later allocation.
     state.next_object_id = state.next_object_id.max(command.resulting_next_object_id);
@@ -1729,6 +1735,7 @@ pub(crate) fn commit_liminal_token_entry_with_post_actions(
         ResolvedTokenCreationCommand {
             object: ObjectIncarnationRef::from_object(entry.object.projected()),
             owner,
+            putter: Some(entry.controller),
             entry_timestamp: entry.object.projected().timestamp,
             // CR 302.6: the entered-turn the liminal build already stamped, read
             // back off the object rather than re-read from the live turn.

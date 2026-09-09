@@ -25413,7 +25413,7 @@ pub struct TriggerGrantInstanceRef(pub u64);
 /// it needs the same stable source-definition identity that trigger producers
 /// use. Keeping both origins explicit prevents an invented transient id from
 /// colliding with a real resolving copy effect.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(tag = "type")]
 pub enum CopyEffectInstanceRef {
     Transient {
@@ -25425,6 +25425,65 @@ pub enum CopyEffectInstanceRef {
         definition_index: usize,
         modification_index: usize,
     },
+}
+
+/// Wire compatibility for pre-identity trigger snapshots. Older runtime
+/// captures serialized the transient copy-effect payload without the enum's
+/// `type: "Transient"` tag; the identity-bearing form above is the canonical
+/// current representation, while this bridge reads the old payload exactly
+/// as the transient variant it was.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum CopyEffectInstanceRefWire {
+    Tagged(CopyEffectInstanceRefTagged),
+    LegacyTransient {
+        continuous_effect_id: u64,
+        modification_index: usize,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "type")]
+enum CopyEffectInstanceRefTagged {
+    Transient {
+        continuous_effect_id: u64,
+        modification_index: usize,
+    },
+    Static {
+        source: ObjectIncarnationRef,
+        definition_index: usize,
+        modification_index: usize,
+    },
+}
+
+impl<'de> Deserialize<'de> for CopyEffectInstanceRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match CopyEffectInstanceRefWire::deserialize(deserializer)? {
+            CopyEffectInstanceRefWire::Tagged(CopyEffectInstanceRefTagged::Transient {
+                continuous_effect_id,
+                modification_index,
+            })
+            | CopyEffectInstanceRefWire::LegacyTransient {
+                continuous_effect_id,
+                modification_index,
+            } => Ok(Self::Transient {
+                continuous_effect_id,
+                modification_index,
+            }),
+            CopyEffectInstanceRefWire::Tagged(CopyEffectInstanceRefTagged::Static {
+                source,
+                definition_index,
+                modification_index,
+            }) => Ok(Self::Static {
+                source,
+                definition_index,
+                modification_index,
+            }),
+        }
+    }
 }
 
 /// Payload-free identity of the continuous-effect occurrence which produced a

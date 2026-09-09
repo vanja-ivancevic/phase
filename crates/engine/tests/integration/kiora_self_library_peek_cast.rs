@@ -10,9 +10,10 @@ use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::visibility::filter_state_for_viewer;
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
-    AbilityDefinition, CastFromZoneDriver, CastPermissionConstraint, ChoiceType, Comparator,
-    ControllerRef, Duration, Effect, FilterProp, ObjectScope, QuantityExpr, QuantityRef,
-    ResolutionCastWindow, ResolvedAbility, TargetFilter, TypeFilter, TypedFilter,
+    AbilityDefinition, CardPlayMode, CastFromZoneDriver, CastPermissionConstraint,
+    CastingPermission, ChoiceType, Comparator, ControllerRef, Duration, Effect, FilterProp,
+    ObjectScope, QuantityExpr, QuantityRef, ResolutionCastWindow, ResolvedAbility, TargetFilter,
+    TypeFilter, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
@@ -135,6 +136,51 @@ fn parsed_cast_from_zone_def(
 
 fn parsed_cast_from_zone(parsed: &engine::parser::oracle::ParsedAbilities) -> &Effect {
     parsed_cast_from_zone_def(parsed).effect.as_ref()
+}
+
+/// Return the duration on either canonical carrier for a zone-play permission.
+///
+/// Most cast-only clauses use `Effect::CastFromZone`, while the coordinated
+/// "play lands and cast spells" grammar uses `GrantCastingPermission` with a
+/// `PlayFromExile` permission so one grant can authorize both CR 305.1 land
+/// plays and CR 601.2a spell casts.  The semantic assertion below is about the
+/// duration reaching the cast permission, not about which carrier owns it.
+fn parsed_zone_play_permission_duration(
+    parsed: &engine::parser::oracle::ParsedAbilities,
+) -> Option<Duration> {
+    fn in_definition(definition: &AbilityDefinition) -> Option<Duration> {
+        let duration = match definition.effect.as_ref() {
+            Effect::CastFromZone { duration, .. } => duration.clone(),
+            Effect::GrantCastingPermission {
+                permission:
+                    CastingPermission::PlayFromExile {
+                        mode: CardPlayMode::Play,
+                        duration,
+                        ..
+                    },
+                ..
+            } => Some(duration.clone()),
+            _ => None,
+        };
+        duration.or_else(|| {
+            definition
+                .sub_ability
+                .as_deref()
+                .and_then(in_definition)
+        })
+    }
+
+    parsed
+        .abilities
+        .iter()
+        .find_map(in_definition)
+        .or_else(|| {
+            parsed
+                .triggers
+                .iter()
+                .filter_map(|trigger| trigger.execute.as_deref())
+                .find_map(in_definition)
+        })
 }
 
 fn has_self_library_peek(definition: &AbilityDefinition) -> bool {
@@ -384,12 +430,11 @@ fn coordinated_leading_durations_bind_to_the_cast_half() {
         ("Temporal Aperture", TEMPORAL_APERTURE, &["Artifact"][..]),
     ] {
         let parsed = parse(oracle, name, types);
-        let Effect::CastFromZone { duration, .. } = parsed_cast_from_zone(&parsed) else {
-            unreachable!("helper returns CastFromZone")
-        };
+        let duration = parsed_zone_play_permission_duration(&parsed)
+            .unwrap_or_else(|| panic!("{name} must parse a zone-play permission"));
         assert_eq!(
-            *duration,
-            Some(Duration::UntilEndOfTurn),
+            duration,
+            Duration::UntilEndOfTurn,
             "{name}: the sentence-leading \"Until end of turn\" must reach the \
              cast conjunct, not just the conjunct it sits next to — an unbound \
              graveyard/library cast permission is the failure mode"

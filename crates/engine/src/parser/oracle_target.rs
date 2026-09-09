@@ -18980,12 +18980,14 @@ mod tests {
 
     #[test]
     fn mana_value_suffix_binds_a_resolution_number_choice() {
-        let mut ctx = ParseContext::default();
-        ctx.pending_choice_type = Some(ChoiceType::NumberRange {
-            min: 0,
-            max: None,
-            distinctness: NumberDistinctness::Repeatable,
-        });
+        let mut ctx = ParseContext {
+            pending_choice_type: Some(ChoiceType::NumberRange {
+                min: 0,
+                max: None,
+                distinctness: NumberDistinctness::Repeatable,
+            }),
+            ..ParseContext::default()
+        };
         let input = "with mana value equal to that number";
         let (prop, consumed) = parse_mana_value_suffix(input, &mut ctx)
             .expect("resolution-local chosen number suffix parses");

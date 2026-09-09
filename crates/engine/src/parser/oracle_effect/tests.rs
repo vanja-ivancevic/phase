@@ -199,7 +199,7 @@ fn wild_dogs_full_oracle_text_has_dynamic_control_handoff() {
         .and_then(|trigger| trigger.execute.as_deref())
         .expect("Wild Dogs must have an upkeep trigger body");
 
-    fn find_give_control<'a>(ability: &'a AbilityDefinition) -> Option<&'a Effect> {
+    fn find_give_control(ability: &AbilityDefinition) -> Option<&Effect> {
         if matches!(ability.effect.as_ref(), Effect::GiveControl { .. }) {
             return Some(ability.effect.as_ref());
         }

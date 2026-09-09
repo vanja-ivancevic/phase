@@ -447,6 +447,7 @@ fn continuous_modification_quantity(
         | CM::RetainPrintedTriggerFromSource { .. }
         | CM::RetainPrintedAbilityFromSource { .. }
         | CM::RetainAllOtherAbilitiesFromSource
+        | CM::CopyTopOfZone { .. }
         | CM::AddSupertype { .. }
         | CM::RemoveSupertype { .. }
         | CM::RemoveManaCost => None,

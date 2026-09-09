@@ -7527,6 +7527,13 @@ fn event_context_target_refs(
     if matches!(filter, TargetFilter::EventTarget) {
         return source
             .event_target_id
+            // CR 603.2 + CR 603.6a: trigger target selection runs from the
+            // published trigger event, not from replacement matching. In
+            // that path the event target is authoritative on the current
+            // trigger event while `SourceContext::event_target_id` is only
+            // populated for replacement filters. Keep both doors, with the
+            // explicit replacement binding taking precedence.
+            .or_else(|| crate::game::quantity::triggering_event_target_object(state))
             .map(TargetRef::Object)
             .into_iter()
             .collect();

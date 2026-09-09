@@ -690,6 +690,9 @@ fn redundancy_delta(
         // static redundancy signal (the value depends on the runtime choice).
         | Effect::ChooseCounterKind { .. }
         | Effect::PutChosenCounter { .. }
+        | Effect::LoseAllUnspentMana { .. }
+        | Effect::RepeatPaidLibraryLook
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::HeistExile => None,
     }
 }
