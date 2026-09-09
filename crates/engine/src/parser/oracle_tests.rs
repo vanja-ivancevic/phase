@@ -12597,6 +12597,31 @@ fn false_cure_scales_life_loss_by_triggering_gain() {
     );
 }
 
+/// CR 121.1: Cabal Conditioning discards a number of cards equal to a
+/// battlefield aggregate, not one card.
+#[test]
+fn cabal_conditioning_uses_greatest_mana_value_as_discard_count() {
+    let r = parse(
+        "Any number of target players each discard a number of cards equal to the greatest mana value among permanents you control.",
+        "Cabal Conditioning",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    assert!(r.parse_warnings.is_empty(), "Cabal Conditioning: {r:#?}");
+
+    let Effect::Discard { count, .. } = r.abilities[0].effect.as_ref() else {
+        panic!(
+            "expected Cabal Conditioning discard effect, got {:?}",
+            r.abilities[0].effect
+        );
+    };
+    assert!(
+        matches!(count, QuantityExpr::Ref { qty: QuantityRef::PropertyAggregate(_) }),
+        "expected greatest-mana-value discard count, got {count:?}"
+    );
+}
+
 #[test]
 fn enchanted_player_cast_trigger_scopes_caster_to_enchanted_player() {
     // CR 303.4m + CR 702.5a: Maddening Hex — "Whenever enchanted player casts a

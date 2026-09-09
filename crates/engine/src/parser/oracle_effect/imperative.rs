@@ -643,6 +643,7 @@ fn resolve_earthbend_target(
 ///
 /// Covers the cross-verb dynamic-count idioms shared by Draw/Mill/Discard:
 /// - "cards equal to <ref>"  / "a card equal to <ref>"  → Ref{<ref>}
+/// - "a number of cards equal to <ref>" → Ref{<ref>}
 /// - "that many cards"       / "that many"              → Ref{EventContextAmount}
 ///
 /// CR 121.1 / CR 701.13a / CR 701.8a — chained-effect amounts and target-
@@ -652,6 +653,7 @@ fn parse_dynamic_count_phrase(lower: &str) -> Option<QuantityExpr> {
     if let Ok((qty_tail, _)) = alt((
         tag::<_, _, OracleError<'_>>("cards equal to "),
         tag("a card equal to "),
+        tag("a number of cards equal to "),
     ))
     .parse(lower)
     {
