@@ -3251,6 +3251,48 @@ fn word_of_blasting_subtype_possessive_damage_is_supported() {
     assert_eq!(damage.1, &TargetFilter::ParentTargetController);
 }
 
+/// CR 120.9 + CR 608.2c: Whipkeeper reads prior damage marked on its chosen
+/// target this turn. The quantity must remain typed and must not open a second
+/// target slot for the historical recipient.
+#[test]
+fn whipkeeper_damage_history_amount_is_supported() {
+    let face = oracle_face_for(
+        "Whipkeeper",
+        "{T}: Whipkeeper deals damage to target creature equal to the damage already dealt to it this turn.",
+        &["Creature"],
+        &["Human"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Whipkeeper must be fully supported: {gaps:?}"
+    );
+
+    let damage = face
+        .abilities
+        .first()
+        .expect("Whipkeeper must have an activated ability")
+        .effect
+        .as_ref();
+    let Effect::DealDamage { amount, target, .. } = damage else {
+        panic!("expected Whipkeeper's ability to deal damage, got {damage:?}");
+    };
+    assert!(matches!(
+        amount,
+        QuantityExpr::Ref {
+            qty: QuantityRef::DamageDealtThisTurn {
+                target,
+                aggregate: AggregateFunction::Sum,
+                group_by: None,
+                damage_kind: crate::types::ability::DamageKindFilter::Any,
+                channel: crate::types::ability::DamageChannel::Total,
+                ..
+            }
+        } if target.as_ref() == &TargetFilter::ParentTarget
+    ));
+    assert!(matches!(target, TargetFilter::Typed(_)));
+}
+
 /// CR 708.5: Found Footage's "You may look at face-down creatures your
 /// opponents control any time" lowers to a `MayLookAtFaceDown` static whose
 /// affected filter carries the FaceDown property and the opponent scope. The

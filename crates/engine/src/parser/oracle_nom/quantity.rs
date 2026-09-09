@@ -3619,6 +3619,29 @@ fn parse_attached_creature_pt_ref(input: &str) -> OracleResult<'_, QuantityRef> 
 /// damage this turn (120.9 specified-source semantics).
 fn parse_damage_dealt_this_turn_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     let (input, _) = opt(tag("the ")).parse(input)?;
+    // CR 120.9 + CR 608.2c: Whipkeeper's old-border wording refers to the
+    // damage already marked on the creature selected by the ability. The
+    // target is the parent target here, not a new target slot and not the
+    // ability source.
+    if let Ok((rest, _)) = (
+        tag::<_, _, OracleError<'_>>("damage already dealt to "),
+        tag("it"),
+        tag(" this turn"),
+    )
+        .parse(input)
+    {
+        return Ok((
+            rest,
+            QuantityRef::DamageDealtThisTurn {
+                source: Box::new(TargetFilter::Any),
+                target: Box::new(TargetFilter::ParentTarget),
+                aggregate: AggregateFunction::Sum,
+                group_by: None,
+                damage_kind: DamageKindFilter::Any,
+                channel: DamageChannel::Total,
+            },
+        ));
+    }
     alt((
         value(
             QuantityRef::DamageDealtThisTurn {
