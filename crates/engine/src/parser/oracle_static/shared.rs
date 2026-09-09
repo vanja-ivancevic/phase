@@ -1361,6 +1361,98 @@ fn parse_spells_have_quoted_keyword_list(text: &str) -> Option<Vec<StaticDefinit
     Some(defs)
 }
 
+/// CR 611.3a + CR 613.1f: Split a repeated conditional static that shares one
+/// subject but gives each conjunct its own "as long as" gate. Oracle's compact
+/// form for Tek is the representative shape:
+///
+/// `~ gets +0/+2 as long as you control a Plains, has flying as long as you
+/// control an Island, gets +2/+0 as long as you control a Swamp, ...`
+///
+/// The single-line parser sees the first `as long as` and treats the remainder
+/// (including the next conjuncts) as one condition. That produces one partial
+/// static with an `Unrecognized` condition and silently loses the other
+/// modifications. Decompose only when every comma-delimited conjunct starts
+/// with a supported continuous verb and carries its own typed condition; an
+/// ordinary comma list or an untyped condition remains with the existing
+/// fail-closed parser.
+fn parse_repeated_conditional_statics(text: &str) -> Option<Vec<StaticDefinition>> {
+    let lower = text.to_lowercase();
+    let tp = TextPair::new(text, &lower);
+    let (subject_lower, verb_prefix, rest_lower) = super::anthem::continuous_subject_verb(&lower)?;
+    let subject = text[..text.len() - rest_lower.len() - verb_prefix.len()].trim();
+    if subject.is_empty() {
+        return None;
+    }
+    let affected = parse_continuous_subject_filter(subject)?;
+
+    let predicate_start = text.len() - rest_lower.len() - verb_prefix.len();
+    let predicate = tp.slice(predicate_start, tp.len());
+    let mut conjuncts = Vec::new();
+    let mut remaining = predicate;
+    loop {
+        let Some((head, tail)) = split_conditional_conjunct(&remaining) else {
+            conjuncts.push(remaining.trim_end());
+            break;
+        };
+        conjuncts.push(head.trim_end());
+        remaining = tail;
+    }
+
+    if conjuncts.len() < 2 || subject_lower.trim().is_empty() {
+        return None;
+    }
+
+    let mut definitions = Vec::with_capacity(conjuncts.len());
+    for conjunct in conjuncts {
+        let body = strip_continuous_verb(conjunct)?;
+        if body.split_around_outside_quotes(" as long as ").is_none() {
+            return None;
+        }
+        let definition =
+            super::anthem::parse_continuous_gets_has(conjunct.original, affected.clone(), text)?;
+        if definition.condition.is_none()
+            || matches!(
+                definition.condition,
+                Some(StaticCondition::Unrecognized { .. })
+            )
+        {
+            return None;
+        }
+        definitions.push(definition);
+    }
+    Some(definitions)
+}
+
+/// Find the next top-level comma that introduces another continuous predicate.
+/// Conditions can contain `and`, so the comma-plus-verb boundary is the narrow
+/// structural marker used here. The optional `and` is consumed while preserving
+/// the following verb in the returned tail.
+fn split_conditional_conjunct<'a>(tp: &TextPair<'a>) -> Option<(TextPair<'a>, TextPair<'a>)> {
+    let mut offset = 0;
+    while let Some(relative) = tp.lower[offset..].find(", ") {
+        let position = offset + relative;
+        let candidate = tp.slice(position + 2, tp.len());
+        let candidate = candidate.strip_prefix("and ").unwrap_or(candidate);
+        if ["gets ", "get ", "has ", "have ", "gains ", "gain "]
+            .iter()
+            .any(|verb| candidate.starts_with(verb))
+        {
+            let head = tp.slice(0, position);
+            return Some((head, candidate));
+        }
+        offset = position + 2;
+    }
+    None
+}
+
+/// Remove the continuous predicate verb from one conjunct while preserving
+/// original casing for descriptions and any quoted text.
+fn strip_continuous_verb(tp: TextPair<'_>) -> Option<TextPair<'_>> {
+    ["gets ", "get ", "has ", "have ", "gains ", "gain "]
+        .iter()
+        .find_map(|verb| tp.strip_prefix(verb))
+}
+
 /// Peel a leading color-quality qualifier ("colorless"/"monocolored"/
 /// "multicolored") from a lowercase subject, returning the remainder and the
 /// matching `FilterProp::ColorCount` (CR 105.2). Mirrors the color-quality
@@ -2647,6 +2739,15 @@ fn parse_static_line_multi_dispatch(text: &str) -> Vec<StaticDefinition> {
     // trigger per granted instance). Mirrors the exiled-object / color-conditional
     // grant handlers above (one static per listed keyword).
     if let Some(defs) = parse_spells_have_quoted_keyword_list(&stripped) {
+        return defs;
+    }
+
+    // CR 611.3a + CR 613.1f: a shared subject may carry several independent
+    // conditional predicates in one Oracle sentence (Tek). The single-return
+    // path can retain only the first modification and turns the remainder into
+    // an unrecognized condition, so claim the fully validated decomposition
+    // before falling through to that path.
+    if let Some(defs) = parse_repeated_conditional_statics(&stripped) {
         return defs;
     }
 

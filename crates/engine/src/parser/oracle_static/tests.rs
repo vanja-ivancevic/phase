@@ -15,6 +15,45 @@ use crate::types::keywords::Keyword;
 use crate::types::mana::ManaCost;
 use crate::types::statics::{AdditionalCostTaxAction, CrewAction, CrewContributionKind};
 
+/// CR 611.3a + CR 613.1f: each conjunct in Tek's compact Oracle sentence has
+/// its own condition. The parser must emit one conditional static per conjunct,
+/// rather than attaching the tail of the sentence to the first condition.
+#[test]
+fn repeated_conditional_statics_split_shared_subject() {
+    let defs = parse_static_line_multi(
+        "~ gets +0/+2 as long as you control a Plains, has flying as long as you control an Island, gets +2/+0 as long as you control a Swamp, has first strike as long as you control a Mountain, and has trample as long as you control a Forest.",
+    );
+    assert_eq!(
+        defs.len(),
+        5,
+        "expected one static per land condition: {defs:?}"
+    );
+
+    let expected = [
+        (
+            Some(ContinuousModification::AddToughness { value: 2 }),
+            None,
+        ),
+        (None, Some(Keyword::Flying)),
+        (Some(ContinuousModification::AddPower { value: 2 }), None),
+        (None, Some(Keyword::FirstStrike)),
+        (None, Some(Keyword::Trample)),
+    ];
+    for (def, (pt_mod, keyword)) in defs.iter().zip(expected) {
+        assert_eq!(def.mode, StaticMode::Continuous);
+        assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+        assert!(def.condition.is_some(), "each conjunct needs its own gate");
+        if let Some(pt_mod) = pt_mod {
+            assert!(def.modifications.contains(&pt_mod), "missing {pt_mod:?}");
+        }
+        if let Some(keyword) = keyword {
+            assert!(def
+                .modifications
+                .contains(&ContinuousModification::AddKeyword { keyword }));
+        }
+    }
+}
+
 /// CR 613.1f (Layer 6) + CR 105.2: Scion of Draco — "Each creature you control has
 /// vigilance if it's white, hexproof if it's blue, lifelink if it's black, first
 /// strike if it's red, and trample if it's green." Each `if it's <color>` qualifies
