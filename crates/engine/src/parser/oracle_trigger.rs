@@ -346,7 +346,10 @@ fn trigger_condition_source_zones(condition: &TriggerCondition) -> Vec<Zone> {
 
 fn collect_trigger_condition_source_zones(condition: &TriggerCondition, out: &mut Vec<Zone>) {
     match condition {
-        TriggerCondition::SourceInZone { zone } if !out.contains(zone) => {
+        TriggerCondition::SourceInZone { zone }
+        | TriggerCondition::SourceInZoneWithAdjacentFilter { zone, .. }
+            if !out.contains(zone) =>
+        {
             out.push(*zone);
         }
         TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
@@ -374,6 +377,33 @@ fn stamp_self_return_origin_from_trigger_condition(def: &mut TriggerDefinition) 
     };
     if let Some(execute) = def.execute.as_deref_mut() {
         stamp_self_return_origin_in_effect(&mut execute.effect, origin);
+    }
+}
+
+/// CR 603.10a + CR 400.7: A zone-change trigger that watches an object enter
+/// the graveyard and then returns that event object by an anaphoric
+/// `TriggeringSource` (or its pre-lift `ParentTarget`) target must read it from
+/// the graveyard. Special event
+/// parsers (such as Sacred Ground's opponent-caused form) have no intervening
+/// source-zone condition for `stamp_self_return_origin_from_trigger_condition`
+/// to inspect, so carry the event destination across this seam explicitly.
+fn stamp_event_destination_origin(def: &mut TriggerDefinition) {
+    if def.destination != Some(Zone::Graveyard) {
+        return;
+    }
+    let Some(execute) = def.execute.as_deref_mut() else {
+        return;
+    };
+    if let Effect::ChangeZone {
+        origin,
+        destination,
+        target: TargetFilter::TriggeringSource | TargetFilter::ParentTarget,
+        ..
+    } = execute.effect.as_mut()
+    {
+        if origin.is_none() && matches!(destination, Zone::Battlefield | Zone::Hand) {
+            *origin = Some(Zone::Graveyard);
+        }
     }
 }
 
@@ -1145,6 +1175,18 @@ fn condition_introduces_attacking_player(cond_lower: &str) -> bool {
     false
 }
 
+/// CR 110.2a + CR 305.1: an active-voice condition of the form
+/// "a player puts ... onto the battlefield" introduces the player who
+/// performed the put action as the relative player for trailing "that player"
+/// anaphors. This is intentionally a narrow lexical gate; the object phrase
+/// itself is parsed by `parse_trigger_subject` in the trigger dispatcher.
+fn condition_introduces_zone_change_putter(cond_lower: &str) -> bool {
+    nom_primitives::scan_at_word_boundaries(cond_lower, |input| {
+        tag::<_, _, OracleError<'_>>("a player puts ").parse(input)
+    })
+    .is_some()
+}
+
 /// CR 603.2e + CR 115.1 + CR 608.2c: A "becomes the target of a spell or
 /// ability" trigger (Lethal Voice — Black Bolt, Inhuman King; Scalelord
 /// Reckoner) fires on the "becomes the target" event (CR 603.2e). The targeting
@@ -1325,14 +1367,24 @@ pub(crate) fn relative_player_scope_for_condition(cond_lower: &str) -> Option<Co
         // player for "that player" anaphors in the effect body (Total War:
         // "...destroy all untapped non-Wall creatures that player controls...").
         Some(ControllerRef::TriggeringPlayer)
-    } else if condition_introduces_becomes_target_source_player(cond_lower) {
+    } else if condition_introduces_zone_change_putter(cond_lower) {
+        // CR 608.2c: active-voice "a player puts" binds a body-level
+        // "that player" to the event-time putter. ScopedPlayer is stamped on
+        // the resolved triggered ability from the authoritative event record;
+        // generic zone-change TriggeringPlayer remains controller-based.
+        Some(ControllerRef::ScopedPlayer)
+    } else if condition_introduces_becomes_target_source_player(cond_lower)
+        || try_parse_opponent_controlled_destroy_trigger(cond_lower).is_some()
+    {
         // CR 115.1 + CR 603.2e + CR 608.2c: "Whenever ~ becomes the target of a
         // spell or ability an opponent controls, … that player controls" — reading
         // the English text (CR 608.2c), "that player" is the controller of the
         // targeting source, delivered by
         // `extract_player_from_event`'s BecomesTarget arm (game/targeting.rs).
-        // (Black Bolt Lethal Voice, Scalelord Reckoner.) Unlike `TargetPlayer`,
-        // `TriggeringPlayer` surfaces no phantom companion Player target slot.
+        // Karmic Justice uses the sibling destruction form: the destruction event
+        // retains the source object, and the same runtime extractor resolves its
+        // controller. Unlike `TargetPlayer`, `TriggeringPlayer` surfaces no
+        // phantom companion Player target slot.
         Some(ControllerRef::TriggeringPlayer)
     } else if condition_introduces_target_player(cond_lower) {
         Some(ControllerRef::TargetPlayer)
@@ -1472,7 +1524,13 @@ pub(crate) fn parse_trigger_line_with_index_ir(
     let effect_final = strip_constraint_sentences(&effect_without_if);
 
     // CR 118.12: Detect "unless [player] pays {cost}" in effect text.
-    let (effect_for_parse, unless_pay) = extract_unless_pay_modifier(&effect_final, &cond_lower);
+    let (effect_without_unless, unless_pay) =
+        extract_unless_pay_modifier(&effect_final, &cond_lower);
+    let effect_for_parse = if unless_pay.is_some() {
+        append_payment_rider(&effect_final, effect_without_unless)
+    } else {
+        effect_without_unless
+    };
 
     // CR 107.4 + CR 202.1 + CR 603.4: Stage the cast-trigger's colored-mana-symbol
     // qualifier color (Namor) so a "create that many tokens" effect clause can
@@ -1695,6 +1753,31 @@ fn has_later_sentence_if(lower: &str) -> bool {
             .parse(sentence.trim_start())
             .is_ok()
     })
+}
+
+/// CR 118.12a + CR 608.2c: preserve Cyclone-style "If you pay" text after a
+/// successfully extracted unless cost. The extractor owns only the payment
+/// modifier, so the rider is normalized here into the existing optional-outcome
+/// continuation grammar instead of being silently discarded with the clause.
+fn append_payment_rider(original: &str, mut cleaned: String) -> String {
+    let lower = original.to_lowercase();
+    let Some(unless_pos) = lower.find(" unless ") else {
+        return cleaned;
+    };
+    let Some(relative_start) = lower[unless_pos..].find(". if you pay, ") else {
+        return cleaned;
+    };
+    let body_start = unless_pos + relative_start + ". if you pay, ".len();
+    let body = original
+        .get(body_start..)
+        .map(str::trim)
+        .unwrap_or_default();
+    if body.is_empty() {
+        return cleaned;
+    }
+    cleaned.push_str(". If you do, ");
+    cleaned.push_str(body);
+    cleaned
 }
 
 /// True when a resolution-time optional cast names a player-chosen target that
@@ -2135,8 +2218,20 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
         }
     }
 
-    // Text-based constraints take precedence; fall back to condition-parser constraint.
-    def.constraint = modifiers.constraint.clone().or(def.constraint.take());
+    // Text-based constraints normally take precedence over the condition-parser
+    // constraint. Active-voice put triggers are the exception: their event-time
+    // provenance gate is independent of a timing/frequency gate, so preserve
+    // both instead of silently dropping one (CR 603.2).
+    def.constraint = match (modifiers.constraint.clone(), def.constraint.take()) {
+        (
+            Some(text_constraint),
+            Some(parsed_constraint @ TriggerConstraint::ZoneChangePutterPresent),
+        ) => Some(TriggerConstraint::All {
+            constraints: vec![parsed_constraint, text_constraint],
+        }),
+        (Some(text_constraint), _) => Some(text_constraint),
+        (None, parsed_constraint) => parsed_constraint,
+    };
 
     // CR 603.2: Apply trigger-event frequency limits as a fallback.
     if let (Some(limit), None) = (modifiers.first_time_limit, def.constraint.as_ref()) {
@@ -2198,6 +2293,7 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     }
 
     stamp_self_return_origin_from_trigger_condition(&mut def);
+    stamp_event_destination_origin(&mut def);
 
     // CR 107.3a + CR 107.3i + CR 601.2f: Rewrite X in ETB-self triggers.
     if trigger_should_rewrite_cost_x(&def) {
@@ -3281,11 +3377,64 @@ fn parse_unless_mana_payment(cost_str: &str) -> Option<AbilityCost> {
     {
         return None;
     }
+    if let Some(cost) = parse_reduced_unless_mana_payment(after_cost, &mana_cost) {
+        return Some(cost);
+    }
     if let Some(cost) = super::oracle_effect::parse_unless_for_each_payment(after_cost, &mana_cost)
     {
         return Some(cost);
     }
     Some(AbilityCost::Mana { cost: mana_cost })
+}
+
+/// CR 118.7a + CR 118.12a: A triggered payment may modify its own generic
+/// cost in a following sentence: "unless you pay {10}. This cost is reduced by
+/// {2} for each basic land type among lands you control" (Draco).  Reuse the
+/// ordinary self-spell cost-reduction grammar rather than growing a second
+/// Domain parser here, then lower its reduction to the dynamic generic amount
+/// the resolution-time payment path already evaluates.
+fn parse_reduced_unless_mana_payment(
+    after_base_cost: &str,
+    base_cost: &crate::types::mana::ManaCost,
+) -> Option<AbilityCost> {
+    let crate::types::mana::ManaCost::Cost { shards, generic } = base_cost else {
+        return None;
+    };
+    // CR 118.7a: generic cost reducers cannot reduce colored components.  The
+    // dynamic-payment representation likewise carries a generic amount only,
+    // so decline any future colored shape rather than silently losing a pip.
+    if !shards.is_empty() {
+        return None;
+    }
+
+    let suffix = after_base_cost
+        .trim_start()
+        .trim_start_matches('.')
+        .trim_start();
+    let reduction_text = suffix.strip_prefix("this cost is reduced by ")?;
+    let (amount, counted_objects) = reduction_text.split_once(" for each ")?;
+    let reduction = super::oracle_cost::try_parse_cost_reduction(&format!(
+        "this spell costs {amount} less to cast for each {counted_objects}"
+    ))?;
+    if reduction.mode != crate::types::statics::CostModifyMode::Reduce
+        || reduction.condition.is_some()
+    {
+        return None;
+    }
+
+    Some(AbilityCost::ManaDynamic {
+        quantity: QuantityExpr::Sum {
+            exprs: vec![
+                QuantityExpr::Fixed {
+                    value: i32::try_from(*generic).ok()?,
+                },
+                QuantityExpr::Multiply {
+                    factor: -i32::try_from(reduction.amount_per).ok()?,
+                    inner: Box::new(reduction.count),
+                },
+            ],
+        },
+    })
 }
 
 /// CR 118.12: Detect "unless [player] pays {cost}" in trigger effect text.
@@ -4483,6 +4632,23 @@ fn parse_unless_they_discard_cost(input: &str) -> Option<(AbilityCost, &str)> {
 /// CR 119.4 + CR 118.12: Parse the tail of "they pay N life" preserving
 /// the unconsumed remainder.
 fn parse_unless_they_pay_life(input: &str) -> Option<(AbilityCost, &str)> {
+    // CR 119.4 + CR 115.1: in "that creature's controller pays life equal
+    // to its toughness", `its` names the object targeted by the surrounding
+    // effect, not the source ability. Preserve the target-relative quantity
+    // for the shared resolution payment path.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("life equal to its toughness").parse(input)
+    {
+        return Some((
+            AbilityCost::PayLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::Toughness {
+                        scope: ObjectScope::Target,
+                    },
+                },
+            },
+            rest,
+        ));
+    }
     let (amount, after_num) = parse_number(input)?;
     let trimmed = after_num.trim_start();
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("life").parse(trimmed) {
@@ -5738,6 +5904,41 @@ fn parse_source_suspected_intervening_if(input: &str) -> OracleResult<'_, Trigge
     Ok((rest, condition))
 }
 
+/// CR 404.1 + CR 603.4: Parse a source-zone adjacency rider such as
+/// "if this card is in your graveyard with a creature card directly above it".
+///
+/// The source remains the exact live object; the adjacent card is a typed
+/// TargetFilter so the runtime can reuse owner-zone filter semantics for core
+/// types, subtypes, and future filter properties. The parser intentionally
+/// consumes only a single adjacent card phrase and its fixed positional rider;
+/// any trailing comma/effect remains for the trigger-body parser.
+fn parse_source_zone_adjacent_filter_intervening_if(
+    input: &str,
+) -> OracleResult<'_, TriggerCondition> {
+    let (rest, _) = tag("if ").parse(input)?;
+    let (rest, _) = alt((
+        tag("this card"),
+        tag("this creature"),
+        tag("this permanent"),
+        tag("~"),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag(" is in your graveyard with ").parse(rest)?;
+    let (rest, _) = alt((tag("a "), tag("an "))).parse(rest)?;
+    let (rest, adjacent) = parse_type_phrase_nom(rest)?;
+    if matches!(adjacent, TargetFilter::Any) {
+        return Err(oracle_err(input));
+    }
+    let (rest, _) = tag(" card directly above it").parse(rest)?;
+    Ok((
+        rest,
+        TriggerCondition::SourceInZoneWithAdjacentFilter {
+            zone: Zone::Graveyard,
+            adjacent,
+        },
+    ))
+}
+
 /// CR 603.4 + CR 601.2: Parse "if you didn't cast it from your hand/exile" or
 /// "if you didn't cast it from your graveyard" — negated zone-specific cast
 /// provenance intervening-if (Chainer, Nightmare Adept; Phage the Untouchable;
@@ -6273,6 +6474,15 @@ fn extract_if_condition_with_card_name(
     // nom production at word boundaries so a leading intervening-if is retained
     // while later sentence-local conditionals remain outside this function.
     if let Some((prefix, _, rest)) = scan_preceded(&lower, |i| {
+        tag::<_, _, OracleError<'_>>("if ~ attacked or blocked this combat").parse(i)
+    }) {
+        let clause_len = lower.len() - prefix.len() - rest.len();
+        return (
+            strip_condition_clause(text, prefix.len(), clause_len),
+            Some(TriggerCondition::SourceAttackedOrBlockedThisCombat),
+        );
+    }
+    if let Some((prefix, _, rest)) = scan_preceded(&lower, |i| {
         tag::<_, _, OracleError<'_>>("if ~ attacked this combat").parse(i)
     }) {
         let clause_len = lower.len() - prefix.len() - rest.len();
@@ -6443,6 +6653,25 @@ fn extract_if_condition_with_card_name(
     // shared `parse_source_has_counters` authority (any/typed/quantified forms).
     if let Some(result) = try_extract_has_counter_condition(&tp, &lower, text) {
         return result;
+    }
+
+    // CR 106.3 + CR 603.4: Carpet of Flowers' reusable "with this ability"
+    // gate. This is source-ability-relative rather than a static game-state
+    // predicate, so it cannot be lowered through `parse_inner_condition`.
+    // Keep the grammar generic for any future ability using the same Oracle
+    // wording; the runtime binds the exact printed ability index at collection.
+    if let Some((before, _, rest)) =
+        scan_preceded(&lower, parse_source_ability_added_mana_intervening_if)
+            .filter(|(before, _, _)| before.trim().is_empty())
+    {
+        let pos = before.len();
+        let clause_len = lower.len() - before.len() - rest.len();
+        return (
+            strip_condition_clause(text, pos, clause_len),
+            Some(TriggerCondition::Not {
+                condition: Box::new(TriggerCondition::SourceAbilityAddedManaThisTurn),
+            }),
+        );
     }
 
     // CR 207.2c: Adamant — "if at least N [color] mana was spent to cast this/it"
@@ -6655,6 +6884,24 @@ fn extract_if_condition_with_card_name(
     // parsed predicate in `Not`. Cost-form `unless` ("unless you pay {2}",
     // "unless you sacrifice a creature") is already stripped upstream by
     // `extract_unless_pay_modifier`.
+    // CR 404.1 + CR 603.4: Krovikan Horror and the reusable graveyard-stack
+    // shape "if this card is in your graveyard with a [type] card directly
+    // above it". This is source-relative (not an event-object it), so it
+    // must be recognized before the generic static-condition bridge, which
+    // can parse only the leading source-zone prefix and would leave the
+    // adjacency rider as an honest swallowed clause.
+    if let Some((before, condition, rest)) =
+        scan_preceded(&lower, parse_source_zone_adjacent_filter_intervening_if)
+            .filter(|(before, _, _)| before.trim_start().is_empty())
+    {
+        let pos = before.len();
+        let clause_len = lower.len() - before.len() - rest.len();
+        return (
+            strip_condition_clause(text, pos, clause_len),
+            Some(condition),
+        );
+    }
+
     if let Some(result) = try_extract_spell_targets_intervening_if(&tp, &lower, text) {
         return result;
     }
@@ -8545,6 +8792,18 @@ fn try_extract_has_counter_condition(
     ))
 }
 
+/// CR 106.3 + CR 603.4: Parse the exact reusable phrase used by
+/// "if you haven't added mana with this ability this turn". The leading
+/// `if` is included so `scan_preceded` can enforce that this is an
+/// intervening-if at the head of the trigger effect, not a later conditional.
+fn parse_source_ability_added_mana_intervening_if(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        tag::<_, _, OracleError<'_>>("if you haven't added mana with this ability this turn"),
+    )
+    .parse(input)
+}
+
 /// Consume `" counter"` (or, when already at the word, `"counter"`), an optional
 /// plural `"s"`, and an optional trailing `" on it"`. Shared tail for both the
 /// typed and any-counter branches of [`parse_had_counters_body`].
@@ -9342,6 +9601,10 @@ fn parse_event_verb_start(input: &str) -> OracleResult<'_, ()> {
         parse_event_phrase("explore "),
         parse_event_word("exploits"),
         parse_event_word("mutates"),
+        parse_event_word("regenerates"),
+        parse_event_phrase("is regenerated"),
+        parse_event_phrase("are regenerated"),
+        parse_event_word("regenerated"),
         parse_event_word("transforms"),
         parse_event_phrase("becomes the target of a spell or ability"),
         parse_event_phrase("become the target of a spell or ability"),
@@ -9888,15 +10151,25 @@ fn continues_player_action_list(after_comma: &str) -> bool {
     // sentence (the effect body), not a type list continuation.
     // E.g. "creatures you control get +1/+1" starts with "creatures" (type word) but
     // has "get" (predicate verb) — this is the effect, not a continuation.
-    let after_conjunction = alt((
+    let (after_conjunction, had_conjunction) = alt((
         value((), tag::<_, _, OracleError<'_>>("and/or ")),
         value((), tag::<_, _, OracleError<'_>>("or ")),
         value((), tag("and ")),
     ))
     .parse(trimmed)
-    .map(|(rest, _)| rest)
-    .unwrap_or(trimmed);
+    .map(|(rest, _)| (rest, true))
+    .unwrap_or((trimmed, false));
     if type_phrase_continues_to_combat_damage_player_event(after_conjunction) {
+        return true;
+    }
+    // CR 603.1 + CR 603.2e: the final leg of a comma-separated trigger subject
+    // list is followed by the event head, not by another type word.  Without
+    // this bridge, `Swamp, Mountain, black permanent, or red permanent becomes
+    // tapped` is mistaken for a condition/effect boundary at the comma before
+    // `or red permanent`: the predicate-verb heuristic below quite reasonably
+    // classifies `becomes` as a new sentence, but here it is the shared trigger
+    // event for every subject leg.
+    if had_conjunction && type_phrase_continues_to_event_head(after_conjunction) {
         return true;
     }
     if !starts_with_type_word(after_conjunction) {
@@ -9915,6 +10188,19 @@ fn type_phrase_continues_to_combat_damage_player_event(text: &str) -> bool {
     }
     let rest = rest.trim_start();
     parse_combat_damage_to_player(rest).is_ok()
+}
+
+/// CR 603.1 + CR 603.2e: Recognize the final type-list leg when its shared
+/// trigger event follows immediately after the type phrase (for example,
+/// `or red permanent becomes tapped`).  This is deliberately narrower than
+/// `is_new_sentence_not_type_continuation`: an effect sentence such as
+/// `creatures you control get +1/+1` does not begin with a recognized event
+/// head and remains a real boundary.
+fn type_phrase_continues_to_event_head(text: &str) -> bool {
+    let (filter, rest) = parse_type_phrase(text);
+    !matches!(filter, TargetFilter::Any)
+        && rest.len() < text.len()
+        && parse_event_head_start(rest.trim_start()).is_ok()
 }
 
 fn parse_combat_damage_to_player(input: &str) -> OracleResult<'_, ()> {
@@ -10237,6 +10523,10 @@ pub(crate) fn parse_trigger_condition(
         return result;
     }
 
+    if let Some(result) = try_parse_cumulative_upkeep_not_paid_trigger(&lower) {
+        return result;
+    }
+
     if let Some(result) = try_parse_special_trigger_pattern(&lower) {
         return result;
     }
@@ -10257,6 +10547,15 @@ pub(crate) fn parse_trigger_condition(
 
     // --- Player triggers: "you gain life", "you cast a spell", "you draw a card" ---
     if let Some(result) = try_parse_player_trigger(&lower) {
+        return result;
+    }
+
+    // CR 701.8a + CR 603.2: "Whenever a spell or ability an opponent
+    // controls destroys [permanent-filter]" is an active-voice destruction
+    // trigger. It is distinct from the ordinary passive "[subject] is
+    // destroyed" grammar below: the trigger must retain both the destroyed
+    // subject and the controller of the spell/ability that caused it.
+    if let Some(result) = try_parse_opponent_controlled_destroy_trigger(&lower) {
         return result;
     }
 
@@ -10559,6 +10858,9 @@ fn trigger_object_pronoun_ref_for_intervening_if(
     fn pins_source_off_battlefield(condition: &TriggerCondition) -> bool {
         match condition {
             TriggerCondition::SourceInZone { zone } => *zone != Zone::Battlefield,
+            TriggerCondition::SourceInZoneWithAdjacentFilter { zone, .. } => {
+                *zone != Zone::Battlefield
+            }
             TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
                 conditions.iter().any(pins_source_off_battlefield)
             }
@@ -10754,6 +11056,32 @@ fn parse_single_subject<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetFil
     // remaining "enters this way" qualifier is consumed by the ETB rider).
     if let Ok((rest, ())) = value((), tag::<_, _, OracleError<'_>>("it ")).parse(text) {
         if tag::<_, _, OracleError<'_>>("enters").parse(rest).is_ok() {
+            return (TargetFilter::SelfRef, rest);
+        }
+        // CR 701.19 + CR 603.12: reflexive regeneration riders use
+        // "when it regenerates this way". The pronoun names the ability source,
+        // just as "it enters this way" does for escape riders.
+        if tag::<_, _, OracleError<'_>>("regenerates")
+            .parse(rest)
+            .is_ok()
+        {
+            return (TargetFilter::SelfRef, rest);
+        }
+    }
+    // CR 701.19 + CR 603.12: passive past-participle wording in delayed
+    // regeneration riders ("when it's regenerated"). Keep the contraction and
+    // expanded form explicit; a bare "it" remains intentionally unbound for
+    // unrelated event verbs.
+    if let Ok((rest, ())) = value(
+        (),
+        alt((tag::<_, _, OracleError<'_>>("it's "), tag("it is "))),
+    )
+    .parse(text)
+    {
+        if tag::<_, _, OracleError<'_>>("regenerated")
+            .parse(rest)
+            .is_ok()
+        {
             return (TargetFilter::SelfRef, rest);
         }
     }
@@ -12687,6 +13015,7 @@ fn try_parse_event(
         BecomesMonstrous,
         BecomesRenowned,
         Mutates,
+        Regenerates,
         ExploitsCreature,
         Exploits,
         /// CR 701.44b: A permanent "explores" after the explore process completes.
@@ -12950,6 +13279,11 @@ fn try_parse_event(
                 SimpleEvent::BecomesTargetAbility,
                 tag("becomes the target of an ability"),
             ),
+            // CR 701.19: a regeneration trigger fires when a shield is used.
+            value(SimpleEvent::Regenerates, tag("regenerates")),
+            value(SimpleEvent::Regenerates, tag("is regenerated")),
+            value(SimpleEvent::Regenerates, tag("are regenerated")),
+            value(SimpleEvent::Regenerates, tag("regenerated")),
             // CR 702.26c: "phases in" / "phase in" — phasing trigger.
             value(SimpleEvent::PhasesIn, tag("phases in")),
             value(SimpleEvent::PhasesIn, tag("phase in")),
@@ -13163,6 +13497,10 @@ fn try_parse_event(
             }
             SimpleEvent::Mutates => {
                 def.mode = TriggerMode::Mutates;
+                def.valid_card = Some(subject.clone());
+            }
+            SimpleEvent::Regenerates => {
+                def.mode = TriggerMode::Regenerated;
                 def.valid_card = Some(subject.clone());
             }
             SimpleEvent::ExploitsCreature | SimpleEvent::Exploits => {
@@ -13402,6 +13740,42 @@ fn try_parse_event(
     }
 
     None
+}
+
+/// CR 702.24a: Printed cumulative-upkeep rider triggers — "When a player
+/// doesn't pay ~'s cumulative upkeep, ..." (Heart of Bogardan) and "When a
+/// player doesn't pay this enchantment's cumulative upkeep, ..." (Thought
+/// Lash). The head names the non-payment event; the payload after the comma
+/// is the rider effect, parsed by the ordinary body pipeline with
+/// `relative_player_scope` bound to the non-paying player. The trigger fires
+/// on `GameEvent::CumulativeUpkeepNotPaid`, emitted by the unless-payment
+/// resolver — in addition to the default sacrifice the same non-payment
+/// drives (CR 702.24a keeps the sacrifice; the rider is a separate ability).
+/// Possessor spellings accepted: the normalized "~'s", the printed
+/// "this <single-word type>'s", and "its" — anything else fails closed.
+fn try_parse_cumulative_upkeep_not_paid_trigger(
+    lower: &str,
+) -> Option<(TriggerMode, TriggerDefinition)> {
+    let rest = lower
+        .strip_prefix("whenever ")
+        .or_else(|| lower.strip_prefix("when "))?;
+    let rest = rest.strip_prefix("a player doesn't pay ")?;
+    let this_type_form = rest.strip_prefix("this ").and_then(|after| {
+        let type_word = after.strip_suffix("'s cumulative upkeep")?;
+        (!type_word.is_empty() && !type_word.contains(' ')).then_some("cumulative upkeep")
+    });
+    let after_possessor = this_type_form
+        .or_else(|| rest.strip_prefix("~'s "))
+        .or_else(|| rest.strip_prefix("its "))?;
+    // The head is exactly the possessive plus the cost name — anything after
+    // it on the same clause is a shape this parser does not claim.
+    if after_possessor != "cumulative upkeep" {
+        return None;
+    }
+    let mut def = make_base();
+    def.mode = TriggerMode::CumulativeUpkeepNotPaid;
+    def.trigger_zones = vec![Zone::Battlefield];
+    Some((TriggerMode::CumulativeUpkeepNotPaid, def))
 }
 
 fn try_parse_named_trigger_mode(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
@@ -14494,6 +14868,37 @@ fn try_parse_special_trigger_pattern(lower: &str) -> Option<(TriggerMode, Trigge
             def.valid_card = Some(TargetFilter::Typed(TypedFilter::creature()));
             def.condition = Some(TriggerCondition::DealtDamageBySourceThisTurn);
             return Some((TriggerMode::ChangesZone, def));
+        }
+    }
+
+    // CR 700.4 + CR 120.1 + CR 608.2i: the same event-embedded death
+    // trigger also accepts a non-self damage source, such as an Aura's
+    // "creature dealt damage by enchanted creature this turn dies". Reuse the
+    // shared damage-source grammar so attachment-relative sources retain
+    // their `AttachedTo` filter and are evaluated against damage snapshots.
+    let mut damaged_by_source_prefix = alt((
+        tag::<_, _, OracleError<'_>>("whenever a creature dealt damage by "),
+        tag("when a creature dealt damage by "),
+    ));
+    if let Ok((rest, _)) = damaged_by_source_prefix.parse(lower) {
+        if let Some((after_source, source)) =
+            super::oracle_replacement::parse_damage_history_source(rest)
+        {
+            if tag::<_, _, OracleError<'_>>(" this turn dies")
+                .parse(after_source)
+                .is_ok()
+            {
+                let mut def = make_base();
+                def.mode = TriggerMode::ChangesZone;
+                def.origin = Some(Zone::Battlefield);
+                def.destination = Some(Zone::Graveyard);
+                def.valid_card = Some(TargetFilter::Typed(TypedFilter::creature()));
+                def.condition = Some(match source {
+                    TargetFilter::SelfRef => TriggerCondition::DealtDamageBySourceThisTurn,
+                    source => TriggerCondition::DealtDamageThisTurnBySource { source },
+                });
+                return Some((TriggerMode::ChangesZone, def));
+            }
         }
     }
 
@@ -15977,6 +16382,13 @@ fn try_parse_bend_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefinition
 
 /// Parse player-centric triggers: "you gain life", "you cast a/an ...", "you draw a card"
 fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
+    // CR 110.2a + CR 305.1: active-voice battlefield-entry triggers must be
+    // recognized before the generic player-action grammar, because their
+    // subject is the object being put while their actor is a player.
+    if let Some(result) = try_parse_player_puts_onto_battlefield_trigger(lower) {
+        return Some(result);
+    }
+
     // Avatar crossover: bending-verb triggers ("whenever you waterbend, …") must
     // run before the generic player-action dispatch, which does not recognize the
     // bend verbs and would fall through to `TriggerMode::Unknown`.
@@ -16125,6 +16537,30 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
                 }
             }
         }
+    }
+
+    // CR 109.5 + CR 603.2: a land put into the controller's graveyard from the
+    // battlefield by an opponent-controlled spell or ability (Sacred Ground).
+    // The source-controller predicate is evaluated against the delivery's
+    // record-owned cause rather than the land's controller or a later object.
+    if matches!(
+        lower,
+        "whenever a spell or ability an opponent controls causes a land to be put into your graveyard from the battlefield"
+    ) {
+        let mut def = make_base();
+        def.mode = TriggerMode::ChangesZone;
+        def.valid_card = Some(with_owner_scope(
+            TargetFilter::Typed(TypedFilter::land()),
+            ControllerRef::You,
+        ));
+        def.origin = Some(Zone::Battlefield);
+        def.destination = Some(Zone::Graveyard);
+        def.constraint = Some(
+            crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+                controller: ControllerRef::Opponent,
+            },
+        );
+        return Some((TriggerMode::ChangesZone, def));
     }
 
     // Discard triggers: prefix-based matching for broader card coverage.
@@ -16999,6 +17435,35 @@ fn try_parse_player_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefiniti
     }
 
     None
+}
+
+/// CR 110.2a + CR 305.1: Parse
+/// "Whenever a player puts [object-filter] onto the battlefield".
+///
+/// The resulting trigger keeps the ordinary `ChangesZone` matcher for the
+/// object/destination axes and adds an event-time putter constraint. The
+/// latter is separate from the entrant's controller because ETB replacements
+/// can change control.
+fn try_parse_player_puts_onto_battlefield_trigger(
+    lower: &str,
+) -> Option<(TriggerMode, TriggerDefinition)> {
+    let after_keyword = lower
+        .strip_prefix("whenever ")
+        .or_else(|| lower.strip_prefix("when "))
+        .unwrap_or(lower);
+    let subject_text = after_keyword.strip_prefix("a player puts ")?;
+    let mut ctx = ParseContext::default();
+    let (subject, tail) = parse_trigger_subject(subject_text, &mut ctx);
+    if tail.trim() != "onto the battlefield" {
+        return None;
+    }
+
+    let mut def = make_base();
+    def.mode = TriggerMode::ChangesZone;
+    def.valid_card = Some(subject);
+    def.destination = Some(Zone::Battlefield);
+    def.constraint = Some(TriggerConstraint::ZoneChangePutterPresent);
+    Some((TriggerMode::ChangesZone, def))
 }
 
 fn try_parse_player_action_trigger(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
@@ -18280,22 +18745,30 @@ fn parse_counter_type_prefix(prefix: &str) -> Option<CounterTriggerFilter> {
     })
 }
 
-/// CR 122.1: Parse "a [type] counter is removed from [subject]" patterns.
-/// Also handles zone constraints like "while it's exiled" (e.g. suspend cards).
+/// CR 122.1: Parse "a [type] counter is removed from [subject]" and "the
+/// last [type] counter is removed from [subject]" patterns. Also handles zone
+/// constraints like "while it's exiled" (e.g. suspend cards).
 fn try_parse_counter_removed(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
-    // Pattern: "a [type] counter is removed from [subject] [while ...]"
+    // Pattern: "[a|the last] [type] counter is removed from [subject] [while ...]".
     let (after_prefix, _) = opt(alt((
         tag::<_, _, OracleError<'_>>("whenever "),
         tag("when "),
     )))
     .parse(lower)
     .ok()?;
-    let (after_a, ()) = value((), tag::<_, _, OracleError<'_>>("a "))
-        .parse(after_prefix)
-        .ok()?;
+    let (after_article, last_counter) = if let Ok((rest, ())) =
+        value((), tag::<_, _, OracleError<'_>>("the last ")).parse(after_prefix)
+    {
+        (rest, true)
+    } else {
+        let (rest, ()) = value((), tag::<_, _, OracleError<'_>>("a "))
+            .parse(after_prefix)
+            .ok()?;
+        (rest, false)
+    };
 
     let (_, (counter_type, subject_rest)) =
-        nom_primitives::split_once_on(after_a, " counter is removed from ").ok()?;
+        nom_primitives::split_once_on(after_article, " counter is removed from ").ok()?;
     let counter_type = counter_type.trim();
     let subject_rest = subject_rest.trim();
 
@@ -18320,10 +18793,16 @@ fn try_parse_counter_removed(lower: &str) -> Option<(TriggerMode, TriggerDefinit
         def.valid_card = Some(filter);
     }
 
-    // Set counter type as description metadata (the counter_filter field could be extended
-    // but for now the type info is captured in the description)
+    // CR 122.1 + CR 603.2: retain the counter kind in the typed filter so the
+    // matcher does not fire on an unrelated counter. A "last" trigger also
+    // carries threshold 0, which the removal matcher interprets as the
+    // post-removal count crossing to zero.
     if !counter_type.is_empty() {
         def.description = Some(format!("{counter_type} counter"));
+        def = def.counter_filter(CounterTriggerFilter {
+            counter_type: crate::types::counter::parse_counter_type(counter_type),
+            threshold: last_counter.then_some(0),
+        });
     }
 
     // CR 122.1: Zone constraint for cards that trigger from exile (e.g. suspend)
@@ -18531,6 +19010,43 @@ fn parse_dies_verb_phrase(input: &str) -> OracleResult<'_, ()> {
         value((), tag("are put into a graveyard from the battlefield")),
     ))
     .parse(input)
+}
+
+/// CR 701.8a + CR 603.2: Parse the active-voice trigger family
+/// "a spell or ability an opponent controls destroys [permanent-filter]".
+///
+/// The passive destruction grammar maps directly to [`TriggerMode::Destroyed`]
+/// after subject decomposition. This family instead leads with the causing
+/// spell/ability, so it must construct the same trigger mode while retaining
+/// an event-source controller constraint. `parse_trigger_subject` owns the
+/// shared permanent-filter grammar, keeping forms such as "a noncreature
+/// permanent you control" aligned with other trigger heads.
+fn try_parse_opponent_controlled_destroy_trigger(
+    condition: &str,
+) -> Option<(TriggerMode, TriggerDefinition)> {
+    // `parse_trigger_condition` receives the clause after `split_trigger`,
+    // whereas direct parser callers and scope derivation may retain its leading
+    // trigger keyword. Accept both normalized forms.
+    let after_keyword = condition
+        .strip_prefix("whenever ")
+        .or_else(|| condition.strip_prefix("when "))
+        .unwrap_or(condition);
+    let subject_text =
+        after_keyword.strip_prefix("a spell or ability an opponent controls destroys ")?;
+    let (subject, tail) = parse_trigger_subject(subject_text, &mut ParseContext::default());
+    if !tail.trim().is_empty() {
+        return None;
+    }
+
+    let mut def = make_base();
+    def.mode = TriggerMode::Destroyed;
+    def.valid_card = Some(subject);
+    def.constraint = Some(
+        crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+            controller: ControllerRef::Opponent,
+        },
+    );
+    Some((TriggerMode::Destroyed, def))
 }
 
 /// CR 603.6 + CR 603.2: Parse one clause of a disjunctive zone-change trigger
@@ -19173,6 +19689,29 @@ fn try_parse_discard_trigger(
         }
         def.batched = true;
         return Some((TriggerMode::DiscardedAll, def));
+    }
+
+    // CR 109.5 + CR 603.2: "a spell or ability an opponent controls causes you to
+    // discard a card" — a battlefield trigger for an opponent-caused discard
+    // (Spiritual Focus). The `EventSourceControlledBy { Opponent }` constraint
+    // gates on the discard event's cause; mirrors the replacement form in
+    // `oracle_replacement.rs`.
+    if tag::<_, _, OracleError<'_>>(
+        "a spell or ability an opponent controls causes you to discard a card",
+    )
+    .parse(event)
+    .is_ok()
+    {
+        let mut def = make_base();
+        def.mode = TriggerMode::Discarded;
+        def.valid_card = Some(TargetFilter::Typed(TypedFilter::card()));
+        def.valid_target = Some(TargetFilter::Controller);
+        def.constraint = Some(
+            crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+                controller: ControllerRef::Opponent,
+            },
+        );
+        return Some((TriggerMode::Discarded, def));
     }
 
     // CR 109.5 + CR 603.2: "a spell or ability an opponent controls causes you to

@@ -863,14 +863,10 @@ fn has_missing_required_stack_targets(state: &GameState, ability: &ResolvedAbili
 }
 
 fn has_no_legal_required_stack_targets(state: &GameState, ability: &ResolvedAbility) -> bool {
-    if !flatten_targets_in_chain(ability).is_empty() {
-        return false;
-    }
-
     match build_target_slots(state, ability) {
-        Ok(slots) => slots
-            .iter()
-            .any(|slot| !slot.optional && slot.legal_targets.is_empty()),
+        // An empty slot set means there is no unresolved target choice. Any
+        // live legal slot still represents construction that must not resolve.
+        Ok(slots) => slots.iter().all(|slot| slot.legal_targets.is_empty()),
         Err(_) => true,
     }
 }
@@ -879,6 +875,23 @@ fn top_pending_trigger_has_no_legal_required_targets(
     state: &mut GameState,
     pending_id: ObjectId,
 ) -> bool {
+    // CR 603.3d: `pending_trigger_entry` is the construction cursor, while
+    // `pending_trigger` is the live construction payload.  A few non-target
+    // delayed-trigger paths can finish with the cursor still set after the
+    // payload has already been consumed.  There is no choice left to wait for
+    // in that state, so let the resolver clear the stale cursor below.
+    if state.pending_trigger.is_none() {
+        return true;
+    }
+    // A non-priority waiting state is an active mode/target/division prompt;
+    // only a priority checkpoint may use the target-slot probe below to
+    // distinguish a completed non-target construction from a live choice.
+    if !matches!(
+        state.waiting_for,
+        crate::types::game_state::WaitingFor::Priority { .. }
+    ) {
+        return false;
+    }
     let Some((ability, trigger_event, trigger_events, subject_match_count)) = state
         .stack
         .back()
@@ -910,7 +923,11 @@ fn top_pending_trigger_has_no_legal_required_targets(
         &trigger_events,
         subject_match_count,
     );
-    let missing_required_targets = has_no_legal_required_stack_targets(state, &ability);
+    // A pre-populated target vector means the construction pass already
+    // supplied the target context; a stale cursor must not re-open a prompt
+    // for a context-ref effect that merely reads that target at resolution.
+    let missing_required_targets = !flatten_targets_in_chain(&ability).is_empty()
+        || has_no_legal_required_stack_targets(state, &ability);
     super::triggers::restore_trigger_event_context(state, context_snapshot);
     missing_required_targets
 }
@@ -1043,6 +1060,7 @@ pub(crate) fn bind_resolution_scope(
             trigger_event: trigger_event.as_ref(),
             subject_match_count: *subject_match_count,
             die_result: *die_result,
+            ability_index: entry.ability().and_then(|ability| ability.ability_index),
         }),
         _ => None,
     };
@@ -1066,6 +1084,9 @@ pub(crate) struct TriggeredResolutionScope<'a> {
     pub trigger_event: Option<&'a GameEvent>,
     pub subject_match_count: Option<u32>,
     pub die_result: Option<i32>,
+    /// Exact printed ability index for source-ability-relative intervening-if
+    /// conditions (for example Carpet of Flowers).
+    pub ability_index: Option<usize>,
 }
 
 /// The decision-and-binding half of [`bind_resolution_scope`], with no stack
@@ -1084,12 +1105,13 @@ pub(crate) fn bind_triggered_resolution_scope(
     // CR 603.4: Intervening-if condition rechecked at resolution time.
     if let Some(scope) = &triggered {
         if let Some(condition) = scope.condition {
-            if !super::triggers::check_trigger_condition_with_source(
+            if !super::triggers::check_trigger_condition_with_source_and_ability_index(
                 state,
                 condition,
                 scope.controller,
                 scope.trigger_source,
                 scope.trigger_event,
+                scope.ability_index,
             ) {
                 return false;
             }
@@ -1838,10 +1860,16 @@ pub fn resolve_top(state: &mut GameState, events: &mut Vec<GameEvent>) {
             // in replace_event below, and hard-overwrites this default
             // unconditionally.
             if let crate::types::proposed_event::ProposedEvent::ZoneChange {
+                putter,
                 controller_override,
                 ..
             } = &mut proposed
             {
+                // CR 601.2a + CR 110.2a: the caster is the player who puts a
+                // permanent spell onto the battlefield. Keep this separate
+                // from the resulting controller, which ETB replacements may
+                // change later in the pipeline.
+                *putter = Some(entry.controller);
                 *controller_override = Some(entry.controller);
             }
             // CR 702.190b: Sneak-cast permanent enters the battlefield tapped.
@@ -3362,6 +3390,7 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         modal,
         mode_abilities,
         parent_target_missing_reason,
+        unless_was_cumulative_upkeep: _, // unless-payment discriminator, not part of these predicates
     } = ability;
 
     let self_counter = matches!(
@@ -3592,6 +3621,7 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         modal,
         mode_abilities,
         parent_target_missing_reason,
+        unless_was_cumulative_upkeep: _, // unless-payment discriminator, not part of these predicates
     } = ability;
 
     let fixed_controller_gain_life = matches!(
@@ -3802,6 +3832,7 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         modal,
         mode_abilities,
         parent_target_missing_reason,
+        unless_was_cumulative_upkeep: _, // unless-payment discriminator, not part of these predicates
     } = ability;
 
     let fixed_opponent_effect = matches!(
@@ -4284,6 +4315,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         modal: a_modal,
         mode_abilities: a_mode_abilities,
         parent_target_missing_reason: a_parent_target_missing_reason,
+        unless_was_cumulative_upkeep: _, // transient payment discriminator, ignored for inert equality
         selected_target_incarnations: a_selected_target_incarnations,
     } = a;
     let ResolvedAbility {
@@ -4357,6 +4389,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         modal: b_modal,
         mode_abilities: b_mode_abilities,
         parent_target_missing_reason: b_parent_target_missing_reason,
+        unless_was_cumulative_upkeep: _, // transient payment discriminator, ignored for inert equality
         selected_target_incarnations: b_selected_target_incarnations,
     } = b;
 
@@ -5562,6 +5595,20 @@ mod tests {
 
         let obj = &state.objects[&spell_id];
         assert_eq!(obj.zone, Zone::Battlefield);
+        let entry = events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    object_id, record, ..
+                } if *object_id == spell_id => Some(record),
+                _ => None,
+            })
+            .expect("permanent spell resolution must emit its battlefield entry");
+        assert_eq!(
+            entry.zone_change_putter(),
+            Some(PlayerId(0)),
+            "the caster is the event-time putter even when entry replacements may change control"
+        );
         assert_eq!(
             obj.kickers_paid,
             vec![KickerVariant::First],
@@ -14315,6 +14362,7 @@ mod tests {
                     trigger_event: Some(&event_a),
                     subject_match_count: Some(4),
                     die_result: Some(6),
+                    ability_index: None,
                 }),
                 None,
             ));
@@ -14340,6 +14388,7 @@ mod tests {
                     trigger_event: Some(&event_a),
                     subject_match_count: None,
                     die_result: None,
+                    ability_index: None,
                 }),
                 Some(vec![event_a.clone(), event_b.clone()]),
             ));
@@ -14366,6 +14415,7 @@ mod tests {
                     trigger_event: None,
                     subject_match_count: Some(2),
                     die_result: None,
+                    ability_index: None,
                 }),
                 Some(vec![event_b.clone(), event_a.clone()]),
             ));
@@ -14415,6 +14465,7 @@ mod tests {
                     trigger_event: Some(&event_a),
                     subject_match_count: Some(4),
                     die_result: Some(6),
+                    ability_index: None,
                 }),
                 Some(vec![event_a.clone(), event_b.clone()]),
             ));
@@ -14445,6 +14496,7 @@ mod tests {
                     trigger_event: Some(&event_a),
                     subject_match_count: Some(4),
                     die_result: Some(6),
+                    ability_index: None,
                 }),
                 None,
             ));
@@ -14493,6 +14545,7 @@ mod tests {
                     trigger_event: Some(&event_a),
                     subject_match_count: Some(3),
                     die_result: Some(20),
+                    ability_index: None,
                 }),
                 Some(vec![event_a.clone(), event_b.clone()]),
             ));

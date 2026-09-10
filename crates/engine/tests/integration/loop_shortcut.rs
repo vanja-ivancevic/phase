@@ -444,7 +444,8 @@ fn on_shortcut_byte_identical_to_pre_pr7_golden() {
     // The golden covers event ordering and effect payloads from before
     // SpellCast gained its optional cast-time snapshot. That orthogonal field
     // is asserted by the Thor quantity tests, so omit it from this legacy
-    // byte-for-byte stream comparison.
+    // byte-for-byte stream comparison. The LKI snapshot later gained the
+    // orthogonal zone-change provenance pair for the same reason.
     for event in &mut all {
         if let GameEvent::SpellCast {
             cast_mana_value, ..
@@ -463,7 +464,12 @@ fn on_shortcut_byte_identical_to_pre_pr7_golden() {
         life(&runner, P1) > 0,
         "ON: the shortcut fired early (P1 positive)"
     );
-    let event_stream = format!("{all:?}").replace(", cast_mana_value: None", "");
+    let event_stream = format!("{all:?}")
+        .replace(", cast_mana_value: None", "")
+        .replace(
+            ", zone_change_cause_source_id: Some(ObjectId(3)), zone_change_putter: None",
+            "",
+        );
     assert_eq!(
         event_stream, GOLDEN_ON,
         "ON: the accumulated event stream must be byte-identical to the pre-PR-7 golden — \
@@ -4970,8 +4976,8 @@ fn exactly_two_waiting_for_variants_carry_a_decision_template_and_both_are_redac
     // ── the classifier's own reach-guard: the enum was actually found ──
     let total = enum_variants(&enum_src, "WaitingFor").len();
     assert_eq!(
-        total, 133,
-        "`WaitingFor` has 133 variants at this tip, read off the `syn` parse. This number is \
+        total, 135,
+        "`WaitingFor` has 135 variants at this tip, read off the `syn` parse. This number is \
          pinned so a variant REMOVED is as visible as one added; if you added a variant and it \
          carries no `DecisionTemplate`, update this number. A wildly different count means the \
          reader lost its anchor, and every assertion below would then be measuring an empty enum"
@@ -4996,6 +5002,9 @@ fn exactly_two_waiting_for_variants_carry_a_decision_template_and_both_are_redac
     // no merge conflict and could not have, so CI was the only thing between it and shipping.
     // 130 ⇒ 132 is ADJUDICATED: ResolveAllConsent and ResolveAllReady are control-protocol states
     // with no DecisionTemplate payload, so neither expands the carrier set nor the redaction duty.
+    // 133 ⇒ 135 is ADJUDICATED: MeldPairChoice and MeldAttackTargetChoice carry frozen
+    // server-authored topology, not a client DecisionTemplate, so they likewise do not expand
+    // the carrier set or the redaction duty.
 
     let carriers = carriers_in_source(&enum_src, "WaitingFor", &corpus, &marker, true);
     assert_eq!(

@@ -225,6 +225,7 @@
 //! present or future — can read prose as evidence.
 
 use serde::de::DeserializeOwned;
+use serde::Deserialize;
 use serde_json::Value;
 
 use crate::parser::oracle::ParsedAbilities;
@@ -626,6 +627,31 @@ impl UnitEvidence {
     /// variant name of `AbilityCondition` and `ReplacementCondition`. See [`EFFECT_KEYS`].
     pub(super) fn any_effect(&self, pred: impl Fn(&crate::types::ability::Effect) -> bool) -> bool {
         self.any_at(EFFECT_KEYS, pred)
+    }
+
+    /// Count the Effect carriers satisfying pred in this unit.
+    ///
+    /// Like the any_effect probe, this is anchored to the two fields that can
+    /// actually carry an Effect. A count is useful when a rule's
+    /// representation is inherently cardinality-sensitive — for example,
+    /// the CR 608.2b rider that checks that both announced targets remain
+    /// legal at resolution. An existential probe would incorrectly accept
+    /// a partial parse containing only one target slot.
+    pub(super) fn count_effect(
+        &self,
+        pred: impl Fn(&crate::types::ability::Effect) -> bool,
+    ) -> usize {
+        let mut count = 0;
+        Self::visit(&self.root, None, &mut |node, key| {
+            if key.is_some_and(|k| EFFECT_KEYS.contains(&k))
+                && crate::types::ability::Effect::deserialize(node)
+                    .is_ok_and(|effect| pred(&effect))
+            {
+                count += 1;
+            }
+            false
+        });
+        count
     }
 
     /// Does any `ActivationRestriction` carrier satisfy `pred`? Key-anchored per

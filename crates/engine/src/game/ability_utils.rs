@@ -2413,15 +2413,20 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
 /// SIBLING leaf — the actual "instant or sorcery spell" filter that
 /// `targeting.rs::filter_targets_stack_spells` can enumerate on the stack.
 ///
-/// Returns `None` for recipient-scoped or `ChosenDamageSource`/`IsChosenColor`
-/// ("by …" Arachnogenesis) prevents, so those are NOT diverted into a source
-/// target slot.
+/// The helper is shared by source-scoped `PreventDamage` and
+/// `CreateDamageReplacement` effects. Returns `None` for recipient-scoped or
+/// `ChosenDamageSource`/`IsChosenColor` ("by …" Arachnogenesis) effects, so
+/// those are NOT diverted into a source target slot.
 fn prevent_damage_source_slot_filter(effect: &Effect) -> Option<&TargetFilter> {
-    let Effect::PreventDamage {
-        damage_source_filter: Some(TargetFilter::And { filters }),
-        ..
-    } = effect
-    else {
+    let source_filter = match effect {
+        Effect::PreventDamage {
+            damage_source_filter,
+            ..
+        } => damage_source_filter.as_ref(),
+        Effect::CreateDamageReplacement { source_filter, .. } => source_filter.as_ref(),
+        _ => None,
+    }?;
+    let TargetFilter::And { filters } = source_filter else {
         return None;
     };
     // Only an `And` that carries the `ParentTargetSlot` sentinel is a
@@ -2538,7 +2543,12 @@ fn companion_target_player_legal_targets(
             // opponents (self excluded; any one opponent in >2p). Reuses the
             // Typed{controller:Opponent} legality path bare "target opponent" uses
             // (targeting.rs → players::is_opponent). Plain "target player" → any player.
-            let slot_filter = if effect_references_target_opponent(&ability.effect) {
+            let slot_filter = if effect_references_target_opponent(&ability.effect)
+                || ability
+                    .condition
+                    .as_ref()
+                    .is_some_and(ability_condition_references_target_opponent)
+            {
                 TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
             } else {
                 TargetFilter::Player
@@ -2691,14 +2701,13 @@ fn collect_target_slots_inner(
         return Err(TargetSlotBuildError::RequiresChosenX);
     }
 
-    // CR 609.7 + CR 601.2c: A source-scoped `PreventDamage` ("prevent all damage
-    // target instant or sorcery spell would deal this turn") surfaces the
-    // choosable source spell as a target slot. Declared FIRST (CR 601.2c
-    // declaration order). The generic path below cannot reach it —
-    // `target_filter()` returns the `Any` recipient and short-circuits to `None`
-    // — so we surface it here, mirroring the `CreateDamageReplacement` arm. We
-    // do NOT `return`: the generic recipient logic still runs, but for the
-    // source-scoped form `target == Any` so it adds nothing.
+    // CR 609.7 + CR 601.2c: A source-scoped damage effect (PreventDamage or
+    // CreateDamageReplacement) surfaces the choosable source spell as a target
+    // slot. Declared FIRST (CR 601.2c declaration order). The generic path
+    // below cannot reach it — `target_filter()` returns the `Any` recipient and
+    // short-circuits to `None` — so we surface it here. We do NOT `return`: the
+    // generic recipient logic still runs, but for the source-scoped form
+    // `target == Any` so it adds nothing.
     if ability.target_choice_timing == TargetChoiceTiming::Stack {
         if let Some(src_leaf) = prevent_damage_source_slot_filter(&ability.effect) {
             let legal_targets =
@@ -3502,6 +3511,7 @@ fn filter_prop_contains_quantity_scope(prop: &FilterProp, scope: ObjectScope) ->
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::MostPrevalentCreatureTypeIn { .. }
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
@@ -3648,6 +3658,7 @@ fn filter_prop_binds_prior_target(prop: &FilterProp) -> bool {
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::MostPrevalentCreatureTypeIn { .. }
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
@@ -3820,7 +3831,16 @@ fn union_over_prior_object_candidates(
 }
 
 fn target_filter_needs_ability_context(filter: &TargetFilter) -> bool {
-    target_filter_contains_chosen_x_ref(filter)
+    let player_matching = match filter {
+        TargetFilter::PlayerMatching { .. } => true,
+        TargetFilter::Or { filters } | TargetFilter::And { filters } => {
+            filters.iter().any(target_filter_needs_ability_context)
+        }
+        TargetFilter::Not { filter } => target_filter_needs_ability_context(filter),
+        _ => false,
+    };
+    player_matching
+        || target_filter_contains_chosen_x_ref(filter)
         || target_filter_contains_quantity_scope(filter, ObjectScope::AmassedArmy)
         || target_filter_contains_scoped_player_ref(filter)
         || filter_needs_trigger_source(filter)
@@ -4098,6 +4118,105 @@ fn effect_references_target_opponent(effect: &Effect) -> bool {
     effect_bound_filter_matches(effect, filter_references_target_opponent)
 }
 
+/// CR 115.1 + CR 608.2c: A conditional effect can itself declare a player
+/// target, even when its `Effect` has no target-bearing filter. Tithe's
+/// "If target opponent controls more lands than you" is the old-border
+/// exemplar: both count expressions are resolution conditions, but the target
+/// opponent is still chosen while the spell is announced and retained on that
+/// conditional link for the later recheck.
+fn ability_condition_references_target_player(condition: &AbilityCondition) -> bool {
+    match condition {
+        AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
+            quantity_expr_references_target_player(lhs)
+                || quantity_expr_references_target_player(rhs)
+        }
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => conditions
+            .iter()
+            .any(ability_condition_references_target_player),
+        AbilityCondition::Not { condition }
+        | AbilityCondition::ConditionInstead { inner: condition } => {
+            ability_condition_references_target_player(condition)
+        }
+        _ => false,
+    }
+}
+
+/// Opponent-only counterpart to `ability_condition_references_target_player`.
+/// Slot detection and legality are deliberately separate: the former sees any
+/// declared target player; this one narrows that slot to opponents when the
+/// condition's filter says `TargetOpponent`.
+fn ability_condition_references_target_opponent(condition: &AbilityCondition) -> bool {
+    match condition {
+        AbilityCondition::QuantityCheck { lhs, rhs, .. } => {
+            quantity_expr_references_target_opponent(lhs)
+                || quantity_expr_references_target_opponent(rhs)
+        }
+        AbilityCondition::And { conditions } | AbilityCondition::Or { conditions } => conditions
+            .iter()
+            .any(ability_condition_references_target_opponent),
+        AbilityCondition::Not { condition }
+        | AbilityCondition::ConditionInstead { inner: condition } => {
+            ability_condition_references_target_opponent(condition)
+        }
+        _ => false,
+    }
+}
+
+fn quantity_expr_references_target_player(expr: &QuantityExpr) -> bool {
+    quantity_expr_filter_matches(expr, filter_references_target_player)
+}
+
+fn quantity_expr_references_target_opponent(expr: &QuantityExpr) -> bool {
+    quantity_expr_filter_matches(expr, filter_references_target_opponent)
+}
+
+/// Walk the quantity forms which may carry an object-population filter. These
+/// are the same filter-bearing count family used by `quantity_ref_target_slot_spec`;
+/// the distinction is that this walker asks whether the population is scoped to
+/// a declared *player* rather than whether it embeds a target *object*.
+fn quantity_expr_filter_matches(expr: &QuantityExpr, pred: fn(&TargetFilter) -> bool) -> bool {
+    match expr {
+        QuantityExpr::Ref { qty } => quantity_ref_filter_matches(qty, pred),
+        QuantityExpr::Offset { inner, .. }
+        | QuantityExpr::ClampMin { inner, .. }
+        | QuantityExpr::Multiply { inner, .. }
+        | QuantityExpr::DivideRounded { inner, .. }
+        | QuantityExpr::UpTo { max: inner }
+        | QuantityExpr::Power {
+            exponent: inner, ..
+        } => quantity_expr_filter_matches(inner, pred),
+        QuantityExpr::Sum { exprs } | QuantityExpr::Max { exprs } => exprs
+            .iter()
+            .any(|expr| quantity_expr_filter_matches(expr, pred)),
+        QuantityExpr::Difference { left, right } => {
+            quantity_expr_filter_matches(left, pred) || quantity_expr_filter_matches(right, pred)
+        }
+        QuantityExpr::Fixed { .. } => false,
+    }
+}
+
+fn quantity_ref_filter_matches(qty: &QuantityRef, pred: fn(&TargetFilter) -> bool) -> bool {
+    match qty {
+        QuantityRef::ObjectCount { filter }
+        | QuantityRef::ObjectCountDistinct { filter, .. }
+        | QuantityRef::ObjectCountBySharedQuality { filter, .. }
+        | QuantityRef::CountersOnObjects { filter, .. }
+        | QuantityRef::EnteredThisTurn { filter }
+        | QuantityRef::BattlefieldEntriesThisTurn { filter, .. }
+        | QuantityRef::SacrificedThisTurn { filter, .. }
+        | QuantityRef::ZoneChangeCountThisTurn { filter, .. }
+        | QuantityRef::ZoneChangeAggregateThisTurn { filter, .. }
+        | QuantityRef::CounterAddedThisTurn { target: filter, .. }
+        | QuantityRef::TokensCreatedThisTurn { filter, .. }
+        | QuantityRef::DistinctCounterKindsAmong { filter }
+        | QuantityRef::ControlledByEachPlayer { filter, .. } => pred(filter),
+        QuantityRef::SpellsCastThisTurn { filter, .. }
+        | QuantityRef::SpellsCastBeforeTriggeringSpell { filter, .. }
+        | QuantityRef::SpellsCastThisGame { filter, .. } => filter.as_ref().is_some_and(pred),
+        _ => false,
+    }
+}
+
 fn ability_needs_companion_target_player_slot(ability: &ResolvedAbility) -> bool {
     // Triggered abilities carry an exact trigger source. Hellkite-style
     // GainControlAll uses "that player" from the triggering event, not a
@@ -4106,6 +4225,10 @@ fn ability_needs_companion_target_player_slot(ability: &ResolvedAbility) -> bool
         return false;
     }
     effect_references_target_player(&ability.effect)
+        || ability
+            .condition
+            .as_ref()
+            .is_some_and(ability_condition_references_target_player)
         // CR 115.1 + CR 118.12a: a targeted unless-payer declared inside the unless
         // clause surfaces its own player target slot even when the primary effect
         // references no target player (e.g. Athreos, God of Passage).
@@ -5137,7 +5260,7 @@ fn collect_target_slot_specs(
         }
     }
 
-    // CR 609.7 + CR 601.2c: Mirror the source-scoped `PreventDamage` slot from
+    // CR 609.7 + CR 601.2c: Mirror the source-scoped damage-effect slot from
     // `collect_target_slots` one-for-one so per-slot specs line up with the
     // surfaced TargetSelectionSlots (the choosable source spell, declared first).
     if ability.target_choice_timing == TargetChoiceTiming::Stack {
@@ -6012,7 +6135,9 @@ fn concretize_granting_object_in_cost(cost: &mut AbilityCost, granter: ObjectId)
                 concretize_granting_object_in_cost(c, granter);
             }
         }
-        AbilityCost::EffectCost { effect } => concretize_granting_object_in_effect(effect, granter),
+        AbilityCost::EffectCost { effect, .. } => {
+            concretize_granting_object_in_effect(effect, granter)
+        }
         _ => {}
     }
 }
@@ -7371,7 +7496,7 @@ fn assign_targets_recursive(
         return Ok(());
     }
 
-    // CR 609.7 + CR 601.2c: Mirror the source-scoped `PreventDamage` slot pushed
+    // CR 609.7 + CR 601.2c: Mirror the source-scoped damage-effect slot pushed
     // by `collect_target_slots`. The chosen source spell is consumed into THIS
     // node's `targets` (the PreventDamage HEAD node) BEFORE descending into the
     // sub-chain, so the modal sub (mode 3's PutCounter) consumes its own target
@@ -7705,7 +7830,7 @@ fn assign_selected_slots_recursive(
         return Ok(());
     }
 
-    // CR 609.7 + CR 601.2c: Mirror the source-scoped `PreventDamage` slot — the
+    // CR 609.7 + CR 601.2c: Mirror the source-scoped damage-effect slot — the
     // modal cast pipeline drives the slots path, so the chosen source spell must
     // be consumed into THIS node's `targets` here too, BEFORE descending into the
     // (modal) sub-chain. Slot order matches `collect_target_slots`: source first.
@@ -8104,7 +8229,7 @@ fn chain_has_target_sink(ability: &ResolvedAbility) -> bool {
         return true;
     }
 
-    // CR 609.7 + CR 601.2c: A source-scoped `PreventDamage` head node consumes
+    // CR 609.7 + CR 601.2c: A source-scoped damage-effect head node consumes
     // the chosen source spell into its own `targets[0]` — `collect_target_slots`
     // pushes a source slot for it, and `assign_targets_recursive` consumes one
     // target into this node BEFORE descending into the (modal) sub-chain.
@@ -9801,6 +9926,57 @@ mod tests {
         assert!(
             ability_needs_companion_target_player_slot(&ability),
             "a declared-target opponent unless-payer must surface a companion player slot"
+        );
+    }
+
+    /// CR 115.1 + CR 608.2c: a declared player target can live solely in an
+    /// `if` condition. Tithe's conditional second search has no target-bearing
+    /// effect of its own, so it must still expose exactly one opponent-only
+    /// announcement slot and keep the chosen player on the conditional link.
+    #[test]
+    fn quantity_condition_target_opponent_surfaces_companion_player_slot() {
+        let state = GameState::new_two_player(7);
+        let target_lands =
+            TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::TargetOpponent));
+        let your_lands = TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You));
+        let mut ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        ability.condition = Some(AbilityCondition::QuantityCheck {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: target_lands,
+                },
+            },
+            comparator: crate::types::ability::Comparator::GT,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter: your_lands },
+            },
+        });
+
+        assert!(ability_needs_companion_target_player_slot(&ability));
+        let slots = build_target_slots(&state, &ability).expect("conditional target slot builds");
+        assert_eq!(slots.len(), 1);
+        assert_eq!(slots[0].legal_targets, vec![TargetRef::Player(PlayerId(1))]);
+
+        let progress = build_target_selection_progress_for_ability(
+            &state,
+            &ability,
+            &slots,
+            &ability.target_constraints,
+            0,
+            vec![],
+        )
+        .expect("conditional target slot recomputes");
+        assert_eq!(
+            progress.current_legal_targets,
+            vec![TargetRef::Player(PlayerId(1))]
         );
     }
 
@@ -17280,6 +17456,81 @@ mod tests {
             slots[0].legal_targets.contains(&TargetRef::Object(spell)),
             "the stack spell must be a legal source target, got {:?}",
             slots[0].legal_targets
+        );
+    }
+
+    #[test]
+    fn build_target_slots_surfaces_source_scoped_damage_replacement_spell_slot() {
+        use crate::types::ability::{DamageRedirectTarget, RedirectionLifetime};
+        use crate::types::game_state::CastingVariant;
+        let mut state = GameState::new_two_player(42);
+        let host = create_object(
+            &mut state,
+            crate::types::identifiers::CardId(1),
+            PlayerId(0),
+            "Reverberation".into(),
+            Zone::Stack,
+        );
+        let sorcery = create_object(
+            &mut state,
+            crate::types::identifiers::CardId(2),
+            PlayerId(1),
+            "Target Sorcery".into(),
+            Zone::Stack,
+        );
+        state.stack.push_back(crate::types::game_state::StackEntry {
+            id: sorcery,
+            source_id: sorcery,
+            controller: PlayerId(1),
+            kind: crate::types::game_state::StackEntryKind::Spell {
+                card_id: crate::types::identifiers::CardId(2),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        state
+            .objects
+            .get_mut(&sorcery)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Sorcery];
+
+        let ability = ResolvedAbility::new(
+            Effect::CreateDamageReplacement {
+                redirect_lifetime: RedirectionLifetime::Continuous,
+                source_filter: Some(TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::ParentTargetSlot { index: 0 },
+                        TargetFilter::And {
+                            filters: vec![
+                                TargetFilter::StackSpell,
+                                TargetFilter::Typed(
+                                    TypedFilter::default().with_type(TypeFilter::Sorcery),
+                                ),
+                            ],
+                        },
+                    ],
+                }),
+                combat_scope: None,
+                target_filter: None,
+                modification: None,
+                redirect_to: Some(DamageRedirectTarget::SourceController),
+                redirect_amount: None,
+                redirect_object_filter: None,
+                recipient_object_filter: None,
+            },
+            vec![],
+            host,
+            PlayerId(0),
+        );
+
+        let slots = build_target_slots(&state, &ability).expect("source slot must build");
+        assert_eq!(slots.len(), 1, "exactly one source-scope slot");
+        assert_eq!(
+            slots[0].legal_targets,
+            vec![TargetRef::Object(sorcery)],
+            "only the target sorcery on the stack should be legal"
         );
     }
 

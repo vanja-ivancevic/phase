@@ -643,6 +643,7 @@ fn resolve_earthbend_target(
 ///
 /// Covers the cross-verb dynamic-count idioms shared by Draw/Mill/Discard:
 /// - "cards equal to <ref>"  / "a card equal to <ref>"  → Ref{<ref>}
+/// - "a number of cards equal to <ref>" → Ref{<ref>}
 /// - "that many cards"       / "that many"              → Ref{EventContextAmount}
 ///
 /// CR 121.1 / CR 701.13a / CR 701.8a — chained-effect amounts and target-
@@ -652,6 +653,7 @@ fn parse_dynamic_count_phrase(lower: &str) -> Option<QuantityExpr> {
     if let Ok((qty_tail, _)) = alt((
         tag::<_, _, OracleError<'_>>("cards equal to "),
         tag("a card equal to "),
+        tag("a number of cards equal to "),
     ))
     .parse(lower)
     {
@@ -790,6 +792,23 @@ fn parse_life_equal_quantity(
         .parse(after_verb_lower)
         .ok()?;
     let qty_text = qty_text.trim_end_matches('.').trim();
+    // CR 608.2c + CR 120.3: Drain Life's second instruction is a bounded
+    // immediate look-back at the actual damage dealt by the first. This must
+    // be recognized before the generic "damage dealt" parser: the trailing
+    // cap is semantic text, not ignorable prose. Kept narrow to the full
+    // Oracle form so a superficially similar but differently scoped clause
+    // remains an honest coverage gap instead of silently acquiring this rule.
+    if all_consuming((
+        tag::<_, _, OracleError<'_>>("the damage dealt, but not more life than the player's life total before the damage was dealt, the planeswalker's loyalty before the damage was dealt, or the creature's toughness"),
+        opt(tag(".")),
+    ))
+    .parse(qty_text)
+    .is_ok()
+    {
+        return Some(QuantityExpr::Ref {
+            qty: QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue,
+        });
+    }
     // CR 115.1: target-relative "they/that player lost/gained this turn" → Target
     // scope. Tried before the generic delegation, which would otherwise map the
     // third-person anaphor to the controller (see helper doc).
@@ -1025,6 +1044,20 @@ fn parse_numeric_imperative_ast_with_bare_card_source(
             }
             if let Some((amount, remainder)) = parse_count_expr(amount_phrase) {
                 if remainder.trim().is_empty() {
+                    // CR 119.3 + CR 603.2c: "lose N life for each 1 life
+                    // they gained" scales the fixed N by the triggering
+                    // life-change amount. The tail begins after the noun
+                    // "life", so it must be attached here rather than left
+                    // for the generic sequence parser.
+                    let tail = after_lower
+                        .split_once(" life")
+                        .map(|(_, tail)| tail.trim().trim_end_matches('.').trim())
+                        .unwrap_or("");
+                    if let Some(for_each_expr) = parse_for_each_multiplier_prefix(tail) {
+                        return Some(NumericImperativeAst::LoseLife {
+                            amount: replace_fixed_quantity(amount, for_each_expr),
+                        });
+                    }
                     return Some(NumericImperativeAst::LoseLife { amount });
                 }
             }
@@ -1344,6 +1377,68 @@ fn parse_discard_unless_filter<'a>(
 /// Dokuchi Silencer ("you may discard a creature card") preserves the same
 /// filter data as cost-form discards like "Discard a creature card:".
 pub(crate) fn parse_discard_card_filter(tail: &str) -> Option<TargetFilter> {
+    parse_discard_card_filter_inner(tail, None)
+}
+
+/// Context-aware form used by resolution effects.  A card filter can refer to
+/// a value chosen earlier in the same resolution (for example, "cards with
+/// mana value equal to that number"), so this path preserves the chain's
+/// quantity bindings while the cost and trigger callers retain their
+/// context-free contract.
+fn parse_discard_card_filter_with_ctx(tail: &str, ctx: &mut ParseContext) -> Option<TargetFilter> {
+    parse_discard_card_filter_inner(tail, Some(ctx))
+}
+
+fn parse_discard_card_filter_inner(
+    tail: &str,
+    mut ctx: Option<&mut ParseContext>,
+) -> Option<TargetFilter> {
+    // CR 201.2a + CR 608.2d: a preceding "choose a card name" instruction
+    // supplies a resolution-local name for a following discard instruction.
+    // This is deliberately a noun-phrase parser rather than card dispatch:
+    // Cabal Therapy, and any future wording with this grammar, share the same
+    // `HasChosenName` runtime filter.
+    let lower = tail.to_ascii_lowercase();
+    if nom_parse_lower(&lower, |input| {
+        all_consuming(value(
+            (),
+            alt((
+                tag::<_, _, OracleError<'_>>("card with that name"),
+                tag("cards with that name"),
+                tag("card with the chosen name"),
+                tag("cards with the chosen name"),
+            )),
+        ))
+        .parse(input)
+    })
+    .is_some()
+    {
+        return Some(TargetFilter::HasChosenName);
+    }
+
+    // CR 105.4 + CR 608.2d: a color chosen earlier in this resolution can
+    // qualify a following discard instruction. The filter remains generic;
+    // the resolver supplies the resolution-local color when matching each
+    // card in the affected hand.
+    if nom_parse_lower(&lower, |input| {
+        all_consuming(value(
+            (),
+            alt((
+                tag::<_, _, OracleError<'_>>("card of that color"),
+                tag("cards of that color"),
+                tag("card of the chosen color"),
+                tag("cards of the chosen color"),
+            )),
+        ))
+        .parse(input)
+    })
+    .is_some()
+    {
+        return Some(TargetFilter::Typed(
+            TypedFilter::default().properties(vec![FilterProp::IsChosenColor]),
+        ));
+    }
+
     let (filter, remainder) = parse_type_phrase(tail);
     let is_bare_card = matches!(
         &filter,
@@ -1357,6 +1452,17 @@ pub(crate) fn parse_discard_card_filter(tail: &str) -> Option<TargetFilter> {
         return Some(filter);
     }
 
+    // A qualified card phrase has text after its "card(s)" noun, such as
+    // "nonland cards with mana value equal to that number".  The type-only
+    // fast path above deliberately leaves that suffix untouched; let the full
+    // target grammar consume it when resolution context is available.
+    if let Some(ctx) = ctx.as_deref_mut() {
+        let (filter, remainder) = parse_target_with_ctx(tail, ctx);
+        if remainder.trim().is_empty() && !matches!(filter, TargetFilter::Any) {
+            return Some(filter);
+        }
+    }
+
     // Find the " card" / " cards" suffix — the type phrase lies before it.
     // No suffix or empty before-suffix → no type qualifier.
     let type_phrase = tail
@@ -1366,7 +1472,11 @@ pub(crate) fn parse_discard_card_filter(tail: &str) -> Option<TargetFilter> {
     if type_phrase.is_empty() {
         return None;
     }
-    let (filter, remainder) = parse_target(type_phrase);
+    let (filter, remainder) = if let Some(ctx) = ctx {
+        parse_target_with_ctx(type_phrase, ctx)
+    } else {
+        parse_target(type_phrase)
+    };
     if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return None;
     }
@@ -1825,6 +1935,25 @@ pub(super) fn parse_targeted_action_ast(
                 up_to,
                 unless_filter: None,
                 filter: None,
+            });
+        }
+        // "Discard all <filter> cards" means every eligible card in the
+        // affected player's hand.  Model that as the hand size with the typed
+        // eligibility filter: the resolver already limits the actual choice to
+        // matching cards, and therefore naturally caps the count at their
+        // number.  Unlike "all cards in their hand", this retains the filter.
+        if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("all ").parse(after_discard) {
+            let filter = parse_discard_card_filter_with_ctx(rest, ctx)?;
+            return Some(TargetedImperativeAst::Discard {
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::HandSize {
+                        player: PlayerScope::Controller,
+                    },
+                },
+                random,
+                up_to: false,
+                unless_filter: None,
+                filter: Some(filter),
             });
         }
         // CR 701.8a: "discard any number of [filter] cards" — opt-choice
@@ -3692,6 +3821,23 @@ pub(super) fn parse_hand_reveal_ast(
         return Some(HandRevealImperativeAst::RevealBackRef);
     }
 
+    // CR 701.9a + CR 701.20a: the game selects one card uniformly at random
+    // from a hand. Keep this separate from the ordinary singular reveal path:
+    // `RevealHand { selection: Chosen }` would incorrectly open a controller
+    // choice prompt for cards such as Cursed Scroll.
+    if let Some((target, _)) = nom_on_lower(after_reveal_lower, after_reveal_lower, |input| {
+        let (rest, _) = alt((
+            tag::<_, _, OracleError<'_>>("a card at random from "),
+            tag("one card at random from "),
+            tag("a card at random in "),
+            tag("one card at random in "),
+        ))
+        .parse(input)?;
+        parse_hand_possessive_target(rest)
+    }) {
+        return Some(HandRevealImperativeAst::RevealRandom { target });
+    }
+
     // CR 701.20a: the definite-article forms ("the card" / "the cards") are the
     // same back-reference, but far more collision-prone than the pronoun forms:
     // "reveal the cards you want to splice onto it" and "reveal the cards in your
@@ -3750,11 +3896,32 @@ pub(super) fn parse_hand_reveal_ast(
     // This function only handles hand-related reveals.
 
     if nom_primitives::scan_contains(lower, "hand") {
+        // CR 701.20a: "reveal a card at random from your hand" selects the
+        // card as part of the effect, so it must not become a second interactive
+        // hand-card choice. Preserve the possessive player axis and lower the
+        // card filter to `None` (the random selection is the result object).
+        let random_prefixes = ["a card at random from ", "one card at random from "];
+        for prefix in random_prefixes {
+            if let Some(hand_phrase) = after_reveal_lower.strip_prefix(prefix) {
+                let hand_phrase = hand_phrase.trim_end_matches('.').trim();
+                if let Ok((rest, target)) = parse_hand_possessive_target(hand_phrase) {
+                    if rest.trim().is_empty() {
+                        return Some(HandRevealImperativeAst::RevealAll {
+                            target,
+                            card_filter: TargetFilter::None,
+                            random: true,
+                        });
+                    }
+                }
+            }
+        }
+
         let (target, card_filter) =
             parse_hand_reveal_target_and_card_filter(after_reveal_lower, ctx);
         return Some(HandRevealImperativeAst::RevealAll {
             target,
             card_filter,
+            random: false,
         });
     }
 
@@ -3866,11 +4033,24 @@ pub(super) fn lower_hand_reveal_ast(ast: HandRevealImperativeAst) -> Effect {
         HandRevealImperativeAst::RevealAll {
             target,
             card_filter,
+            random,
         } => Effect::RevealHand {
             target,
             card_filter,
             count: None,
-            selection: crate::types::ability::CardSelectionMode::Chosen,
+            selection: if random {
+                crate::types::ability::CardSelectionMode::Random
+            } else {
+                crate::types::ability::CardSelectionMode::Chosen
+            },
+            choice_optional: false,
+            reveal: true,
+        },
+        HandRevealImperativeAst::RevealRandom { target } => Effect::RevealHand {
+            target,
+            card_filter: TargetFilter::None,
+            count: Some(QuantityExpr::Fixed { value: 1 }),
+            selection: crate::types::ability::CardSelectionMode::Random,
             choice_optional: false,
             reveal: true,
         },
@@ -4146,6 +4326,24 @@ pub(super) fn parse_choose_ast(
         // de-inflected the leading actor verb; the inner "exiles" keeps its -s).
         if let Some(ast) = try_parse_choose_and_verb_it_edict(rest_lower) {
             return Some(ast);
+        }
+
+        // CR 608.2d + CR 701.21a: "choose and sacrifice one of those
+        // creatures" is a resolution-time choice from the already-announced
+        // parent target set. It is not ordinary target syntax, and routing it
+        // through the generic target fallback would turn the choice into a
+        // mandatory first target or leave the sacrifice unrepresented.
+        if all_consuming(terminated(
+            alt((
+                tag::<_, _, OracleError<'_>>("choose and sacrifices one of those creatures"),
+                tag("choose and sacrifice one of those creatures"),
+            )),
+            opt(tag(".")),
+        ))
+        .parse(lower.trim())
+        .is_ok()
+        {
+            return Some(ChooseImperativeAst::ChooseAndSacrificeOneOfThoseCreatures);
         }
 
         if super::is_choose_as_targeting(rest_lower) {
@@ -5457,6 +5655,14 @@ pub(super) fn lower_choose_ast(ast: ChooseImperativeAst) -> Effect {
             Effect::ChooseDamageSource { source_filter }
         }
         ChooseImperativeAst::TargetOnly { target } => Effect::TargetOnly { target },
+        ChooseImperativeAst::ChooseAndSacrificeOneOfThoseCreatures => {
+            Effect::ChooseObjectsIntoTrackedSet {
+                chooser: TargetFilter::ParentTargetController,
+                filter: TargetFilter::ParentTarget,
+                min: 1,
+                max: Some(1),
+            }
+        }
         ChooseImperativeAst::Reparse { text } => super::parse_effect(&text),
         ChooseImperativeAst::NamedChoice {
             choice_type,
@@ -12740,6 +12946,33 @@ pub(super) fn lower_imperative_family_ast(ast: ImperativeFamilyAst) -> ParsedEff
             clause.sub_ability = Some(Box::new(target_b_clause));
             clause
         }
+        // CR 608.2d + CR 701.21a: resolution-time choice from the parent
+        // target set, followed by sacrificing the selected object. The
+        // tracked-set result remains available to the sacrifice step and the
+        // existing "the other" continuation is rewritten to the parent
+        // target complement.
+        ImperativeFamilyAst::Structured(ImperativeAst::Choose(
+            ChooseImperativeAst::ChooseAndSacrificeOneOfThoseCreatures,
+        )) => {
+            let mut clause = parsed_clause(Effect::ChooseObjectsIntoTrackedSet {
+                chooser: TargetFilter::ParentTargetController,
+                filter: TargetFilter::ParentTarget,
+                min: 1,
+                max: Some(1),
+            });
+            let sacrifice = AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Sacrifice {
+                    target: TargetFilter::TrackedSet {
+                        id: crate::types::identifiers::TrackedSetId(0),
+                    },
+                    count: QuantityExpr::Fixed { value: 1 },
+                    min_count: 1,
+                },
+            );
+            clause.sub_ability = Some(Box::new(sacrifice));
+            clause
+        }
         // CR 701.23a + CR 107.1: Dual/N-way search ("a X card and a Y card") lowers
         // to a chain of independent `SearchLibrary` effects linked via sub_ability,
         // mirroring `lower_put_counter_list`. Intercepted here because the bare
@@ -14546,7 +14779,68 @@ fn try_parse_bolster(lower: &str) -> Option<Effect> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::parser::oracle_effect::parse_effect_chain;
     use crate::types::ability::ParitySource;
+
+    #[test]
+    fn discard_filter_preserves_resolution_local_chosen_name() {
+        for wording in [
+            "cards with that name",
+            "cards with the chosen name",
+            "CARD WITH THAT NAME",
+        ] {
+            assert_eq!(
+                parse_discard_card_filter(wording),
+                Some(TargetFilter::HasChosenName),
+                "{wording:?} must retain the preceding named choice"
+            );
+        }
+    }
+
+    #[test]
+    fn discard_filter_preserves_resolution_local_chosen_color() {
+        for wording in [
+            "cards of that color",
+            "cards of the chosen color",
+            "CARD OF THAT COLOR",
+        ] {
+            let Some(TargetFilter::Typed(filter)) = parse_discard_card_filter(wording) else {
+                panic!("{wording:?} must retain the preceding color choice");
+            };
+            assert!(
+                filter.properties.contains(&FilterProp::IsChosenColor),
+                "{wording:?} must retain IsChosenColor, got {:?}",
+                filter.properties
+            );
+        }
+    }
+
+    #[test]
+    fn persecute_chains_its_color_choice_into_filtered_discard() {
+        let definition = super::super::parse_effect_chain(
+            "Choose a color. Target player reveals their hand and discards all cards of that color.",
+            AbilityKind::Spell,
+        );
+        let reveal = definition
+            .sub_ability
+            .as_deref()
+            .expect("color choice must retain the reveal instruction");
+        let discard = reveal
+            .sub_ability
+            .as_deref()
+            .expect("reveal instruction must retain the filtered discard");
+        let Effect::Discard {
+            filter: Some(TargetFilter::Typed(filter)),
+            ..
+        } = discard.effect.as_ref()
+        else {
+            panic!(
+                "expected Persecute-style filtered discard, got {:?}",
+                discard.effect
+            );
+        };
+        assert!(filter.properties.contains(&FilterProp::IsChosenColor));
+    }
 
     /// Matrix row 18 — the mana ROLE must survive the cost-resource AST
     /// round-trip byte-for-byte.
@@ -22964,6 +23258,67 @@ mod tests {
             Effect::AssembleContraptions {
                 count: QuantityExpr::Fixed { value: 1 }
             }
+        ));
+    }
+
+    #[test]
+    fn retribution_chooses_sacrifices_and_counters_the_other_target() {
+        let def = parse_effect_chain(
+            "Choose two target creatures controlled by the same opponent. That player chooses and sacrifices one of those creatures. Put a -1/-1 counter on the other.",
+            AbilityKind::Spell,
+        );
+
+        assert!(matches!(def.effect.as_ref(), Effect::TargetOnly { .. }));
+        let choose = def
+            .sub_ability
+            .as_deref()
+            .expect("targeting must continue into the resolution-time choice");
+        assert!(matches!(
+            choose.effect.as_ref(),
+            Effect::ChooseObjectsIntoTrackedSet {
+                chooser: TargetFilter::ParentTargetController,
+                filter: TargetFilter::ParentTarget,
+                min: 1,
+                max: Some(1),
+            }
+        ));
+
+        let sacrifice = choose
+            .sub_ability
+            .as_deref()
+            .expect("choice must continue into sacrifice");
+        assert!(matches!(
+            sacrifice.effect.as_ref(),
+            Effect::Sacrifice {
+                target: TargetFilter::TrackedSet { .. },
+                count: QuantityExpr::Fixed { value: 1 },
+                min_count: 1,
+            }
+        ));
+
+        let counter = sacrifice
+            .sub_ability
+            .as_deref()
+            .expect("sacrifice must continue into the counter instruction");
+        let Effect::PutCounter { target, .. } = counter.effect.as_ref() else {
+            panic!(
+                "expected the other target to receive a counter, got {:?}",
+                counter.effect
+            );
+        };
+        assert!(matches!(
+            target,
+            TargetFilter::And { filters }
+                if filters.len() == 2
+                    && matches!(filters[0], TargetFilter::ParentTarget)
+                    && matches!(
+                        &filters[1],
+                        TargetFilter::Not { filter }
+                            if matches!(
+                                filter.as_ref(),
+                                TargetFilter::TrackedSet { id: crate::types::identifiers::TrackedSetId(0) }
+                            )
+                    )
         ));
     }
 

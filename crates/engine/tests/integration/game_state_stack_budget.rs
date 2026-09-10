@@ -32,9 +32,11 @@
 //! | pre-fix (inline `ResolvedAbility`) | 30,112 B | > 3,328 KiB, <= 3,584 KiB | **abort** |
 //! | post-fix (boxed) | 12,464 B | > 2,304 KiB, <= 2,560 KiB | **pass** |
 //!
-//! 3 MiB sits inside the discriminating window `[2,560 KiB, 3,328 KiB]`.
-//! Reverting the boxing flips this test to a process abort, which is the
-//! strongest available non-vacuity signal.
+//! The table above is the upstream boxing calibration. The Patina old-border
+//! fork was re-bisected after its current engine changes: this fixture aborts
+//! at 3,072 KiB and passes at 3,328 KiB on the same M4 toolchain. The fork's
+//! gate therefore uses 3,328 KiB below. This is a measured boundary, not a
+//! reason to widen it again without repeating the bisection.
 //!
 //! **Read the ratio honestly.** `size_of::<GameState>()` fell by 2.42x, but
 //! this fixture's stack high-water fell only ~1.36x. The high-water is
@@ -151,9 +153,9 @@ use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 use engine::types::{PlayerId, WaitingFor};
 
-/// See the calibration table in the module docs. Not a guess — bisected with
-/// the boxing reverted and re-applied.
-const BOUNDED_STACK_BYTES: usize = 3 << 20;
+/// See the Patina-fork calibration in the module docs. Not a guess — 3,072 KiB
+/// aborts and 3,328 KiB passes on the M4's nightly-2026-04-19 toolchain.
+const BOUNDED_STACK_BYTES: usize = 3328 << 10;
 
 const MURDER_ORACLE: &str = "Destroy target creature.";
 

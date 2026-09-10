@@ -4,7 +4,10 @@
 use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
-use crate::types::ability::CastTimingPermission;
+use crate::types::ability::{
+    CardSelectionMode, CastTimingPermission, DiscardSelfScope, FilterProp, QuantityExpr,
+    SharedQuality, TargetFilter, TypedFilter,
+};
 use crate::types::mana::{ManaCost, ManaCostShard};
 
 /// CR 602.1: Parse the leading keyword of a "<Keyword> abilities of …" class-wide
@@ -342,6 +345,61 @@ fn supported_alternative_cast_cost(cost: &AbilityCost) -> bool {
             | AbilityCost::CollectEvidence { .. }
             // CR 702.122a: Remove counter as crew alternative cost (Heart of Kiran).
             | AbilityCost::RemoveCounter { .. }
+    )
+}
+
+/// CR 118.9 + CR 601.2b: Parse the global pitch-cost alternative used by Dream
+/// Halls: "Rather than pay the mana cost for a spell, its controller may discard
+/// a card that shares a color with that spell."
+///
+/// The discarded card's filter is deliberately source-relative rather than
+/// card-name-specific: while a spell is being announced, the established
+/// discard-cost path evaluates `SelfRef` against that pending spell. This reuses
+/// the normal interactive discard choice, its payability gate, and its move to
+/// the graveyard. The static's affected filter has no controller scope because
+/// the printed permission is global.
+pub(crate) fn parse_discard_matching_color_alternative_cost(
+    text: &str,
+) -> Option<StaticDefinition> {
+    let lower = text.to_lowercase();
+    // This is deliberately a grammar, rather than a verbatim Dream Halls
+    // string: each grammatical component remains independently visible for
+    // future "rather than pay" pitch-cost variants.  The final `eof` makes
+    // the parser fail closed if an unmodelled rider changes the permission.
+    let parsed: OracleResult<'_, ()> = (|| {
+        let input = lower.trim();
+        let (input, _) = tag("rather than pay ").parse(input)?;
+        let (input, _) = tag("the mana cost ").parse(input)?;
+        let (input, _) = tag("for a spell, ").parse(input)?;
+        let (input, _) = tag("its controller may discard ").parse(input)?;
+        let (input, _) = tag("a card that shares a color ").parse(input)?;
+        let (input, _) = tag("with that spell").parse(input)?;
+        let (input, _) = opt(tag(".")).parse(input)?;
+        let (input, _) = eof(input)?;
+        Ok((input, ()))
+    })();
+    parsed.ok()?;
+
+    Some(
+        StaticDefinition::new(StaticMode::CastWithAlternativeCost {
+            cost: AbilityCost::Discard {
+                count: QuantityExpr::Fixed { value: 1 },
+                filter: Some(TargetFilter::Typed(TypedFilter::card().properties(vec![
+                    FilterProp::SharesQuality {
+                        quality: SharedQuality::Color,
+                        reference: Some(Box::new(TargetFilter::SelfRef)),
+                        relation: Default::default(),
+                    },
+                ]))),
+                selection: CardSelectionMode::Chosen,
+                self_scope: DiscardSelfScope::FromHand,
+            },
+            timing_permission: None,
+            frequency: CastFrequency::Unlimited,
+        })
+        .affected(TargetFilter::Typed(TypedFilter::card()))
+        .description(text.to_string())
+        .active_zones(vec![Zone::Battlefield]),
     )
 }
 

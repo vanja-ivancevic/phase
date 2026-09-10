@@ -193,6 +193,11 @@ fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondit
         // distinctive "the top card of your library is " prefix, so ordering
         // relative to the other filter conditions is not sensitive.
         parse_top_of_library_condition,
+        // CR 509.1g: this source-relative existential must precede the
+        // generic combat-presence arms, which can otherwise claim the
+        // beginning of "at least one creature is blocking this creature" and
+        // leave the source-relative tail unconsumed.
+        parse_at_least_one_creature_blocking_source,
         parse_source_state_conditions,
         parse_player_state_conditions,
         // CR 402.1 + CR 602.5: existential "a player has <hand-size predicate>".
@@ -225,9 +230,102 @@ fn parse_control_presence_conditions(input: &str) -> OracleResult<'_, StaticCond
         // "you control N or more creatures".
         parse_creatures_are_attacking_count_ge,
         parse_source_controlled_or_your_commander,
+        parse_you_control_more_than_combat_player,
+        parse_you_control_more_than_each_opponent,
         parse_control_conditions,
     ))
     .parse(input)
+}
+
+/// CR 508.1b + CR 509.1a: "you control more <type> than defending/attacking
+/// player" is a combat-relative object-count comparison.  The left side is
+/// always the static ability's controller; the right-side anchor is preserved
+/// as a controller reference for combat legality to bind at declaration time.
+///
+/// This is intentionally a normal `QuantityComparison`, rather than a
+/// Goblin-Goon-specific condition.  Attack declaration binds
+/// `DefendingPlayer` to the proposed target; block declaration's attacking
+/// player is the active player (CR 508.1a).  That leaves the parser reusable
+/// for any future relative-count combat restriction.
+fn parse_you_control_more_than_combat_player(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("you control more ").parse(input)?;
+    let (rest, type_text) = take_until(" than ").parse(rest)?;
+    let (rest, _) = tag(" than ").parse(rest)?;
+    let (rest, relative_controller) = alt((
+        value(ControllerRef::DefendingPlayer, tag("defending player")),
+        // CR 508.1a: the player declaring attackers is the active player.
+        value(ControllerRef::ActivePlayer, tag("attacking player")),
+    ))
+    .parse(rest)?;
+    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any | TargetFilter::None) {
+        return Err(oracle_err(type_text));
+    }
+
+    let you_filter = match filter.clone() {
+        TargetFilter::Typed(typed) => TargetFilter::Typed(typed.controller(ControllerRef::You)),
+        other => other,
+    };
+    let relative_filter = match filter {
+        TargetFilter::Typed(typed) => TargetFilter::Typed(typed.controller(relative_controller)),
+        other => other,
+    };
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter: you_filter },
+            },
+            comparator: Comparator::GT,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: relative_filter,
+                },
+            },
+        },
+    ))
+}
+
+/// CR 109.5 + CR 102.2: "you control more [type] than each opponent" is a
+/// universal comparison, not an aggregate count of all opponents' permanents.
+///
+/// It therefore compares your count to the *maximum* count held by any one
+/// opponent.  This is the object-count counterpart of the existing hand-size
+/// grammar for "more cards in hand than each opponent" and keeps multiplayer
+/// semantics exact: two opponents with one creature each do not collectively
+/// stop a player who controls two creatures.
+///
+/// This is distinct from Goblin Goon's current combat-player comparison above:
+/// here every opponent is checked independently.
+fn parse_you_control_more_than_each_opponent(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("you control more ").parse(input)?;
+    let (rest, type_text) = take_until(" than each opponent").parse(rest)?;
+    let (rest, _) = tag(" than each opponent").parse(rest)?;
+    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any | TargetFilter::None) {
+        return Err(oracle_err(type_text));
+    }
+
+    let you_filter = match filter.clone() {
+        TargetFilter::Typed(typed) => TargetFilter::Typed(typed.controller(ControllerRef::You)),
+        other => other,
+    };
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter: you_filter },
+            },
+            comparator: Comparator::GT,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::ControlledByEachPlayer {
+                    filter,
+                    aggregate: AggregateFunction::Max,
+                    relation: PlayerRelation::Opponent,
+                },
+            },
+        },
+    ))
 }
 
 /// CR 903.3 + CR 903.3d + CR 611.3a: "you control ~ or it's your commander"
@@ -266,6 +364,7 @@ fn parse_remaining_state_presence_conditions(input: &str) -> OracleResult<'_, St
         parse_opponent_poison_conditions,
         parse_defending_player_more_life_than_another_opponent,
         parse_defending_player_comparison_conditions,
+        parse_target_opponent_controls_more_comparison,
         parse_that_player_controls_more_comparison,
         parse_no_opponent_comparison_conditions,
         parse_triggering_player_has_unattacked_opponent,
@@ -319,6 +418,7 @@ fn parse_event_history_conditions(input: &str) -> OracleResult<'_, StaticConditi
     alt((
         parse_damage_dealt_this_turn_conditions,
         parse_source_damage_threshold_this_turn,
+        parse_source_was_blocked_this_turn,
         parse_source_didnt_this_turn,
         parse_was_cast_condition,
         parse_entered_this_turn,
@@ -332,6 +432,29 @@ fn parse_event_history_conditions(input: &str) -> OracleResult<'_, StaticConditi
         parse_event_state_conditions,
     ))
     .parse(input)
+}
+
+/// CR 509.1a + CR 603.4: a source that has left combat can still be identified
+/// by the turn-scoped blocker ledger. This covers Fyndhorn Druid's
+/// "if it was blocked this turn" intervening-if without confusing it with the
+/// live-combat `SourceIsBlocked` predicate.
+fn parse_source_was_blocked_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = alt((
+        tag("it was "),
+        tag("~ was "),
+        tag("this creature was "),
+        tag("this permanent was "),
+    ))
+    .parse(input)?;
+    value(
+        StaticCondition::SourceMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::BlockedThisTurn]),
+            ),
+        },
+        tag("blocked this turn"),
+    )
+    .parse(rest)
 }
 
 /// CR 601.2 + CR 611.3a: "as long as it was cast" — cast-origin gate for
@@ -1900,7 +2023,22 @@ fn parse_source_is_equipped(input: &str) -> OracleResult<'_, StaticCondition> {
 /// no-quantifier idiom.
 fn parse_source_is_enchanted(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = parse_source_subject(input)?;
-    value(StaticCondition::SourceIsEnchanted, tag("is enchanted")).parse(rest)
+    let (rest, negated) = alt((
+        value(true, alt((tag("isn't "), tag("is not ")))),
+        value(false, tag("is ")),
+    ))
+    .parse(rest)?;
+    let (rest, _) = tag("enchanted").parse(rest)?;
+    if negated {
+        Ok((
+            rest,
+            StaticCondition::Not {
+                condition: Box::new(StaticCondition::SourceIsEnchanted),
+            },
+        ))
+    } else {
+        Ok((rest, StaticCondition::SourceIsEnchanted))
+    }
 }
 
 /// CR 700.9: "<subject> is modified" → SourceMatchesFilter on a creature filter
@@ -2591,6 +2729,11 @@ fn parse_pt_ref_scoped(input: &str, scope: ObjectScope) -> OracleResult<'_, Quan
 fn parse_possessive_property(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = alt((
         tag("its "),
+        // CR 201.5 + CR 208.1: the parser normalizes a card's own name to
+        // `~`, but Oracle state triggers may retain the possessive form
+        // (`~'s power is 7 or greater`, Phyrexian Devourer). Treat it as the
+        // same source-relative pronoun used by the named-card form.
+        tag("~'s "),
         // CR 201.5: a possessive pronoun in a self-referential ability refers to
         // the object that has the ability (the source). Legendary creatures with
         // she/he pronouns use the gendered possessive instead of "its" (e.g. "if
@@ -3914,8 +4057,8 @@ pub(crate) fn parse_control_conditions(input: &str) -> OracleResult<'_, StaticCo
         parse_filtered_creature_is_attacking,
         // CR 508.1 + CR 509.1: "a/an <type> is attacking [or blocking]" → IsPresent(type + combat
         // state). Retained for the "[or blocking]" predicate that the attacking-only filtered form
-        // above does not cover; tried after it so filtered owns the attacking/defender form (the
-        // attacking case here yields the identical IsPresent, so filtered simply reaches it first).
+        // above does not cover; tried after the source-relative form so a longer phrase cannot be
+        // claimed by a partial generic combat parse.
         parse_a_type_is_in_combat,
         // "you don't control a/an [type]" → Not(IsPresent)
         parse_you_dont_control_a,
@@ -3933,6 +4076,27 @@ pub(crate) fn parse_control_conditions(input: &str) -> OracleResult<'_, StaticCo
         parse_creature_has_keyword,
     ))
     .parse(input)
+}
+
+/// CR 509.1g + CR 602.5: Parse "at least one creature is blocking ~" (and the
+/// equivalent "this creature" form) as a source-relative presence condition.
+/// `BlockingSource` is evaluated against the source object's live blocker
+/// assignments, so a blocker elsewhere in combat cannot satisfy the gate.
+fn parse_at_least_one_creature_blocking_source(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("at least one ").parse(input)?;
+    let (filter, rest) = parse_type_phrase(rest);
+    let TargetFilter::Typed(mut filter) = filter else {
+        return Err(oracle_err(input));
+    };
+    let (rest, _) = tag("is blocking ").parse(rest.trim_start())?;
+    let (rest, _) = alt((tag("~"), tag("this creature"))).parse(rest)?;
+    filter.properties.push(FilterProp::BlockingSource);
+    Ok((
+        rest,
+        StaticCondition::IsPresent {
+            filter: Some(TargetFilter::Typed(filter)),
+        },
+    ))
 }
 
 /// Parse a "≥ N" threshold prefix: either `"N or more "` or `"at least N "`.
@@ -5390,7 +5554,7 @@ fn parse_source_self_token(input: &str) -> OracleResult<'_, ()> {
 ///
 /// CR-correct qualifier mapping (printed Oracle text always uses exactly one
 /// of these forms per zone):
-///   - " on the <Z>"  — only Battlefield (CR 400.1).
+///   - " on the <Z>"  — Battlefield (CR 400.1) and Stack (CR 405.1).
 ///   - " in the <Z>"  — shared zones with definite article (CR 408 command).
 ///   - " in your <Z>" — player-specific zones (CR 401 / 402 / 403).
 ///   - " in <Z>"      — Exile (shared zone with no possessive; CR 406).
@@ -5415,9 +5579,10 @@ fn parse_zone_phrase(input: &str) -> OracleResult<'_, Zone> {
     }
 
     alt((
-        // " on the <Z>" — CR 400.1: only the battlefield uses "on".
+        // " on the battlefield" / "on the stack" — CR 400.1 + CR 405.1.
+        // Both zones use the printed "on the" form.
         preceded(tag(" on the "), |i| {
-            zone_in(i, |z| matches!(z, Zone::Battlefield))
+            zone_in(i, |z| matches!(z, Zone::Battlefield | Zone::Stack))
         }),
         // " in the <Z>" — CR 408: shared zones (command zone) take "the".
         // Bare-word player zones (graveyard/hand/library) print "in your <Z>",
@@ -7066,6 +7231,27 @@ fn parse_combat_context_conditions(input: &str) -> OracleResult<'_, StaticCondit
 /// CR 509.1b: "defending player controls a/an [type]" → DefendingPlayerControls.
 fn parse_defending_player_controls(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("defending player controls ").parse(input)?;
+    // CR 509.1b: the old-border negative form "defending player controls no
+    // snow lands" is the zero-count sibling of the article form below. Lower
+    // it through the same typed quantity vocabulary used by all other control
+    // counts so activation restrictions can retain the exact no-land gate.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("no ").parse(rest) {
+        let (filter, remainder) = parse_type_phrase(rest);
+        let TargetFilter::Typed(filter) = filter else {
+            return Err(oracle_err(input));
+        };
+        let filter = inject_controller(TargetFilter::Typed(filter), ControllerRef::DefendingPlayer);
+        return Ok((
+            remainder,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 0 },
+            },
+        ));
+    }
     let (rest, _) = parse_article(rest)?;
     // parse_type_phrase returns (filter, remaining_str) — bridge to nom remainder
     let (filter, type_rest) = parse_type_phrase(rest);
@@ -8035,6 +8221,18 @@ fn parse_you_didnt_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
 fn parse_source_didnt_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = alt((tag("~ didn't "), tag("this creature didn't "))).parse(input)?;
     alt((
+        // CR 302.6 + CR 508.1a: Mad Dog's intervening-if checks two
+        // independent histories. Keep this longer arm before the bare attack
+        // form so the connective remains part of one source-bound condition.
+        value(
+            StaticCondition::And {
+                conditions: vec![
+                    make_source_history_absence(FilterProp::AttackedThisTurn { defender: None }),
+                    make_source_controlled_continuously_this_turn(),
+                ],
+            },
+            tag("attack or come under your control this turn"),
+        ),
         value(
             make_source_history_absence(FilterProp::AttackedThisTurn { defender: None }),
             tag("attack this turn"),
@@ -8061,6 +8259,29 @@ fn make_source_history_absence(prop: FilterProp) -> StaticCondition {
         },
         comparator: Comparator::EQ,
         rhs: QuantityExpr::Fixed { value: 0 },
+    }
+}
+
+/// CR 302.6 + CR 508.1a: the source has remained under its controller's
+/// control continuously since that player's turn began. This is the positive
+/// form of "didn't come under your control this turn".
+fn make_source_controlled_continuously_this_turn() -> StaticCondition {
+    StaticCondition::QuantityComparison {
+        lhs: QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::SelfRef,
+                        TargetFilter::Typed(
+                            TypedFilter::default()
+                                .properties(vec![FilterProp::ControlledContinuouslySinceTurnBegan]),
+                        ),
+                    ],
+                },
+            },
+        },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
     }
 }
 
@@ -8781,6 +9002,43 @@ fn parse_there_exists_condition(input: &str) -> OracleResult<'_, StaticCondition
             crate::parser::oracle_quantity::canonicalize_quantity_ref(qty),
             1,
         ),
+    ))
+}
+
+/// Parse "target opponent controls more [type] than you" → QuantityComparison.
+///
+/// CR 115.1 + CR 608.2c: Unlike the existential "an opponent controls more"
+/// form, `target opponent` names one player that must be chosen while the spell
+/// or ability is announced. `ControllerRef::TargetOpponent` preserves both that
+/// declared-target identity and its opponent-only legality; ability construction
+/// surfaces the companion player target slot from this reference.
+fn parse_target_opponent_controls_more_comparison(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("target opponent controls more ").parse(input)?;
+    let (rest, type_text) = take_until::<_, _, OracleError<'_>>(" than you").parse(rest)?;
+    let (rest, _) = tag(" than you").parse(rest)?;
+
+    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any | TargetFilter::None) {
+        return Err(oracle_err(type_text));
+    }
+    let target_filter = inject_controller(filter.clone(), ControllerRef::TargetOpponent);
+    let you_filter = inject_controller(filter, ControllerRef::You);
+
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: target_filter,
+                },
+            },
+            comparator: Comparator::GT,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter: you_filter },
+            },
+        },
     ))
 }
 
@@ -10229,6 +10487,15 @@ pub(crate) fn parse_affirmative_reflexive_connector(
             AbilityCondition::effect_performed(),
             tag("if the player does, "),
         ),
+        // CR 608.2c: Oath of Druids/Oath of Lieges name the player who made
+        // the preceding optional choice as "the first player".  This is the
+        // same reflexive OptionalEffectPerformed gate as "that player" and
+        // must stay in the shared connector grammar so the sequence splitter
+        // and effect-condition parser consume it identically.
+        value(
+            AbilityCondition::effect_performed(),
+            tag("if the first player does, "),
+        ),
         value(AbilityCondition::effect_performed(), tag("if you do, ")),
         parse_discard_this_way_affirmative_connector,
     ))
@@ -10639,6 +10906,39 @@ mod tests {
             "inject_controller must add InZone{{Battlefield}}, got {:?}",
             tf.properties
         );
+    }
+
+    /// CR 509.1b: negative defending-player control gates use an exact zero
+    /// comparison, not a dropped condition or a permissive "controls no
+    /// permanent" fallback.
+    #[test]
+    fn parse_defending_player_controls_no_snow_lands() {
+        let text = "defending player controls no snow lands";
+        let (rest, cond) = parse_inner_condition(text)
+            .unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::ObjectCount {
+                            filter: TargetFilter::Typed(filter),
+                        },
+                },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Fixed { value: 0 },
+        } = cond
+        else {
+            panic!("expected defending-player zero count, got {cond:?}");
+        };
+        assert_eq!(filter.controller, Some(ControllerRef::DefendingPlayer));
+        assert!(filter.type_filters.contains(&TypeFilter::Land));
+        assert!(filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::HasSupertype {
+                value: Supertype::Snow
+            }
+        )));
     }
 
     /// CR 508.5 + CR 509.1b + CR 205.3m: Graxiplon's printed gate — the
@@ -13888,6 +14188,28 @@ mod tests {
         );
     }
 
+    /// CR 509.1g: the source-relative blocker phrase must preserve the
+    /// `BlockingSource` relation rather than degrade to a board-wide blocker
+    /// presence check.
+    #[test]
+    fn test_at_least_one_creature_is_blocking_source() {
+        for text in [
+            "at least one creature is blocking ~",
+            "at least one creature is blocking this creature",
+        ] {
+            let (rest, c) = parse_inner_condition(text).unwrap();
+            assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+            let StaticCondition::IsPresent {
+                filter: Some(TargetFilter::Typed(filter)),
+            } = c
+            else {
+                panic!("expected typed blocker presence for {text:?}, got {c:?}");
+            };
+            assert!(filter.type_filters.contains(&TypeFilter::Creature));
+            assert!(filter.properties.contains(&FilterProp::BlockingSource));
+        }
+    }
+
     #[test]
     fn test_tapped_untapped_regression_after_subject_refactor() {
         // Regression guard: after extracting `parse_source_subject` (which now consumes
@@ -15821,6 +16143,98 @@ mod tests {
         }
     }
 
+    /// CR 109.5 + CR 102.2: Goblin Goon's "than each opponent" comparison is
+    /// universal.  The opponent side must therefore be the per-player maximum,
+    /// never a sum across opponents or the existential PlayerCount shape used by
+    /// "an opponent controls more creatures than you".
+    #[test]
+    fn test_you_control_more_creatures_than_each_opponent() {
+        let (rest, condition) =
+            parse_inner_condition("you control more creatures than each opponent").unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            lhs,
+            comparator,
+            rhs,
+        } = condition
+        else {
+            panic!("expected quantity comparison");
+        };
+        assert_eq!(comparator, Comparator::GT);
+        assert_eq!(
+            lhs,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(
+                        TypedFilter::creature().controller(ControllerRef::You),
+                    ),
+                },
+            }
+        );
+        assert_eq!(
+            rhs,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ControlledByEachPlayer {
+                    filter: TargetFilter::Typed(TypedFilter::creature()),
+                    aggregate: AggregateFunction::Max,
+                    relation: PlayerRelation::Opponent,
+                },
+            }
+        );
+    }
+
+    /// Goblin Goon's current Oracle text compares against the relevant combat
+    /// player, not an aggregate of opponents.  The parser must preserve the
+    /// two different bindings: proposed defender while attacking and active
+    /// attacking player while blocking.
+    #[test]
+    fn test_you_control_more_creatures_than_combat_player() {
+        for (text, expected_controller) in [
+            (
+                "you control more creatures than defending player",
+                ControllerRef::DefendingPlayer,
+            ),
+            (
+                "you control more creatures than attacking player",
+                ControllerRef::ActivePlayer,
+            ),
+        ] {
+            let (rest, condition) = parse_inner_condition(text).unwrap();
+            assert_eq!(rest, "", "{text}");
+            let StaticCondition::QuantityComparison {
+                lhs,
+                comparator,
+                rhs,
+            } = condition
+            else {
+                panic!("{text}: expected quantity comparison");
+            };
+            assert_eq!(comparator, Comparator::GT, "{text}");
+            assert!(matches!(
+                lhs,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            controller: Some(ControllerRef::You),
+                            ..
+                        }),
+                    },
+                }
+            ));
+            assert!(matches!(
+                rhs,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            controller: Some(controller),
+                            ..
+                        }),
+                    },
+                } if controller == expected_controller
+            ));
+        }
+    }
+
     /// Issue #859: Weathered Wayfarer — "Activate only if an opponent controls
     /// more lands than you."
     #[test]
@@ -15934,6 +16348,41 @@ mod tests {
                     },
             } => {
                 assert_eq!(lhs.controller, Some(ControllerRef::ScopedPlayer));
+                assert_eq!(rhs.controller, Some(ControllerRef::You));
+            }
+            other => panic!("expected ObjectCount GT ObjectCount, got {other:?}"),
+        }
+    }
+
+    /// CR 115.1 + CR 608.2c: Tithe's conditional target is a specific
+    /// opponent, not the existential aggregate used by Land Tax / Weathered
+    /// Wayfarer. The AST must preserve `TargetOpponent` so announcement can
+    /// surface an opponent-only player slot and resolution can recheck the
+    /// chosen player's land count.
+    #[test]
+    fn test_target_opponent_controls_more_lands_than_you() {
+        let (rest, c) =
+            parse_inner_condition("target opponent controls more lands than you").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::ObjectCount {
+                                filter: TargetFilter::Typed(lhs),
+                            },
+                    },
+                comparator: Comparator::GT,
+                rhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::ObjectCount {
+                                filter: TargetFilter::Typed(rhs),
+                            },
+                    },
+            } => {
+                assert_eq!(lhs.controller, Some(ControllerRef::TargetOpponent));
                 assert_eq!(rhs.controller, Some(ControllerRef::You));
             }
             other => panic!("expected ObjectCount GT ObjectCount, got {other:?}"),
@@ -17367,6 +17816,53 @@ mod tests {
             parse_inner_condition("this creature didn't enter the battlefield this turn").unwrap();
         assert_eq!(rest, "");
         assert_source_history_absence(c, FilterProp::EnteredThisTurn);
+    }
+
+    #[test]
+    fn source_didnt_attack_or_come_under_control_preserves_both_histories() {
+        let (rest, c) = parse_inner_condition(
+            "this creature didn't attack or come under your control this turn",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::And { conditions } = c else {
+            panic!("expected compound source history condition");
+        };
+        assert_eq!(conditions.len(), 2);
+        assert_source_history_absence(
+            conditions[0].clone(),
+            FilterProp::AttackedThisTurn { defender: None },
+        );
+        assert!(matches!(
+            &conditions[1],
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::And { filters },
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } if filters.iter().any(|filter| matches!(
+                filter,
+                TargetFilter::Typed(TypedFilter { properties, .. })
+                    if properties.contains(&FilterProp::ControlledContinuouslySinceTurnBegan)
+            ))
+        ));
+    }
+
+    #[test]
+    fn source_was_blocked_this_turn_uses_turn_history_filter() {
+        let (rest, c) = parse_inner_condition("it was blocked this turn").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            c,
+            StaticCondition::SourceMatchesFilter {
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::BlockedThisTurn]),
+                ),
+            }
+        );
     }
 
     fn assert_source_history_absence(c: StaticCondition, prop: FilterProp) {

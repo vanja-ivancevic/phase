@@ -15,8 +15,9 @@ use crate::types::ability::{
     CastingRestriction, ChoiceType, ChosenSubtypeKind, ContinuousModification, ControllerRef,
     CostReduction, DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp,
     ManaProduction, ModalChoice, ParsedCondition, PlayerFilter, QuantityExpr, QuantityRef,
-    ReplacementDefinition, SolveCondition, SpellCastingOption, StaticCondition, StaticDefinition,
-    TapStateChange, TargetFilter, TriggerCondition, TriggerDefinition, TypedFilter,
+    ReplacementCondition, ReplacementDefinition, SolveCondition, SpellCastingOption,
+    StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TriggerCondition,
+    TriggerDefinition, TypedFilter,
 };
 use crate::types::ability_visit::{visit_ability_def_scoped, ResolutionScope};
 use crate::types::card::DraftEffect;
@@ -110,6 +111,7 @@ use super::oracle_special::{
 use super::oracle_static::{
     is_speed_unlock_sentence, lower_static_ir, parse_alternative_keyword_cost,
     parse_cast_spells_alternative_cost_multi, parse_collect_evidence_alt_cost,
+    parse_discard_matching_color_alternative_cost,
     parse_flashback_trailing_self_spell_cost_reduction, parse_spells_alternative_cost,
     parse_static_line, parse_static_line_multi, try_parse_graveyard_keyword_grant_clause,
     try_parse_graveyard_keyword_grant_static, try_parse_top_of_library_cast_permission,
@@ -5521,6 +5523,18 @@ pub(crate) fn parse_oracle_ir(
             }
         }
 
+        // Priority 6c-altcost-a: CR 118.9 — a global pitch-cost alternative:
+        // "Rather than pay the mana cost for a spell, its controller may discard
+        // a card that shares a color with that spell." (Dream Halls). This has a
+        // different grammatical subject from the "you may pay" class above, so
+        // route it through its strict lowering before Priority 7 can treat it as
+        // an effect sentence.
+        if let Some(static_def) = parse_discard_matching_color_alternative_cost(&line) {
+            emitter.static_ir_at(item_line, StaticIr::from_definition(&line, static_def));
+            i += 1;
+            continue;
+        }
+
         // Priority 6c-altcost-b: CR 118.9 — "You may cast [filter] by paying {X}
         // rather than paying their mana costs." (Primal Prayers). May also carry a
         // flash rider on the same line.
@@ -5769,10 +5783,40 @@ pub(crate) fn parse_oracle_ir(
         } else {
             std::borrow::Cow::Borrowed(lower.as_str())
         };
-        if is_static_pattern(&static_classify_view) {
+        // CR 207.2c + CR 611.3a: the ability-word label is semantically
+        // transparent, but the classifier sees the unstripped line.  Some
+        // valid static bodies (notably Threshold's conditional anthem) do not
+        // match the broad heuristic even though the authoritative static
+        // parser can consume them exactly.  Probe only the known-label body;
+        // this keeps arbitrary spell/effect prose on the existing path.
+        let ability_word_static =
+            strip_ability_word_with_name(&line).is_some_and(|(_, effect_text)| {
+                let effect_static = normalize_self_refs_for_static(&effect_text, card_name);
+                !parse_static_line_with_graveyard_keyword_continuation(&effect_static, None, None)
+                    .is_empty()
+            });
+        if is_static_pattern(&static_classify_view) || ability_word_static {
             if result.strive_cost.is_some() && parse_strive_cost_line(&line).is_some() {
                 i += 1;
                 continue;
+            }
+            // CR 122.1 + CR 614.1a: counter-gated per-damage prevention lines
+            // (Rock Hydra class) are static-shaped but are replacements. Route
+            // only the fully typed condition through the replacement parser so
+            // an unrelated static line cannot be claimed by a partial parse.
+            if let Some(replacement_ir) = parse_replacement_line_ir(&line, card_name) {
+                let definition = &replacement_ir.definition;
+                if matches!(
+                    (&definition.event, &definition.condition),
+                    (
+                        ReplacementEvent::DamageDone,
+                        Some(ReplacementCondition::SourceHasCounterAtLeast { .. })
+                    )
+                ) {
+                    emitter.replacement_ir_at(item_line, replacement_ir);
+                    i += 1;
+                    continue;
+                }
             }
             // CR 614.1c / CR 707.9: Lines that are both static-shaped (e.g.
             // trailing "doesn't untap during…" from a reflexive "When you do"
@@ -7137,14 +7181,15 @@ fn parse_activated_ability_ir(
 /// This is intentionally an all-consuming nom grammar: other possessives,
 /// colors, subjects, or trailing words stay in the effect text and therefore
 /// remain an explicit residual parse gap rather than weakening a cost rule.
-fn strip_activated_mana_payment_restriction(
+pub(super) fn strip_activated_mana_payment_restriction(
     text: &str,
 ) -> (&str, Option<ActivationManaPaymentRestriction>) {
-    const SUFFIX: &str = ". spend only mana of the chosen color to activate this ability";
+    const CHOSEN_COLOR_SUFFIX: &str =
+        ". spend only mana of the chosen color to activate this ability";
     let lower = text.to_lowercase();
     let parsed = nom_on_lower(text, &lower, |input| {
-        let (input, prefix) = take_until(SUFFIX).parse(input)?;
-        let (input, _) = tag(SUFFIX).parse(input)?;
+        let (input, prefix) = take_until(CHOSEN_COLOR_SUFFIX).parse(input)?;
+        let (input, _) = tag(CHOSEN_COLOR_SUFFIX).parse(input)?;
         let (input, _) = opt(tag(".")).parse(input)?;
         let (input, _) = all_consuming(multispace0).parse(input)?;
         Ok((input, prefix.len()))
@@ -7154,8 +7199,34 @@ fn strip_activated_mana_payment_restriction(
             text[..prefix_len].trim_end(),
             Some(ActivationManaPaymentRestriction::OnlySourceChosenColor),
         ),
-        None => (text, None),
+        None => strip_activated_x_mana_payment_restriction(text),
     }
+}
+
+/// CR 107.1b + CR 118.3: Strip the terminal activated-ability rider "Spend
+/// only [color] mana on X." The rider describes payment, not resolution, so
+/// keeping it in the effect body would make an otherwise supported ability
+/// falsely unimplemented.
+fn strip_activated_x_mana_payment_restriction(
+    text: &str,
+) -> (&str, Option<ActivationManaPaymentRestriction>) {
+    // Find the sentence boundary in the original text before lowercasing the
+    // rider. Lowercase mappings are not universally byte-length-preserving,
+    // so an index found in the lowercase projection must never slice `text`.
+    let Some(marker_index) = text.rfind(". ") else {
+        return (text, None);
+    };
+    let rider_lower = text[marker_index + 2..]
+        .trim_end_matches('.')
+        .to_lowercase();
+    let Some(restriction) = super::oracle_casting::parse_x_mana_payment_restriction(&rider_lower)
+    else {
+        return (text, None);
+    };
+    (
+        text[..marker_index].trim_end(),
+        Some(ActivationManaPaymentRestriction::OnlyColorsOnX(restriction)),
+    )
 }
 
 /// Parse Oracle text into structured ability definitions.
@@ -7309,7 +7380,10 @@ fn demote_lifetimes_in_ability(def: &mut AbilityDefinition) {
 /// chain. Wildcard-free for the same reason as the walks above.
 fn demote_lifetimes_in_cost(cost: &mut AbilityCost) {
     match cost {
-        AbilityCost::EffectCost { effect } => demote_lifetimes_in_effect(effect),
+        AbilityCost::EffectCost {
+            effect,
+            player_scope: _,
+        } => demote_lifetimes_in_effect(effect),
         AbilityCost::Mana { .. }
         | AbilityCost::ManaDynamic { .. }
         | AbilityCost::Tap
@@ -7365,7 +7439,11 @@ fn demote_lifetimes_in_replacement(replacement: &mut ReplacementDefinition) {
         demote_lifetimes_in_ability(execute);
     }
     match &mut replacement.mode {
-        crate::types::ability::ReplacementMode::MayCost { cost, decline } => {
+        crate::types::ability::ReplacementMode::MayCost {
+            cost,
+            decline,
+            payment_record: _,
+        } => {
             demote_lifetimes_in_cost(cost);
             if let Some(decline) = decline.as_deref_mut() {
                 demote_lifetimes_in_ability(decline);
@@ -7390,9 +7468,22 @@ fn demote_lifetimes_in_replacement(replacement: &mut ReplacementDefinition) {
 /// header on `demote_unenforceable_replacement_lifetimes`.
 fn demote_lifetimes_in_effect(effect: &mut Effect) {
     match effect {
+        // No nested ability definitions or boxed effects: a player-targeted
+        // purge and two choice bookkeeping markers carry nothing to demote.
+        Effect::LoseAllUnspentMana { .. }
+        | Effect::RepeatPaidLibraryLook
+        | Effect::RevealChosenLowestManaValueCreatures => {}
         // --- nested effect, same shape ---
-        Effect::CreateDrawReplacement { replacement_effect }
-        | Effect::CreatePlaneswalkReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
+            demote_lifetimes_in_effect(replacement_effect);
+            if let Some(sub) = replacement_sub_ability.as_deref_mut() {
+                demote_lifetimes_in_ability(sub);
+            }
+        }
+        Effect::CreatePlaneswalkReplacement { replacement_effect } => {
             demote_lifetimes_in_effect(replacement_effect)
         }
         // --- nested ability definitions ---
@@ -7752,6 +7843,10 @@ fn demote_lifetimes_in_modification(modification: &mut ContinuousModification) {
         ContinuousModification::GrantAbility { definition } => {
             demote_lifetimes_in_ability(definition)
         }
+        // No nested ability definition: a zone-copy marker and a plain
+        // keyword-family removal carry nothing to demote.
+        ContinuousModification::CopyTopOfZone { .. }
+        | ContinuousModification::RemoveAllLandwalk => {}
         ContinuousModification::GrantTrigger { trigger } => demote_lifetimes_in_trigger(trigger),
         ContinuousModification::GrantReplacement { replacement } => {
             demote_lifetimes_in_replacement(replacement)
@@ -8197,8 +8292,16 @@ fn render_effect_descriptions(effect: &mut Effect, card_name: &str) {
         Effect::AddTargetReplacement { replacement, .. } => {
             render_replacement_descriptions(replacement, card_name)
         }
-        Effect::CreateDrawReplacement { replacement_effect }
-        | Effect::CreatePlaneswalkReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
+            render_effect_descriptions(replacement_effect, card_name);
+            if let Some(sub) = replacement_sub_ability {
+                render_ability_descriptions(sub, card_name);
+            }
+        }
+        Effect::CreatePlaneswalkReplacement { replacement_effect } => {
             render_effect_descriptions(replacement_effect, card_name)
         }
         // CR 611.2 + CR 111.1: a resolution-time grant onto a target, and a created
@@ -8380,6 +8483,7 @@ pub(crate) fn render_modification_descriptions(
         ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
         | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
         | ContinuousModification::CopyValues { .. }
+        | ContinuousModification::CopyTopOfZone { .. }
         | ContinuousModification::CopyChosen
         | ContinuousModification::SetName { .. }
         | ContinuousModification::SetTextName { .. }
@@ -8390,6 +8494,7 @@ pub(crate) fn render_modification_descriptions(
         | ContinuousModification::AddKeyword { .. }
         | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::RemoveAllAbilities
         | ContinuousModification::AddType { .. }
         | ContinuousModification::RemoveType { .. }
@@ -9027,7 +9132,9 @@ fn find_top_level_colon(line: &str) -> Option<usize> {
 /// `ActivationRestriction`(s). Used for the "Any player may activate this ability
 /// but only <phrase>" form (and composable with other timing-suffix handlers).
 /// Returns `None` for phrases without a recognized timing gate so the caller can
-/// decline rather than mis-classify.
+/// decline rather than mis-classify. Exact legacy combat-step phrases lower to
+/// the structured `DuringPhase`/`BeforePhase` variants so runtime enforcement
+/// does not widen them to the neighboring combat windows.
 /// The single-gate `during`-role / speed sub-combinator, factored out so it can
 /// be the first half of a compound "X and only Y" / "X, Y" activation-timing
 /// gate. Every arm emits an EXISTING `ActivationRestriction` variant — the
@@ -9047,17 +9154,45 @@ fn parse_activation_during_role_gate(i: &str) -> OracleResult<'_, ActivationRest
             tag::<_, _, OracleError<'_>>("as a sorcery"),
         ),
         value(ActivationRestriction::AsInstant, tag("as an instant")),
+        parse_activation_during_step_gate,
         parse_activation_during_gate,
     ))
     .parse(i)
 }
 
+/// CR 508.1 + CR 509.1 + CR 511.1: preserve the exact step named by the
+/// pre-modern activation wording. These are deliberately not lowered to the
+/// broader combat gates: an ability restricted to the declare blockers step
+/// must not be activatable in beginning of combat or during combat damage.
+fn parse_activation_during_step_gate(i: &str) -> OracleResult<'_, ActivationRestriction> {
+    value(
+        ActivationRestriction::DuringPhase {
+            phase: Phase::DeclareAttackers,
+        },
+        tag::<_, _, OracleError<'_>>("during the declare attackers step"),
+    )
+    .or(value(
+        ActivationRestriction::DuringPhase {
+            phase: Phase::DeclareBlockers,
+        },
+        tag("during the declare blockers step"),
+    ))
+    .or(value(
+        ActivationRestriction::DuringPhase {
+            phase: Phase::EndCombat,
+        },
+        tag("during the end of combat step"),
+    ))
+    .parse(i)
+}
+
 /// CR 508.1 + CR 509.1 + CR 510: the combat-window half of an activation-timing
-/// gate. Each phrasing maps to an EXISTING enforced variant, so no new variant is
-/// introduced:
+/// gate. Each phrasing maps to a structured, runtime-enforced variant:
 /// - "before the combat damage step" / "before combat damage [has been dealt]"
 ///   → `BeforeCombatDamage` (CR 510; enforced = `BeginCombat | DeclareAttackers
 ///   | DeclareBlockers`) — Angus Mackenzie, Save Point.
+/// - "before blockers are declared" → `BeforeBlockersDeclared` (CR 509.1;
+///   enforced = `BeginCombat | DeclareAttackers`) — Acidic Dagger.
 /// - "before attackers are declared" / "before combat" → `BeforeAttackersDeclared`
 ///   (CR 508.1; enforced = `PreCombatMain | BeginCombat`) — Arcum's Whistle.
 ///
@@ -9068,12 +9203,22 @@ fn parse_activation_during_role_gate(i: &str) -> OracleResult<'_, ActivationRest
 fn parse_activation_before_window_gate(i: &str) -> OracleResult<'_, ActivationRestriction> {
     alt((
         value(
+            ActivationRestriction::BeforePhase {
+                phase: Phase::EndCombat,
+            },
+            tag("before the end of combat step"),
+        ),
+        value(
             ActivationRestriction::BeforeCombatDamage,
             alt((
                 tag("before combat damage has been dealt"),
                 tag("before the combat damage step"),
                 tag("before combat damage"),
             )),
+        ),
+        value(
+            ActivationRestriction::BeforeBlockersDeclared,
+            tag("before blockers are declared"),
         ),
         value(
             ActivationRestriction::BeforeAttackersDeclared,
@@ -9083,9 +9228,66 @@ fn parse_activation_before_window_gate(i: &str) -> OracleResult<'_, ActivationRe
     .parse(i)
 }
 
+/// CR 509.1 + CR 510.1 + CR 511.1: the post-blockers combat window used by
+/// activated abilities such as Trap Runner. The parser deliberately keeps this
+/// separate from `BeforeCombatDamage`: the two windows overlap in the declare
+/// blockers step but have different boundaries on either side of it.
+fn parse_activation_after_window_gate(i: &str) -> OracleResult<'_, ActivationRestriction> {
+    value(
+        ActivationRestriction::AfterBlockersDeclared,
+        tag("after blockers are declared"),
+    )
+    .parse(i)
+}
+
+/// CR 512.1: the ending phase begins with the end step, so "before the end
+/// step" is a phase boundary rather than an end-step-only condition. Keep it
+/// as its own timing restriction so it composes with a separate turn-role gate
+/// (`during their turn`) without inventing a role×window enum matrix.
+fn parse_activation_before_end_step_gate(i: &str) -> OracleResult<'_, ActivationRestriction> {
+    value(
+        ActivationRestriction::BeforeEndStep,
+        tag("before the end step"),
+    )
+    .parse(i)
+}
+
 fn parse_activation_timing_restriction(phrase: &str) -> Option<Vec<ActivationRestriction>> {
     let phrase = phrase.trim().trim_end_matches('.').trim();
     let lower = phrase.to_lowercase();
+    // CR 504.1 + CR 602.5b: older Oracle uses "during your/their draw
+    // step" for the activating player's own draw step. Keep the player-role
+    // gate separate from the exact phase gate so shared-team turns do not
+    // widen this to a teammate's draw step.
+    if matches!(
+        lower.as_str(),
+        "during your draw step" | "during their draw step"
+    ) {
+        return Some(vec![
+            ActivationRestriction::DuringYourTurn,
+            ActivationRestriction::DuringPhase { phase: Phase::Draw },
+        ]);
+    }
+    if lower == "during the draw step" {
+        return Some(vec![ActivationRestriction::DuringPhase {
+            phase: Phase::Draw,
+        }]);
+    }
+    // CR 602.5b + CR 503.1: "during any upkeep step" has no player-turn
+    // axis. Reuse the existing unscoped upkeep condition instead of inventing
+    // an activation-only enum variant; this is the same predicate that already
+    // enforces "any upkeep" for spell-casting restrictions.
+    if all_consuming((
+        tag::<_, _, OracleError<'_>>("during any upkeep"),
+        opt(tag(" step")),
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        return Some(vec![ActivationRestriction::RequiresCondition {
+            condition: Some(ParsedCondition::IsDuringUpkeep),
+        }]);
+    }
     // Speed / turn / upkeep gates — case-insensitive value matches. "their" is the
     // activating player's possessive, equivalent to "your" once an activator is fixed.
     let gate = parse_activation_during_role_gate(lower.as_str());
@@ -9108,6 +9310,19 @@ fn parse_activation_timing_restriction(phrase: &str) -> Option<Vec<ActivationRes
         )
             .parse(rest);
         if let Ok((tail, (_sep, window))) = compound {
+            if tail.trim().is_empty() {
+                return Some(vec![restr, window]);
+            }
+        }
+        // CR 512.1: Mana Cache's "during their turn before the end step" has
+        // no conjunction or comma between the two timing axes. Parse the
+        // boundary directly after the role gate and retain both restrictions.
+        if let Ok((tail, window)) = preceded(
+            tag::<_, _, OracleError<'_>>(" "),
+            parse_activation_before_end_step_gate,
+        )
+        .parse(rest)
+        {
             if tail.trim().is_empty() {
                 return Some(vec![restr, window]);
             }
@@ -9137,6 +9352,26 @@ fn parse_activation_timing_restriction(phrase: &str) -> Option<Vec<ActivationRes
             if tail.trim().is_empty() {
                 return Some(vec![ActivationRestriction::DuringCombat, window]);
             }
+        }
+        if let Ok((tail, window)) = parse_activation_after_window_gate(rest) {
+            if tail.trim().is_empty() {
+                return Some(vec![ActivationRestriction::DuringCombat, window]);
+            }
+        }
+    }
+    // CR 509.1: permit the standalone post-blockers phrase as well. Current
+    // Oracle usually combines it with "during combat", but retaining the
+    // standalone form keeps this combinator complete and safely enforceable.
+    if let Ok((tail, window)) = parse_activation_after_window_gate(lower.as_str()) {
+        if tail.trim().is_empty() {
+            return Some(vec![window]);
+        }
+    }
+    // CR 512.1: retain the standalone form for future cards whose activation
+    // text names only the phase boundary.
+    if let Ok((tail, window)) = parse_activation_before_end_step_gate(lower.as_str()) {
+        if tail.trim().is_empty() {
+            return Some(vec![window]);
         }
     }
     // CR 602.5: "if <condition>" gate (Lightning Storm "if ~ is on the stack").
@@ -9404,6 +9639,25 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
             }
         }
 
+        // CR 602.5b: legacy timing clauses may separate the condition with a
+        // comma — "Activate only during the declare blockers step, only if
+        // ...". Keep this distinct from the ordinary "activate only if"
+        // form: the guard requires that the left side already contains the
+        // activation-timing prefix, so an effect sentence's incidental
+        // "only if" is never consumed here.
+        if let Some((before, after)) = tp.rsplit_around(" only if ") {
+            if before.lower.contains("activate only ") && !before.lower.ends_with("activate") {
+                if !commit_requires_condition(after.original, &mut constraints.restrictions) {
+                    break;
+                }
+                remaining = before
+                    .original
+                    .trim_end_matches(|c: char| c == ',' || c == '.' || c.is_whitespace())
+                    .to_string();
+                continue;
+            }
+        }
+
         // CR 602.2 + CR 602.5: "Any player may activate this ability but only
         // <restriction>" combines the any-player permission with an activation
         // timing restriction (Endbringer's Revel "as a sorcery", Volrath's Dungeon
@@ -9449,6 +9703,25 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
             }
         }
 
+        // CR 602.5b: pre-modern Oracle also phrases an activation timing
+        // rider as "Activate this ability but only <timing>". This is the
+        // same restriction as the modern "Activate only <timing>" form; keep
+        // the wrapper separate so the timing parser remains the single
+        // authority for the actual gate.
+        if let Some((before, restriction)) = tp.rsplit_around("activate this ability but only ") {
+            if let Some(parsed) = parse_activation_timing_restriction(restriction.original) {
+                constraints.restrictions.extend(parsed);
+                remaining = before
+                    .original
+                    .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
+                    .to_string();
+                if remaining.trim().is_empty() {
+                    break;
+                }
+                continue;
+            }
+        }
+
         if let Some((before, restrictions)) = split_legacy_play_this_ability_timing(&remaining) {
             remaining = before
                 .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
@@ -9467,6 +9740,35 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
                 .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
                 .to_string();
             constraints.activator_filter = Some(PlayerFilter::Opponent);
+            if remaining.is_empty() {
+                break 'parse_constraints;
+            }
+            continue 'parse_constraints;
+        }
+
+        // CR 602.2a: "Only this creature's owner may activate this ability."
+        // Older Oracle data also omits the apostrophe in "creatures owner".
+        // This is a permission rider, not an effect sentence: preserve the
+        // owner-vs-controller distinction when the permanent is stolen.
+        const SOURCE_OWNER_ACTIVATE_SUFFIX: &str =
+            "only this creature's owner may activate this ability";
+        const SOURCE_OWNER_ACTIVATE_LEGACY_SUFFIX: &str =
+            "only this creatures owner may activate this ability";
+        let source_owner_suffix = if lower.ends_with(SOURCE_OWNER_ACTIVATE_SUFFIX) {
+            Some(SOURCE_OWNER_ACTIVATE_SUFFIX)
+        } else if lower.ends_with(SOURCE_OWNER_ACTIVATE_LEGACY_SUFFIX) {
+            Some(SOURCE_OWNER_ACTIVATE_LEGACY_SUFFIX)
+        } else {
+            None
+        };
+        if let Some(suffix) = source_owner_suffix {
+            let end = remaining.len() - suffix.len();
+            remaining = remaining[..end]
+                .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
+                .to_string();
+            constraints
+                .restrictions
+                .push(ActivationRestriction::OnlySourceOwner);
             if remaining.is_empty() {
                 break 'parse_constraints;
             }
@@ -9615,6 +9917,30 @@ pub(super) fn strip_activated_constraints(text: &str) -> (String, ActivatedConst
                 break;
             }
             continue;
+        }
+
+        // CR 602.5b: older Oracle also expresses an activation cap as a
+        // quantity comparison. Keep the quantity typed so the cap is read at
+        // activation time, not frozen during card-data generation.
+        const DYNAMIC_LIMIT_PREFIX: &str = "activate no more times each turn than ";
+        if let Some(idx) = tp.rfind(DYNAMIC_LIMIT_PREFIX) {
+            if idx == 0 || lower[..idx].ends_with(". ") {
+                let count_text = lower[idx + DYNAMIC_LIMIT_PREFIX.len()..].trim();
+                if let Some(count) = super::oracle_quantity::parse_quantity_ref(count_text) {
+                    constraints
+                        .restrictions
+                        .push(ActivationRestriction::MaxTimesEachTurnDynamic {
+                            count: QuantityExpr::Ref { qty: count },
+                        });
+                    remaining = remaining[..idx]
+                        .trim_end_matches(|c: char| c == '.' || c == ',' || c.is_whitespace())
+                        .to_string();
+                    if remaining.is_empty() {
+                        break;
+                    }
+                    continue;
+                }
+            }
         }
 
         if let Some(idx) = tp.rfind("activate only if ") {

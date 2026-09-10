@@ -55,6 +55,21 @@ pub fn parse_quantity_ref_complete(input: &str) -> OracleResult<'_, QuantityRef>
     all_consuming(parse_quantity_ref).parse(input)
 }
 
+/// CR 614.12 + CR 119.4: persistent entry-payment provenance, used by cards
+/// whose later abilities refer to the life paid as this permanent entered.
+pub fn parse_entry_life_paid_ref(input: &str) -> OracleResult<'_, QuantityRef> {
+    value(
+        QuantityRef::EntryLifePaid,
+        alt((
+            tag("the life paid as ~ entered the battlefield"),
+            tag("the life paid as it entered the battlefield"),
+            tag("the life paid as ~ entered"),
+            tag("the life paid as it entered"),
+        )),
+    )
+    .parse(input)
+}
+
 pub fn parse_for_each_clause_ref_complete(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, mut qty) = parse_for_each_clause_ref_complete_deferred(input)?;
     // CR 608.2k: a caller reaching this entry has no antecedent for a deferred
@@ -944,9 +959,23 @@ pub(crate) fn parse_extreme_chosen_number_ref(input: &str) -> OracleResult<'_, Q
     .parse(input)
 }
 
+/// A singular number chosen earlier while resolving this ability. The caller
+/// supplies the provenance gate: without a preceding `NumberRange` choice,
+/// these ordinary anaphors have no resolution-local meaning.
+pub(crate) fn parse_resolution_chosen_number_ref(input: &str) -> OracleResult<'_, QuantityRef> {
+    value(
+        QuantityRef::PlayerChosenNumber {
+            player: crate::types::ability::PlayerScope::Controller,
+        },
+        alt((tag("that number"), tag("the number"))),
+    )
+    .parse(input)
+}
+
 pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     alt((
         alt((
+            parse_entry_life_paid_ref,
             parse_guessed_number_ref,
             parse_object_count_by_shared_quality,
             parse_chosen_number_ref,
@@ -3283,12 +3312,40 @@ fn parse_for_each_opponents_life_change(input: &str) -> OracleResult<'_, Quantit
 /// "1 ") and from Blood Tyrant's "1 life lost or gained this way" (no "you";
 /// handled by the `TrackedSetSize` "this way" block).
 fn parse_for_each_one_life_changed(input: &str) -> OracleResult<'_, QuantityRef> {
-    let (rest, _) = alt((tag("1 life you "), tag("one life you "))).parse(input)?;
+    let (rest, _) = alt((
+        tag("1 life you "),
+        tag("one life you "),
+        tag("1 life they "),
+        tag("one life they "),
+    ))
+    .parse(input)?;
     value(
         QuantityRef::EventContextAmount,
         alt((tag("gained"), tag("lost"))),
     )
     .parse(rest)
+}
+
+/// CR 120.1 + CR 120.9 + CR 603.4: "for each 1 damage dealt to you this
+/// turn" counts the amount of damage dealt to the source controller, rather
+/// than the number of damage events. `DamageDealtThisTurn` already carries the
+/// exact historical amount and keeps the recipient bound to the ability's
+/// controller through `ControllerRef::You`.
+fn parse_for_each_one_damage_dealt_to_you(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, _) = tag("1 damage dealt to you this turn").parse(input)?;
+    Ok((
+        rest,
+        QuantityRef::DamageDealtThisTurn {
+            source: Box::new(TargetFilter::Any),
+            target: Box::new(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::You),
+            )),
+            aggregate: AggregateFunction::Sum,
+            group_by: None,
+            damage_kind: DamageKindFilter::Any,
+            channel: DamageChannel::Total,
+        },
+    ))
 }
 
 /// Parse "your life total".
@@ -3568,6 +3625,29 @@ fn parse_attached_creature_pt_ref(input: &str) -> OracleResult<'_, QuantityRef> 
 /// damage this turn (120.9 specified-source semantics).
 fn parse_damage_dealt_this_turn_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     let (input, _) = opt(tag("the ")).parse(input)?;
+    // CR 120.9 + CR 608.2c: Whipkeeper's old-border wording refers to the
+    // damage already marked on the creature selected by the ability. The
+    // target is the parent target here, not a new target slot and not the
+    // ability source.
+    if let Ok((rest, _)) = (
+        tag::<_, _, OracleError<'_>>("damage already dealt to "),
+        tag("it"),
+        tag(" this turn"),
+    )
+        .parse(input)
+    {
+        return Ok((
+            rest,
+            QuantityRef::DamageDealtThisTurn {
+                source: Box::new(TargetFilter::Any),
+                target: Box::new(TargetFilter::ParentTarget),
+                aggregate: AggregateFunction::Sum,
+                group_by: None,
+                damage_kind: DamageKindFilter::Any,
+                channel: DamageChannel::Total,
+            },
+        ));
+    }
     alt((
         value(
             QuantityRef::DamageDealtThisTurn {
@@ -4813,6 +4893,7 @@ fn parse_for_each_clause_ref_with_they_controller(
         parse_for_each_card_drawn_this_way,
         parse_for_each_recipient_attack_count,
         parse_for_each_spells_before_triggering_spell,
+        parse_for_each_one_damage_dealt_to_you,
         alt((
             parse_for_each_one_life_changed,
             alt((
@@ -4917,6 +4998,7 @@ fn parse_for_each_clause_ref_with_they_controller(
         // Gagglemaster, Aerial Assault, Alert Heedbonder, Overgrown Battlement).
         parse_for_each_controlled_type_with_keyword,
         parse_for_each_object_spell_could_target,
+        parse_for_each_type_of_chosen_color,
         parse_for_each_controlled_type,
         // CR 201.2: "for each [other] <type> named <CardName> you control"
         // (Seven Dwarves). The `named X` qualifier sits between the type word
@@ -6223,6 +6305,25 @@ fn parse_for_each_battlefield_type(input: &str) -> OracleResult<'_, QuantityRef>
     ))
 }
 
+/// CR 105.4: Parse a battlefield-wide population narrowed by a chosen color,
+/// such as Rith and Treva's "for each permanent of that color". The absence
+/// of a controller qualifier means the count includes every player's
+/// permanents, while `IsChosenColor` defers the selected color to resolution.
+fn parse_for_each_type_of_chosen_color(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, tf) = parse_type_filter_word(input)?;
+    let (rest, chosen_color) = parse_pre_controller_chosen_filter_suffix(rest)?;
+    Ok((
+        rest,
+        QuantityRef::ObjectCount {
+            filter: TargetFilter::Typed(TypedFilter {
+                type_filters: vec![tf],
+                controller: None,
+                properties: vec![chosen_color],
+            }),
+        },
+    ))
+}
+
 /// CR 604.1 + CR 611.3a + CR 613.4c: Parse "[other] <type> on the
 /// battlefield with <keyword>" in a "for each" clause -> a battlefield-wide
 /// (any-controller) population count of permanents of the given type that
@@ -6511,6 +6612,12 @@ fn parse_for_each_controlled_type(input: &str) -> OracleResult<'_, QuantityRef> 
     let (rest, chosen_type_prop) = opt(alt((
         value(FilterProp::IsChosenCreatureType, tag(" of that type")),
         value(FilterProp::IsChosenCreatureType, tag(" of the chosen type")),
+        // CR 105.4: "<type> you control of that color" scopes the
+        // population to the color chosen earlier in the same resolving
+        // ability (Rith, the Awakener and the old-border color-count class).
+        // Keep this on the controller-scoped quantity path so the resulting
+        // ObjectCount is evaluated against the source controller's permanents.
+        parse_pre_controller_chosen_filter_suffix,
     )))
     .parse(rest)?;
     let mut properties = Vec::new();
@@ -7741,6 +7848,42 @@ mod tests {
         }
     }
 
+    /// CR 105.4 + CR 109.4: a controller-scoped "for each" count can narrow
+    /// the chosen population by the color selected earlier in the ability.
+    #[test]
+    fn parse_for_each_controlled_type_of_chosen_color() {
+        let (rest, q) = parse_for_each_clause_ref("permanent you control of that color")
+            .expect("chosen-color population should parse");
+        assert_eq!(rest, "");
+        match q {
+            QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(tf),
+            } => {
+                assert_eq!(tf.controller, Some(ControllerRef::You));
+                assert!(tf.type_filters.contains(&TypeFilter::Permanent));
+                assert!(tf.properties.contains(&FilterProp::IsChosenColor));
+            }
+            other => panic!("expected chosen-color ObjectCount, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_for_each_type_of_chosen_color_is_battlefield_wide() {
+        let (rest, q) = parse_for_each_clause_ref("permanent of that color")
+            .expect("battlefield-wide chosen-color population should parse");
+        assert_eq!(rest, "");
+        match q {
+            QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(tf),
+            } => {
+                assert_eq!(tf.controller, None);
+                assert!(tf.type_filters.contains(&TypeFilter::Permanent));
+                assert!(tf.properties.contains(&FilterProp::IsChosenColor));
+            }
+            other => panic!("expected battlefield-wide chosen-color ObjectCount, got {other:?}"),
+        }
+    }
+
     /// CR 208.1 + CR 208.4b + CR 109.4: the shared property arm retains the
     /// candidate-relative power/base-power predicate in a controller-scoped
     /// for-each population.
@@ -8338,6 +8481,34 @@ mod tests {
             }
         );
         assert_eq!(rest, "");
+    }
+
+    /// CR 120.1 + CR 120.9: Discordant Spirit's counter amount is the total
+    /// damage dealt to its controller this turn, not the number of damage
+    /// records. The dynamic quantity must therefore lower to the historical
+    /// damage aggregate used by the resolver.
+    #[test]
+    fn parse_for_each_one_damage_dealt_to_you_uses_damage_amount() {
+        use crate::parser::oracle_quantity::{parse_for_each_clause, parse_for_each_clause_expr};
+
+        let expected = QuantityRef::DamageDealtThisTurn {
+            source: Box::new(TargetFilter::Any),
+            target: Box::new(TargetFilter::Typed(
+                TypedFilter::default().controller(ControllerRef::You),
+            )),
+            aggregate: AggregateFunction::Sum,
+            group_by: None,
+            damage_kind: DamageKindFilter::Any,
+            channel: DamageChannel::Total,
+        };
+        assert_eq!(
+            parse_for_each_clause("1 damage dealt to you this turn"),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            parse_for_each_clause_expr("1 damage dealt to you this turn"),
+            Some(QuantityExpr::Ref { qty: expected })
+        );
     }
 
     #[test]
@@ -10558,6 +10729,24 @@ mod tests {
                 "{unrelated} must not read as a chosen-number extremum"
             );
         }
+    }
+
+    #[test]
+    fn parse_resolution_chosen_number_ref_shape() {
+        for text in ["that number", "the number"] {
+            let (rest, qty) = parse_resolution_chosen_number_ref(text).unwrap();
+            assert_eq!(rest, "");
+            assert_eq!(
+                qty,
+                QuantityRef::PlayerChosenNumber {
+                    player: PlayerScope::Controller,
+                },
+                "{text}"
+            );
+        }
+
+        let (rest, _) = parse_resolution_chosen_number_ref("the number of cards").unwrap();
+        assert_eq!(rest, " of cards");
     }
 
     /// The extremum reference is NOT reachable from the context-free

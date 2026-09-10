@@ -14,6 +14,11 @@ use crate::types::zones::Zone;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TokenPtFollowup {
     PowerToughness { power: PtValue, toughness: PtValue },
+    /// The next sentence grants a token characteristic-defining ability which
+    /// supplies its power/toughness. The definitions themselves are absorbed
+    /// by the sequence continuation; this marker only lets the creature token
+    /// clause lower before that continuation is applied.
+    StaticAbility,
 }
 
 /// Parser-internal scope flag: whether the trigger CONDITION currently being

@@ -8579,6 +8579,7 @@ mod tests {
                     cost: AbilityCost::PayLife {
                         amount: QuantityExpr::Fixed { value: 2 },
                     },
+                    payment_record: None,
                     decline: Some(Box::new(AbilityDefinition::new(
                         AbilityKind::Spell,
                         Effect::SetTapState {
@@ -9106,6 +9107,7 @@ mod tests {
                 cost: AbilityCost::PayLife {
                     amount: QuantityExpr::Fixed { value: 2 },
                 },
+                payment_record: None,
                 decline: Some(Box::new(AbilityDefinition::new(
                     AbilityKind::Spell,
                     Effect::SetTapState {
@@ -9528,6 +9530,7 @@ mod tests {
                     cost: AbilityCost::PayLife {
                         amount: QuantityExpr::Fixed { value: 2 },
                     },
+                    payment_record: None,
                     decline: Some(Box::new(AbilityDefinition::new(
                         AbilityKind::Spell,
                         Effect::SetTapState {
@@ -9562,6 +9565,7 @@ mod tests {
                     cost: AbilityCost::PayLife {
                         amount: QuantityExpr::Fixed { value: 2 },
                     },
+                    payment_record: None,
                     decline: Some(Box::new(AbilityDefinition::new(
                         AbilityKind::Spell,
                         Effect::SetTapState {

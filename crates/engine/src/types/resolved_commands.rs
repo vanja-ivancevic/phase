@@ -679,6 +679,11 @@ pub enum ResolvedTokenBody {
 pub struct ResolvedTokenCreationCommand {
     pub object: ObjectIncarnationRef,
     pub owner: PlayerId,
+    /// CR 110.2a + CR 305.1: the player who performed the action that put the
+    /// token onto the battlefield. This is separate from the resulting
+    /// controller because an entry replacement can change control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub putter: Option<PlayerId>,
     pub entry_timestamp: u64,
     /// CR 302.6: the turn the token entered, which backs "has been under its
     /// controller's control continuously since their most recent turn began"

@@ -1833,12 +1833,107 @@ fn static_condition_matches_context(
     context: &StaticCheckContext,
 ) -> bool {
     def.condition.as_ref().is_none_or(|condition| {
+        // CR 508.1b / CR 508.5: during attacker declaration, "defending
+        // player" means the player defended by THIS proposed attack target,
+        // not a creature already recorded in CombatState (there is none yet).
+        // Bind the otherwise normal typed quantity AST just for this legality
+        // check; every non-combat evaluation retains its existing semantics.
+        let bound_condition = context.attack_target.map(|target| {
+            let defending =
+                crate::game::combat::defending_player_for_target_or(state, target, controller);
+            bind_proposed_defending_player(condition, defending)
+        });
+        let condition = bound_condition.as_ref().unwrap_or(condition);
         if let Some(recipient_id) = context.target_id {
             evaluate_condition_with_recipient(state, condition, controller, source_id, recipient_id)
         } else {
             evaluate_condition(state, condition, controller, source_id)
         }
     })
+}
+
+/// Bind a proposed defender into combat-relative conditions before the attack
+/// declaration has populated `CombatState`. Boolean wrappers are handled so
+/// the normal "can't … unless" negation remains intact. This covers both the
+/// typed quantity shape produced by the combat-relative count parser and the
+/// direct "defending player controls [filter]" static condition.
+fn bind_proposed_defending_player(
+    condition: &crate::types::ability::StaticCondition,
+    defending_player: PlayerId,
+) -> crate::types::ability::StaticCondition {
+    use crate::types::ability::StaticCondition;
+
+    match condition {
+        StaticCondition::Not { condition } => StaticCondition::Not {
+            condition: Box::new(bind_proposed_defending_player(condition, defending_player)),
+        },
+        StaticCondition::And { conditions } => StaticCondition::And {
+            conditions: conditions
+                .iter()
+                .map(|condition| bind_proposed_defending_player(condition, defending_player))
+                .collect(),
+        },
+        StaticCondition::Or { conditions } => StaticCondition::Or {
+            conditions: conditions
+                .iter()
+                .map(|condition| bind_proposed_defending_player(condition, defending_player))
+                .collect(),
+        },
+        StaticCondition::QuantityComparison {
+            lhs,
+            comparator,
+            rhs,
+        } => StaticCondition::QuantityComparison {
+            lhs: bind_proposed_defender_in_quantity_expr(lhs, defending_player),
+            comparator: *comparator,
+            rhs: bind_proposed_defender_in_quantity_expr(rhs, defending_player),
+        },
+        // CR 508.1b: before attackers are declared there is no CombatState
+        // record for the source, so `layers::evaluate_condition` cannot yet
+        // resolve `DefendingPlayerControls` from an attacker entry. Rebind it
+        // into the ordinary, already-supported battlefield-presence condition
+        // over this proposed defender.
+        StaticCondition::DefendingPlayerControls { filter } => StaticCondition::IsPresent {
+            // The Oracle grammar for this condition constructs a typed
+            // permanent filter ("a snow land", "an Island", etc.); bind its
+            // controller to the proposed defender. Keep an unexpected manual
+            // non-typed filter intact rather than inventing a broader match.
+            filter: Some(match filter {
+                TargetFilter::Typed(typed) => TargetFilter::Typed(
+                    typed.clone().controller(ControllerRef::SpecificPlayer {
+                        id: defending_player,
+                    }),
+                ),
+                other => other.clone(),
+            }),
+        },
+        other => other.clone(),
+    }
+}
+
+fn bind_proposed_defender_in_quantity_expr(
+    expr: &crate::types::ability::QuantityExpr,
+    defending_player: PlayerId,
+) -> crate::types::ability::QuantityExpr {
+    use crate::types::ability::{ControllerRef, QuantityExpr, QuantityRef, TargetFilter};
+
+    match expr {
+        QuantityExpr::Ref {
+            qty:
+                QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(filter),
+                },
+        } if filter.controller == Some(ControllerRef::DefendingPlayer) => QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(filter.clone().controller(
+                    ControllerRef::SpecificPlayer {
+                        id: defending_player,
+                    },
+                )),
+            },
+        },
+        other => other.clone(),
+    }
 }
 
 /// CR 702.122d: Returns true when the creature has an active "can't crew Vehicles" static.
@@ -2126,7 +2221,9 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::parser::oracle_static::parse_static_line;
     use crate::types::ability::StaticCondition;
-    use crate::types::ability::{ControllerRef, StaticDefinition, TargetFilter, TypedFilter};
+    use crate::types::ability::{
+        ControllerRef, StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
+    };
     use crate::types::card_type::CoreType;
     use crate::types::identifiers::CardId;
     use crate::types::statics::StaticMode;
@@ -2192,6 +2289,167 @@ mod tests {
             ..Default::default()
         };
         assert!(check_static_ability(&state, StaticMode::CantAttack, &ctx));
+    }
+
+    /// CR 508.1b: a relative-count attack restriction is evaluated against the
+    /// player the creature is proposed to attack, before the declaration has
+    /// populated `CombatState`.  This is the runtime half of Goblin Goon's
+    /// parser coverage: two creatures beat one defender creature, but not two.
+    #[test]
+    fn combat_relative_count_binds_the_proposed_defending_player() {
+        use crate::game::combat::AttackTarget;
+        use crate::types::ability::{Comparator, QuantityExpr, QuantityRef};
+
+        let mut state = setup();
+        let goon = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Goblin Goon".to_string(),
+            Zone::Battlefield,
+        );
+        let ally = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Goblin Ally".to_string(),
+            Zone::Battlefield,
+        );
+        let defender = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(1),
+            "Defender Creature".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [goon, ally, defender] {
+            state
+                .objects
+                .get_mut(&id)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Creature);
+        }
+
+        let creature_count = |controller| QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(TypedFilter::creature().controller(controller)),
+            },
+        };
+        let def = StaticDefinition::new(StaticMode::CantAttack).condition(StaticCondition::Not {
+            condition: Box::new(StaticCondition::QuantityComparison {
+                lhs: creature_count(ControllerRef::You),
+                comparator: Comparator::GT,
+                rhs: creature_count(ControllerRef::DefendingPlayer),
+            }),
+        });
+        let context = StaticCheckContext {
+            target_id: Some(goon),
+            attack_target: Some(AttackTarget::Player(PlayerId(1))),
+            ..Default::default()
+        };
+
+        assert!(
+            !static_condition_matches_context(&state, goon, PlayerId(0), &def, &context),
+            "two creatures are more than the proposed defender's one"
+        );
+
+        let second_defender = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(1),
+            "Second Defender".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&second_defender)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        assert!(
+            static_condition_matches_context(&state, goon, PlayerId(0), &def, &context),
+            "an equal creature count leaves the can't-attack restriction active"
+        );
+
+        let block_def =
+            StaticDefinition::new(StaticMode::CantBlock).condition(StaticCondition::Not {
+                condition: Box::new(StaticCondition::QuantityComparison {
+                    lhs: creature_count(ControllerRef::You),
+                    comparator: Comparator::GT,
+                    rhs: creature_count(ControllerRef::ActivePlayer),
+                }),
+            });
+        assert!(
+            static_condition_matches_context(
+                &state,
+                defender,
+                PlayerId(1),
+                &block_def,
+                &StaticCheckContext {
+                    target_id: Some(defender),
+                    ..Default::default()
+                },
+            ),
+            "the block-side mirror compares its controller to the active attacking player"
+        );
+    }
+
+    /// CR 508.1b: the direct "can't attack if defending player controls an
+    /// artifact" form must use the proposed defender during declaration,
+    /// before the attacker is recorded in `CombatState`. This is the shared
+    /// runtime path for Arctic Foxes, Mogg Jailer, Orgg, and similar cards.
+    #[test]
+    fn defending_player_controls_binds_the_proposed_defender() {
+        use crate::game::combat::AttackTarget;
+
+        let mut state = setup();
+        let attacker = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        let def = StaticDefinition::new(StaticMode::CantAttack).condition(
+            StaticCondition::DefendingPlayerControls {
+                filter: TargetFilter::Typed(
+                    TypedFilter::new(TypeFilter::Artifact),
+                ),
+            },
+        );
+        let context = StaticCheckContext {
+            target_id: Some(attacker),
+            attack_target: Some(AttackTarget::Player(PlayerId(1))),
+            ..Default::default()
+        };
+
+        assert!(
+            !static_condition_matches_context(&state, attacker, PlayerId(0), &def, &context),
+            "without a matching permanent, the attack restriction must not apply"
+        );
+
+        let artifact = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Defender Artifact".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&artifact)
+            .expect("defender artifact exists")
+            .card_types
+            .core_types
+            .push(CoreType::Artifact);
+
+        assert!(
+            static_condition_matches_context(&state, attacker, PlayerId(0), &def, &context),
+            "the restriction must apply when the proposed defender controls an artifact"
+        );
     }
 
     /// Unit 2, site #1: `check_static_ability` gates its O(N) whole-battlefield

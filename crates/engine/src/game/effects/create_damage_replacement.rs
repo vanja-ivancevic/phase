@@ -137,7 +137,13 @@ pub fn resolve(
                 }
             }
         }
-        other => other.clone(),
+        // CR 609.7a: source-scoped targets such as Reverberation's
+        // `ParentTargetSlot` must be concretized before the shield outlives the
+        // resolving spell. Keep the ordinary SelfRef/typed filters unchanged;
+        // `resolve_source_filter` is deliberately identity-preserving for them.
+        other => other.as_ref().map(|filter| {
+            resolve_source_filter(filter, state, ability.source_id, &ability.targets)
+        }),
     };
 
     // CR 614.5 vs CR 611.2a: label the shield by its actual lifetime.
@@ -219,7 +225,10 @@ pub fn resolve(
                 redirect_amount.unwrap_or(PreventionAmount::All),
                 redirect_lifetime,
             );
-            if recipient == DamageRedirectTarget::ChosenObjectTarget {
+            if matches!(
+                recipient,
+                DamageRedirectTarget::ChosenObjectTarget | DamageRedirectTarget::ChosenTarget
+            ) {
                 // The redirect target is the LAST declared object slot — the
                 // original-recipient slot (Jade Monolith) is declared first when
                 // both are present, though no single card has both today. The
@@ -227,8 +236,11 @@ pub fn resolve(
                 // the target its parent instruction already chose ("Choose target
                 // creature you control. …to the chosen creature instead"), which
                 // reaches this resolver through the propagated parent targets.
-                if let Some(id) = chosen_redirect_object(ability, recipient_consumes_slot) {
-                    shield = shield.redirect_target(TargetFilter::SpecificObject { id });
+                if let Some(target) = chosen_redirect_target(ability, recipient_consumes_slot) {
+                    shield = shield.redirect_target(match target {
+                        TargetRef::Object(id) => TargetFilter::SpecificObject { id },
+                        TargetRef::Player(id) => TargetFilter::SpecificPlayer { id },
+                    });
                 }
             }
         }
@@ -297,25 +309,29 @@ fn chosen_target_object(ability: &ResolvedAbility, skip: usize) -> Option<Object
         .nth(skip)
 }
 
-/// Return the object target slot for a `ChosenObjectTarget` redirect recipient.
-/// When the original recipient is itself a chosen target object (Jade Monolith —
-/// `recipient_consumed_slot` is `true`), the redirect slot is the *second*
-/// object target; otherwise (no recipient slot, or a self recipient like the
-/// en-Kor cycle) it is the first.
-fn chosen_redirect_object(
+/// Return the target slot for a chosen redirect recipient. When the original
+/// recipient is itself a chosen target object (Jade Monolith —
+/// `recipient_consumed_slot` is `true`), the redirect slot is the second
+/// declared slot; otherwise (no recipient slot, or a self recipient like the
+/// en-Kor cycle) it is the first. Unlike the legacy object-only helper, this
+/// preserves a player selected for an `any target` recipient.
+fn chosen_redirect_target(
     ability: &ResolvedAbility,
     recipient_consumed_slot: bool,
-) -> Option<ObjectId> {
+) -> Option<TargetRef> {
     let skip = if recipient_consumed_slot { 1 } else { 0 };
-    chosen_target_object(ability, skip)
+    ability.targets.get(skip).cloned()
 }
 
 /// CR 614.9: Resolve a redirection recipient to a concrete `TargetRef` against
 /// the live game state, at damage-apply time. `Controller` → the replacement
 /// source's controller; `SourceObject` → the source object itself;
-/// `ChosenObjectTarget` → `chosen_object`, captured at resolution time into the
+/// `SourceController` → the damage source's controller;
+/// `ChosenObjectTarget` → its chosen object and `ChosenTarget` → its chosen
+/// object or player, captured at resolution time into the
 /// shield's `redirect_target` field (the shield host does not retain the
 /// creating ability's targets, so the applier reads them back from there);
+/// `SourceOwner` → the replacement source object's owner;
 /// `AttachedToSource` → the permanent the source is attached to.
 ///
 /// Used by `replacement::damage_done_applier` to rewrite the damage event's
@@ -323,16 +339,29 @@ fn chosen_redirect_object(
 pub(crate) fn resolve_redirect_recipient(
     state: &GameState,
     recipient: DamageRedirectTarget,
-    source_id: ObjectId,
-    chosen_object: Option<ObjectId>,
+    replacement_source_id: ObjectId,
+    damage_source_id: ObjectId,
+    chosen_target: Option<TargetRef>,
 ) -> Option<TargetRef> {
     match recipient {
         DamageRedirectTarget::Controller => state
             .objects
-            .get(&source_id)
+            .get(&replacement_source_id)
             .map(|obj| TargetRef::Player(obj.controller)),
-        DamageRedirectTarget::SourceObject => Some(TargetRef::Object(source_id)),
-        DamageRedirectTarget::ChosenObjectTarget => chosen_object.map(TargetRef::Object),
+        DamageRedirectTarget::SourceController => state
+            .objects
+            .get(&damage_source_id)
+            .map(|obj| TargetRef::Player(obj.controller)),
+        DamageRedirectTarget::SourceOwner => state
+            .objects
+            .get(&replacement_source_id)
+            .map(|obj| TargetRef::Player(obj.owner)),
+        DamageRedirectTarget::SourceObject => Some(TargetRef::Object(replacement_source_id)),
+        DamageRedirectTarget::ChosenObjectTarget => match chosen_target {
+            Some(TargetRef::Object(id)) => Some(TargetRef::Object(id)),
+            Some(TargetRef::Player(_)) | None => None,
+        },
+        DamageRedirectTarget::ChosenTarget => chosen_target,
         // CR 303.4b + CR 301.5a: the Aura's/Equipment's own host, read LIVE from
         // `attached_to` on every damage event rather than latched at install, so
         // moving the attachment moves the redirect (Pariah, Pariah's Shield, With
@@ -353,7 +382,7 @@ pub(crate) fn resolve_redirect_recipient(
         // the CR 614.9 "left the game" clause is checked there.)
         DamageRedirectTarget::AttachedToSource => state
             .objects
-            .get(&source_id)
+            .get(&replacement_source_id)
             .and_then(|obj| obj.attached_to.as_ref())
             .and_then(AttachTarget::as_object)
             .map(TargetRef::Object),
@@ -395,6 +424,206 @@ mod tests {
         let id = create_object(state, CardId(1), owner, name.to_string(), Zone::Battlefield);
         state.objects.get_mut(&id).unwrap().card_types.core_types = vec![CoreType::Creature];
         id
+    }
+
+    #[test]
+    fn source_controller_redirect_resolves_from_damage_source() {
+        let mut state = GameState::new_two_player(42);
+        let replacement_source = create_creature(&mut state, PlayerId(0), "Aegis of Honor");
+        let damage_source = create_creature(&mut state, PlayerId(1), "Damage Source");
+
+        assert_eq!(
+            resolve_redirect_recipient(
+                &state,
+                DamageRedirectTarget::SourceController,
+                replacement_source,
+                damage_source,
+                None,
+            ),
+            Some(TargetRef::Player(PlayerId(1)))
+        );
+        assert_eq!(
+            resolve_redirect_recipient(
+                &state,
+                DamageRedirectTarget::Controller,
+                replacement_source,
+                damage_source,
+                None,
+            ),
+            Some(TargetRef::Player(PlayerId(0)))
+        );
+    }
+
+    #[test]
+    fn source_owner_redirect_resolves_from_replacement_source() {
+        let mut state = GameState::new_two_player(42);
+        let replacement_source = create_creature(&mut state, PlayerId(1), "Personal Incarnation");
+        let damage_source = create_creature(&mut state, PlayerId(0), "Damage Source");
+
+        assert_eq!(
+            resolve_redirect_recipient(
+                &state,
+                DamageRedirectTarget::SourceOwner,
+                replacement_source,
+                damage_source,
+                None,
+            ),
+            Some(TargetRef::Player(PlayerId(1)))
+        );
+    }
+
+    #[test]
+    fn source_controller_redirect_moves_damage_to_live_source_controller() {
+        let mut state = GameState::new_two_player(42);
+        let replacement_source = create_creature(&mut state, PlayerId(0), "Aegis of Honor");
+        let damage_source = create_creature(&mut state, PlayerId(1), "Damage Source");
+        let ability = ResolvedAbility::new(
+            Effect::CreateDamageReplacement {
+                redirect_lifetime: RedirectionLifetime::OneOpportunity,
+                source_filter: None,
+                combat_scope: None,
+                target_filter: None,
+                modification: None,
+                redirect_to: Some(DamageRedirectTarget::SourceController),
+                redirect_amount: None,
+                redirect_object_filter: None,
+                recipient_object_filter: None,
+            },
+            vec![],
+            replacement_source,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+
+        let ctx = deal_damage::DamageContext::from_source(&state, damage_source).unwrap();
+        deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Player(PlayerId(0)),
+            3,
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        assert_eq!(state.players[0].life, 20, "the original recipient is untouched");
+        assert_eq!(state.players[1].life, 17, "the damage source's controller is hit");
+    }
+
+    #[test]
+    fn source_scoped_continuous_redirect_captures_target_sorcery() {
+        let mut state = GameState::new_two_player(42);
+        let reverberation = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Reverberation".to_string(),
+            Zone::Stack,
+        );
+        let sorcery = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Target Sorcery".to_string(),
+            Zone::Stack,
+        );
+        state.stack.push_back(crate::types::game_state::StackEntry {
+            id: sorcery,
+            source_id: sorcery,
+            controller: PlayerId(1),
+            kind: crate::types::game_state::StackEntryKind::Spell {
+                card_id: CardId(2),
+                ability: None,
+                casting_variant: crate::types::game_state::CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        state
+            .objects
+            .get_mut(&sorcery)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Sorcery];
+
+        let ability = ResolvedAbility::new(
+            Effect::CreateDamageReplacement {
+                redirect_lifetime: RedirectionLifetime::Continuous,
+                source_filter: Some(TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::ParentTargetSlot { index: 0 },
+                        TargetFilter::And {
+                            filters: vec![
+                                TargetFilter::StackSpell,
+                                TargetFilter::Typed(crate::types::ability::TypedFilter::new(
+                                    crate::types::ability::TypeFilter::Sorcery,
+                                )),
+                            ],
+                        },
+                    ],
+                }),
+                combat_scope: None,
+                target_filter: None,
+                modification: None,
+                redirect_to: Some(DamageRedirectTarget::SourceController),
+                redirect_amount: None,
+                redirect_object_filter: None,
+                recipient_object_filter: None,
+            },
+            vec![TargetRef::Object(sorcery)],
+            reverberation,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+
+        assert_eq!(state.pending_damage_replacements.len(), 1);
+        assert_eq!(
+            state.pending_damage_replacements[0].damage_source_filter,
+            Some(TargetFilter::And {
+                filters: vec![
+                    TargetFilter::SpecificObject { id: sorcery },
+                    TargetFilter::Typed(crate::types::ability::TypedFilter::new(
+                        crate::types::ability::TypeFilter::Sorcery,
+                    )),
+                ],
+            })
+        );
+
+        let ctx = deal_damage::DamageContext::from_source(&state, sorcery).unwrap();
+        let mut events = Vec::new();
+        deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Player(PlayerId(0)),
+            3,
+            false,
+            &mut events,
+        )
+        .unwrap();
+        assert_eq!(
+            state.players[0].life, 20,
+            "the original recipient is untouched"
+        );
+        assert_eq!(
+            state.players[1].life, 17,
+            "the target sorcery's controller is hit"
+        );
+
+        let mut events = Vec::new();
+        deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Player(PlayerId(0)),
+            2,
+            false,
+            &mut events,
+        )
+        .unwrap();
+        assert_eq!(
+            state.players[0].life, 20,
+            "continuous replacement remains active"
+        );
+        assert_eq!(state.players[1].life, 15);
+        assert!(!state.pending_damage_replacements[0].is_consumed);
     }
 
     fn amount_oneshot_ability(source: ObjectId, controller: PlayerId) -> ResolvedAbility {
@@ -1103,6 +1332,68 @@ mod tests {
         )
     }
 
+    #[test]
+    fn chosen_source_half_prevention_scopes_to_you_and_is_one_shot() {
+        use crate::types::game_state::ChosenDamageSource;
+
+        let mut state = GameState::new_two_player(42);
+        let host = create_creature(&mut state, PlayerId(0), "Dark Sphere");
+        let chosen_source = create_creature(&mut state, PlayerId(1), "Chosen Attacker");
+        state.last_chosen_damage_source = Some(ChosenDamageSource {
+            source_id: chosen_source,
+            source_filter: TargetFilter::ChosenDamageSource { filter: None },
+        });
+        let ability = ResolvedAbility::new(
+            Effect::CreateDamageReplacement {
+                redirect_lifetime: RedirectionLifetime::OneOpportunity,
+                source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
+                combat_scope: None,
+                target_filter: Some(DamageTargetFilter::Player {
+                    player: DamageTargetPlayerScope::Controller,
+                }),
+                modification: Some(DamageModification::PreventionHalf),
+                redirect_to: None,
+                redirect_amount: None,
+                redirect_object_filter: None,
+                recipient_object_filter: None,
+            },
+            vec![],
+            host,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+        state.last_chosen_damage_source = None;
+
+        let ctx = deal_damage::DamageContext::from_source(&state, chosen_source).unwrap();
+        let first = deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Player(PlayerId(0)),
+            3,
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(first, deal_damage::DamageResult::Applied(2)));
+        assert_eq!(state.players[0].life, 18);
+        assert!(
+            state.objects[&host].replacement_definitions[0].is_consumed,
+            "half-prevention one-shot must be consumed after the first matching event"
+        );
+
+        let second = deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Player(PlayerId(0)),
+            3,
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(matches!(second, deal_damage::DamageResult::Applied(3)));
+        assert_eq!(state.players[0].life, 15);
+    }
+
     /// CR 609.7a + CR 614.9 (Defect 2): An inline "a source of your choice"
     /// one-shot prompts the source choice when none is recorded, then on the
     /// continuation pass captures the chosen source into a DURABLE
@@ -1333,6 +1624,70 @@ mod tests {
             state.objects.get(&redirect_dest).unwrap().damage_marked,
             3,
             "redirected combat damage must land on the chosen creature"
+        );
+    }
+
+    /// CR 614.9: unlike a creature-only redirect, an `any target` recipient
+    /// may be a player. The replacement must retain that player identity when
+    /// it is installed, then deliver the redirected combat damage to them.
+    #[test]
+    fn redirect_to_any_target_lands_on_chosen_player() {
+        let mut state = GameState::new_two_player(42);
+        let host = create_creature(&mut state, PlayerId(0), "Zhalfirin Crusader");
+        let attacker = create_creature(&mut state, PlayerId(1), "Attacker");
+        let redirect_dest = PlayerId(1);
+
+        let replacement_effect = crate::parser::oracle_effect::parse_effect(
+            "the next 1 damage that would be dealt to ~ this turn is dealt to any target instead",
+        );
+        assert!(
+            matches!(
+                replacement_effect,
+                Effect::CreateDamageReplacement {
+                    source_filter: None,
+                    combat_scope: None,
+                    recipient_object_filter: Some(TargetFilter::SelfRef),
+                    redirect_to: Some(DamageRedirectTarget::ChosenTarget),
+                    ..
+                }
+            ),
+            "Zhalfirin Crusader must enter the live one-shot redirection parser path"
+        );
+        let ability = ResolvedAbility::new(
+            replacement_effect,
+            vec![TargetRef::Player(redirect_dest)],
+            host,
+            PlayerId(0),
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        let shield = &state.objects.get(&host).unwrap().replacement_definitions[0];
+        assert_eq!(
+            shield.redirect_target,
+            Some(TargetFilter::SpecificPlayer { id: redirect_dest }),
+            "the chosen player must be captured on the shield"
+        );
+
+        let ctx = deal_damage::DamageContext::from_source(&state, attacker).unwrap();
+        let mut events = Vec::new();
+        deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Object(host),
+            3,
+            true,
+            &mut events,
+        )
+        .unwrap();
+        assert_eq!(
+            state.objects[&host].damage_marked,
+            2,
+            "only the next 1 damage is redirected; the remaining 2 stays on the creature"
+        );
+        assert_eq!(
+            state.players[1].life,
+            19,
+            "the chosen player takes exactly the redirected 1 damage"
         );
     }
 

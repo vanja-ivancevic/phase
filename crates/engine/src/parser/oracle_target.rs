@@ -11,9 +11,10 @@ use nom::Parser;
 use crate::types::ability::{
     AggregateFunction, AttachmentKind, CardTypeSetSource, ChoiceType, CombatRelation,
     CombatRelationSubject, Comparator, ControllerRef, CountScope, DamageKindFilter, FilterProp,
-    ObjectProperty, ObjectScope, ParitySource, PlayerFilter, PropertyAggregate, PtStat,
-    PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality, SharedQualityRelation,
-    TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter, TypedFilter,
+    ObjectProperty, ObjectScope, ParitySource, PlayerFilter, PlayerRelation, PropertyAggregate,
+    PtStat, PtValueScope, QuantityExpr, QuantityRef, SeatDirection, SharedQuality,
+    SharedQualityRelation, TargetFilter, TargetSelectionMode, ThisWayCause, TypeFilter,
+    TypedFilter,
 };
 use crate::types::card_type::{noncreature_subtype_set, SubtypeSet, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
@@ -23,7 +24,8 @@ use crate::types::mana::ManaColor;
 use crate::types::zones::Zone;
 
 use super::oracle_effect::{
-    is_bare_object_pronoun, parse_multi_target_count_expr, resolve_it_pronoun,
+    is_bare_object_pronoun, parse_controls_permanent_object, parse_multi_target_count_expr,
+    resolve_it_pronoun,
 };
 use super::oracle_ir::context::ParseContext;
 use super::oracle_ir::diagnostic::OracleDiagnostic;
@@ -305,6 +307,14 @@ pub fn parse_event_context_ref(text: &str) -> Option<(TargetFilter, &str)> {
             value(TargetFilter::ParentTargetOwner, tag("their owner")),
             value(TargetFilter::TriggeringPlayer, tag("that player")),
             value(TargetFilter::TriggeringSource, tag("that source")),
+            // CR 509.3d: on a per-blocker filtered block event, the blocker is
+            // the event source.  This is the definite-article spelling used by
+            // No Quarter's "destroy the blocking creature" body.
+            value(TargetFilter::TriggeringSource, tag("the blocking creature")),
+            // CR 509.3d: the matching attacker's counterpart is carried by the
+            // filtered block event as its event target.  Keep this distinct from
+            // TriggeringSource: the same event must support both orientations.
+            value(TargetFilter::EventTarget, tag("the attacking creature")),
             value(
                 TargetFilter::TriggeringSource,
                 terminated(
@@ -555,6 +565,37 @@ pub fn parse_target_with_syntax<'a>(
     let mut syntax = TargetSyntax::Descriptor;
     let text = text.trim_start();
     let lower = text.to_lowercase();
+
+    // CR 509.3d: filtered block triggers carry two distinct object roles. The
+    // ordinary target grammar cannot classify these definite-article phrases,
+    // but destroy/exile/etc. all route through this entry point, so bind them
+    // here rather than teaching each imperative parser a card-specific escape.
+    // Keep the arm deliberately narrow: generic "that creature" and "that
+    // player" remain subject/context-sensitive through their existing paths.
+    if let Some((_, rest)) = nom_on_lower(text, &lower, |input| {
+        alt((
+            value(
+                TargetFilter::TriggeringSource,
+                tag::<_, _, OracleError<'_>>("the blocking creature"),
+            ),
+            value(
+                TargetFilter::EventTarget,
+                tag::<_, _, OracleError<'_>>("the attacking creature"),
+            ),
+        ))
+        .parse(input)
+    }) {
+        let consumed = text.len() - rest.len();
+        return (
+            if text[..consumed].eq_ignore_ascii_case("the blocking creature") {
+                TargetFilter::TriggeringSource
+            } else {
+                TargetFilter::EventTarget
+            },
+            rest,
+            syntax,
+        );
+    }
 
     // CR 115.1 + CR 701.9b: Trailing " chosen at random" suffix on a noun-phrase
     // target (e.g. Zaffai, Thunder Conductor — "an opponent chosen at random").
@@ -1072,6 +1113,50 @@ pub fn parse_target_with_syntax<'a>(
                 &text[lower.len() - rest.len()..],
                 syntax,
             );
+        }
+        // CR 115.1 + CR 109.5: a player target may carry a relative
+        // controlled-count clause, e.g. Oath of Druids' "target player who
+        // controls more creatures than they do and is their opponent". Reuse
+        // the shared `who controls …` parser used by player-scope effects;
+        // this keeps comparative, presence, and future controlled-count
+        // vocabulary in one place instead of growing a target-only grammar.
+        // The `their opponent` tail is a second predicate on the same player,
+        // so it composes as the ControlsCount relation rather than as a
+        // card-specific special case.
+        let player_head = after_target
+            .strip_prefix("player ")
+            .map(|rest| ("player ", PlayerRelation::All, rest))
+            .or_else(|| {
+                after_target
+                    .strip_prefix("opponent ")
+                    .map(|rest| ("opponent ", PlayerRelation::Opponent, rest))
+            });
+        if let Some((head, relation, _)) = player_head {
+            let original_target_offset = target_offset + head.len();
+            let original_clause = &text[original_target_offset..];
+            if let Some((comparator, count, bare_filter, mut remainder)) =
+                parse_controls_permanent_object(original_clause, ctx)
+            {
+                let mut relation = relation;
+                let remainder_lower = remainder.to_lowercase();
+                const OPPONENT_SUFFIX: &str = " and is their opponent";
+                if remainder_lower.starts_with(OPPONENT_SUFFIX) {
+                    relation = PlayerRelation::Opponent;
+                    remainder = &remainder[OPPONENT_SUFFIX.len()..];
+                }
+                return (
+                    TargetFilter::PlayerMatching {
+                        player: Box::new(PlayerFilter::ControlsCount {
+                            relation,
+                            filter: bare_filter,
+                            comparator,
+                            count: Box::new(count),
+                        }),
+                    },
+                    remainder,
+                    syntax,
+                );
+            }
         }
         // CR 115.1: A coordinated target noun phrase may elide "target" after
         // its first player leg: "target opponent, creature an opponent
@@ -4615,6 +4700,7 @@ fn prop_reads_creature_pt(prop: &FilterProp) -> bool {
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::MostPrevalentCreatureTypeIn { .. }
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
@@ -5474,6 +5560,20 @@ fn parse_controller_suffix(text: &str, ctx: &ParseContext) -> Option<(Controller
             .relative_player_scope
             .clone()
             .unwrap_or(ControllerRef::You);
+        return Some((ctrl, leading_ws + trimmed.len() - rest.len()));
+    }
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("opponent controls").parse(trimmed) {
+        // CR 109.4 + CR 608.2c: this is normally reached from the type-phrase
+        // "that opponent controls" suffix.  Like "that player controls", the
+        // noun is an anaphor to the player introduced by the triggering event
+        // (Karmic Justice's spell-or-ability controller, for example), rather
+        // than an arbitrary opponent of the ability controller.  Keep the
+        // explicit `Opponent` fallback for non-trigger contexts, where no
+        // event-relative player exists to bind.
+        let ctrl = ctx
+            .relative_player_scope
+            .clone()
+            .unwrap_or(ControllerRef::Opponent);
         return Some((ctrl, leading_ws + trimmed.len() - rest.len()));
     }
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("controlled by that player").parse(trimmed)
@@ -6399,12 +6499,14 @@ pub(crate) fn parse_mana_value_suffix(
             take_till::<_, _, OracleError<'_>>(|c: char| c == ',' || c == '.')
                 .parse(after_equal_to)
                 .ok()?;
-        let parse_value = |phrase: &str| -> Option<QuantityExpr> {
+        let mut parse_value = |phrase: &str| -> Option<QuantityExpr> {
             let phrase = phrase.trim();
-            crate::parser::oracle_quantity::parse_cda_quantity(phrase).or_else(|| {
-                parse_mana_value_reference_expr(phrase)
-                    .and_then(|(value, after)| after.trim().is_empty().then_some(value))
-            })
+            crate::parser::oracle_quantity::parse_cda_quantity_with_context(phrase, ctx).or_else(
+                || {
+                    parse_mana_value_reference_expr(phrase)
+                        .and_then(|(value, after)| after.trim().is_empty().then_some(value))
+                },
+            )
         };
         // CR 119.3 + CR 400.1 + CR 108.3: Resolve the dynamic quantity, preferring
         // the FULL phrase first. A quantity whose own grammar already includes a
@@ -9406,6 +9508,9 @@ pub(crate) fn parse_zone_word(i: &str) -> super::oracle_nom::error::OracleResult
         // bare-word arms because it has no shared prefix with them and the
         // longest-prefix-first convention keeps additions ordered by length.
         value(Zone::Command, tag("command zone")),
+        // CR 405.1: the stack is a zone and Oracle source conditions print
+        // it as "on the stack".
+        value(Zone::Stack, tag("stack")),
         value(Zone::Graveyard, alt((tag("graveyards"), tag("graveyard")))),
         value(Zone::Exile, alt((tag("exiles"), tag("exile")))),
         value(Zone::Hand, alt((tag("hands"), tag("hand")))),
@@ -9431,7 +9536,9 @@ mod tests {
     use super::*;
     use crate::parser::oracle_ir::context::ParseContext;
     use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
-    use crate::types::ability::{PtStat, PtValueScope};
+    use crate::types::ability::{
+        ChoiceType, NumberDistinctness, PlayerScope, PtStat, PtValueScope,
+    };
     use crate::types::counter::CounterType;
 
     fn typed_leg(filter: &TargetFilter) -> Option<&TypedFilter> {
@@ -10805,6 +10912,39 @@ mod tests {
         assert_eq!(
             f,
             TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
+        );
+    }
+
+    #[test]
+    fn target_player_controls_more_than_scoped_player_and_is_opponent() {
+        let (filter, rest) = parse_target(
+            "target player who controls more creatures than they do and is their opponent",
+        );
+        assert!(rest.trim().is_empty(), "unexpected remainder: {rest:?}");
+        let TargetFilter::PlayerMatching { player } = filter else {
+            panic!("expected PlayerMatching target filter, got {filter:?}");
+        };
+        let PlayerFilter::ControlsCount {
+            relation,
+            filter,
+            comparator,
+            count,
+        } = *player
+        else {
+            panic!("expected controlled-count player predicate");
+        };
+        assert_eq!(relation, PlayerRelation::Opponent);
+        assert_eq!(comparator, Comparator::GT);
+        assert_eq!(filter, TargetFilter::Typed(TypedFilter::creature()));
+        assert_eq!(
+            *count,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(
+                        TypedFilter::creature().controller(ControllerRef::ScopedPlayer),
+                    ),
+                },
+            }
         );
     }
 
@@ -13266,6 +13406,17 @@ mod tests {
     fn parse_event_context_that_source() {
         let (filter, rem) = parse_event_context_ref("that source").unwrap();
         assert_eq!(filter, TargetFilter::TriggeringSource);
+        assert_eq!(rem, "");
+    }
+
+    #[test]
+    fn parse_event_context_filtered_block_pair() {
+        let (filter, rem) = parse_event_context_ref("the blocking creature").unwrap();
+        assert_eq!(filter, TargetFilter::TriggeringSource);
+        assert_eq!(rem, "");
+
+        let (filter, rem) = parse_event_context_ref("the attacking creature").unwrap();
+        assert_eq!(filter, TargetFilter::EventTarget);
         assert_eq!(rem, "");
     }
 
@@ -19037,6 +19188,33 @@ mod tests {
             ),
             "expected Cmc LE Fixed(3), got {prop:?}"
         );
+    }
+
+    #[test]
+    fn mana_value_suffix_binds_a_resolution_number_choice() {
+        let mut ctx = ParseContext {
+            pending_choice_type: Some(ChoiceType::NumberRange {
+                min: 0,
+                max: None,
+                distinctness: NumberDistinctness::Repeatable,
+            }),
+            ..ParseContext::default()
+        };
+        let input = "with mana value equal to that number";
+        let (prop, consumed) = parse_mana_value_suffix(input, &mut ctx)
+            .expect("resolution-local chosen number suffix parses");
+        assert_eq!(consumed, input.len());
+        assert!(matches!(
+            prop,
+            FilterProp::Cmc {
+                comparator: Comparator::EQ,
+                value: QuantityExpr::Ref {
+                    qty: QuantityRef::PlayerChosenNumber {
+                        player: PlayerScope::Controller,
+                    },
+                },
+            }
+        ));
     }
 
     /// CR 107.3a: control — a bare "with mana value X or less" with NO binder

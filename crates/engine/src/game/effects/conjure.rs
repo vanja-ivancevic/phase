@@ -214,8 +214,15 @@ pub fn resolve(
                     // placeholder, and so the CR 608.2i battlefield-entry row is written
                     // exactly once (the authority calls `record_battlefield_entry` itself —
                     // a co-located second call here would double-count it).
+                    let entry_event_start = events.len();
                     crate::game::zones::record_and_emit_entry_from_no_zone(state, obj_id, events)
                         .expect("conjured object was just created");
+                    crate::game::zones::stamp_zone_change_putter(
+                        state,
+                        &mut events[entry_event_start..],
+                        obj_id,
+                        Some(ability.controller),
+                    );
                 }
 
                 events.push(GameEvent::ObjectConjured {
@@ -585,6 +592,14 @@ mod tests {
 
         assert_eq!(zone_change.1, None);
         assert_eq!(zone_change.2, Zone::Battlefield);
+        assert_eq!(
+            events.iter().find_map(|event| match event {
+                GameEvent::ZoneChanged { record, .. } => record.zone_change_putter(),
+                _ => None,
+            }),
+            Some(PlayerId(0)),
+            "the conjuring ability's controller is the event-time putter"
+        );
         assert_eq!(state.zone_changes_this_turn.len(), 1);
         assert_eq!(state.zone_changes_this_turn[0].object_id, zone_change.0);
         assert_eq!(state.zone_changes_this_turn[0].from_zone, None);

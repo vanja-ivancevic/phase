@@ -613,21 +613,52 @@ pub(crate) fn apply_damage_after_replacement(
     // those counters (clamping at 0), which destroys the pre-hit value, so capture
     // it here before mutating. (Creatures mark — not clamp — damage, so their
     // excess is reconstructed from `damage_marked` below.)
-    let (is_creature, is_planeswalker, is_battle, loyalty_before, defense_before) = match t {
+    let (
+        is_creature,
+        is_planeswalker,
+        is_battle,
+        loyalty_before,
+        defense_before,
+        drain_life_cap_before,
+    ) = match t {
         TargetRef::Object(obj_id) => state
             .objects
             .get(obj_id)
             .map(|obj| {
+                // Drain Life's Oracle wording supplies a ceiling for each
+                // applicable target characteristic. A multi-typed permanent
+                // has to satisfy every printed ceiling, so use their minimum.
+                // (Old-border cards never target a planeswalker, but retaining
+                // the Oracle's modern wording here keeps the primitive general.)
+                let mut caps = Vec::new();
+                if obj.card_types.core_types.contains(&CoreType::Creature) {
+                    caps.push(obj.toughness.unwrap_or(0));
+                }
+                if obj.card_types.core_types.contains(&CoreType::Planeswalker) {
+                    caps.push(obj.loyalty.unwrap_or(0) as i32);
+                }
                 (
                     obj.card_types.core_types.contains(&CoreType::Creature),
                     obj.card_types.core_types.contains(&CoreType::Planeswalker),
                     obj.card_types.core_types.contains(&CoreType::Battle),
                     obj.loyalty,
                     obj.defense,
+                    caps.into_iter().min().map(|cap| cap.max(0)),
                 )
             })
-            .unwrap_or((false, false, false, None, None)),
-        TargetRef::Player(_) => (false, false, false, None, None),
+            .unwrap_or((false, false, false, None, None, None)),
+        TargetRef::Player(player_id) => (
+            false,
+            false,
+            false,
+            None,
+            None,
+            state
+                .players
+                .iter()
+                .find(|player| player.id == *player_id)
+                .map(|player| player.life.max(0)),
+        ),
     };
 
     match t {
@@ -845,6 +876,10 @@ pub(crate) fn apply_damage_after_replacement(
         is_combat,
         excess: primary_excess,
     });
+    // CR 608.2c + CR 120.3: publish the exact target ceiling beside the
+    // damage result so the immediately following Drain Life-class instruction
+    // sees the pre-damage value, never a post-damage live lookup.
+    state.last_damage_target_pre_damage_life_gain_cap = drain_life_cap_before;
 
     // CR 120.1: Record damage for "was dealt damage by" condition queries.
     if actual_amount > 0 {
@@ -4763,6 +4798,68 @@ mod tests {
                 .any(|e| matches!(e, GameEvent::DamageDealt { .. })),
             "must not emit DamageDealt for fully prevented damage"
         );
+    }
+
+    /// CR 122.1 + CR 614.1a: Rock Hydra — one +1/+1 counter prevents one
+    /// damage, and excess damage still lands once the counters are exhausted.
+    #[test]
+    fn rock_hydra_prevention_spends_one_counter_per_damage() {
+        use crate::types::ability::{
+            DamageModification, ReplacementCondition, ReplacementDefinition,
+        };
+        use crate::types::counter::CounterType;
+        use crate::types::replacements::ReplacementEvent;
+
+        let mut state = GameState::new_two_player(42);
+        let hydra = create_object(
+            &mut state,
+            CardId(42),
+            PlayerId(1),
+            "Rock Hydra".to_string(),
+            Zone::Battlefield,
+        );
+        {
+            let obj = state.objects.get_mut(&hydra).unwrap();
+            obj.card_types.core_types.push(CoreType::Creature);
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.counters.insert(CounterType::Plus1Plus1, 2);
+            obj.replacement_definitions.push(
+                ReplacementDefinition::new(ReplacementEvent::DamageDone)
+                    .damage_modification(DamageModification::PreventionMinus {
+                        value: u32::MAX,
+                    })
+                    .damage_counter_removal(CounterType::Plus1Plus1)
+                    .valid_card(TargetFilter::SelfRef)
+                    .condition(ReplacementCondition::SourceHasCounterAtLeast {
+                        counter_type: CounterType::Plus1Plus1,
+                        count: 1,
+                    })
+                    .description("Rock Hydra prevention".to_string()),
+            );
+        }
+
+        let ability = make_ability(3, vec![TargetRef::Object(hydra)]);
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+
+        let hydra_obj = state.objects.get(&hydra).unwrap();
+        assert_eq!(
+            hydra_obj
+                .counters
+                .get(&CounterType::Plus1Plus1)
+                .copied()
+                .unwrap_or(0),
+            0,
+            "two counters should prevent exactly two damage points"
+        );
+        assert_eq!(
+            hydra_obj.damage_marked, 1,
+            "damage beyond the available counters must still be marked"
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, GameEvent::DamagePrevented { amount: 2, .. })));
     }
 
     /// CR 615.5: Crumbling Sanctuary-class prevention follow-ups resolve "that

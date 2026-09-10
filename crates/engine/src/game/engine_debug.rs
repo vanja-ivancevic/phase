@@ -864,6 +864,7 @@ pub fn route_debug_create_to_battlefield(
         from,
         to: Zone::Battlefield,
         cause: None,
+        putter: None,
         attach_to: None,
         enter_tapped: Default::default(),
         enters_attacking: false,

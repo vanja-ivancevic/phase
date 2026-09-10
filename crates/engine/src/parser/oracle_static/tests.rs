@@ -6,14 +6,53 @@ use super::support::*;
 use super::*;
 use crate::types::ability::{
     ActivationRestriction, AggregateFunction, CardTypeSetSource, Comparator, CountScope,
-    DamageKindFilter, Duration, Effect, FilterProp, ObjectProperty, ObjectScope, PlayerFilter,
-    PlayerRelation, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef, SharedQuality,
-    SharedQualityRelation, SubtypeExclusion, TypeFilter, ZoneRef,
+    DamageKindFilter, Duration, Effect, FilterProp, ObjectProperty, ObjectScope, ParsedCondition,
+    PlayerFilter, PlayerRelation, PlayerScope, PtStat, PtValueScope, QuantityExpr, QuantityRef,
+    SharedQuality, SharedQualityRelation, SubtypeExclusion, TypeFilter, ZoneRef,
 };
 use crate::types::counter::CounterType;
 use crate::types::keywords::Keyword;
 use crate::types::mana::ManaCost;
 use crate::types::statics::{AdditionalCostTaxAction, CrewAction, CrewContributionKind};
+
+/// CR 611.3a + CR 613.1f: each conjunct in Tek's compact Oracle sentence has
+/// its own condition. The parser must emit one conditional static per conjunct,
+/// rather than attaching the tail of the sentence to the first condition.
+#[test]
+fn repeated_conditional_statics_split_shared_subject() {
+    let defs = parse_static_line_multi(
+        "~ gets +0/+2 as long as you control a Plains, has flying as long as you control an Island, gets +2/+0 as long as you control a Swamp, has first strike as long as you control a Mountain, and has trample as long as you control a Forest.",
+    );
+    assert_eq!(
+        defs.len(),
+        5,
+        "expected one static per land condition: {defs:?}"
+    );
+
+    let expected = [
+        (
+            Some(ContinuousModification::AddToughness { value: 2 }),
+            None,
+        ),
+        (None, Some(Keyword::Flying)),
+        (Some(ContinuousModification::AddPower { value: 2 }), None),
+        (None, Some(Keyword::FirstStrike)),
+        (None, Some(Keyword::Trample)),
+    ];
+    for (def, (pt_mod, keyword)) in defs.iter().zip(expected) {
+        assert_eq!(def.mode, StaticMode::Continuous);
+        assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+        assert!(def.condition.is_some(), "each conjunct needs its own gate");
+        if let Some(pt_mod) = pt_mod {
+            assert!(def.modifications.contains(&pt_mod), "missing {pt_mod:?}");
+        }
+        if let Some(keyword) = keyword {
+            assert!(def
+                .modifications
+                .contains(&ContinuousModification::AddKeyword { keyword }));
+        }
+    }
+}
 
 /// CR 613.1f (Layer 6) + CR 105.2: Scion of Draco — "Each creature you control has
 /// vigilance if it's white, hexproof if it's blue, lifelink if it's black, first
@@ -3763,11 +3802,11 @@ fn alt_cost_jodah_mv_qualifier_behavior() {
     }
 }
 
-/// Strict-fail: non-mana payment shapes must NOT misparse into the static.
-/// Bolas's Citadel ("pay life equal to ...") and Dream Halls ("discard a
-/// card ...") defer to None rather than producing a wrong CastWithAlternativeCost.
+/// Strict-fail: unsupported non-mana payment shapes must NOT misparse into the
+/// generic "you may pay" static. Dream Halls has a separately typed global
+/// pitch-cost lowering below.
 #[test]
-fn alt_cost_non_mana_payment_defers_to_none() {
+fn alt_cost_unsupported_non_mana_payment_defers_to_none() {
     // Bolas's Citadel-style life payment.
     assert!(
             parse_spells_alternative_cost(
@@ -3776,21 +3815,48 @@ fn alt_cost_non_mana_payment_defers_to_none() {
             .is_none(),
             "life payment must defer to None"
         );
-    // Dream Halls-style discard payment.
-    assert!(
-            parse_spells_alternative_cost(
-                "You may discard a card that shares a color with that spell rather than pay the mana cost for spells you cast.",
-            )
-            .is_none(),
-            "discard payment must defer to None"
-        );
+}
+
+/// CR 118.9 + CR 601.2b: Dream Halls is a global alternative-cost permission;
+/// its discard filter must remain bound to the spell being announced, rather
+/// than to the enchantment that granted it.
+#[test]
+fn dream_halls_lowers_to_a_global_matching_color_discard_alternative() {
+    use crate::parser::oracle_static::cost_mod::parse_discard_matching_color_alternative_cost;
+    use crate::types::ability::{CardSelectionMode, DiscardSelfScope, SharedQuality};
+
+    let def = parse_discard_matching_color_alternative_cost(
+        "Rather than pay the mana cost for a spell, its controller may discard a card that shares a color with that spell.",
+    )
+    .expect("Dream Halls must lower to a cast alternative");
+
+    assert_eq!(def.affected, Some(TargetFilter::Typed(TypedFilter::card())));
+    assert_eq!(
+        def.mode,
+        StaticMode::CastWithAlternativeCost {
+            cost: AbilityCost::Discard {
+                count: QuantityExpr::Fixed { value: 1 },
+                filter: Some(TargetFilter::Typed(TypedFilter::card().properties(vec![
+                    FilterProp::SharesQuality {
+                        quality: SharedQuality::Color,
+                        reference: Some(Box::new(TargetFilter::SelfRef)),
+                        relation: Default::default(),
+                    },
+                ]))),
+                selection: CardSelectionMode::Chosen,
+                self_scope: DiscardSelfScope::FromHand,
+            },
+            timing_permission: None,
+            frequency: CastFrequency::Unlimited,
+        }
+    );
 }
 
 /// CR 118.9: full-dispatcher regression — Fist of Suns must route through
 /// the new Priority 6c-altcost branch into a CastWithAlternativeCost static
 /// with NO free-floating Effect::PayCost ability (the prior misparse), and
-/// the deferred non-mana classes (Bolas's Citadel, Dream Halls, As Foretold,
-/// Conspiracy Unraveler) must NOT be newly misparsed into this static.
+/// Bolas's Citadel must remain deferred while Dream Halls uses its dedicated
+/// global pitch-cost lowering.
 #[test]
 fn full_dispatch_alt_cost_routing_and_deferrals() {
     use crate::parser::oracle::parse_oracle_text;
@@ -3821,17 +3887,11 @@ fn full_dispatch_alt_cost_routing_and_deferrals() {
         parsed.abilities
     );
 
-    // Deferred non-mana payment classes: must NOT produce the new static.
-    let deferred = [
-            (
-                "Bolas's Citadel",
-                "You may pay life equal to a spell's mana value rather than pay its mana cost.",
-            ),
-            (
-                "Dream Halls",
-                "Rather than pay the mana cost for a spell, its controller may discard a card that shares a color with that spell.",
-            ),
-        ];
+    // Unsupported non-mana payment class: must NOT produce the new static.
+    let deferred = [(
+        "Bolas's Citadel",
+        "You may pay life equal to a spell's mana value rather than pay its mana cost.",
+    )];
     for (name, text) in deferred {
         let parsed = parse_oracle_text(text, name, &[], &["Enchantment".to_string()], &[]);
         assert!(
@@ -3843,6 +3903,22 @@ fn full_dispatch_alt_cost_routing_and_deferrals() {
             parsed.statics
         );
     }
+
+    let dream_halls = parse_oracle_text(
+        "Rather than pay the mana cost for a spell, its controller may discard a card that shares a color with that spell.",
+        "Dream Halls",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+    assert!(
+        dream_halls
+            .statics
+            .iter()
+            .any(|d| matches!(d.mode, StaticMode::CastWithAlternativeCost { .. })),
+        "Dream Halls must route through its dedicated alternative-cost lowering, got {:?}",
+        dream_halls.statics
+    );
 }
 
 /// CR 202.3 + CR 208.2a + CR 604.3: Dragon Man, Reformed Robot's CDA —
@@ -15624,6 +15700,8 @@ fn hand_cast_free_omniscience() {
         StaticMode::CastFromHandFree {
             frequency: CastFrequency::Unlimited,
             origin: CastFreeOrigin::Hand,
+            all_players: false,
+            grants_flash: false,
         }
     );
     assert_eq!(def.affected, Some(TargetFilter::Any));
@@ -15648,6 +15726,8 @@ fn hand_cast_free_zaffai_once_per_turn() {
             StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
                 origin: CastFreeOrigin::Hand,
+                all_players: false,
+                grants_flash: false,
             }
         ),
         "expected CastFromHandFree {{ OncePerTurn }}, got: {:?}",
@@ -15689,6 +15769,8 @@ fn cast_free_dracogenesis_no_zone_qualifier() {
         StaticMode::CastFromHandFree {
             frequency: CastFrequency::Unlimited,
             origin: CastFreeOrigin::DefaultCastPermission,
+            all_players: false,
+            grants_flash: false,
         }
     );
     // Dragon subtype filter must survive.
@@ -15738,6 +15820,41 @@ fn cast_free_unqualified_accepts_dynamic_mv_filter() {
         "expected CmcLE with dynamic ObjectCount RHS, got {:?}",
         tf.properties
     );
+}
+
+/// CR 601.2b + CR 601.3b + CR 702.8a: Aluren is a global, typed free-cast
+/// permission.  Its flash rider is deliberately carried by the same static so
+/// neither half can accidentally apply outside the other half's player/spell
+/// scope.
+#[test]
+fn aluren_global_free_cast_permission_carries_flash() {
+    use crate::types::ability::{Comparator, FilterProp, QuantityExpr, TargetFilter, TypeFilter};
+
+    let text = "Any player may cast creature spells with mana value 3 or less without paying their mana costs and as though they had flash.";
+    let def = parse_static_line(text).expect("Aluren must parse as a free-cast permission");
+    assert!(matches!(
+        def.mode,
+        StaticMode::CastFromHandFree {
+            frequency: CastFrequency::Unlimited,
+            origin: CastFreeOrigin::DefaultCastPermission,
+            all_players: true,
+            grants_flash: true,
+        }
+    ));
+    let TargetFilter::Typed(filter) = def.affected.expect("Aluren filter") else {
+        panic!("Aluren must retain a typed creature/MV filter");
+    };
+    assert!(filter
+        .type_filters
+        .iter()
+        .any(|kind| matches!(kind, TypeFilter::Creature)));
+    assert!(filter.properties.iter().any(|property| matches!(
+        property,
+        FilterProp::Cmc {
+            comparator: Comparator::LE,
+            value: QuantityExpr::Fixed { value: 3 },
+        }
+    )));
 }
 
 // Negative test: text without "without paying" must not match the
@@ -19636,6 +19753,18 @@ fn map_keyword_all_creature_types_returns_changeling() {
     assert_eq!(map_keyword("All Creature Types"), Some(Keyword::Changeling));
 }
 
+/// CR 702.14 + CR 613.1f: Hammerheim's "all landwalk abilities" must be
+/// represented as a keyword-family removal, not as an unqualified landwalk
+/// keyword that could accidentally remove only one variant.
+#[test]
+fn lose_all_landwalk_abilities_emits_family_removal() {
+    let modifications = parse_continuous_modifications("lose all landwalk abilities");
+    assert_eq!(
+        modifications,
+        vec![ContinuousModification::RemoveAllLandwalk]
+    );
+}
+
 #[test]
 fn gain_all_creature_types_produces_add_keyword_changeling() {
     let mods = parse_continuous_modifications("gain all creature types");
@@ -22974,6 +23103,38 @@ fn static_chosen_color_pump() {
             );
         }
         other => panic!("Expected Some(Typed filter), got {other:?}"),
+    }
+}
+
+/// CR 105.4 + CR 508.1c: Teferi's Moat's subject has two independent quality
+/// axes — the source's chosen color and the absence of flying. The shared
+/// chosen-qualifier parser must retain both instead of silently dropping the
+/// trailing "without flying" clause.
+#[test]
+fn teferis_moat_retains_chosen_color_and_without_flying_filter() {
+    let def = parse_static_line("Creatures of the chosen color without flying can't attack you.")
+        .expect("Teferi's Moat should lower to a combat static");
+    assert_eq!(def.mode, StaticMode::CantAttack);
+    assert_eq!(
+        def.attack_defended,
+        Some(crate::types::triggers::AttackTargetFilter::Player)
+    );
+    match &def.affected {
+        Some(TargetFilter::Typed(tf)) => {
+            assert!(
+                tf.properties.contains(&FilterProp::IsChosenColor),
+                "chosen-color axis was lost: {:?}",
+                tf.properties
+            );
+            assert!(
+                tf.properties.contains(&FilterProp::WithoutKeyword {
+                    value: Keyword::Flying
+                }),
+                "without-flying axis was lost: {:?}",
+                tf.properties
+            );
+        }
+        other => panic!("expected a typed creature filter, got {other:?}"),
     }
 }
 
@@ -27247,6 +27408,33 @@ fn combat_tax_self_ref_subject_cant_attack_only() {
     assert!(matches!(scaling, UnlessPayScaling::PerQuantityRef { .. }));
 }
 
+/// CR 508.1c + CR 509.1b: Goblin Goon's one condition gates both combat
+/// restrictions.  It is a board-state gate, not a mana-payment tax: when the
+/// controller has more creatures than every opponent, the `Not` condition is
+/// false and the Goon may both attack and block.
+#[test]
+fn goblin_goon_universal_creature_count_gates_attack_and_block() {
+    let def = parse_static_line(
+        "~ can't attack or block unless you control more creatures than each opponent.",
+    )
+    .expect("Goblin Goon combat restriction should parse");
+    assert_eq!(def.mode, StaticMode::CantAttackOrBlock);
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert!(matches!(
+        def.condition,
+        Some(crate::types::ability::StaticCondition::Not { condition })
+            if matches!(condition.as_ref(), crate::types::ability::StaticCondition::QuantityComparison {
+                comparator: Comparator::GT,
+                rhs: QuantityExpr::Ref { qty: QuantityRef::ControlledByEachPlayer {
+                    aggregate: AggregateFunction::Max,
+                    relation: PlayerRelation::Opponent,
+                    ..
+                } },
+                ..
+            })
+    ));
+}
+
 /// CR 506.3 + CR 508.1d: Propaganda — `defended` field captures the
 /// "you" attack-target scope so the runtime tax only applies to attacks
 /// targeting the static's controller. Regression for issue #302
@@ -29514,6 +29702,51 @@ fn non_aura_multi_sentence_anthem_scope_unchanged() {
             "non-aura anthem must stay controller-scoped, got {:?}",
             def.affected
         );
+    }
+}
+
+/// Stronghold's Goblin Goon is two independent combat restrictions in one
+/// Oracle line.  The static sentence splitter must retain both, and the
+/// `unless` parser must leave their distinct combat-player count anchors in the
+/// typed condition instead of accepting only the first sentence.
+#[test]
+fn goblin_goon_relative_creature_count_restrictions_parse_as_two_statics() {
+    use crate::types::ability::StaticCondition;
+
+    let defs = parse_static_line_multi(
+        "This creature can't attack unless you control more creatures than defending player. \
+         This creature can't block unless you control more creatures than attacking player.",
+    );
+    assert_eq!(
+        defs.len(),
+        2,
+        "both combat restrictions must survive: {defs:?}"
+    );
+    assert!(matches!(defs[0].mode, StaticMode::CantAttack));
+    assert!(matches!(defs[1].mode, StaticMode::CantBlock));
+
+    for (def, expected_controller) in [
+        (&defs[0], ControllerRef::DefendingPlayer),
+        (&defs[1], ControllerRef::ActivePlayer),
+    ] {
+        let Some(StaticCondition::Not { condition }) = &def.condition else {
+            panic!("expected an unless condition on {def:?}");
+        };
+        assert!(matches!(
+            condition.as_ref(),
+            StaticCondition::QuantityComparison {
+                comparator: Comparator::GT,
+                rhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            controller: Some(controller),
+                            ..
+                        }),
+                    },
+                },
+                ..
+            } if controller == &expected_controller
+        ));
     }
 }
 
@@ -35011,5 +35244,135 @@ fn attached_conditional_grant_state_backed_gate_still_passes_through() {
             .is_some_and(|c| !c.contains_unrecognized()),
         "a board-state gate must survive the enforcement-point gate unchanged, got {:?}",
         def.condition
+    );
+}
+
+/// CR 613.1a + CR 707.2: a live top-of-graveyard copy is a Layer-1 modifier,
+/// not an unrecognized condition attached to an otherwise harmless ability
+/// grant. The quoted ability remains a separate later-layer grant so it is
+/// retained after the copied characteristic set replaces the source's text.
+#[test]
+fn top_of_graveyard_full_text_copy_is_live_layer_one_static() {
+    for subject in ["this creature", "~"] {
+        let def = parse_static_line(&format!(
+            "As long as the top card of your graveyard is a creature card, {subject} has the full text of that card and has the text \"{{2}}: Discard a card.\""
+        ))
+        .expect("top-of-graveyard full-text copy should parse");
+
+        assert_eq!(def.mode, StaticMode::Continuous);
+        assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+        assert!(matches!(
+            def.modifications.first(),
+            Some(ContinuousModification::CopyTopOfZone {
+                zone: Zone::Graveyard,
+                controller: ControllerRef::You,
+                filter,
+            }) if matches!(filter, TargetFilter::Typed(typed) if typed.type_filters == vec![TypeFilter::Creature])
+        ));
+        assert!(def.modifications.iter().any(|modification| matches!(
+            modification,
+            ContinuousModification::GrantAbility { definition }
+                if matches!(*definition.effect, Effect::Discard { .. })
+        )));
+    }
+}
+
+/// CR 301.5 + CR 303.4 + CR 602.5b: Nature's Chosen's real Oracle-text
+/// pipeline must retain the attached-creature activation gate as a typed
+/// `RequiresCondition`, rather than swallowing "Activate only if ..." after
+/// parsing the untap effect.
+#[test]
+fn natures_chosen_retains_attached_creature_activation_gate() {
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        "Enchant creature you control\n\
+         {0}: Untap enchanted creature. Activate only during your turn and only once each turn.\n\
+         Tap enchanted creature: Untap target artifact, creature, or land. Activate only if enchanted creature is white and untapped and only once each turn.",
+        "Nature's Chosen",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+
+    assert!(
+        parsed.abilities.iter().any(|ability| {
+            ability.activation_restrictions.iter().any(|restriction| {
+                matches!(
+                    restriction,
+                    ActivationRestriction::RequiresCondition {
+                        condition: Some(ParsedCondition::QuantityComparison {
+                            lhs: QuantityExpr::Ref {
+                                qty: QuantityRef::ObjectCount { filter: TargetFilter::Typed(typed) }
+                            },
+                            comparator: crate::types::ability::Comparator::GE,
+                            rhs: QuantityExpr::Fixed { value: 1 },
+                        })
+                    } if typed.type_filters.contains(&TypeFilter::Creature)
+                        && typed.properties.contains(&FilterProp::EnchantedBy)
+                        && typed.properties.contains(&FilterProp::Untapped)
+                )
+            })
+        }),
+        "Nature's Chosen must retain a typed attached-creature activation gate, got {:?}",
+        parsed.abilities
+    );
+}
+
+/// CR 120.1 + CR 120.9: Discordant Spirit's full Oracle-text pipeline must
+/// retain the damage-total quantity inside its first triggered PutCounter
+/// effect. A parser-only quantity test is insufficient here because the
+/// static lowering path historically swallowed this exact DynamicQty clause.
+#[test]
+fn discordant_spirit_retains_damage_total_counter_quantity() {
+    use crate::types::ability::AbilityDefinition;
+
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        "At the beginning of each end step, if it's an opponent's turn, put a +1/+1 counter on this creature for each 1 damage dealt to you this turn.\n\
+         At the beginning of your end step, remove all +1/+1 counters from this creature.",
+        "Discordant Spirit",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+
+    fn collect_quantities(ability: &AbilityDefinition, out: &mut Vec<QuantityExpr>) {
+        ability
+            .effect
+            .for_each_quantity_expr(&mut |quantity| out.push(quantity.clone()));
+        if let Some(sub) = &ability.sub_ability {
+            collect_quantities(sub, out);
+        }
+        if let Some(else_ability) = &ability.else_ability {
+            collect_quantities(else_ability, out);
+        }
+    }
+
+    let mut quantities = Vec::new();
+    for ability in &parsed.abilities {
+        collect_quantities(ability, &mut quantities);
+    }
+    for trigger in &parsed.triggers {
+        if let Some(execute) = trigger.execute.as_deref() {
+            collect_quantities(execute, &mut quantities);
+        }
+    }
+
+    assert!(
+        quantities.iter().any(|quantity| {
+            matches!(
+                quantity,
+                QuantityExpr::Ref {
+                    qty: QuantityRef::DamageDealtThisTurn {
+                        aggregate: AggregateFunction::Sum,
+                        target,
+                        ..
+                    }
+                } if matches!(
+                    target.as_ref(),
+                    TargetFilter::Typed(filter)
+                        if filter.controller == Some(ControllerRef::You)
+                )
+            )
+        }),
+        "Discordant Spirit must retain a summed damage-to-you quantity, got {quantities:?}"
     );
 }

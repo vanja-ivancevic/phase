@@ -17,7 +17,8 @@
 
 use crate::game::players::apnap_order_from;
 use crate::types::ability::{
-    Effect, EffectError, EffectKind, PileSource, PlayerScope, ResolvedAbility, VoterScope,
+    Effect, EffectError, EffectKind, PileSource, PlayerScope, ResolvedAbility, TargetRef,
+    VoterScope,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{GameState, PileResult, WaitingFor};
@@ -96,15 +97,27 @@ fn resolve_battlefield(
 
     // CR 101.4: APNAP order starting at the active player; CR 800.4f drops
     // eliminated players.
-    let subjects: Vec<PlayerId> = apnap_order_from(state, None, controller)
-        .into_iter()
-        .filter(|pid| match partition_subject {
-            // CR 800.4g: `EachOpponent` excludes the controller.
-            VoterScope::EachOpponent | VoterScope::AnOpponent => *pid != controller,
-            VoterScope::AllPlayers => true,
-            VoterScope::ControllerLabels => false,
-        })
-        .collect();
+    let subjects: Vec<PlayerId> = match partition_subject {
+        VoterScope::TargetPlayer => ability
+            .targets
+            .iter()
+            .find_map(|target| match target {
+                TargetRef::Player(player) => Some(*player),
+                TargetRef::Object(_) => None,
+            })
+            .filter(|player| crate::game::players::player_exists_for_choice(state, *player))
+            .into_iter()
+            .collect(),
+        _ => apnap_order_from(state, None, controller)
+            .into_iter()
+            .filter(|pid| match partition_subject {
+                // CR 800.4g: `EachOpponent` excludes the controller.
+                VoterScope::EachOpponent | VoterScope::AnOpponent => *pid != controller,
+                VoterScope::AllPlayers => true,
+                VoterScope::ControllerLabels | VoterScope::TargetPlayer => false,
+            })
+            .collect(),
+    };
 
     // CR 700.3 + CR 700.3c: Compute each subject's eligible objects.
     let ctx = crate::game::filter::FilterContext::from_ability(ability);
@@ -481,6 +494,10 @@ fn resolve_chooser(
 ) -> Option<PlayerId> {
     match chooser {
         PlayerScope::Controller => Some(ability.controller),
+        PlayerScope::Target => ability.targets.iter().find_map(|target| match target {
+            TargetRef::Player(player) => Some(*player),
+            TargetRef::Object(_) => None,
+        }),
         _ => None,
     }
 }
@@ -488,7 +505,9 @@ fn resolve_chooser(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::{AbilityDefinition, AbilityKind, QuantityExpr, TargetFilter};
+    use crate::types::ability::{
+        AbilityDefinition, AbilityKind, QuantityExpr, TargetFilter, TargetRef,
+    };
     use crate::types::identifiers::CardId;
     use crate::types::zones::Zone;
 
@@ -499,6 +518,16 @@ mod tests {
                 target: TargetFilter::ParentTarget,
                 count: QuantityExpr::Fixed { value: 1 },
                 min_count: 0,
+            },
+        ))
+    }
+
+    fn destroy_sub() -> Box<AbilityDefinition> {
+        Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Destroy {
+                target: TargetFilter::ParentTarget,
+                cant_regenerate: true,
             },
         ))
     }
@@ -567,6 +596,68 @@ mod tests {
             }
             other => panic!("expected SeparatePilesPartition, got {other:?}"),
         }
+    }
+
+    /// CR 700.3 + CR 115.1: A target player must be both the partitioner and
+    /// the chooser, and the chosen pile's per-object destroy effect must run.
+    #[test]
+    fn target_player_piles_partition_and_destroy_chosen_objects() {
+        use crate::game::engine::apply;
+        use crate::types::actions::GameAction;
+        use crate::types::game_state::PileSide;
+
+        let mut state = GameState::new_two_player(42);
+        let caster = state.players[0].id;
+        let target_player = state.players[1].id;
+        let c1 = place_creature(&mut state, target_player, 21);
+        let c2 = place_creature(&mut state, target_player, 22);
+        let ability = ResolvedAbility::new(
+            Effect::SeparateIntoPiles {
+                partition_subject: VoterScope::TargetPlayer,
+                object_filter: TargetFilter::Typed(crate::types::ability::TypedFilter::creature()),
+                chooser: PlayerScope::Target,
+                chosen_pile_effect: destroy_sub(),
+                pile_source: PileSource::Battlefield,
+                unchosen_pile_effect: None,
+            },
+            vec![TargetRef::Player(target_player)],
+            ObjectId(700),
+            caster,
+        );
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).expect("resolves");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::SeparatePilesPartition { player, chooser, .. }
+                if player == target_player && chooser == target_player
+        ));
+
+        apply(
+            &mut state,
+            target_player,
+            GameAction::SubmitPilePartition { pile_a: vec![c1] },
+        )
+        .expect("partition accepted");
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::SeparatePilesChoice { player, .. } if player == target_player
+        ));
+        apply(
+            &mut state,
+            target_player,
+            GameAction::ChoosePile { pile: PileSide::A },
+        )
+        .expect("pile choice accepted");
+
+        assert!(
+            !state.battlefield.contains(&c1),
+            "chosen object must be destroyed"
+        );
+        assert!(
+            state.battlefield.contains(&c2),
+            "unchosen object must remain"
+        );
+        assert!(state.players[1].graveyard.contains(&c1));
     }
 
     /// R4k — CR 608.2d + CR 700.3: *"an opponent"* separates the piles, and WHICH opponent

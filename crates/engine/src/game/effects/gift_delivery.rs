@@ -57,6 +57,7 @@ pub fn resolve(
                 opponent,
                 "Treasure",
                 ability.source_id,
+                ability.controller,
                 |ct| {
                     ct.core_types.push(CoreType::Artifact);
                     ct.subtypes.push("Treasure".to_string());
@@ -64,17 +65,33 @@ pub fn resolve(
             );
         }
         GiftKind::Food => {
-            create_gift_token(state, events, opponent, "Food", ability.source_id, |ct| {
-                ct.core_types.push(CoreType::Artifact);
-                ct.subtypes.push("Food".to_string());
-            });
+            create_gift_token(
+                state,
+                events,
+                opponent,
+                "Food",
+                ability.source_id,
+                ability.controller,
+                |ct| {
+                    ct.core_types.push(CoreType::Artifact);
+                    ct.subtypes.push("Food".to_string());
+                },
+            );
         }
         GiftKind::TappedFish => {
             let obj_id =
-                create_gift_token(state, events, opponent, "Fish", ability.source_id, |ct| {
-                    ct.core_types.push(CoreType::Creature);
-                    ct.subtypes.push("Fish".to_string());
-                });
+                create_gift_token(
+                    state,
+                    events,
+                    opponent,
+                    "Fish",
+                    ability.source_id,
+                    ability.controller,
+                    |ct| {
+                        ct.core_types.push(CoreType::Creature);
+                        ct.subtypes.push("Fish".to_string());
+                    },
+                );
             if let Some(obj) = state.objects.get_mut(&obj_id) {
                 obj.color = vec![ManaColor::Blue];
                 obj.base_color = vec![ManaColor::Blue];
@@ -148,6 +165,7 @@ fn create_gift_token(
     owner: PlayerId,
     name: &str,
     source_id: ObjectId,
+    putter: PlayerId,
     setup: impl FnOnce(&mut CardType),
 ) -> crate::types::identifiers::ObjectId {
     let obj_id = zones::create_object(state, CardId(0), owner, name.to_string(), Zone::Battlefield);
@@ -185,6 +203,7 @@ fn create_gift_token(
         obj_id,
         name.to_string(),
         source_id,
+        Some(putter),
         events,
     )
     .expect("token just created");
@@ -368,6 +387,14 @@ mod tests {
         let token = token.unwrap();
         assert!(token.card_types.subtypes.contains(&"Treasure".to_string()));
         assert!(token.card_types.core_types.contains(&CoreType::Artifact));
+        assert_eq!(
+            events.iter().find_map(|event| match event {
+                GameEvent::ZoneChanged { record, .. } => record.zone_change_putter(),
+                _ => None,
+            }),
+            Some(PlayerId(0)),
+            "the gifting ability's controller is the token's event-time putter"
+        );
     }
 
     #[test]

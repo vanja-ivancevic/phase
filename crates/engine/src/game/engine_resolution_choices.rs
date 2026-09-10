@@ -2306,6 +2306,10 @@ pub(super) fn handle_resolution_choice(
                         Zone::Battlefield,
                         source_id,
                     );
+                    // CR 701.20a + CR 110.2a: the player accepting the
+                    // optional put is the event-time putter, independently of
+                    // any controller override applied on entry.
+                    req.putter = Some(player);
                     req.mods.enter_tapped = enter_tapped;
                     req.mods.enters_attacking = enters_attacking;
                     match crate::game::zone_pipeline::move_object(state, req, events) {
@@ -3243,7 +3247,7 @@ pub(super) fn handle_resolution_choice(
             // read `QuantityRef::EventContextAmount` (e.g. "deals that much
             // damage"). `last_effect_count` is the documented fallback slot.
             let total = accumulated.saturating_add(amount);
-            let waiting_for = finish_pay_amount_choice(state, player, total, events);
+            let waiting_for = finish_pay_amount_choice(state, player, total, events)?;
             ResolutionChoiceOutcome::WaitingFor(waiting_for)
         }
         (
@@ -7984,7 +7988,7 @@ fn finish_effect_zone_put_at_library_position(
     finish_with_continuation(state, player, events);
 }
 
-fn finish_with_continuation(
+pub(crate) fn finish_with_continuation(
     state: &mut GameState,
     player: crate::types::player::PlayerId,
     events: &mut Vec<GameEvent>,
@@ -8003,7 +8007,21 @@ pub(crate) fn finish_pay_amount_choice(
     player: crate::types::player::PlayerId,
     total: u32,
     events: &mut Vec<GameEvent>,
-) -> WaitingFor {
+) -> Result<WaitingFor, EngineError> {
+    if state
+        .pending_entry_life_payment
+        .as_ref()
+        .is_some_and(|payment| payment.amount.is_none())
+    {
+        let payment = state
+            .pending_entry_life_payment
+            .as_mut()
+            .expect("entry payment was checked above");
+        payment.amount = Some(total);
+        // CR 614.12: the payment has completed, so finish the already-accepted
+        // replacement and deliver its permanent before returning priority.
+        return super::engine_replacement::handle_replacement_choice(state, 0, events);
+    }
     state.last_effect_count = Some(total as i32);
     let pending_starts_with_pay_amount = state
         .active_ability_continuation()
@@ -8022,7 +8040,7 @@ pub(crate) fn finish_pay_amount_choice(
         *next_accumulated = total;
         state.waiting_for = waiting_for.clone();
     }
-    waiting_for
+    Ok(waiting_for)
 }
 
 /// CR 701.25a / CR 616.1: Run the post-loop cleanup a rest-pile batch deferred

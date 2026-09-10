@@ -7812,6 +7812,16 @@ fn drain_pending_deferred_life_cost_resume(
     let resume_for_restore = resume.clone();
     let result = (|| -> Result<WaitingFor, EngineError> {
         match resume {
+            crate::types::game_state::DeferredLifeCostResume::RepeatPaidLibraryLook {
+                player,
+                source_id,
+                cards,
+                ..
+            } => Ok(
+                crate::game::effects::repeat_paid_library_look::resume_after_paid_life(
+                    state, player, source_id, cards,
+                ),
+            ),
             crate::types::game_state::DeferredLifeCostResume::Cast {
                 player,
                 pending,
@@ -7863,9 +7873,9 @@ fn drain_pending_deferred_life_cost_resume(
             }
             crate::types::game_state::DeferredLifeCostResume::PayAmount {
                 player, total, ..
-            } => Ok(super::engine_resolution_choices::finish_pay_amount_choice(
+            } => super::engine_resolution_choices::finish_pay_amount_choice(
                 state, player, total, events,
-            )),
+            ),
             crate::types::game_state::DeferredLifeCostResume::ManaRoot {
                 player,
                 resume,
@@ -11323,6 +11333,40 @@ fn apply_action(
         ) => engine_casting::cancel_pending_cast(state, *player, pending_cast, &mut events)?,
         // CR 608.2d: Player decided whether to perform an optional effect ("You may X").
         (
+            WaitingFor::RepeatPaidLibraryLookPayment {
+                player,
+                source_id,
+                cards,
+                life_payment,
+            },
+            GameAction::DecideOptionalEffect { accept },
+        ) => crate::game::effects::repeat_paid_library_look::handle_payment(
+            state,
+            *player,
+            *source_id,
+            cards.clone(),
+            *life_payment,
+            accept,
+            &mut events,
+        )?,
+        (
+            WaitingFor::ReorderLibraryChoice {
+                player,
+                cards,
+                top,
+                source_id,
+            },
+            GameAction::SelectCards { cards: ordered },
+        ) => crate::game::effects::repeat_paid_library_look::handle_reorder(
+            state,
+            *player,
+            cards.clone(),
+            *top,
+            *source_id,
+            ordered,
+            &mut events,
+        )?,
+        (
             WaitingFor::OptionalEffectChoice {
                 player, source_id, ..
             },
@@ -11688,7 +11732,9 @@ fn apply_action(
                 // whether or not the ability has deferred targets.
                 let mut trial = pending.as_ref().clone();
                 trial.ability.set_chosen_x_recursive(value);
-                trial.cost.concretize_x(value);
+                let mut trial_cost = trial.cost.clone();
+                casting::concretize_pending_x(&mut trial_cost, value);
+                trial.cost = trial_cost;
                 if trial.activation_ability_index.is_some()
                     && trial.activation_cost.as_ref().is_some_and(|cost| {
                         !casting_costs::activation_cost_is_payable_after_x_choice(
@@ -11737,7 +11783,9 @@ fn apply_action(
                 EngineError::InvalidAction("No pending cast awaiting X".to_string())
             })?;
             pending.ability.set_chosen_x_recursive(value);
-            pending.cost.concretize_x(value);
+            let mut concrete_cost = pending.cost.clone();
+            casting::concretize_pending_x(&mut concrete_cost, value);
+            pending.cost = concrete_cost;
             let object_id = pending.object_id;
             events.push(GameEvent::XValueChosen {
                 player,
@@ -15315,10 +15363,14 @@ fn handle_play_land(
     // hard-overwrites this default unconditionally (identical safety
     // property to the stack.rs spell-cast seam this mirrors).
     if let crate::types::proposed_event::ProposedEvent::ZoneChange {
+        putter,
         controller_override,
         ..
     } = &mut proposed
     {
+        // CR 305.1: the player performing the special action is the putter,
+        // even if an ETB replacement later changes the entrant's controller.
+        *putter = Some(player);
         *controller_override = Some(player);
     }
 

@@ -195,6 +195,7 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         copy_count_status: CopyCountStatus::Pending,
         forward_result: false,
         unless_pay: None,
+        unless_was_cumulative_upkeep: false,
         distribution: None,
         distribute: None,
         target_selection_mode: TargetSelectionMode::Chosen,

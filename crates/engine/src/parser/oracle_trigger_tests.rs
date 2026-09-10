@@ -1148,6 +1148,38 @@ fn static_condition_to_trigger_condition_source_in_battlefield() {
 }
 
 #[test]
+fn krovikan_horror_graveyard_adjacency_is_typed() {
+    // CR 404.1 + CR 603.4: the source-zone condition must preserve the
+    // immediately-above-card rider rather than swallowing the whole `if`
+    // clause after parsing only "in your graveyard".
+    let parsed = parse_oracle_text(
+        "At the beginning of the end step, if this card is in your graveyard with a creature card directly above it, you may return this card to your hand.\n{1}, Sacrifice a creature: This creature deals 1 damage to any target.",
+        "Krovikan Horror",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let trigger = parsed.triggers.first().expect("Krovikan Horror trigger");
+    assert_eq!(trigger.mode, TriggerMode::Phase);
+    assert_eq!(trigger.trigger_zones, vec![Zone::Graveyard]);
+    assert!(matches!(
+        trigger.condition.as_ref(),
+        Some(TriggerCondition::SourceInZoneWithAdjacentFilter {
+            zone: Zone::Graveyard,
+            adjacent: TargetFilter::Typed(TypedFilter {
+                type_filters,
+                controller: None,
+                properties,
+            }),
+        }) if type_filters == &vec![TypeFilter::Creature] && properties.is_empty()
+    ));
+    assert!(parsed.parse_warnings.iter().all(|warning| !matches!(
+        warning,
+        OracleDiagnostic::SwallowedClause { detector, .. } if detector == "Condition_If"
+    )));
+}
+
+#[test]
 fn intervening_if_source_attacked_this_turn_populates_condition() {
     // CR 508.1 + CR 603.4: a source-scoped "if ~ attacked this turn"
     // intervening-if must gate the trigger on the ability's own source creature
@@ -1203,6 +1235,25 @@ fn tolsimir_midnights_light_preserves_combat_source_and_event_attacker_axes() {
             duration: Duration::UntilEndOfCombat,
             ..
         })
+    ));
+}
+
+#[test]
+fn intervening_if_source_attacked_or_blocked_this_combat_populates_condition() {
+    // CR 508.1 + CR 509.1 + CR 603.4: a source-scoped intervening-if must
+    // retain both sides of "attacked or blocked" and be evaluated against the
+    // exact current-combat incarnation of the source.
+    let trigger = parse_trigger_line(
+        "At end of combat, if ~ attacked or blocked this combat, remove a +1/+0 counter from it.",
+        "Clockwork Beast",
+    );
+    assert_eq!(
+        trigger.condition,
+        Some(TriggerCondition::SourceAttackedOrBlockedThisCombat)
+    );
+    assert!(matches!(
+        trigger.execute.as_deref().map(|ability| &*ability.effect),
+        Some(Effect::RemoveCounter { .. })
     ));
 }
 
@@ -3181,6 +3232,68 @@ fn trigger_intervening_if_source_didnt_attack_this_turn_attaches_condition() {
     ));
 }
 
+#[test]
+fn mad_dog_intervening_if_preserves_attack_and_control_history() {
+    let def = parse_trigger_line(
+        "At the beginning of your end step, if this creature didn't attack or come under your control this turn, sacrifice it.",
+        "Mad Dog",
+    );
+    let Some(TriggerCondition::And { conditions }) = def.condition else {
+        panic!("expected both Mad Dog intervening-if predicates");
+    };
+    assert_eq!(conditions.len(), 2);
+    assert!(conditions.iter().any(|condition| matches!(
+        condition,
+        TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::And { filters },
+                },
+            },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Fixed { value: 0 },
+        } if filters.iter().any(|filter| matches!(
+            filter,
+            TargetFilter::Typed(TypedFilter { properties, .. })
+                if properties.contains(&FilterProp::AttackedThisTurn { defender: None })
+        ))
+    )));
+    assert!(conditions.iter().any(|condition| matches!(
+        condition,
+        TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::And { filters },
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        } if filters.iter().any(|filter| matches!(
+            filter,
+            TargetFilter::Typed(TypedFilter { properties, .. })
+                if properties.contains(&FilterProp::ControlledContinuouslySinceTurnBegan)
+        ))
+    )));
+}
+
+#[test]
+fn fyndhorn_druid_intervening_if_preserves_blocked_history() {
+    let def = parse_trigger_line(
+        "When this creature dies, if it was blocked this turn, you gain 4 life.",
+        "Fyndhorn Druid",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::SourceMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::BlockedThisTurn]),
+            ),
+        })
+    );
+    assert!(def.execute.is_some());
+}
+
 /// CR 506.2 + CR 508.6 + CR 603.4 (issue #2924): Suppressor Skyguard's
 /// attack-trigger intervening-if must hoist to `def.condition` as a
 /// `PlayerCount(OpponentOfTriggeringPlayerNotAttacked) >= 1` comparison.
@@ -3566,6 +3679,16 @@ fn trigger_combat_damage_to_player() {
     assert_eq!(def.mode, TriggerMode::DamageDone);
     assert_eq!(def.damage_kind, DamageKindFilter::CombatOnly);
     assert_eq!(def.valid_target, Some(TargetFilter::Player));
+}
+
+/// CR 701.19: passive past-participle wording is equivalent to the active
+/// "regenerates" event and binds "it's" to the delayed trigger's source.
+#[test]
+fn passive_regenerated_trigger_binds_its_source() {
+    let mut ctx = ParseContext::default();
+    let (mode, def) = parse_trigger_condition("it's regenerated", &mut ctx);
+    assert_eq!(mode, TriggerMode::Regenerated);
+    assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
 }
 
 #[test]
@@ -16270,6 +16393,197 @@ fn trigger_opponent_causes_you_to_discard_this_card() {
     assert_eq!(def.trigger_zones, vec![Zone::Graveyard, Zone::Exile]);
 }
 
+/// CR 109.5 + CR 603.2: opponent-caused discard is not restricted to a
+/// self-discard trigger. Spiritual Focus remains on the battlefield and watches
+/// every card its controller discards to an opponent-controlled spell or ability.
+#[test]
+fn trigger_opponent_causes_you_to_discard_a_card() {
+    let def = parse_trigger_line(
+        "Whenever a spell or ability an opponent controls causes you to discard a card, \
+         you gain 2 life and you may draw a card.",
+        "Spiritual Focus",
+    );
+    assert_eq!(def.mode, TriggerMode::Discarded);
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::Typed(TypedFilter::card()))
+    );
+    assert_eq!(def.valid_target, Some(TargetFilter::Controller));
+    assert_eq!(
+        def.constraint,
+        Some(
+            crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+                controller: ControllerRef::Opponent
+            }
+        )
+    );
+    assert_eq!(def.trigger_zones, vec![Zone::Battlefield]);
+
+    let execute = def
+        .execute
+        .expect("Spiritual Focus must retain its life gain");
+    assert!(matches!(
+        execute.effect.as_ref(),
+        Effect::GainLife {
+            amount: QuantityExpr::Fixed { value: 2 },
+            player: TargetFilter::Controller,
+        }
+    ));
+    let draw = execute
+        .sub_ability
+        .expect("Spiritual Focus must retain its optional draw");
+    assert!(draw.optional);
+    assert!(matches!(
+        draw.effect.as_ref(),
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        }
+    ));
+}
+
+/// CR 109.5 + CR 603.2: Sacred Ground watches the event source, the departing
+/// land's owner, and the battlefield-to-graveyard transition independently.
+#[test]
+fn trigger_opponent_causes_land_to_enter_your_graveyard() {
+    let def = parse_trigger_line(
+        "Whenever a spell or ability an opponent controls causes a land to be put into your graveyard from the battlefield, \
+         return that card to the battlefield.",
+        "Sacred Ground",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.origin, Some(Zone::Battlefield));
+    assert_eq!(def.destination, Some(Zone::Graveyard));
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::Typed(TypedFilter::land().properties(vec![
+            FilterProp::Owned {
+                controller: ControllerRef::You,
+            }
+        ])))
+    );
+    assert_eq!(
+        def.constraint,
+        Some(
+            crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+                controller: ControllerRef::Opponent
+            }
+        )
+    );
+    assert!(matches!(
+        def.execute
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Battlefield,
+            target: TargetFilter::TriggeringSource,
+            ..
+        })
+    ));
+}
+
+/// CR 110.2a + CR 305.1: active-voice battlefield-entry triggers retain the
+/// object filter and separately require event-time putter provenance.
+#[test]
+fn trigger_player_puts_onto_battlefield_has_putter_constraint() {
+    for condition in [
+        "a player puts an Island or blue permanent onto the battlefield",
+        "a player puts a nontoken creature onto the battlefield",
+        "a player puts a Swamp onto the battlefield",
+        "a player puts a Forest onto the battlefield",
+    ] {
+        let mut ctx = ParseContext::default();
+        let (mode, def) = super::parse_trigger_condition(condition, &mut ctx);
+        assert_eq!(mode, TriggerMode::ChangesZone, "condition: {condition}");
+        assert_eq!(def.destination, Some(Zone::Battlefield));
+        assert!(
+            def.valid_card.is_some(),
+            "object filter was dropped: {condition}"
+        );
+        assert_eq!(
+            def.constraint,
+            Some(crate::types::ability::TriggerConstraint::ZoneChangePutterPresent),
+            "condition: {condition}"
+        );
+        assert_eq!(
+            super::relative_player_scope_for_condition(condition),
+            Some(ControllerRef::ScopedPlayer),
+            "that-player scope was not introduced: {condition}"
+        );
+    }
+}
+
+/// CR 603.2: preserve independent event provenance and frequency gates when
+/// lowering one active-voice trigger.
+#[test]
+fn trigger_player_puts_onto_battlefield_composes_with_once_each_turn() {
+    let def = parse_trigger_line(
+        "Whenever a player puts a Swamp onto the battlefield, draw a card. This ability triggers only once each turn.",
+        "Synthetic",
+    );
+    let Some(crate::types::ability::TriggerConstraint::All { constraints }) = def.constraint else {
+        panic!("expected composed putter and frequency constraints");
+    };
+    assert!(
+        constraints.contains(&crate::types::ability::TriggerConstraint::ZoneChangePutterPresent)
+    );
+    assert!(constraints.contains(&crate::types::ability::TriggerConstraint::OncePerTurn));
+}
+
+/// CR 701.8a + CR 603.2: Karmic Justice binds both the destroyed permanent
+/// and the opponent-controlled spell/ability that destroyed it. The active
+/// voice must not fall through to the passive "is destroyed" grammar, which
+/// has no event-source controller to retain.
+#[test]
+fn trigger_opponent_controlled_spell_destroys_noncreature_permanent() {
+    let condition =
+        "a spell or ability an opponent controls destroys a noncreature permanent you control";
+    assert_eq!(
+        relative_player_scope_for_condition(condition),
+        Some(ControllerRef::TriggeringPlayer),
+        "the destruction source's controller must be available to the trailing that-opponent target"
+    );
+    let def = parse_trigger_line(
+        "Whenever a spell or ability an opponent controls destroys a noncreature permanent you control, \
+         you may destroy target permanent that opponent controls.",
+        "Karmic Justice",
+    );
+    assert_eq!(def.mode, TriggerMode::Destroyed);
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::Typed(
+            TypedFilter::permanent()
+                .with_type(TypeFilter::Non(Box::new(TypeFilter::Creature)))
+                .controller(ControllerRef::You)
+        ))
+    );
+    assert_eq!(
+        def.constraint,
+        Some(
+            crate::types::ability::TriggerConstraint::EventSourceControlledBy {
+                controller: ControllerRef::Opponent
+            }
+        )
+    );
+    assert!(def.optional);
+    assert!(matches!(
+        def.execute
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::Destroy {
+            target: TargetFilter::Typed(TypedFilter {
+                // "That opponent" refers to the controller of the spell or
+                // ability recorded on the destruction event, not simply any
+                // opponent of Karmic Justice's controller.
+                controller: Some(ControllerRef::TriggeringPlayer),
+                ..
+            }),
+            ..
+        })
+    ));
+}
+
 /// CR 701.9 + CR 608.2k + CR 406.1: Necropotence's on-discard trigger
 /// exiles the just-discarded card from the graveyard. The "that card"
 /// anaphor must lift from `ParentTarget` to `TriggeringSource` so the
@@ -20222,6 +20536,22 @@ fn trigger_each_of_your_main_phases_uses_main_phase_constraint() {
         Some(TriggerConstraint::OnlyDuringYourMainPhase)
     );
     assert!(def.optional, "trigger should be optional ('you may')");
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::Not {
+            condition: Box::new(TriggerCondition::SourceAbilityAddedManaThisTurn),
+        }),
+        "Carpet's 'with this ability' gate must remain tied to the exact printed ability"
+    );
+    assert!(
+        matches!(
+            def.execute
+                .as_deref()
+                .map(|ability| ability.effect.as_ref()),
+            Some(Effect::Mana { .. })
+        ),
+        "Carpet's payload must remain a mana effect"
+    );
 }
 
 /// Coalition Relic, third ability — Future Sight artifact, issue #130.
@@ -20894,6 +21224,35 @@ fn trigger_dealt_damage_by_source_dies() {
 }
 
 #[test]
+fn trigger_enchanted_creature_damaged_dies_uses_attachment_source() {
+    // CR 301.5 + CR 120.1: "enchanted creature" names the Aura's attached
+    // host as the damage source, not the Aura itself.
+    let def = parse_trigger_line(
+        "Whenever a creature dealt damage by enchanted creature this turn dies, put a +1/+1 counter on that creature.",
+        "Vampiric Embrace",
+    );
+    assert_eq!(def.mode, TriggerMode::ChangesZone);
+    assert_eq!(def.origin, Some(Zone::Battlefield));
+    assert_eq!(def.destination, Some(Zone::Graveyard));
+    assert_eq!(
+        def.valid_card,
+        Some(TargetFilter::Typed(TypedFilter::creature()))
+    );
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::DealtDamageThisTurnBySource {
+            source: TargetFilter::AttachedTo,
+        })
+    );
+    assert!(matches!(
+        def.execute
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::PutCounter { .. })
+    ));
+}
+
+#[test]
 fn trigger_another_creature_damaged_by_spider_you_controlled_dies() {
     // Issue #1206 — Shelob, Child of Ungoliant
     let def = parse_trigger_line(
@@ -21156,6 +21515,42 @@ fn trigger_counter_removed_no_zone_constraint() {
     assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
     // No zone constraint — fires from default zones
     assert_eq!(def.trigger_zones, vec![Zone::Battlefield]);
+    assert_eq!(
+        def.counter_filter
+            .as_ref()
+            .map(|filter| &filter.counter_type),
+        Some(&crate::types::counter::CounterType::Time)
+    );
+    assert_eq!(
+        def.counter_filter
+            .as_ref()
+            .and_then(|filter| filter.threshold),
+        None
+    );
+}
+
+#[test]
+fn trigger_last_ore_counter_removed_is_zero_thresholded() {
+    let def = parse_trigger_line(
+        "When the last ore counter is removed from this Aura, destroy enchanted land and this Aura deals 2 damage to that land's controller.",
+        "Orcish Mine",
+    );
+    assert_eq!(def.mode, TriggerMode::CounterRemoved);
+    assert_eq!(def.valid_card, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.counter_filter
+            .as_ref()
+            .map(|filter| &filter.counter_type),
+        Some(&crate::types::counter::CounterType::Generic(
+            "ore".to_string()
+        ))
+    );
+    assert_eq!(
+        def.counter_filter
+            .as_ref()
+            .and_then(|filter| filter.threshold),
+        Some(0)
+    );
 }
 
 // -----------------------------------------------------------------------
@@ -23852,6 +24247,104 @@ fn state_trigger_control_no_islands() {
         matches!(*execute.effect, Effect::Sacrifice { .. }),
         "expected Sacrifice, got {:?}",
         execute.effect,
+    );
+}
+
+#[test]
+fn phyrexian_devourer_power_state_trigger_is_typed() {
+    let def = parse_trigger_line(
+        "When ~'s power is 7 or greater, sacrifice it.",
+        "Phyrexian Devourer",
+    );
+    assert_eq!(def.mode, TriggerMode::StateCondition);
+    assert_eq!(
+        def.condition,
+        Some(TriggerCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::Power {
+                    scope: ObjectScope::Source,
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 7 },
+        })
+    );
+    assert!(matches!(
+        def.execute.as_deref().map(|a| a.effect.as_ref()),
+        Some(Effect::Sacrifice { .. })
+    ));
+}
+
+/// CR 603.8 + CR 208.1: Phyrexian Devourer's state trigger must observe its
+/// live power and sacrifice the source once it reaches seven or more.
+#[test]
+fn phyrexian_devourer_power_state_trigger_fires_and_sacrifices_self() {
+    use crate::game::scenario::GameRunner;
+    use crate::game::triggers::check_state_triggers;
+    use crate::game::zones::create_object;
+    use crate::types::card_type::CoreType;
+    use crate::types::game_state::GameState;
+    use crate::types::identifiers::CardId;
+    use crate::types::phase::Phase;
+    use crate::types::zones::Zone;
+    use crate::types::PlayerId;
+    use std::sync::Arc;
+
+    let parsed = parse_oracle_text(
+        "When ~'s power is 7 or greater, sacrifice it.",
+        "Phyrexian Devourer",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|t| t.mode == TriggerMode::StateCondition)
+        .expect("Phyrexian Devourer state trigger");
+    assert!(matches!(
+        trigger.condition,
+        Some(TriggerCondition::QuantityComparison { .. })
+    ));
+
+    let mut state = GameState::new_two_player(71);
+    state.phase = Phase::PreCombatMain;
+    state.turn_number = 2;
+    state.active_player = PlayerId(0);
+    state.priority_player = PlayerId(0);
+    let devourer_id = create_object(
+        &mut state,
+        CardId(71),
+        PlayerId(0),
+        "Phyrexian Devourer".to_string(),
+        Zone::Battlefield,
+    );
+    {
+        let obj = state.objects.get_mut(&devourer_id).unwrap();
+        obj.controller = PlayerId(0);
+        obj.power = Some(7);
+        obj.toughness = Some(7);
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.base_card_types.core_types.push(CoreType::Creature);
+        obj.base_trigger_definitions = Arc::new(parsed.triggers.clone());
+        obj.trigger_definitions = parsed.triggers.clone().into();
+    }
+
+    check_state_triggers(&mut state);
+    assert!(
+        state.pending_trigger.is_some() || !state.stack.is_empty(),
+        "power threshold should enqueue the state trigger",
+    );
+
+    let mut runner = GameRunner::from_state(state);
+    runner.advance_until_stack_empty();
+    assert!(
+        !runner
+            .state()
+            .battlefield
+            .iter()
+            .any(|id| *id == devourer_id),
+        "Phyrexian Devourer should sacrifice itself at seven power",
     );
 }
 
@@ -31336,4 +31829,51 @@ fn ogre_marauder_attack_trigger_carries_defending_player_unless_sacrifice() {
         !format!("{:?}", execute.effect).contains("Unimplemented"),
         "the body must not fall through to a parser gap"
     );
+}
+
+// CR 702.24a: printed cumulative-upkeep rider triggers — Thought Lash /
+// Heart of Bogardan. The head names the non-payment event; the payload's
+// "that player" binds to the non-paying player (TriggeringPlayer).
+#[test]
+fn cumulative_upkeep_not_paid_rider_printed_possessor_parses() {
+    let trigger = parse_trigger_line(
+        "When a player doesn't pay this enchantment's cumulative upkeep, \
+         that player exiles all cards from their library.",
+        "Thought Lash",
+    );
+    assert_eq!(trigger.mode, TriggerMode::CumulativeUpkeepNotPaid);
+    assert_eq!(
+        trigger.trigger_zones,
+        vec![crate::types::zones::Zone::Battlefield]
+    );
+    let execute = trigger.execute.as_deref().expect("rider body must parse");
+    assert!(
+        !format!("{:?}", execute.effect).contains("Unimplemented"),
+        "the rider body must not fall through to a parser gap"
+    );
+    assert!(
+        format!("{:?}", execute.effect).contains("ScopedPlayer"),
+        "body 'that player' must lower to the ScopedPlayer referent, got {:?}",
+        execute.effect
+    );
+}
+
+#[test]
+fn cumulative_upkeep_not_paid_rider_normalized_possessor_parses() {
+    let trigger = parse_trigger_line(
+        "When a player doesn't pay ~'s cumulative upkeep, that player exiles all cards from their library.",
+        "Thought Lash",
+    );
+    assert_eq!(trigger.mode, TriggerMode::CumulativeUpkeepNotPaid);
+}
+
+#[test]
+fn cumulative_upkeep_not_paid_rider_fails_closed_on_other_costs() {
+    // A non-cumulative-upkeep "doesn't pay" head must not be claimed by the
+    // rider parser — it stays an Unknown trigger so coverage stays red.
+    let trigger = parse_trigger_line(
+        "When a player doesn't pay ~'s echo cost, that player discards a card.",
+        "Not A Card",
+    );
+    assert_ne!(trigger.mode, TriggerMode::CumulativeUpkeepNotPaid);
 }

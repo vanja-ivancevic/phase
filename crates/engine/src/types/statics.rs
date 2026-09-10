@@ -1465,6 +1465,18 @@ pub enum StaticMode {
         /// or applies to built-in cast zones that already authorize the spell.
         #[serde(default)]
         origin: CastFreeOrigin,
+        /// CR 109.5 + CR 601.2b: Whether this permission is available to every
+        /// player rather than only the source's controller.  Aluren is the
+        /// canonical printed form.  Defaulting to `false` preserves the
+        /// controller-only Omniscience / Zaffai family in existing card data.
+        #[serde(default)]
+        all_players: bool,
+        /// CR 601.3b + CR 702.8a: This permission also lets the admitted spell
+        /// be cast as though it had flash.  It belongs on the permission rather
+        /// than a second, independently-scoped static: Aluren grants both
+        /// privileges to precisely the same spell/player pair.
+        #[serde(default)]
+        grants_flash: bool,
     },
     /// CR 601.2a + CR 113.6b + CR 118.9: Static ability granting permission to
     /// cast cards exiled with this source — restricted to cards exiled *this
@@ -2600,9 +2612,16 @@ impl Hash for StaticMode {
                 play_mode.hash(state);
                 frequency.hash(state);
             }
-            StaticMode::CastFromHandFree { frequency, origin } => {
+            StaticMode::CastFromHandFree {
+                frequency,
+                origin,
+                all_players,
+                grants_flash,
+            } => {
                 frequency.hash(state);
                 origin.hash(state);
+                all_players.hash(state);
+                grants_flash.hash(state);
             }
             StaticMode::ExileCastPermission {
                 frequency,
@@ -2994,12 +3013,23 @@ impl fmt::Display for StaticMode {
             // the Display payload.
             StaticMode::TopOfLibraryHasPlot => write!(f, "TopOfLibraryHasPlot"),
             StaticMode::TopOfLibraryPlotPermission => write!(f, "TopOfLibraryPlotPermission"),
-            StaticMode::CastFromHandFree { frequency, origin } => {
-                if matches!(origin, CastFreeOrigin::Hand) {
-                    write!(f, "CastFromHandFree({frequency})")
-                } else {
-                    write!(f, "CastFromHandFree({frequency},{origin})")
+            StaticMode::CastFromHandFree {
+                frequency,
+                origin,
+                all_players,
+                grants_flash,
+            } => {
+                let mut parts = vec![frequency.to_string()];
+                if !matches!(origin, CastFreeOrigin::Hand) {
+                    parts.push(origin.to_string());
                 }
+                if *all_players {
+                    parts.push("all_players".to_string());
+                }
+                if *grants_flash {
+                    parts.push("flash".to_string());
+                }
+                write!(f, "CastFromHandFree({})", parts.join(","))
             }
             StaticMode::ExileCastPermission {
                 frequency,
@@ -3514,6 +3544,8 @@ impl FromStr for StaticMode {
             "CastFromHandFree" => StaticMode::CastFromHandFree {
                 frequency: CastFrequency::Unlimited,
                 origin: CastFreeOrigin::Hand,
+                all_players: false,
+                grants_flash: false,
             },
             s if s.starts_with("CastFromHandFree(") => {
                 let inner = s
@@ -3522,13 +3554,16 @@ impl FromStr for StaticMode {
                     .unwrap_or("unlimited");
                 let mut parts = inner.split(',');
                 let freq = parts.next().unwrap_or("unlimited");
-                let origin = parts
-                    .next()
-                    .and_then(|s| s.parse().ok())
+                let trailing: Vec<_> = parts.collect();
+                let origin = trailing
+                    .iter()
+                    .find_map(|part| part.parse().ok())
                     .unwrap_or(CastFreeOrigin::Hand);
                 StaticMode::CastFromHandFree {
                     frequency: freq.parse().unwrap_or(CastFrequency::Unlimited),
                     origin,
+                    all_players: trailing.contains(&"all_players"),
+                    grants_flash: trailing.contains(&"flash"),
                 }
             }
             "ExileCastPermission" => StaticMode::ExileCastPermission {
@@ -4373,14 +4408,27 @@ mod tests {
             StaticMode::CastFromHandFree {
                 frequency: CastFrequency::Unlimited,
                 origin: CastFreeOrigin::Hand,
+                all_players: false,
+                grants_flash: false,
             },
             StaticMode::CastFromHandFree {
                 frequency: CastFrequency::OncePerTurn,
                 origin: CastFreeOrigin::Hand,
+                all_players: false,
+                grants_flash: false,
             },
             StaticMode::CastFromHandFree {
                 frequency: CastFrequency::Unlimited,
                 origin: CastFreeOrigin::DefaultCastPermission,
+                all_players: false,
+                grants_flash: false,
+            },
+            // Aluren's coupled global free-cast / flash permission.
+            StaticMode::CastFromHandFree {
+                frequency: CastFrequency::Unlimited,
+                origin: CastFreeOrigin::DefaultCastPermission,
+                all_players: true,
+                grants_flash: true,
             },
             // Exile-cast permission (Maralen, Fae Ascendant).
             StaticMode::ExileCastPermission {

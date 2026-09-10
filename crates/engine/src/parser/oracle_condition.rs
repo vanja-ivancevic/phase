@@ -5,15 +5,15 @@ use nom::branch::alt;
 use nom::bytes::complete::{tag, take_until};
 use nom::character::complete::{multispace0, one_of};
 use nom::combinator::{all_consuming, opt, value};
-use nom::sequence::terminated;
+use nom::sequence::{preceded, terminated};
 use nom::Parser;
 
 use super::oracle_nom::condition as nom_condition;
 use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_target::parse_type_phrase;
 use crate::types::ability::{
-    Comparator, FilterProp, ParsedCondition, QuantityExpr, QuantityRef, StaticCondition,
-    TargetFilter, TypedFilter,
+    Comparator, ControllerRef, FilterProp, ParsedCondition, QuantityExpr, QuantityRef,
+    StaticCondition, TargetFilter, TypedFilter,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterMatch;
@@ -60,6 +60,51 @@ fn scan_source_zone_filter(text: &str) -> Option<Zone> {
 /// `RequiresCondition { condition: None }`.
 pub fn parse_restriction_condition(text: &str) -> Option<ParsedCondition> {
     let lower = text.trim().trim_end_matches('.').to_lowercase();
+    // CR 404.1 + CR 602.5b: Ashen Ghoul's old-border activation rider counts
+    // creature cards physically above the source in its owner's graveyard.
+    // This is source-relative and ordered; it is not interchangeable with the
+    // ordinary "three or more creature cards in your graveyard" quantity.
+    if lower
+        .strip_prefix("three or more creature cards are above ")
+        .is_some_and(|tail| !tail.trim().is_empty())
+    {
+        return Some(ParsedCondition::SourceHasCreatureCardsAbove { minimum: 3 });
+    }
+    // CR 509.1h + CR 603.4: Sea Troll's pre-modern rider combines the live
+    // "blocked" predicate with a historical color-qualified blocker predicate.
+    if let Some(color_text) =
+        lower
+            .split_once(" blocked or was blocked by a ")
+            .and_then(|(_, tail)| {
+                tail.strip_suffix(" this turn")
+                    .unwrap_or(tail)
+                    .strip_suffix(" creature")
+            })
+    {
+        if let Some(color) = parse_color_word(color_text) {
+            return Some(ParsedCondition::SourceWasBlockedOrBlockedByColorThisTurn { color });
+        }
+    }
+    // CR 301.5 + CR 303.4 + CR 602.5b: an activation restriction may inspect
+    // the permanent an Aura or Equipment is attached to (Nature's Chosen:
+    // "Activate only if enchanted creature is white and untapped"). The
+    // attached-subject grammar already produces the exact relationship-aware
+    // filter; a restriction has no recipient slot, so lower its host predicate
+    // to an ObjectCount against that source-relative filter. This is exact:
+    // `EnchantedBy`/`EquippedBy` matches only the source's host, and the
+    // `GE 1` presence test is false when the source is unattached.
+    if let Some(condition) = parse_attached_subject_restriction(&lower) {
+        return Some(condition);
+    }
+    // Preserve the restriction-only source-power vocabulary for the named
+    // self form. The shared grammar also accepts `~'s power`, which is the
+    // correct normalized shape for state triggers, but activation restrictions
+    // historically expose `SourcePowerAtLeast` to the restriction evaluator.
+    // Keep the two consumers' public AST contracts distinct while retaining
+    // the trigger parser's normalized `QuantityComparison` representation.
+    if let Some(power) = parse_source_power_threshold(&lower) {
+        return Some(ParsedCondition::SourcePowerAtLeast { minimum: power });
+    }
     match parse_shared_restriction_condition(&lower) {
         // The shared grammar recognized the phrase and `ParsedCondition` can hold it.
         SharedRestrictionParse::Converted(condition) => Some(condition),
@@ -70,6 +115,50 @@ pub fn parse_restriction_condition(text: &str) -> Option<ParsedCondition> {
         SharedRestrictionParse::Unsupported => None,
         SharedRestrictionParse::NoMatch => parse_restriction_only_condition(&lower),
     }
+}
+
+/// CR 301.5 + CR 303.4 + CR 602.5b: Convert an attached-subject
+/// characteristic restriction into the restriction vocabulary. The shared
+/// static grammar represents the same phrase as `RecipientMatchesFilter`, but
+/// activation evaluation has no recipient parameter; the attachment property
+/// in the filter is the stable source-relative binding we can count instead.
+///
+/// The optional bare tap-state suffix is part of the same attached host
+/// predicate ("white and untapped"), so it is appended to the filter before
+/// lowering. The parser is deliberately limited to the attached-subject
+/// grammar and full consumption; an unrelated or partially recognized phrase
+/// remains an honest gap.
+fn parse_attached_subject_restriction(text: &str) -> Option<ParsedCondition> {
+    let (rest, filter) = nom_condition::parse_attached_subject_is_filter(text).ok()?;
+    let (rest, state_prop) = opt(preceded(
+        tag::<_, _, OracleError<'_>>(" and "),
+        alt((
+            value(FilterProp::Untapped, tag("untapped")),
+            value(FilterProp::Tapped, tag("tapped")),
+        )),
+    ))
+    .parse(rest)
+    .ok()?;
+    if !rest.is_empty() {
+        return None;
+    }
+
+    let TargetFilter::Typed(mut typed) = filter else {
+        return None;
+    };
+    if let Some(property) = state_prop {
+        typed.properties.push(property);
+    }
+
+    Some(ParsedCondition::QuantityComparison {
+        lhs: QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::Typed(typed),
+            },
+        },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
+    })
 }
 
 /// Tri-state outcome of running the shared grammar over a restriction phrase.
@@ -245,11 +334,26 @@ fn static_condition_to_restriction_condition(
             .map(static_condition_to_restriction_condition)
             .collect::<Option<Vec<_>>>()
             .map(|conditions| ParsedCondition::And { conditions }),
-        StaticCondition::Or { conditions } => conditions
-            .into_iter()
-            .map(static_condition_to_restriction_condition)
-            .collect::<Option<Vec<_>>>()
-            .map(|conditions| ParsedCondition::Or { conditions }),
+        StaticCondition::Or { conditions } => {
+            // CR 508.1b + CR 509.1a: the old-border form "this creature is
+            // attacking or blocking" already has an exact restriction leaf.
+            // Handle the pair before the generic recursive conversion because
+            // `SourceIsBlocking` deliberately has no standalone ParsedCondition
+            // (the combined form is the only restriction vocabulary needed).
+            if matches!(
+                conditions.as_slice(),
+                [StaticCondition::SourceIsAttacking, StaticCondition::SourceIsBlocking]
+                    | [StaticCondition::SourceIsBlocking, StaticCondition::SourceIsAttacking]
+            ) {
+                Some(ParsedCondition::SourceIsAttackingOrBlocking)
+            } else {
+                conditions
+                    .into_iter()
+                    .map(static_condition_to_restriction_condition)
+                    .collect::<Option<Vec<_>>>()
+                    .map(|conditions| ParsedCondition::Or { conditions })
+            }
+        }
         StaticCondition::Not { condition } => static_condition_to_restriction_condition(*condition)
             .map(|condition| ParsedCondition::Not {
                 condition: Box::new(condition),
@@ -287,11 +391,59 @@ fn static_condition_to_restriction_condition(
         StaticCondition::ControlsCommander { ownership } => {
             Some(ParsedCondition::ControlsCommander { ownership })
         }
+        // CR 509.1b + CR 602.5: an activation condition such as "defending
+        // player controls a snow land" is the same object-count predicate as
+        // the static condition, with its controller rebound to the defending
+        // player. Keep the full typed filter (including snow and land axes)
+        // instead of reducing it to a hand-picked card shape.
+        StaticCondition::DefendingPlayerControls {
+            filter: TargetFilter::Typed(mut filter),
+        } => {
+            filter.controller = Some(ControllerRef::DefendingPlayer);
+            Some(ParsedCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(filter),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            })
+        }
         // Source zone/state leaves with an exact restriction evaluator.
         StaticCondition::SourceInZone { zone } => Some(ParsedCondition::SourceInZone { zone }),
         StaticCondition::SourceIsAttacking => Some(ParsedCondition::SourceIsAttacking),
         StaticCondition::SourceIsBlocked => Some(ParsedCondition::SourceIsBlocked),
         StaticCondition::SourceEnteredThisTurn => Some(ParsedCondition::SourceEnteredThisTurn),
+        // CR 303.4 + CR 602.5: "this permanent is enchanted" is exactly the
+        // source object having an Aura attachment. Anchor the object-count
+        // filter with `SelfRef`; counting every enchanted permanent would make
+        // the restriction depend on unrelated Auras elsewhere on the battlefield.
+        // `Not` above supplies the inverse for "isn't enchanted" (Hakim,
+        // Loreweaver), while the attachment kind keeps Equipment distinct.
+        StaticCondition::SourceIsEnchanted => Some(ParsedCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::And {
+                        filters: vec![
+                            TargetFilter::SelfRef,
+                            TargetFilter::Typed(
+                                TypedFilter::permanent().properties(vec![
+                                    FilterProp::HasAttachment {
+                                        kind: crate::types::ability::AttachmentKind::Aura,
+                                        controller: None,
+                                        exclude_source:
+                                            crate::types::ability::SourceExclusion::Include,
+                                    },
+                                ]),
+                            ),
+                        ],
+                    },
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        }),
         // CR 301.5 + CR 602.5b: "this permanent is attached to a creature" (Reconfigure).
         StaticCondition::SourceAttachedToCreature => Some(ParsedCondition::SourceAttachedTo {
             required_type: CoreType::Creature,
@@ -399,7 +551,6 @@ fn static_condition_to_restriction_condition(
         | StaticCondition::SourceIsSaddled
         | StaticCondition::SourceControllerEquals { .. }
         | StaticCondition::SourceIsEquipped
-        | StaticCondition::SourceIsEnchanted
         | StaticCondition::SourceIsMonstrous
         | StaticCondition::SourceIsHarnessed
         | StaticCondition::SourceMatchesFilter { .. }
@@ -934,6 +1085,48 @@ mod tests {
         }
     }
 
+    /// CR 301.5 + CR 303.4 + CR 602.5b: Nature's Chosen's activation gate
+    /// names the Aura's enchanted creature and elides the subject on the
+    /// second predicate. The restriction must retain both the attachment
+    /// binding and the live color/tap properties rather than dropping the
+    /// entire `activate only if` clause.
+    #[test]
+    fn attached_subject_activation_gate_preserves_host_filter_and_state() {
+        let condition = parse_restriction_condition("enchanted creature is white and untapped")
+            .expect("attached host activation condition should parse");
+
+        let ParsedCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::ObjectCount {
+                            filter: TargetFilter::Typed(filter),
+                        },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        } = condition
+        else {
+            panic!("expected an attached-host presence condition, got {condition:?}");
+        };
+
+        assert!(filter.type_filters.contains(&TypeFilter::Creature));
+        assert!(filter
+            .properties
+            .iter()
+            .any(|property| matches!(property, FilterProp::EnchantedBy)));
+        assert!(filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::HasColor {
+                color: ManaColor::White
+            }
+        )));
+        assert!(filter
+            .properties
+            .iter()
+            .any(|property| matches!(property, FilterProp::Untapped)));
+    }
+
     /// CR 205.4a: a supertype adjective decomposes into `HasSupertype` + the core type,
     /// never a stringly-typed subtype (which no permanent has, leaving the restriction
     /// permanently unsatisfiable).
@@ -1316,6 +1509,140 @@ mod tests {
             parse_restriction_condition("something completely unknown"),
             None
         );
+    }
+
+    /// CR 508.1b + CR 509.1a: Sawback Manticore's old-border activation
+    /// restriction is an exact two-leaf combat-state disjunction. It must use
+    /// the dedicated runtime predicate rather than reject the blocking leaf or
+    /// silently narrow the condition to attacking only.
+    #[test]
+    fn attacking_or_blocking_source_restriction_is_typed() {
+        assert_eq!(
+            parse_restriction_condition("this creature is attacking or blocking"),
+            Some(ParsedCondition::SourceIsAttackingOrBlocking)
+        );
+    }
+
+    #[test]
+    fn ashen_ghoul_above_source_restriction_is_typed() {
+        assert_eq!(
+            parse_restriction_condition("three or more creature cards are above Ashen Ghoul"),
+            Some(ParsedCondition::SourceHasCreatureCardsAbove { minimum: 3 })
+        );
+    }
+
+    #[test]
+    fn sea_troll_block_history_restriction_is_typed() {
+        assert_eq!(
+            parse_restriction_condition(
+                "this creature blocked or was blocked by a blue creature this turn"
+            ),
+            Some(ParsedCondition::SourceWasBlockedOrBlockedByColorThisTurn {
+                color: ManaColor::Blue,
+            })
+        );
+    }
+
+    /// CR 303.4 + CR 602.5: a source-relative enchantment predicate must remain
+    /// source-relative when lowered to the generic quantity vocabulary. The
+    /// negative form is the old-border Hakim, Loreweaver gate.
+    #[test]
+    fn source_enchanted_restriction_is_source_anchored() {
+        let condition = parse_restriction_condition("~ isn't enchanted")
+            .expect("source enchantment restriction should parse");
+        let ParsedCondition::Not { condition } = condition else {
+            panic!("expected negated enchantment predicate, got {condition:?}");
+        };
+        let ParsedCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::ObjectCount {
+                            filter: TargetFilter::And { filters },
+                        },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        } = *condition
+        else {
+            panic!("expected source-anchored enchantment count, got {condition:?}");
+        };
+        assert!(filters
+            .iter()
+            .any(|filter| matches!(filter, TargetFilter::SelfRef)));
+        assert!(filters.iter().any(|filter| {
+            matches!(
+                filter,
+                TargetFilter::Typed(typed)
+                    if typed.properties.iter().any(|property| matches!(
+                        property,
+                        FilterProp::HasAttachment {
+                            kind: crate::types::ability::AttachmentKind::Aura,
+                            controller: None,
+                            exclude_source: crate::types::ability::SourceExclusion::Include,
+                        }
+                    ))
+            )
+        }));
+    }
+
+    /// CR 509.1b + CR 602.5: preserve both the defending-player controller
+    /// binding and the printed snow-land filter used by Arcum's Sleigh and
+    /// Kjeldoran Guard.
+    #[test]
+    fn defending_player_controls_restriction_rebinds_typed_filter() {
+        let condition = parse_restriction_condition("defending player controls a snow land")
+            .expect("defending-player control restriction should parse");
+        let ParsedCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::ObjectCount {
+                            filter: TargetFilter::Typed(filter),
+                        },
+                },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        } = condition
+        else {
+            panic!("expected typed defending-player count, got {condition:?}");
+        };
+        assert_eq!(filter.controller, Some(ControllerRef::DefendingPlayer));
+        assert!(filter.type_filters.contains(&TypeFilter::Land));
+        assert!(filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::HasSupertype {
+                value: crate::types::card_type::Supertype::Snow
+            }
+        )));
+    }
+
+    #[test]
+    fn defending_player_controls_no_restriction_preserves_zero_count() {
+        let condition = parse_restriction_condition("defending player controls no snow lands")
+            .expect("negative defending-player control restriction should parse");
+        let ParsedCondition::QuantityComparison {
+            lhs:
+                QuantityExpr::Ref {
+                    qty:
+                        QuantityRef::ObjectCount {
+                            filter: TargetFilter::Typed(filter),
+                        },
+                },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Fixed { value: 0 },
+        } = condition
+        else {
+            panic!("expected typed defending-player zero count, got {condition:?}");
+        };
+        assert_eq!(filter.controller, Some(ControllerRef::DefendingPlayer));
+        assert!(filter.type_filters.contains(&TypeFilter::Land));
+        assert!(filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::HasSupertype {
+                value: crate::types::card_type::Supertype::Snow
+            }
+        )));
     }
 
     // -----------------------------------------------------------------------

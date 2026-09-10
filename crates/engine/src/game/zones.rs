@@ -1062,6 +1062,81 @@ pub fn move_to_zone(
     move_to_zone_with_entry_flags(state, object_id, to, events, false);
 }
 
+/// Stamps a just-emitted zone-change record with its causal spell or ability.
+/// The caller supplies only the event slice produced by one delivery, avoiding
+/// any chance of rebinding a same-id zone change from an earlier instruction.
+pub(crate) fn stamp_zone_change_cause(
+    state: &mut GameState,
+    events: &mut [GameEvent],
+    object_id: ObjectId,
+    source_id: Option<ObjectId>,
+) {
+    let Some(source_id) = source_id else {
+        return;
+    };
+    if let Some(GameEvent::ZoneChanged { record, .. }) = events
+        .iter_mut()
+        .rev()
+        .find(|event| matches!(event, GameEvent::ZoneChanged { object_id: id, .. } if *id == object_id))
+    {
+        record.stamp_cause_source_id(Some(source_id));
+        stamp_zone_change_ledger_cause(state, record);
+    }
+}
+
+/// CR 110.2a + CR 305.1: stamps the event-time player who performed the put
+/// action onto the just-emitted record. The entrant's controller is not a
+/// fallback because an ETB replacement may change it.
+pub(crate) fn stamp_zone_change_putter(
+    state: &mut GameState,
+    events: &mut [GameEvent],
+    object_id: ObjectId,
+    putter: Option<PlayerId>,
+) {
+    let Some(putter) = putter else {
+        return;
+    };
+    if let Some(GameEvent::ZoneChanged { record, .. }) = events
+        .iter_mut()
+        .rev()
+        .find(|event| matches!(event, GameEvent::ZoneChanged { object_id: id, .. } if *id == object_id))
+    {
+        record.stamp_zone_change_putter(Some(putter));
+        stamp_zone_change_ledger_putter(state, record);
+    }
+}
+
+/// Keep the per-turn occurrence ledger byte-equivalent to the event carrier.
+/// The ledger row is cloned before post-delivery provenance is known, so every
+/// late event stamp must be mirrored by its already-assigned occurrence index.
+fn stamp_zone_change_ledger_cause(
+    state: &mut GameState,
+    record: &crate::types::game_state::ZoneChangeRecord,
+) {
+    if record.recorded_turn_number == state.turn_number {
+        if let Some(ledger_record) = state
+            .zone_changes_this_turn
+            .get_mut(record.turn_zone_change_index)
+        {
+            ledger_record.stamp_cause_source_id(record.cause_source_id());
+        }
+    }
+}
+
+fn stamp_zone_change_ledger_putter(
+    state: &mut GameState,
+    record: &crate::types::game_state::ZoneChangeRecord,
+) {
+    if record.recorded_turn_number == state.turn_number {
+        if let Some(ledger_record) = state
+            .zone_changes_this_turn
+            .get_mut(record.turn_zone_change_index)
+        {
+            ledger_record.stamp_zone_change_putter(record.zone_change_putter());
+        }
+    }
+}
+
 /// CR 400.7: Move an object to a new zone. An object that moves to a new zone becomes a new object.
 ///
 /// `enter_transformed` (CR 712.14a) is the transient, single-authority "enters

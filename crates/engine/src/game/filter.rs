@@ -316,6 +316,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::PowerGTSource
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
@@ -593,7 +594,9 @@ fn filter_prop_characteristic_reads_at(prop: &FilterProp, depth: u32) -> Charact
         | FilterProp::EquippedBy => CharacteristicKinds::CARD_TYPES,
         // CR 205.3m + CR 702.73a: creature-type reads see through Changeling, so
         // they read layer 6 as well as layer 4.
-        FilterProp::IsChosenCreatureType | FilterProp::SharesCreatureTypeWithCommander => {
+        FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
+        | FilterProp::SharesCreatureTypeWithCommander => {
             CharacteristicKinds::CARD_TYPES.union(CharacteristicKinds::ABILITIES)
         }
         // CR 205.3m + CR 701.23a: whole-zone creature-type tally, scoped to a
@@ -983,6 +986,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::PowerGTSource
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
@@ -1138,6 +1142,11 @@ pub struct FilterContext<'a> {
     /// type with it"). The pronoun "it" refers to the per-id recipient in
     /// `apply_continuous_effect`'s loop, not necessarily the static's source.
     pub recipient_id: Option<ObjectId>,
+    /// CR 614.1a: Object bound as the recipient of the damage event currently
+    /// being tested by a replacement filter. This is separate from
+    /// `recipient_id`, which is the layer-evaluation binding for dynamic
+    /// continuous effects.
+    pub event_target_id: Option<ObjectId>,
     /// CR 120.3: Per-player iteration binding for `DamageEachPlayer` quantity
     /// resolution. Distinct from `source_controller`, which remains the
     /// ability's controller for `ControllerRef::You` ("creatures you control").
@@ -1184,6 +1193,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             trigger_source: None,
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1202,6 +1212,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             trigger_source: None,
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1216,6 +1227,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             trigger_source: None,
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1230,6 +1242,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             trigger_source: Some(source),
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1247,6 +1260,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             trigger_source: Some(source),
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1266,6 +1280,7 @@ impl<'a> FilterContext<'a> {
             ability: None,
             trigger_source: None,
             recipient_id: Some(recipient_id),
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1280,6 +1295,7 @@ impl<'a> FilterContext<'a> {
             ability: Some(ability),
             trigger_source: ability.trigger_source.as_ref(),
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1296,6 +1312,7 @@ impl<'a> FilterContext<'a> {
             ability: Some(ability),
             trigger_source: ability.trigger_source.as_ref(),
             recipient_id: Some(recipient_id),
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1315,6 +1332,7 @@ impl<'a> FilterContext<'a> {
             ability: Some(ability),
             trigger_source: ability.trigger_source.as_ref(),
             recipient_id: None,
+            event_target_id: None,
             scoped_iteration_player: None,
         }
     }
@@ -1718,6 +1736,7 @@ pub(crate) fn filter_prop_contains(
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::MostPrevalentCreatureTypeIn { .. }
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
@@ -2008,6 +2027,7 @@ fn stack_entry_controller_matches(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
     );
     match controller {
         None => true,
@@ -2082,6 +2102,7 @@ pub fn matches_target_filter_including_phased_out(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOnly,
     )
@@ -2418,6 +2439,7 @@ pub fn matches_target_filter_in_owner_zone(
             ctx.ability,
             ctx.trigger_source,
             ctx.recipient_id,
+            ctx.event_target_id,
             ctx.scoped_iteration_player,
             ControllerLookup::LiveOnly,
         );
@@ -2435,6 +2457,7 @@ pub fn matches_target_filter_in_owner_zone(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOnly,
     )
@@ -2542,6 +2565,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.ability,
                     ctx.trigger_source,
                     ctx.recipient_id,
+                    ctx.event_target_id,
                     ctx.scoped_iteration_player,
                     ControllerLookup::LiveOrLki,
                 );
@@ -2567,6 +2591,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.ability,
                     ctx.trigger_source,
                     ctx.recipient_id,
+                    ctx.event_target_id,
                     ctx.scoped_iteration_player,
                     ControllerLookup::LiveOrLki,
                 )
@@ -2581,6 +2606,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.ability,
                     ctx.trigger_source,
                     ctx.recipient_id,
+                    ctx.event_target_id,
                     ctx.scoped_iteration_player,
                     ControllerLookup::LiveOrLki,
                 )
@@ -2600,6 +2626,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                     ctx.ability,
                     ctx.trigger_source,
                     ctx.recipient_id,
+                    ctx.event_target_id,
                     ctx.scoped_iteration_player,
                     ControllerLookup::LiveOrLki,
                 )
@@ -2622,6 +2649,7 @@ pub fn matches_target_filter_on_battlefield_entry(
                 ctx.ability,
                 ctx.trigger_source,
                 ctx.recipient_id,
+                ctx.event_target_id,
                 ctx.scoped_iteration_player,
                 ControllerLookup::LiveOrLki,
             )
@@ -2690,6 +2718,7 @@ pub fn matches_target_filter_on_counter_added_record(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOrLki,
     )
@@ -2735,6 +2764,7 @@ pub fn matches_target_filter_on_attack_declaration_record(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOrLki,
     )
@@ -2784,6 +2814,7 @@ pub fn matches_target_filter_on_damage_record_source(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOrLki,
     )
@@ -2969,6 +3000,7 @@ pub(crate) fn matches_target_filter_on_event_snapshot(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOnly,
     )
@@ -3074,6 +3106,7 @@ fn filter_inner(
         ctx.ability,
         ctx.trigger_source,
         ctx.recipient_id,
+        ctx.event_target_id,
         ctx.scoped_iteration_player,
         ControllerLookup::LiveOrLki,
     )
@@ -3090,6 +3123,7 @@ fn filter_inner_for_object(
     ability: Option<&ResolvedAbility>,
     trigger_source: Option<&TriggerSourceContext>,
     recipient_id: Option<ObjectId>,
+    event_target_id: Option<ObjectId>,
     scoped_iteration_player: Option<PlayerId>,
     controller_lookup: ControllerLookup,
 ) -> bool {
@@ -3242,6 +3276,7 @@ fn filter_inner_for_object(
                             ability,
                             trigger_source,
                             recipient_id,
+                            event_target_id,
                         );
                         match source_defending_player(state, &source_ctx) {
                             Some(pid) if pid == obj_ctrl => {}
@@ -3258,6 +3293,7 @@ fn filter_inner_for_object(
                             ability,
                             trigger_source,
                             recipient_id,
+                            event_target_id,
                         );
                         match source_chosen_player(&source_ctx) {
                             Some(pid) if pid == obj_ctrl => {}
@@ -3329,6 +3365,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                event_target_id,
             );
             properties
                 .iter()
@@ -3344,6 +3381,7 @@ fn filter_inner_for_object(
             ability,
             trigger_source,
             recipient_id,
+            event_target_id,
             scoped_iteration_player,
             controller_lookup,
         ),
@@ -3358,6 +3396,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                event_target_id,
                 scoped_iteration_player,
                 controller_lookup,
             )
@@ -3373,6 +3412,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                event_target_id,
                 scoped_iteration_player,
                 controller_lookup,
             )
@@ -3390,6 +3430,7 @@ fn filter_inner_for_object(
                     ability,
                     trigger_source,
                     recipient_id,
+                    event_target_id,
                     scoped_iteration_player,
                 },
             )
@@ -3467,6 +3508,7 @@ fn filter_inner_for_object(
                     ability,
                     trigger_source,
                     recipient_id,
+                    None,
                 )
                 .chosen_attributes
                 .iter()
@@ -3561,6 +3603,7 @@ fn filter_inner_for_object(
                     ability,
                     trigger_source,
                     recipient_id,
+                    event_target_id,
                     scoped_iteration_player,
                     controller_lookup,
                 )
@@ -3576,6 +3619,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                event_target_id,
             );
             let linked = if trigger_source.is_some() {
                 source_ctx.linked_exile_snapshot
@@ -3613,7 +3657,8 @@ fn filter_inner_for_object(
         // intervening-`if` never fires from an unrelated event. Resolves through
         // the same event-extraction authority as `ObjectScope::EventTarget`;
         // inert (matches nothing) outside a trigger.
-        TargetFilter::EventTarget => crate::game::quantity::triggering_event_target_object(state)
+        TargetFilter::EventTarget => event_target_id
+            .or_else(|| crate::game::quantity::triggering_event_target_object(state))
             .is_some_and(|damaged| damaged == object_id),
         // CR 400.7 + CR 603.7c: a parent object can be the member predicate of
         // a tracked-set continuation. In that one scan-based path, match the
@@ -3662,12 +3707,9 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                event_target_id,
             );
-            let chosen_name = source_ctx.chosen_attributes.iter().find_map(|a| match a {
-                ChosenAttribute::CardName(n) => Some(n.as_str()),
-                _ => None,
-            });
-            chosen_name.is_some_and(|name| obj.name.eq_ignore_ascii_case(name))
+            chosen_name_matches(state, &source_ctx, &obj.name)
         }
         // CR 609.7a: "the chosen source" — match the ObjectId selected by
         // the prior damage-source choice while its continuation resolves.
@@ -3678,6 +3720,7 @@ fn filter_inner_for_object(
                 ability,
                 trigger_source,
                 recipient_id,
+                event_target_id,
                 scoped_iteration_player,
             };
             state
@@ -3815,6 +3858,7 @@ fn zone_change_filter_inner(
                 ability,
                 trigger_source,
                 None,
+                None,
             );
 
             if let Some(ctrl) = controller {
@@ -3930,12 +3974,9 @@ fn zone_change_filter_inner(
                 ability,
                 trigger_source,
                 None,
+                None,
             );
-            let chosen_name = source_ctx.chosen_attributes.iter().find_map(|a| match a {
-                    ChosenAttribute::CardName(n) => Some(n.as_str()),
-                    _ => None,
-            });
-            chosen_name.is_some_and(|name| record.name.eq_ignore_ascii_case(name))
+            chosen_name_matches(state, &source_ctx, &record.name)
         }
         TargetFilter::ChosenDamageSource { .. } => false,
         TargetFilter::Named { name } => record.name == *name,
@@ -4958,6 +4999,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::PtComparison { .. }
         | FilterProp::PowerGTSource
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::MostPrevalentCreatureTypeIn { .. }
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
@@ -5035,6 +5077,11 @@ struct SourceContext<'a> {
     /// nothing, while a non-attachment source triggers "has any" fallback semantics.
     source_is_aura: bool,
     source_is_equipment: bool,
+    /// CR 614.1a: Explicit recipient binding supplied while a damage
+    /// replacement filter is matched. This is kept distinct from the ambient
+    /// trigger event because replacement matching happens before the damage
+    /// event is emitted as a `GameEvent`.
+    event_target_id: Option<ObjectId>,
     saddled_by: Vec<ObjectId>,
     convoked_creatures: Vec<ObjectId>,
     linked_exile_snapshot: Vec<crate::types::game_state::LinkedExileSnapshot>,
@@ -5087,7 +5134,8 @@ pub(crate) fn source_defending_player_for_test(
     source_id: ObjectId,
     trigger_source: Option<&TriggerSourceContext>,
 ) -> Option<PlayerId> {
-    let context = source_context_from_filter(state, source_id, None, None, trigger_source, None);
+    let context =
+        source_context_from_filter(state, source_id, None, None, trigger_source, None, None);
     source_defending_player(state, &context)
 }
 
@@ -5163,6 +5211,7 @@ fn source_context_from_filter<'a>(
     ability: Option<&'a ResolvedAbility>,
     trigger_source: Option<&'a TriggerSourceContext>,
     recipient_id: Option<ObjectId>,
+    event_target_id: Option<ObjectId>,
 ) -> SourceContext<'a> {
     let (lki, attached_to, saddled_by, convoked_creatures, linked_exile_snapshot) =
         if let Some(source) = trigger_source {
@@ -5233,6 +5282,7 @@ fn source_context_from_filter<'a>(
         attached_to,
         source_is_aura,
         source_is_equipment,
+        event_target_id,
         saddled_by,
         convoked_creatures,
         linked_exile_snapshot,
@@ -5251,6 +5301,72 @@ fn source_chosen_player(source: &SourceContext<'_>) -> Option<PlayerId> {
             ChosenAttribute::Player(player) => Some(*player),
             _ => None,
         })
+}
+
+/// CR 201.2 + CR 608.2c: Resolve the name used by a `HasChosenName` filter.
+///
+/// A persisted choice (for example Pithing Needle's as-entered name) lives on
+/// the source object/LKI and remains the authority outside a resolving ability.
+/// Some effects instead say "choose a card name" and immediately test that
+/// answer (Cursed Scroll). Those choices are deliberately not persisted on
+/// the source; while their continuation is draining, the shared resolution
+/// ledger is the only authority. Read that ledger only when an ability is in
+/// scope, so a stale answer from an earlier resolution can never affect a
+/// passive filter or an unrelated history scan.
+fn chosen_name_matches(
+    state: &GameState,
+    source: &SourceContext<'_>,
+    candidate_name: &str,
+) -> bool {
+    if source.ability.is_some()
+        && matches!(
+            state.last_named_choice.as_ref(),
+            Some(ChoiceValue::CardName(name))
+                if candidate_name.eq_ignore_ascii_case(name)
+        )
+    {
+        return true;
+    }
+
+    source
+        .chosen_attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            ChosenAttribute::CardName(name) => Some(name.as_str()),
+            _ => None,
+        })
+        .is_some_and(|name| candidate_name.eq_ignore_ascii_case(name))
+}
+
+/// CR 105.4 + CR 608.2d: Resolve a color used by an `IsChosenColor` filter.
+///
+/// Persistent choices (Hall of Triumph) live on the source, while a resolving
+/// spell's immediately-following instruction (Persecute) reads the active
+/// resolution ledger. As with `chosen_name_matches`, never consult that ledger
+/// without an active ability, so an answer from an earlier resolution cannot
+/// leak into a passive filter.
+fn chosen_color_matches(
+    state: &GameState,
+    source: &SourceContext<'_>,
+    candidate_colors: &[ManaColor],
+) -> bool {
+    if source.ability.is_some()
+        && matches!(
+            state.last_named_choice.as_ref(),
+            Some(ChoiceValue::Color(color)) if candidate_colors.contains(color)
+        )
+    {
+        return true;
+    }
+
+    source
+        .chosen_attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            ChosenAttribute::Color(color) => Some(color),
+            _ => None,
+        })
+        .is_some_and(|color| candidate_colors.contains(color))
 }
 
 /// CR 201.2 + CR 400.7: Resolve the printed name of the first
@@ -5352,6 +5468,7 @@ fn aura_can_enchant_referenced_target(
                 ability: source.ability,
                 trigger_source: source.trigger_source,
                 recipient_id: source.recipient_id,
+                event_target_id: source.event_target_id,
                 scoped_iteration_player: None,
             };
             filter_inner(state, *target_id, enchant_filter, &ctx)
@@ -6058,6 +6175,20 @@ fn matches_filter_prop(
             ),
             None => false,
         },
+        // CR 205.3i + CR 608.2d: Match a land subtype against the source's
+        // persisted general land-type choice (Vision Charm). Unlike creature
+        // types, land types do not use Changeling semantics.
+        FilterProp::IsChosenLandType => source
+            .chosen_attributes
+            .iter()
+            .rev()
+            .find_map(|attribute| match attribute {
+                crate::types::ability::ChosenAttribute::LandType(land_type) => {
+                    Some(land_type.as_str())
+                }
+                _ => None,
+            })
+            .is_some_and(|chosen| obj.card_types.subtypes.iter().any(|subtype| subtype.eq_ignore_ascii_case(chosen))),
         // CR 205.3m: Object's creature type ties for highest count
         // among creature cards in the named player's named zone. Scope picks
         // the player whose zone is inspected; `Opponent` falls back to the
@@ -6078,15 +6209,7 @@ fn matches_filter_prop(
         }
         // CR 105.4: Match objects whose colors include the source's chosen color.
         // Used for "of the chosen color" (Hall of Triumph, Prismatic Strands).
-        FilterProp::IsChosenColor => source
-            .chosen_attributes
-            .iter()
-            .find_map(|a| match a {
-                crate::types::ability::ChosenAttribute::Color(c) => Some(c),
-                _ => None,
-            })
-            // CR 709.4b: combined colors off the stack for a split card.
-            .is_some_and(|chosen| obj.effective_colors().contains(chosen)),
+        FilterProp::IsChosenColor => chosen_color_matches(state, source, &obj.effective_colors()),
         // CR 205 + CR 205.2a: Match objects whose core type includes the
         // source's chosen card type. Used for "spells of the chosen type"
         // (Archon of Valor's Reach) and "all cards of the chosen type revealed
@@ -6196,7 +6319,7 @@ fn matches_filter_prop(
                         .any(|t| matches!(t, TargetRef::Object(id) if *id == object_id))
                 })
             } else {
-                crate::game::targeting::resolve_event_context_targets(state, reference, source.id)
+                event_context_target_refs(state, reference, source)
                     .into_iter()
                     .any(|t| matches!(t, TargetRef::Object(id) if id == object_id))
             };
@@ -6289,9 +6412,23 @@ fn matches_filter_prop(
                 .fold(0, |sum: u32, record| sum.saturating_add(record.count));
             comparator.evaluate(i32::try_from(total).unwrap_or(i32::MAX), *count as i32)
         }
-        // CR 115.7: Stack entry has exactly one target — permissive at filter level,
-        // validated by retarget effects at resolution time.
-        FilterProp::HasSingleTarget => true,
+        // CR 115.9a: A stack spell or ability "with/has only one target" has
+        // exactly one declared target instance. This used to be permissive here
+        // because the announce-time retarget path performs its own check, but a
+        // resolution-time conditional (Quicksilver Dragon) evaluates this
+        // filter directly and must see the live stack entry too.
+        FilterProp::HasSingleTarget => state
+            .stack
+            .iter()
+            .find(|entry| entry.id == object_id)
+            .or_else(|| {
+                state
+                    .resolving_stack_entry
+                    .as_ref()
+                    .filter(|entry| entry.id == object_id)
+            })
+            .and_then(|entry| entry.ability())
+            .is_some_and(|ability| ability.targets.len() == 1),
         // CR 700.2: The object is modal iff its printed modality is present. Read
         // from the static printed characteristic populated at object creation,
         // available at SpellCast-trigger match time (Riku, of Many Paths).
@@ -6607,6 +6744,21 @@ fn zone_change_record_matches_property(
                 &state.all_creature_types,
             )
         }),
+        // CR 205.3i + CR 608.2d: The spell snapshot analogue of the live
+        // chosen-land-type predicate. The comparison is case-insensitive
+        // because Oracle subtype labels are canonicalized at different ingress
+        // points (card data versus player choice).
+        FilterProp::IsChosenLandType => source
+            .chosen_attributes
+            .iter()
+            .rev()
+            .find_map(|attribute| match attribute {
+                crate::types::ability::ChosenAttribute::LandType(land_type) => {
+                    Some(land_type.as_str())
+                }
+                _ => None,
+            })
+            .is_some_and(|chosen| record.subtypes.iter().any(|subtype| subtype.eq_ignore_ascii_case(chosen))),
         FilterProp::MostPrevalentCreatureTypeIn { .. } => false,
         FilterProp::MatchesLastChosenCardPredicate => matches_last_chosen_card_predicate(
             &state.last_named_choice,
@@ -7258,6 +7410,7 @@ fn source_context_from_spell_filter(context: SpellFilterContext<'_>) -> SourceCo
             .is_some_and(|o| o.card_types.subtypes.iter().any(|s| s == "Aura")),
         source_is_equipment: source_obj
             .is_some_and(|o| o.card_types.subtypes.iter().any(|s| s == "Equipment")),
+        event_target_id: None,
         saddled_by: source_obj.map_or_else(Vec::new, |o| o.saddled_by.clone()),
         convoked_creatures: source_obj.map_or_else(Vec::new, |o| o.convoked_creatures.clone()),
         linked_exile_snapshot: Vec::new(),
@@ -7287,8 +7440,7 @@ fn object_shares_quality_with_reference_filter(
         });
     }
 
-    let event_context_references =
-        crate::game::targeting::resolve_event_context_targets(state, reference_filter, source.id);
+    let event_context_references = event_context_target_refs(state, reference_filter, source);
     if !event_context_references.is_empty() {
         return event_context_references
             .into_iter()
@@ -7323,6 +7475,7 @@ fn object_shares_quality_with_reference_filter(
         ability: source.ability,
         trigger_source: source.trigger_source,
         recipient_id: source.recipient_id,
+        event_target_id: source.event_target_id,
         scoped_iteration_player: None,
     };
     // CR 109.2 + CR 205.3m: a bare type reference such as "a creature you
@@ -7360,6 +7513,32 @@ fn object_shares_quality_with_reference_filter(
                     }
             })
     })
+}
+
+/// CR 614.1a: Replacement matching happens before a damage event is emitted as
+/// a `GameEvent`, so the event recipient is carried explicitly by the filter
+/// source context. Other event-context filters retain the ordinary trigger
+/// resolution path.
+fn event_context_target_refs(
+    state: &GameState,
+    filter: &TargetFilter,
+    source: &SourceContext<'_>,
+) -> Vec<TargetRef> {
+    if matches!(filter, TargetFilter::EventTarget) {
+        return source
+            .event_target_id
+            // CR 603.2 + CR 603.6a: trigger target selection runs from the
+            // published trigger event, not from replacement matching. In
+            // that path the event target is authoritative on the current
+            // trigger event while `SourceContext::event_target_id` is only
+            // populated for replacement filters. Keep both doors, with the
+            // explicit replacement binding taking precedence.
+            .or_else(|| crate::game::quantity::triggering_event_target_object(state))
+            .map(TargetRef::Object)
+            .into_iter()
+            .collect();
+    }
+    crate::game::targeting::resolve_event_context_targets(state, filter, source.id)
 }
 
 /// CR 205.3m: Compute the creature subtypes tied for highest
@@ -7586,6 +7765,30 @@ pub fn player_matches_target_filter_in_state(
     source_controller: Option<PlayerId>,
     source_id: Option<ObjectId>,
 ) -> bool {
+    player_matches_target_filter_in_state_with_scope(
+        state,
+        filter,
+        player_id,
+        source_controller,
+        source_id,
+        None,
+    )
+}
+
+/// Check a player target with an explicit anchor for relative `PlayerFilter`
+/// predicates. Most filters are still evaluated relative to `source_controller`;
+/// only `TargetFilter::PlayerMatching` uses `scope_controller`. Triggered
+/// "each player's upkeep" abilities pass their `ResolvedAbility::scoped_player`
+/// here so phrases such as "more creatures than they do" compare against the
+/// upkeep player rather than the permanent's controller.
+pub fn player_matches_target_filter_in_state_with_scope(
+    state: &GameState,
+    filter: &TargetFilter,
+    player_id: PlayerId,
+    source_controller: Option<PlayerId>,
+    source_id: Option<ObjectId>,
+    scope_controller: Option<PlayerId>,
+) -> bool {
     player_matches_target_filter_with(
         filter,
         player_id,
@@ -7606,7 +7809,7 @@ pub fn player_matches_target_filter_in_state(
         // re-implementing any predicate here. `source_controller` is CR 109.5
         // "you": with no controller the payload's `relation` axis is unanswerable,
         // so fail closed — likewise with no source object.
-        &|player, candidate| match (source_controller, source_id) {
+        &|player, candidate| match (scope_controller.or(source_controller), source_id) {
             (Some(controller), Some(source)) => crate::game::effects::matches_player_scope(
                 state, candidate, player, controller, source,
             ),
@@ -7886,7 +8089,15 @@ mod tests {
         ));
 
         let source_ctx =
-            source_context_from_filter(&state, source, Some(PlayerId(0)), Some(&child), None, None);
+            source_context_from_filter(
+                &state,
+                source,
+                Some(PlayerId(0)),
+                Some(&child),
+                None,
+                None,
+                None,
+            );
         assert!(attachment_controller_matches(
             Some(&ControllerRef::TargetOpponent),
             PlayerId(1),
@@ -8801,6 +9012,25 @@ mod tests {
             !matches_target_filter(&state, land, &filter, source),
             "predicate is creature-specific when used without an outer creature filter"
         );
+    }
+
+    /// CR 302.6 + CR 508.1a: the raw continuity property distinguishes a
+    /// permanent controlled since the turn began from one that entered under
+    /// the controller's control this turn. Haste must not satisfy this
+    /// property; it is relevant only to the separate enlist eligibility arm.
+    #[test]
+    fn controlled_continuously_since_turn_began_matches_control_history() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Source");
+        let established = add_creature(&mut state, PlayerId(0), "Established");
+        let fresh = add_creature(&mut state, PlayerId(0), "Fresh");
+        state.objects.get_mut(&fresh).unwrap().summoning_sick = true;
+
+        let filter = TargetFilter::Typed(TypedFilter::default().properties(vec![
+            FilterProp::ControlledContinuouslySinceTurnBegan,
+        ]));
+        assert!(matches_target_filter(&state, established, &filter, source));
+        assert!(!matches_target_filter(&state, fresh, &filter, source));
     }
 
     /// CR 120.6 + CR 120.9 (audit H2): "Was dealt damage this turn" must consult
@@ -11796,6 +12026,59 @@ mod tests {
         ));
     }
 
+    /// CR 608.2c: a non-persisting "choose a card name" must still feed a
+    /// dependent `HasChosenName` condition while the same ability continues.
+    /// The answer belongs to the resolution ledger, not to the source object.
+    #[test]
+    fn has_chosen_name_reads_resolution_local_card_name() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Cursed Scroll");
+        let bolt = add_creature(&mut state, PlayerId(0), "Lightning Bolt");
+        let growth = add_creature(&mut state, PlayerId(0), "Giant Growth");
+        state.last_named_choice = Some(ChoiceValue::CardName("lightning bolt".to_string()));
+
+        let ability = ResolvedAbility::new(
+            Effect::Unimplemented {
+                name: "dependent condition".to_string(),
+                description: None,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        let context = FilterContext::from_ability(&ability);
+
+        assert!(super::matches_target_filter(
+            &state,
+            bolt,
+            &TargetFilter::HasChosenName,
+            &context,
+        ));
+        assert!(!super::matches_target_filter(
+            &state,
+            growth,
+            &TargetFilter::HasChosenName,
+            &context,
+        ));
+    }
+
+    /// A resolution-local answer must not leak into a passive/source-only
+    /// filter evaluation after the resolving ability is gone.
+    #[test]
+    fn has_chosen_name_ignores_resolution_local_card_name_without_ability() {
+        let mut state = setup();
+        let source = add_creature(&mut state, PlayerId(0), "Cursed Scroll");
+        let bolt = add_creature(&mut state, PlayerId(0), "Lightning Bolt");
+        state.last_named_choice = Some(ChoiceValue::CardName("Lightning Bolt".to_string()));
+
+        assert!(!matches_target_filter(
+            &state,
+            bolt,
+            &TargetFilter::HasChosenName,
+            source,
+        ));
+    }
+
     #[test]
     fn has_chosen_name_returns_false_when_no_card_name_chosen() {
         let mut state = setup();
@@ -13164,7 +13447,15 @@ mod tests {
 
         let state = GameState::default();
         let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                ObjectId(1),
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
 
         // Leg 1: legendary creature (Arbaaz Mir, In Garruk's Wake-style ETB).
         let legendary_record = ZoneChangeRecord {
@@ -13235,7 +13526,15 @@ mod tests {
 
         let mut state = GameState::default();
         let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                ObjectId(1),
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
 
         let lki = |tapped: bool| LKISnapshot {
             name: "Tap Probe".to_string(),
@@ -13330,7 +13629,15 @@ mod tests {
 
         let state = GameState::default();
         let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                ObjectId(1),
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
 
         // base 1/1, current 2/2 (had a +1/+1 counter when it left the battlefield).
         let record = ZoneChangeRecord {
@@ -13461,7 +13768,15 @@ mod tests {
         assert_eq!(record.toughness, Some(2));
 
         let source_ctx =
-            source_context_from_filter(&state, id, Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                id,
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
         let pt_filter = |scope| FilterProp::PtComparison {
             stat: PtStat::Power,
             scope,
@@ -13596,7 +13911,15 @@ mod tests {
     fn zone_change_record_token_property_matches_snapshot() {
         let state = GameState::default();
         let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                ObjectId(1),
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
 
         let token_record = ZoneChangeRecord {
             core_types: vec![CoreType::Creature],
@@ -13672,7 +13995,15 @@ mod tests {
 
         let state = GameState::default();
         let source_ctx =
-            source_context_from_filter(&state, ObjectId(1), Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                ObjectId(1),
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
         let attacking_record = ZoneChangeRecord {
             combat_status: ZoneChangeCombatStatus {
                 attacking: true,
@@ -13801,7 +14132,15 @@ mod tests {
             .push(ChosenAttribute::Player(PlayerId(1)));
 
         let source_ctx =
-            source_context_from_filter(&state, src, Some(PlayerId(0)), None, None, None);
+            source_context_from_filter(
+                &state,
+                src,
+                Some(PlayerId(0)),
+                None,
+                None,
+                None,
+                None,
+            );
 
         assert!(
             attacking_defender_matches(
@@ -15142,6 +15481,7 @@ mod characteristic_read_classification_tests {
             | FilterProp::ManaSymbolCount { .. }
             | FilterProp::HasSupertype { .. }
             | FilterProp::IsChosenCreatureType
+            | FilterProp::IsChosenLandType
             | FilterProp::IsChosenColor
             | FilterProp::IsChosenCardType
             | FilterProp::MatchesLastChosenCardPredicate

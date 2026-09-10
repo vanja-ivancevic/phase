@@ -979,6 +979,7 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         | FilterProp::SharesQuality { .. }
         | FilterProp::CanEnchant { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
@@ -1014,6 +1015,8 @@ fn condition_reads_only_memo_safe_state(c: &ParsedCondition) -> bool {
     match c {
         ParsedCondition::QuantityComparison { .. }
         | ParsedCondition::QuantityVsEachOpponent { .. }
+        | ParsedCondition::SourceHasCreatureCardsAbove { .. }
+        | ParsedCondition::SourceWasBlockedOrBlockedByColorThisTurn { .. }
         | ParsedCondition::SpellTargetsFilter { .. } => false,
 
         // Combinators read the union of their children: SAFE iff all children SAFE.

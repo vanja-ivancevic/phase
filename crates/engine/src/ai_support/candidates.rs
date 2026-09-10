@@ -1266,6 +1266,18 @@ pub fn candidate_actions_broad_with_probe(
             }
         }
         WaitingFor::ScryChoice { player, cards } => select_cards_variants(*player, cards, None),
+        WaitingFor::ReorderLibraryChoice { player, cards, .. } => {
+            // The legal surface is every permutation. The heuristic needs one
+            // deterministic representative; human/API input is validated as a
+            // freeform full permutation by the resolver.
+            vec![candidate(
+                GameAction::SelectCards {
+                    cards: cards.clone(),
+                },
+                TacticalClass::Selection,
+                Some(*player),
+            )]
+        }
         WaitingFor::ArrangePlanarDeckTopChoice {
             player,
             cards,
@@ -2533,7 +2545,8 @@ pub fn candidate_actions_broad_with_probe(
             }))
             .collect()
         }
-        WaitingFor::OptionalEffectChoice { .. }
+        WaitingFor::RepeatPaidLibraryLookPayment { .. }
+        | WaitingFor::OptionalEffectChoice { .. }
         | WaitingFor::OpponentMayChoice { .. }
         | WaitingFor::TributeChoice { .. } => {
             vec![

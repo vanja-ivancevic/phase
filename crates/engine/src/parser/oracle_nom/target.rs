@@ -462,6 +462,11 @@ pub fn parse_event_context_ref(input: &str) -> OracleResult<'_, TargetFilter> {
         ),
         value(TargetFilter::TriggeringSource, tag("that spell")),
         value(TargetFilter::TriggeringSource, tag("that creature")),
+        // CR 509.3d: filtered block events carry the blocker as their source
+        // and the attacker as their event target.  These definite-article
+        // forms are used by No Quarter's two trigger bodies.
+        value(TargetFilter::TriggeringSource, tag("the blocking creature")),
+        value(TargetFilter::EventTarget, tag("the attacking creature")),
         value(
             TargetFilter::TriggeringSource,
             terminated(
@@ -1184,6 +1189,14 @@ mod tests {
         let (rest9, f9) = parse_event_context_ref("that permanent").unwrap();
         assert_eq!(rest9, "");
         assert_eq!(f9, TargetFilter::TriggeringSource);
+
+        let (rest10, f10) = parse_event_context_ref("the blocking creature").unwrap();
+        assert_eq!(rest10, "");
+        assert_eq!(f10, TargetFilter::TriggeringSource);
+
+        let (rest11, f11) = parse_event_context_ref("the attacking creature").unwrap();
+        assert_eq!(rest11, "");
+        assert_eq!(f11, TargetFilter::EventTarget);
 
         assert!(parse_event_context_ref("that permanent or player").is_err());
         assert!(parse_event_context_ref("that permanent or a player").is_err());

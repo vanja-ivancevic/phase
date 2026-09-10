@@ -671,6 +671,9 @@ pub(crate) enum AbsorbKind {
     DieExile,
     /// CR 608.2c + CR 701.19c: "dealt damage this way can't be regenerated" rider.
     CantBeRegenerated,
+    /// CR 608.2c + CR 701.19: a regeneration rider that waits for the target's
+    /// regeneration shield to be used ("gain control ... if it regenerates this way").
+    RegenerationThisWay,
 }
 
 /// CR 608.2c + CR 603.7a: WHERE a clause's lowered definition lives in the

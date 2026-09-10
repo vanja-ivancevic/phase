@@ -683,6 +683,7 @@ impl EventObjectSnapshot {
             | FilterProp::NameMatchesAnyPermanent { .. }
             | FilterProp::SharesQuality { .. }
             | FilterProp::IsChosenCreatureType
+            | FilterProp::IsChosenLandType
             | FilterProp::IsChosenCardType => Supported,
 
             // ---- composites ----
@@ -1185,6 +1186,14 @@ pub enum GameEvent {
     },
     CreatureDestroyed {
         object_id: ObjectId,
+        /// CR 701.8a + CR 603.2: the spell or ability source that performed
+        /// this destruction, if the destruction was effect-driven. State-based
+        /// destruction has no source. This is event provenance, so a trigger
+        /// such as Karmic Justice can distinguish an opponent's spell or
+        /// ability from a self-controlled one after the destroyed permanent
+        /// has changed zones.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<ObjectId>,
     },
     PermanentSacrificed {
         object_id: ObjectId,
@@ -1431,6 +1440,16 @@ pub enum GameEvent {
     /// CR 701.19a: Regeneration shield — consumed on use, expires at cleanup.
     Regenerated {
         object_id: ObjectId,
+    },
+    /// CR 702.24a: A cumulative upkeep payment was not made. Emitted by the
+    /// unless-payment resolver when the payer declines or cannot pay the
+    /// per-age-counter cost, so the default sacrifice AND a printed rider
+    /// trigger ("When a player doesn't pay ~'s cumulative upkeep, ...") both
+    /// observe the non-payment. `source_id` is the permanent carrying the
+    /// cumulative upkeep; `player` is the player who didn't pay.
+    CumulativeUpkeepNotPaid {
+        source_id: ObjectId,
+        player: PlayerId,
     },
     /// CR 701.60a: A creature was suspected.
     CreatureSuspected {

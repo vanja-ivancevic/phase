@@ -1086,8 +1086,25 @@ fn activation_restriction_applies(
         }
         // CR 508.1c / CR 509.1b: Combat-phase restrictions on activation timing.
         ActivationRestriction::DuringCombat => state.phase.is_combat(),
+        ActivationRestriction::DuringPhase { phase } => state.phase == *phase,
+        ActivationRestriction::BeforePhase { phase } => state.phase < *phase,
+        ActivationRestriction::BeforeBlockersDeclared => {
+            matches!(state.phase, Phase::BeginCombat | Phase::DeclareAttackers)
+        }
         ActivationRestriction::BeforeAttackersDeclared => is_before_attackers_declared(state),
         ActivationRestriction::BeforeCombatDamage => is_before_combat_damage(state.phase),
+        // CR 509.1 + CR 510.1 + CR 511.1: mirror the casting restriction's
+        // post-blockers window for activated abilities.
+        ActivationRestriction::AfterBlockersDeclared => matches!(
+            state.phase,
+            Phase::DeclareBlockers | Phase::CombatDamage | Phase::EndCombat
+        ),
+        // CR 512.1: "before the end step" admits every phase and step before
+        // the ending phase, but not the end step itself or the cleanup step
+        // that follows it. The latter is included explicitly because a
+        // triggered ability or state-based action can create a priority window
+        // during cleanup; that is still not "before the end step."
+        ActivationRestriction::BeforeEndStep => !matches!(state.phase, Phase::End | Phase::Cleanup),
         // CR 602.5b: Per-turn activation limit tracked via ability activation counter.
         // CR 702.142b: ModifyActivationLimit statics may raise the limit for tagged abilities.
         ActivationRestriction::OnlyOnceEachTurn => {
@@ -1127,6 +1144,22 @@ fn activation_restriction_applies(
                 .unwrap_or(0)
                 < u32::from(*count)
         }
+        ActivationRestriction::MaxTimesEachTurnDynamic { count } => {
+            let limit = super::quantity::resolve_quantity(state, count, player, source_id)
+                .max(0)
+                .try_into()
+                .unwrap_or(u32::MAX);
+            state
+                .activated_abilities_this_turn
+                .get(&key)
+                .copied()
+                .unwrap_or(0)
+                < limit
+        }
+        ActivationRestriction::OnlySourceOwner => state
+            .objects
+            .get(&source_id)
+            .is_some_and(|object| object.owner == player),
         ActivationRestriction::RequiresCondition { condition } => condition
             .as_ref()
             .is_none_or(|cond| evaluate_condition(state, player, source_id, cond)),
@@ -1243,9 +1276,10 @@ fn casting_restriction_applies(
         CastingRestriction::RequiresCondition { condition } => condition
             .as_ref()
             .is_none_or(|cond| evaluate_condition(state, player, source_id, cond)),
-        // Not a timing gate: "can't spend mana" restricts how the cost is paid,
-        // never when. Always satisfied here; enforced in the mana-payment path.
-        CastingRestriction::CantSpendMana => true,
+        // Not timing gates: these restrict how the cost is paid, never when.
+        // Both are enforced after total-cost determination in the mana-payment
+        // path, so they are always satisfied at the timing-check boundary.
+        CastingRestriction::CantSpendMana | CastingRestriction::OnlyColorsOnX(_) => true,
     }
 }
 
@@ -1267,6 +1301,67 @@ pub(crate) fn evaluate_condition(
             is_source_attacking(state, source_id) || is_source_blocking(state, source_id)
         }
         ParsedCondition::SourceIsBlocked => is_source_blocked(state, source_id),
+        ParsedCondition::SourceHasCreatureCardsAbove { minimum } => {
+            let Some(source) = state.objects.get(&source_id) else {
+                return false;
+            };
+            if source.zone != crate::types::zones::Zone::Graveyard {
+                return false;
+            }
+            let Some(graveyard) = state
+                .players
+                .get(source.owner.0 as usize)
+                .map(|player| &player.graveyard)
+            else {
+                return false;
+            };
+            let Some(position) = graveyard.iter().position(|id| *id == source_id) else {
+                return false;
+            };
+            graveyard
+                .iter()
+                .skip(position + 1)
+                .filter(|id| {
+                    state.objects.get(id).is_some_and(|object| {
+                        object.card_types.core_types.contains(&CoreType::Creature)
+                    })
+                })
+                .count()
+                >= *minimum
+        }
+        ParsedCondition::SourceWasBlockedOrBlockedByColorThisTurn { color } => {
+            let Some(source) = state.objects.get(&source_id) else {
+                return false;
+            };
+            let source_identity =
+                crate::types::identifiers::ObjectIncarnationRef::from_object(source);
+            let current_blocked_by_color = state.combat.as_ref().is_some_and(|combat| {
+                combat
+                    .blocker_assignments
+                    .get(&source_id)
+                    .is_some_and(|blockers| {
+                        blockers.iter().any(|blocker_id| {
+                            state
+                                .objects
+                                .get(blocker_id)
+                                .is_some_and(|blocker| blocker.effective_colors().contains(color))
+                        })
+                    })
+            });
+            is_source_blocking(state, source_id)
+                || current_blocked_by_color
+                || state
+                    .combat_block_declarations_this_turn
+                    .iter()
+                    .any(|record| {
+                        record.blocker == Some(source_identity)
+                            || (record.attacker == source_identity
+                                && record
+                                    .blocker_colors
+                                    .iter()
+                                    .any(|blocker_color| blocker_color == color))
+                    })
+        }
         ParsedCondition::SourcePowerAtLeast { minimum } => state
             .objects
             .get(&source_id)
@@ -4787,6 +4882,105 @@ mod tests {
         assert!(is_source_blocked(&state, normally_blocked));
     }
 
+    #[test]
+    fn above_source_restriction_counts_ordered_graveyard_creatures() {
+        let mut state = crate::types::game_state::GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Ashen Ghoul".to_string(),
+            Zone::Graveyard,
+        );
+        let cards: Vec<_> = (2..=5)
+            .map(|id| {
+                let card = create_object(
+                    &mut state,
+                    CardId(id),
+                    PlayerId(0),
+                    format!("Creature {id}"),
+                    Zone::Graveyard,
+                );
+                state
+                    .objects
+                    .get_mut(&card)
+                    .unwrap()
+                    .card_types
+                    .core_types
+                    .push(CoreType::Creature);
+                card
+            })
+            .collect();
+        // `create_object` inserts each object into its requested zone. Start
+        // from a clean ordered graveyard before arranging the fixture so the
+        // test models a real graveyard rather than duplicate entries.
+        state.players[0].graveyard.clear();
+        state.players[0].graveyard.push_back(source);
+        for card in cards.iter().take(3) {
+            state.players[0].graveyard.push_back(*card);
+        }
+        let condition = ParsedCondition::SourceHasCreatureCardsAbove { minimum: 3 };
+        assert!(evaluate_condition(&state, PlayerId(0), source, &condition));
+
+        state.players[0].graveyard.pop_back();
+        assert!(!evaluate_condition(&state, PlayerId(0), source, &condition));
+    }
+
+    #[test]
+    fn sea_troll_block_history_preserves_declaration_colors() {
+        use crate::game::combat::{place_blocking, AttackTarget, AttackerInfo, CombatState};
+
+        let mut state = crate::types::game_state::GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Sea Troll".to_string(),
+            Zone::Battlefield,
+        );
+        let blocker = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Blue Blocker".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        state
+            .objects
+            .get_mut(&blocker)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        state.objects.get_mut(&blocker).unwrap().color = vec![ManaColor::Blue];
+        state.combat = Some(CombatState::default());
+        state
+            .combat
+            .as_mut()
+            .unwrap()
+            .attackers
+            .push(AttackerInfo::new(
+                source,
+                AttackTarget::Player(PlayerId(1)),
+                PlayerId(1),
+            ));
+        assert!(place_blocking(&mut state, blocker, source));
+
+        let condition = ParsedCondition::SourceWasBlockedOrBlockedByColorThisTurn {
+            color: ManaColor::Blue,
+        };
+        state.combat = None;
+        state.objects.get_mut(&blocker).unwrap().color.clear();
+        assert!(evaluate_condition(&state, PlayerId(0), source, &condition));
+    }
+
     // ── Ood Sphere: "can't become tapped" (StaticMode::CantTap) enforcement ──
 
     /// Build a battlefield creature carrying a printed `CantTap` static and run a
@@ -5135,6 +5329,172 @@ mod tests {
             ],
             Phase::DeclareBlockers,
             Phase::CombatDamage,
+        );
+        check_window(
+            "{2}, {T}: Tap target creature. Activate only during combat after blockers are declared.",
+            &[
+                ActivationRestriction::DuringCombat,
+                ActivationRestriction::AfterBlockersDeclared,
+            ],
+            Phase::DeclareBlockers,
+            Phase::DeclareAttackers,
+        );
+    }
+
+    #[test]
+    fn before_end_step_activation_window_is_enforced() {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            "{T}: Add {C}. Activate only during your turn before the end step.",
+            "Mana Cache",
+            &[],
+            &["Artifact".to_string()],
+            &[],
+        );
+        let restrictions = &parsed.abilities[0].activation_restrictions;
+        assert_eq!(
+            restrictions,
+            &[
+                ActivationRestriction::DuringYourTurn,
+                ActivationRestriction::BeforeEndStep,
+            ]
+        );
+
+        let mut state = crate::types::game_state::GameState::new_two_player(42);
+        let player = PlayerId(0);
+        state.active_player = player;
+        state.priority_player = player;
+        state.waiting_for = WaitingFor::Priority { player };
+
+        for phase in [
+            Phase::Untap,
+            Phase::Upkeep,
+            Phase::PreCombatMain,
+            Phase::EndCombat,
+        ] {
+            state.phase = phase;
+            assert!(
+                check_activation_restrictions(&state, player, ObjectId(10), 0, restrictions)
+                    .is_ok(),
+                "activation must be legal before the end step in {phase:?}"
+            );
+        }
+        for phase in [Phase::End, Phase::Cleanup] {
+            state.phase = phase;
+            assert!(
+                check_activation_restrictions(&state, player, ObjectId(10), 0, restrictions)
+                    .is_err(),
+                "activation must be illegal at or after the end step in {phase:?}"
+            );
+        }
+
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(1);
+        assert!(
+            check_activation_restrictions(&state, player, ObjectId(10), 0, restrictions).is_err(),
+            "DuringYourTurn must remain an independent gate"
+        );
+
+        let before_blockers = [ActivationRestriction::BeforeBlockersDeclared];
+        for phase in [Phase::BeginCombat, Phase::DeclareAttackers] {
+            state.phase = phase;
+            assert!(
+                check_activation_restrictions(&state, player, ObjectId(10), 0, &before_blockers,)
+                    .is_ok(),
+                "before-blockers gate must be legal in {phase:?}"
+            );
+        }
+        for phase in [Phase::PreCombatMain, Phase::DeclareBlockers] {
+            state.phase = phase;
+            assert!(
+                check_activation_restrictions(&state, player, ObjectId(10), 0, &before_blockers,)
+                    .is_err(),
+                "before-blockers gate must be illegal in {phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_combat_step_activation_windows_are_exact() {
+        let mut state = crate::types::game_state::GameState::new_two_player(42);
+        let player = PlayerId(0);
+        state.active_player = player;
+        state.priority_player = player;
+        state.waiting_for = WaitingFor::Priority { player };
+
+        for (restriction, allowed, rejected) in [
+            (
+                ActivationRestriction::DuringPhase {
+                    phase: Phase::DeclareAttackers,
+                },
+                [Phase::DeclareAttackers],
+                [Phase::BeginCombat, Phase::DeclareBlockers],
+            ),
+            (
+                ActivationRestriction::DuringPhase {
+                    phase: Phase::DeclareBlockers,
+                },
+                [Phase::DeclareBlockers],
+                [Phase::DeclareAttackers, Phase::CombatDamage],
+            ),
+            (
+                ActivationRestriction::DuringPhase {
+                    phase: Phase::EndCombat,
+                },
+                [Phase::EndCombat],
+                [Phase::CombatDamage, Phase::PostCombatMain],
+            ),
+        ] {
+            for phase in allowed {
+                state.phase = phase;
+                assert!(
+                    check_activation_restrictions(
+                        &state,
+                        player,
+                        ObjectId(10),
+                        0,
+                        std::slice::from_ref(&restriction),
+                    )
+                    .is_ok(),
+                    "{restriction:?} must be legal in {phase:?}"
+                );
+            }
+            for phase in rejected {
+                state.phase = phase;
+                assert!(
+                    check_activation_restrictions(
+                        &state,
+                        player,
+                        ObjectId(10),
+                        0,
+                        std::slice::from_ref(&restriction),
+                    )
+                    .is_err(),
+                    "{restriction:?} must be illegal in {phase:?}"
+                );
+            }
+        }
+
+        let before_end_combat = [ActivationRestriction::BeforePhase {
+            phase: Phase::EndCombat,
+        }];
+        for phase in [
+            Phase::Untap,
+            Phase::BeginCombat,
+            Phase::DeclareBlockers,
+            Phase::CombatDamage,
+        ] {
+            state.phase = phase;
+            assert!(
+                check_activation_restrictions(&state, player, ObjectId(10), 0, &before_end_combat,)
+                    .is_ok(),
+                "before-end-combat gate must be legal in {phase:?}"
+            );
+        }
+        state.phase = Phase::EndCombat;
+        assert!(
+            check_activation_restrictions(&state, player, ObjectId(10), 0, &before_end_combat,)
+                .is_err(),
+            "before-end-combat gate must close at EndCombat"
         );
     }
 

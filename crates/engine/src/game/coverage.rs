@@ -267,6 +267,11 @@ pub(crate) fn is_data_carrying_static(mode: &StaticMode) -> bool {
             // enforcement is in turns.rs::counter_removal_blocked. Not
             // registry-keyed.
             | StaticMode::CountersCantBeRemoved { .. }
+            // CR 201.2a: CountsAsNamed carries the alternate name used by
+            // graveyard name filters. Runtime matching is direct in
+            // filter.rs::matches_filter; the exact-name registry cannot key
+            // this parameterized mode.
+            | StaticMode::CountsAsNamed { .. }
     )
 }
 
@@ -886,6 +891,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 parts.push(format!("{value}").to_lowercase());
             }
             FilterProp::IsChosenCreatureType => parts.push("chosen creature type".into()),
+            FilterProp::IsChosenLandType => parts.push("chosen land type".into()),
             FilterProp::MostPrevalentCreatureTypeIn { zone, scope } => {
                 let scope_str = match scope {
                     ControllerRef::You => "your",
@@ -1311,6 +1317,7 @@ fn fmt_player_scope(scope: &PlayerScope) -> String {
 
 fn fmt_quantity_ref(qty: &QuantityRef) -> String {
     match qty {
+        QuantityRef::EntryLifePaid => "life paid as this entered".into(),
         QuantityRef::HandSize { player } => {
             format!("cards in hand ({})", fmt_player_scope(player))
         }
@@ -1390,6 +1397,10 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 None => format!("counters on {scope_str} (any type)"),
             }
         }
+        QuantityRef::TokenSourceCounters { counter_type } => match counter_type {
+            Some(ct) => format!("{} counters on token creator", ct.as_str()),
+            None => "counters on token creator (any type)".to_string(),
+        },
         QuantityRef::CountersOnObjects {
             counter_type,
             filter,
@@ -1642,6 +1653,9 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 "excess amount from preceding effect".into()
             }
         },
+        QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue => {
+            "damage dealt capped by target's pre-damage value".into()
+        }
         QuantityRef::PreviousEffectCount => "count from preceding effect".into(),
         QuantityRef::TrackedSetSize => "cards moved".into(),
         QuantityRef::FilteredTrackedSetSize { filter, .. } => {
@@ -2920,6 +2934,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         Effect::LoseLife { amount, .. } => {
             d.push(("amount".into(), fmt_quantity(amount)));
         }
+        Effect::LoseAllUnspentMana { .. } => {}
         Effect::ExchangeLifeWithStat { player, stat } => {
             d.push(("player".into(), fmt_target(player)));
             d.push((
@@ -3531,11 +3546,20 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                 d.push(("recipient_object_filter".into(), fmt_target(f)));
             }
         }
-        Effect::CreateDrawReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
             d.push((
                 "replacement_effect".into(),
                 crate::types::ability::effect_variant_name(replacement_effect).to_string(),
             ));
+            if let Some(sub) = replacement_sub_ability {
+                d.push((
+                    "replacement_sub_ability".into(),
+                    crate::types::ability::effect_variant_name(&sub.effect).to_string(),
+                ));
+            }
         }
         Effect::CreatePlaneswalkReplacement { replacement_effect } => {
             d.push((
@@ -3991,10 +4015,12 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
         | Effect::AddPendingEntersModifications { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::EachPlayerCopyChosen { .. }
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::ChooseOneOf { .. }
         | Effect::ChooseCounterAdjustment { .. }
         | Effect::ReturnAsAura { .. }
         | Effect::Specialize => {}
+        Effect::RepeatPaidLibraryLook => {}
     }
     d
 }
@@ -4388,6 +4414,7 @@ fn fmt_trigger_condition(cond: &crate::types::ability::TriggerCondition) -> Stri
         TC::CastVariantPaid { .. } => "cast variant was paid".into(),
         TC::CastVariantPaidPersistent { .. } => "cast variant was paid (persistent)".into(),
         TC::ActivatedAbilityIsNonMana => "activated ability is not a mana ability".into(),
+        TC::SourceAbilityAddedManaThisTurn => "source ability added mana this turn".into(),
         TC::DealtDamageBySourceThisTurn => "dealt damage by source this turn".into(),
         TC::DealtDamageThisTurnBySource { source } => {
             format!("dealt damage this turn by {}", fmt_target(source))
@@ -4404,6 +4431,7 @@ fn fmt_trigger_condition(cond: &crate::types::ability::TriggerCondition) -> Stri
         TC::ControlsNone { filter } => format!("you control no {}", fmt_target(filter)),
         TC::AttackedThisTurn => "attacked this turn".into(),
         TC::SourceAttackedThisCombat => "source attacked this combat".into(),
+        TC::SourceAttackedOrBlockedThisCombat => "source attacked or blocked this combat".into(),
         TC::FirstCombatPhaseOfTurn => "first combat phase of the turn".into(),
         TC::CastSpellThisTurn { filter } => match filter {
             Some(f) => format!("cast a {} spell this turn", fmt_target(f)),
@@ -4441,6 +4469,13 @@ fn fmt_trigger_condition(cond: &crate::types::ability::TriggerCondition) -> Stri
         TC::SourceIsFaceUp => "source is face-up".into(),
         TC::SourceIsFaceDown => "source is face-down".into(),
         TC::SourceInZone { zone } => format!("source is in {}", fmt_zone(zone)),
+        TC::SourceInZoneWithAdjacentFilter { zone, adjacent } => {
+            format!(
+                "source is in {} with adjacent {}",
+                fmt_zone(zone),
+                fmt_target(adjacent)
+            )
+        }
         TC::CounterAddedThisTurn => "added a counter this turn".into(),
         TC::LostLifeLastTurn => "lost life last turn".into(),
         TC::DefendingPlayerControlsNone { filter } => {
@@ -4557,6 +4592,12 @@ fn fmt_trigger_constraint(c: &crate::types::ability::TriggerConstraint) -> Strin
         TC::EventSourceControlledBy { controller } => {
             format!("event source controlled by {}", fmt_controller(controller))
         }
+        TC::ZoneChangePutterPresent => "zone-change putter present".into(),
+        TC::All { constraints } => constraints
+            .iter()
+            .map(fmt_trigger_constraint)
+            .collect::<Vec<_>>()
+            .join(" and "),
     }
 }
 
@@ -4717,6 +4758,15 @@ fn fmt_modification(m: &crate::types::ability::ContinuousModification) -> String
     use crate::types::ability::ContinuousModification;
     match m {
         ContinuousModification::CopyValues { .. } => "copy values".into(),
+        ContinuousModification::CopyTopOfZone {
+            zone,
+            controller,
+            filter,
+        } => format!(
+            "copy qualifying top card of {} ({controller:?}; {})",
+            fmt_zone(zone),
+            fmt_target(filter)
+        ),
         // CR 707.2c (Metamorphic Alteration): parse-time marker for the enchanted
         // host's copy — the runtime copy is the latched `CopyValues` TCE.
         ContinuousModification::CopyChosen => "copy chosen".into(),
@@ -4732,6 +4782,7 @@ fn fmt_modification(m: &crate::types::ability::ContinuousModification) -> String
         ContinuousModification::RemoveKeyword { keyword } => {
             format!("remove {}", keyword_label(keyword))
         }
+        ContinuousModification::RemoveAllLandwalk => "remove all landwalk".into(),
         ContinuousModification::GrantAbility { .. } => "grant ability".into(),
         ContinuousModification::GrantAllActivatedAbilitiesOf { source, cap } => {
             // Blind spot (same class as #5492/#5495/#5501/#5507): this rendered
@@ -5139,6 +5190,47 @@ pub fn build_parse_details(
         build_additional_cost_items(additional_cost, &mut items);
     }
 
+    // CR 207.2c + CR 601.2f: a per-target casting-cost surcharge is a
+    // load-bearing Oracle line even though it is stored on the card face,
+    // rather than as an ability. Represent it explicitly so the silent-drop
+    // audit neither mistakes an implemented Fireball-style rider for a gap nor
+    // makes casting metadata invisible in the coverage tree.
+    if face.strive_cost.is_some() {
+        items.push(ParsedItem {
+            category: ParseCategory::Cost,
+            label: "Strive".to_string(),
+            source_text: strive_cost_source_text(&face.oracle_text),
+            supported: true,
+            details: vec![],
+            children: vec![],
+        });
+    }
+
+    // CR 601.3: a card-level "Cast this spell only ..." restriction is
+    // executable casting metadata, not an ability definition. Project its
+    // source line as one coverage item so the line-count audit does not
+    // mistake a fully enforced restriction (for example, Seedtime's "during
+    // your turn") for a silent parser drop.
+    //
+    // A single Oracle sentence can lower to several conjunctive restrictions
+    // (Wake the Dead has both combat and opponent-turn constraints), so this
+    // is deliberately one item for the metadata line rather than one item per
+    // enum variant.
+    if !face.casting_restrictions.is_empty() {
+        items.push(ParsedItem {
+            category: ParseCategory::Cost,
+            label: "CastingRestriction".to_string(),
+            source_text: casting_restriction_source_text(&face.oracle_text),
+            supported: true,
+            details: face
+                .casting_restrictions
+                .iter()
+                .map(|restriction| ("restriction".to_string(), format!("{restriction:?}")))
+                .collect(),
+            children: vec![],
+        });
+    }
+
     // Spell-casting options (alternative-cost lines such as Force of Will's
     // pitch cost, Snapcaster-style flash, "without paying its mana cost", etc.).
     // Each `SpellCastingOption` corresponds to its own Oracle line, so it must
@@ -5268,6 +5360,51 @@ fn build_cost_item(cost: &AbilityCost, items: &mut Vec<ParsedItem>) {
         }
         _ => {}
     }
+}
+
+/// Return the source line for a parsed per-target casting-cost surcharge.
+///
+/// The parser stores this structure on `CardFace::strive_cost`, rather than on
+/// an ability definition. Keeping its original line in the coverage tree makes
+/// the accounting audit explain *why* the extra cost item exists. The narrow
+/// phrases mirror the two parser entry points: the keyworded Strive template
+/// and the older bare "This spell costs … for each target beyond the first"
+/// template used by Fireball.
+fn strive_cost_source_text(oracle_text: &Option<String>) -> Option<String> {
+    oracle_text.as_deref().and_then(|text| {
+        text.lines().map(str::trim).find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            (lower.starts_with("strive ")
+                || (lower.starts_with("this spell costs")
+                    && lower.contains("for each target beyond the first")))
+            .then(|| line.to_string())
+        })
+    })
+}
+
+/// Return the Oracle sentence represented by card-level casting metadata.
+///
+/// `CastingRestriction` is stored outside an ability definition, so unlike a
+/// spell effect it cannot retain its source description directly. The parser
+/// accepts the direct sentence and ability-word-prefixed form; use that same
+/// narrow surface shape for coverage provenance.
+fn casting_restriction_source_text(oracle_text: &Option<String>) -> Option<String> {
+    oracle_text.as_deref().and_then(|text| {
+        text.lines().map(str::trim).find_map(|line| {
+            let lower = line.to_ascii_lowercase();
+            (lower.starts_with("cast this spell only ")
+                || lower.starts_with("you can't cast ")
+                || lower.starts_with("you cannot cast ")
+                || lower.starts_with("you can\u{2019}t cast ")
+                || lower.starts_with("you can't spend mana to cast ")
+                || lower.starts_with("you can\u{2019}t spend mana to cast ")
+                || lower.contains(" — cast this spell only ")
+                || lower.contains(" — you can't cast ")
+                || lower.contains(" — you cannot cast ")
+                || lower.contains(" — you can\u{2019}t cast "))
+            .then(|| line.to_string())
+        })
+    })
 }
 
 /// Build `ParsedItem` nodes for additional costs (kicker, etc.).
@@ -5605,6 +5742,32 @@ fn extract_gap_details(items: &[ParsedItem]) -> Vec<GapDetail> {
     let mut details = Vec::new();
     extract_gap_details_inner(items, &mut seen, &mut details);
     details
+}
+
+/// Add every coverage-predicate failure which was not already represented by
+/// the parse tree or a parser warning. `missing` is deduplicated by every
+/// checker, but the existing details may already contain the same handler.
+fn append_missing_gap_details(missing: &[String], details: &mut Vec<GapDetail>) {
+    let mut seen: std::collections::HashSet<String> = details
+        .iter()
+        .map(|detail| detail.handler.clone())
+        .collect();
+    // A swallowed-clause / target-fallback parse gap often also reduces the
+    // parse-tree line count. The resulting SilentDrop label is useful when it
+    // is the only evidence, but is redundant when the parser already named the
+    // semantic gap; keep the per-card distance-to-supported metric causal.
+    let has_existing_parse_gap = !seen.is_empty();
+    for handler in missing {
+        if has_existing_parse_gap && handler.starts_with("SilentDrop:") {
+            continue;
+        }
+        if seen.insert(handler.clone()) {
+            details.push(GapDetail {
+                handler: handler.clone(),
+                source_text: None,
+            });
+        }
+    }
 }
 
 fn extract_gap_details_inner(
@@ -6090,6 +6253,12 @@ pub fn analyze_coverage(card_db: &CardDatabase) -> CoverageSummary {
                 });
             }
         }
+        // `missing` is the authoritative support predicate. Some checks (for
+        // example SilentDrop and resolver-feature auditing) have no unsupported
+        // parse-tree node to extract, so surface their labels here as well.
+        // Otherwise a card can truthfully be `supported: false` while reporting
+        // `gap_count: 0`, making the deck-priority tally impossible to trust.
+        append_missing_gap_details(&missing, &mut gap_details);
         let gap_count = gap_details.len();
         for warning in &face.parse_warnings {
             let (category, pattern) = parse_warning_pattern(warning, face.oracle_text.as_deref());
@@ -6784,6 +6953,7 @@ fn visit_direct_effect_ability_payloads<'a>(
         | Effect::Token { .. }
         | Effect::GainLife { .. }
         | Effect::LoseLife { .. }
+        | Effect::LoseAllUnspentMana { .. }
         | Effect::SetTapState { .. }
         | Effect::RemoveCounter { .. }
         | Effect::Sacrifice { .. }
@@ -6931,6 +7101,7 @@ fn visit_direct_effect_ability_payloads<'a>(
         | Effect::ChooseObjectsIntoTrackedSet { .. }
         | Effect::ChooseAndSacrificeRest { .. }
         | Effect::EachPlayerCopyChosen { .. }
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::Exploit { .. }
         | Effect::GainEnergy { .. }
         | Effect::GivePlayerCounter { .. }
@@ -6992,6 +7163,7 @@ fn visit_direct_effect_ability_payloads<'a>(
         | Effect::ApplyPerpetual { .. }
         | Effect::Intensify { .. }
         | Effect::DraftFromSpellbook { .. }
+        | Effect::RepeatPaidLibraryLook
         | Effect::Unimplemented { .. } => {}
     }
 }
@@ -8323,6 +8495,7 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
 fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
     use FeatureSupport::*;
     match qref {
+        QuantityRef::EntryLifePaid => ("EntryLifePaid", Handled),
         QuantityRef::HandSize { .. } => ("HandSize", Handled),
         QuantityRef::LifeTotal { .. } => ("LifeTotal", Handled),
         QuantityRef::UnspentMana { .. } => ("UnspentMana", Handled),
@@ -8339,6 +8512,7 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::PlayerCount { .. } => ("PlayerCount", Handled),
         QuantityRef::EventContextPlayerCount { .. } => ("EventContextPlayerCount", Handled),
         QuantityRef::CountersOn { .. } => ("CountersOn", Handled),
+        QuantityRef::TokenSourceCounters { .. } => ("TokenSourceCounters", Handled),
         QuantityRef::Intensity { .. } => ("Intensity", Handled),
         QuantityRef::CountersOnObjects { .. } => ("CountersOnObjects", Handled),
         QuantityRef::Variable { .. } => ("Variable", Handled),
@@ -8475,6 +8649,9 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
         QuantityRef::DistinctCounterKindsAmong { .. } => ("DistinctCounterKindsAmong", Handled),
         QuantityRef::VoteCount { .. } => ("VoteCount", Handled),
         QuantityRef::PreviousEffectAmount { .. } => ("PreviousEffectAmount", Handled),
+        QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue => {
+            ("PreviousDamageAmountCappedByTargetPreDamageValue", Handled)
+        }
         QuantityRef::PreviousEffectCount => ("PreviousEffectCount", Handled),
         QuantityRef::TrackedSetSize => ("TrackedSetSize", Handled),
         QuantityRef::FilteredTrackedSetSize { .. } => ("FilteredTrackedSetSize", Handled),
@@ -8660,7 +8837,11 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::And { .. } => ("And", Handled),
         StaticCondition::Or { .. } => ("Or", Handled),
         StaticCondition::Not { .. } => ("Not", Handled),
-        StaticCondition::DefendingPlayerControls { .. } => ("DefendingPlayerControls", Unhandled),
+        // CR 509.1b: resolved by `layers::evaluate_condition` from the
+        // source's live attacker record, then evaluated against the defending
+        // player's battlefield. This is a combat-relative condition, not an
+        // unsupported parser placeholder.
+        StaticCondition::DefendingPlayerControls { .. } => ("DefendingPlayerControls", Handled),
         StaticCondition::SourceAttackingAlone => ("SourceAttackingAlone", Unhandled),
         // CR 508.1k / 509.1g / 509.1h: runtime-evaluated against the live combat
         // attacker/blocker sets (conditions.rs:81 / layers.rs:1118 / layers.rs:1123).
@@ -9778,7 +9959,23 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 || after_ability_word.is_some_and(|aw| aw.starts_with(&kw_name))
         }) || is_keyword_line(&lower)
             || after_ability_word.is_some_and(is_keyword_line);
-        let covered_by_casting = !face.casting_restrictions.is_empty()
+        let covered_by_x_mana_payment = lower.starts_with("spend only ")
+            // Consume Spirit / Drain Life attach the rider to the spell;
+            // Crypt Rats / Crimson Hellkite attach it to an activation. Keep
+            // both typed homes visible to the audit, while refusing to green
+            // unrelated mana-production "Spend only" text.
+            && (face.casting_restrictions.iter().any(|restriction| {
+                matches!(
+                    restriction,
+                    crate::types::ability::CastingRestriction::OnlyColorsOnX(_)
+                )
+            }) || face.abilities.iter().any(|ability| {
+                matches!(
+                    ability.activation_mana_payment_restriction,
+                    Some(crate::types::ability::ActivationManaPaymentRestriction::OnlyColorsOnX(_))
+                )
+            }));
+        let covered_by_casting = (!face.casting_restrictions.is_empty()
             && (lower.starts_with("cast this spell only ")
                 || lower.starts_with("you can't cast ")
                 || lower.starts_with("you cannot cast ")
@@ -9786,7 +9983,8 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 // Hogaak, Arisen Necropolis (issue #1095): "You can't spend mana
                 // to cast this spell" is parsed to CastingRestriction::CantSpendMana.
                 || lower.starts_with("you can't spend mana to cast ")
-                || lower.starts_with("you can\u{2019}t spend mana to cast "));
+                || lower.starts_with("you can\u{2019}t spend mana to cast ")))
+            || covered_by_x_mana_payment;
         // Casting option lines ("You may pay X rather than pay...", "If you control a
         // commander, you may cast this spell without paying its mana cost", etc.)
         let covered_by_casting_option = !face.casting_options.is_empty()
@@ -13356,6 +13554,38 @@ mod tests {
         }
     }
 
+    /// Coverage must track the Drain Life-class cap as a handled runtime
+    /// quantity. Without the typed quantity and its coverage registration, the
+    /// parser could retain both instructions while the deck-gap report still
+    /// marked every Drain Life printing red.
+    #[test]
+    fn drain_life_bounded_damage_gain_is_fully_supported() {
+        let oracle = "Spend only black mana on X.\n\
+Drain Life deals X damage to any target. You gain life equal to the damage dealt, but not more life than the player's life total before the damage was dealt, the planeswalker's loyalty before the damage was dealt, or the creature's toughness.";
+        let parsed = crate::parser::parse_oracle_text(
+            oracle,
+            "Drain Life",
+            &[],
+            &["Sorcery".to_string()],
+            &[],
+        );
+        let mut face = make_face();
+        face.name = "Drain Life".to_string();
+        face.oracle_text = Some(oracle.to_string());
+        face.abilities = parsed.abilities;
+        face.casting_restrictions = parsed.casting_restrictions;
+
+        assert!(
+            !card_face_has_unimplemented_parts(&face),
+            "Drain Life must not retain an unimplemented effect: {face:?}"
+        );
+        assert!(
+            card_face_gaps(&face).is_empty(),
+            "Drain Life's bounded prior-damage gain must be a handled coverage feature, got {:?}",
+            card_face_gaps(&face)
+        );
+    }
+
     fn delayed_trigger_payload(effect: Effect) -> AbilityDefinition {
         AbilityDefinition::new(
             AbilityKind::Spell,
@@ -14444,6 +14674,45 @@ mod tests {
     // -----------------------------------------------------------------------
     // Semantic audit tests
     // -----------------------------------------------------------------------
+
+    /// The old-border "Spend only [color] mana on X" payment rider has two
+    /// typed homes: a spell-level casting restriction (Consume Spirit / Drain
+    /// Life) and an activation-level restriction (Crypt Rats / Crimson
+    /// Hellkite). Both must discharge the rider line without blessing unrelated
+    /// "Spend only" Oracle text.
+    #[test]
+    fn x_mana_payment_rider_is_covered_for_spells_and_activations() {
+        use crate::types::ability::{ActivationManaPaymentRestriction, CastingRestriction};
+        use crate::types::mana::XManaPaymentRestriction;
+
+        let oracle = "Spend only black mana on X.";
+        let mut spell_face = make_face();
+        spell_face.casting_restrictions = vec![CastingRestriction::OnlyColorsOnX(
+            XManaPaymentRestriction::One(ManaColor::Black),
+        )];
+        assert!(
+            audit_card_lines(oracle, &spell_face).is_empty(),
+            "a typed spell rider must cover its own Oracle line"
+        );
+
+        let mut activation_face = make_face();
+        let mut ability = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        );
+        ability.activation_mana_payment_restriction =
+            Some(ActivationManaPaymentRestriction::OnlyColorsOnX(
+                XManaPaymentRestriction::One(ManaColor::Black),
+            ));
+        activation_face.abilities.push(ability);
+        assert!(
+            audit_card_lines(oracle, &activation_face).is_empty(),
+            "a typed activated rider must cover its own Oracle line"
+        );
+    }
 
     #[test]
     fn test_audit_per_line_detects_dropped_condition() {
@@ -15606,6 +15875,113 @@ mod tests {
         );
     }
 
+    /// Fireball's older per-target surcharge is stored as `strive_cost`, not an
+    /// ability. The coverage tree must still represent that Oracle line; otherwise
+    /// the generic silent-drop audit marks a fully implemented card unsupported.
+    #[test]
+    fn strive_cost_emits_parsed_item_for_silent_drop_parity() {
+        let mut face = make_face();
+        face.strive_cost = Some(crate::types::mana::ManaCost::generic(1));
+        face.oracle_text = Some(
+            "This spell costs {1} more to cast for each target beyond the first.\n\
+             Fireball deals X damage divided evenly, rounded down, among any number of targets."
+                .to_string(),
+        );
+        face.abilities.push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::DealDamage {
+                amount: QuantityExpr::Ref {
+                    qty: crate::types::ability::QuantityRef::Variable {
+                        name: "X".to_string(),
+                    },
+                },
+                target: TargetFilter::Any,
+                damage_source: None,
+                excess: None,
+            },
+        ));
+
+        let parse_details = build_parse_details_for_face(&face);
+        assert_eq!(count_effective_parsed_items(&parse_details), 2);
+        let strive = parse_details
+            .iter()
+            .find(|item| item.category == ParseCategory::Cost && item.label == "Strive")
+            .expect("implemented per-target surcharge must be visible in coverage");
+        assert!(strive.supported);
+        assert_eq!(
+            strive.source_text.as_deref(),
+            Some("This spell costs {1} more to cast for each target beyond the first.")
+        );
+
+        let mut missing = Vec::new();
+        check_silent_drops(&face.oracle_text, &parse_details, &mut missing);
+        assert!(
+            missing.is_empty(),
+            "represented per-target surcharge must not be reported as a silent drop: {missing:?}"
+        );
+    }
+
+    /// CR 601.3: card-level spell timing restrictions are executable metadata,
+    /// not a child spell ability. They still consume an Oracle line and must be
+    /// visible to the count-based coverage audit.
+    #[test]
+    fn casting_restriction_emits_one_item_for_silent_drop_parity() {
+        let mut face = make_face();
+        face.oracle_text = Some(
+            "Cast this spell only during your turn.\n\
+             Take an extra turn after this one if an opponent cast a blue spell this turn."
+                .to_string(),
+        );
+        face.casting_restrictions = vec![crate::types::ability::CastingRestriction::DuringYourTurn];
+        face.abilities.push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ExtraTurn {
+                target: TargetFilter::Controller,
+            },
+        ));
+
+        let parse_details = build_parse_details_for_face(&face);
+        let restriction = parse_details
+            .iter()
+            .find(|item| item.category == ParseCategory::Cost && item.label == "CastingRestriction")
+            .expect("casting restriction must be visible in coverage");
+        assert!(restriction.supported);
+        assert_eq!(
+            restriction.source_text.as_deref(),
+            Some("Cast this spell only during your turn.")
+        );
+        assert_eq!(count_effective_parsed_items(&parse_details), 2);
+
+        let mut missing = Vec::new();
+        check_silent_drops(&face.oracle_text, &parse_details, &mut missing);
+        assert!(
+            missing.is_empty(),
+            "implemented casting metadata must not trigger SilentDrop: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn audit_only_missing_labels_are_visible_in_gap_details() {
+        let mut details = Vec::new();
+        append_missing_gap_details(
+            &[
+                "SilentDrop:1_of_2".to_string(),
+                "ResolverFeature:Foo".to_string(),
+            ],
+            &mut details,
+        );
+        append_missing_gap_details(&["SilentDrop:1_of_2".to_string()], &mut details);
+
+        assert_eq!(
+            details
+                .iter()
+                .map(|detail| detail.handler.as_str())
+                .collect::<Vec<_>>(),
+            vec!["SilentDrop:1_of_2", "ResolverFeature:Foo"],
+            "every unsupported predicate must have exactly one reportable gap"
+        );
+    }
+
     /// When the underlying additional cost is `Unimplemented`, the existing
     /// `Cost:Unimplemented` gap must still surface (used by `extract_gap_details`).
     #[test]
@@ -16094,6 +16470,21 @@ mod tests {
                 "StaticCondition::{expected_name} is resolved by layers::evaluate_condition",
             );
         }
+    }
+
+    /// CR 509.1b: conditional evasion such as "can't be blocked as long as
+    /// defending player controls an artifact" is evaluated from the source's
+    /// combat attacker record by `layers::evaluate_condition`. The coverage
+    /// classifier must therefore not falsely mark every card using this typed
+    /// condition unsupported.
+    #[test]
+    fn defending_player_controls_static_condition_is_marked_handled() {
+        let condition = StaticCondition::DefendingPlayerControls {
+            filter: TargetFilter::Any,
+        };
+        let (name, support) = static_condition_feature(&condition);
+        assert_eq!(name, "DefendingPlayerControls");
+        assert_eq!(support, FeatureSupport::Handled);
     }
 
     /// `extract_static_condition_features` must recurse
@@ -16657,6 +17048,40 @@ mod tests {
         assert_eq!(
             render(DamageChannel::Excess, AggregateFunction::Min),
             "excess amount from preceding effect"
+        );
+    }
+
+    /// CR 201.2a: CountsAsNamed is a parameterized runtime static, so it
+    /// cannot be keyed in the exact static registry but must remain covered.
+    #[test]
+    fn counts_as_named_static_has_no_coverage_gap() {
+        let mut face = make_face();
+        let oracle = "If this card is in a graveyard, effects from spells named Muscle Burst count it as a card named Muscle Burst.";
+        face.oracle_text = Some(oracle.to_string());
+        face.static_abilities.push(StaticDefinition {
+            mode: StaticMode::CountsAsNamed {
+                name: "Muscle Burst".to_string(),
+            },
+            affected: None,
+            modifications: vec![],
+            condition: None,
+            per_player_condition: None,
+            affected_zone: None,
+            effect_zone: None,
+            active_zones: vec![Zone::Graveyard],
+            characteristic_defining: false,
+            description: Some(oracle.to_string()),
+            attack_defended: None,
+            source_controller: None,
+            source_object: None,
+            bypass_beneficiary: None,
+            protection_does_not_remove: None,
+            room_door: None,
+        });
+
+        assert!(
+            card_face_gaps(&face).is_empty(),
+            "CountsAsNamed statics should be recognized as supported"
         );
     }
 }

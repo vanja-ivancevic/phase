@@ -6,9 +6,10 @@ use crate::types::ability::{
     AbilityCost, AbilityDefinition, CastingPermission, CombatDamageScope, ControllerRef,
     DamageModification, DamageRedirectTarget, DamageTargetFilter, DamageTargetPlayerScope,
     Duration, Effect, EffectScope, ManaSpendPermission, PermissionGrantee,
-    PostReplacementContinuation, PreventionAmount, QuantityExpr, QuantityModification,
+    PostReplacementContinuation, PreventionAmount, QuantityExpr, QuantityModification, QuantityRef,
     RedirectionLifetime, ReplacementCondition, ReplacementDefinition, ReplacementMode,
-    ResolvedAbility, ShieldKind, TapStateChange, TargetFilter, TargetRef,
+    ReplacementPaymentRecord, ResolvedAbility, ShieldKind, TapStateChange, TargetFilter,
+    TargetRef, EXILE_COST_ANY_NUMBER,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterType;
@@ -1051,7 +1052,7 @@ fn optional_replacement_choice_labels(
 
     replacement_definition_for_id(state, replacement_id)
         .map(|replacement| match &replacement.mode {
-            ReplacementMode::MayCost { cost, decline } => {
+            ReplacementMode::MayCost { cost, decline, .. } => {
                 let decline = decline
                     .as_ref()
                     .and_then(|effect| effect.description.clone())
@@ -1168,6 +1169,9 @@ fn replacement_cost_description(cost: &AbilityCost) -> String {
                 Some(Zone::Battlefield) => "from the battlefield",
                 _ => "",
             };
+            if *count == EXILE_COST_ANY_NUMBER {
+                return format!("Exile any number of cards {zone_str}");
+            }
             if *count == 1 {
                 format!("Exile a card {zone_str}")
             } else {
@@ -1437,6 +1441,7 @@ fn pay_replacement_may_cost(
     player: PlayerId,
     source_id: ObjectId,
     cost: &AbilityCost,
+    payment_record: Option<ReplacementPaymentRecord>,
     events: &mut Vec<GameEvent>,
 ) -> MayCostOutcome {
     if replacement_may_cost_has_self_zone_move(cost) {
@@ -1452,6 +1457,43 @@ fn pay_replacement_may_cost(
     let paid = match cost {
         AbilityCost::Mana { cost } => {
             crate::game::casting::pay_unless_cost(state, player, cost, events).is_ok()
+        }
+        // CR 614.12 + CR 119.4: an as-enters "pay any amount of life" choice
+        // is made before delivery. Park the outer replacement and let the
+        // ordinary amount prompt use the single life-cost authority; its resume
+        // records the result on the new permanent incarnation.
+        AbilityCost::PayLife {
+            amount:
+                QuantityExpr::Ref {
+                    qty: QuantityRef::Variable { name },
+                },
+        } if name == "X" && payment_record == Some(ReplacementPaymentRecord::EntryLifePaid) => {
+            let team_life = crate::game::players::team_life_total(state, player);
+            let max = if team_life > 0
+                && crate::game::life_costs::can_pay_life_cost(state, player, 1)
+            {
+                u32::try_from(team_life).unwrap_or(0)
+            } else {
+                0
+            };
+            state.pending_entry_life_payment = Some(
+                crate::types::game_state::PendingEntryLifePayment {
+                    object_id: source_id,
+                    amount: None,
+                },
+            );
+            state.waiting_for = crate::types::game_state::WaitingFor::PayAmountChoice {
+                player,
+                resource: crate::types::game_state::PayableResource::Life,
+                min: 0,
+                max,
+                accumulated: 0,
+                source_id,
+                pending_mana_ability: None,
+            };
+            return MayCostOutcome::PausedForChoice {
+                remaining_cost: None,
+            };
         }
         AbilityCost::PayLife { amount } => {
             let amount =
@@ -1478,7 +1520,14 @@ fn pay_replacement_may_cost(
             // mid-composite pause carries the unpaid suffix so the resume
             // completes the rest before the replacement applies.
             for (index, sub_cost) in costs.iter().enumerate() {
-                match pay_replacement_may_cost(state, player, source_id, sub_cost, events) {
+                match pay_replacement_may_cost(
+                    state,
+                    player,
+                    source_id,
+                    sub_cost,
+                    payment_record,
+                    events,
+                ) {
                     MayCostOutcome::Paid => {}
                     MayCostOutcome::PausedForChoice { remaining_cost } => {
                         return MayCostOutcome::PausedForChoice {
@@ -1678,6 +1727,7 @@ fn discard_applier(
             from: Zone::Hand,
             to: Zone::Graveyard,
             cause: None,
+            putter: None,
             attach_to: None,
             enter_tapped: EtbTapState::Unspecified,
             enters_attacking: false,
@@ -1719,6 +1769,28 @@ fn damage_modification_for_rid(
         .replacement_definitions
         .get(rid.index)?
         .damage_modification
+        .clone()
+}
+
+/// CR 122.1 + CR 614.1a: Read the counter resource consumed by a per-damage
+/// prevention replacement (Rock Hydra class).
+fn damage_counter_removal_for_rid(
+    state: &GameState,
+    rid: ReplacementId,
+) -> Option<crate::types::counter::CounterType> {
+    if rid.source == ObjectId(0) {
+        return state
+            .pending_damage_replacements
+            .get(rid.index)?
+            .damage_counter_removal
+            .clone();
+    }
+    state
+        .objects
+        .get(&rid.source)?
+        .replacement_definitions
+        .get(rid.index)?
+        .damage_counter_removal
         .clone()
 }
 
@@ -1806,10 +1878,10 @@ fn shield_rider_reflects_per_event(state: &GameState, rid: ReplacementId) -> boo
         .is_some_and(rider_reflects_per_event_damage_source)
 }
 
-/// CR 614.9: Read back the captured chosen-object recipient stashed in the
-/// matched replacement's `redirect_target` field (set at resolution time for
-/// `DamageRedirectTarget::ChosenObjectTarget` — "to target creature").
-fn redirect_chosen_object_for_rid(state: &GameState, rid: ReplacementId) -> Option<ObjectId> {
+/// CR 614.9: Read back the captured chosen recipient stashed in the matched
+/// replacement's `redirect_target` field. The effect-created one-shot path can
+/// carry either a permanent or a player ("to any target").
+fn redirect_chosen_target_for_rid(state: &GameState, rid: ReplacementId) -> Option<TargetRef> {
     let repl = if rid.source == ObjectId(0) {
         state.pending_damage_replacements.get(rid.index)
     } else {
@@ -1819,7 +1891,8 @@ fn redirect_chosen_object_for_rid(state: &GameState, rid: ReplacementId) -> Opti
             .and_then(|obj| obj.replacement_definitions.get(rid.index))
     };
     match repl.and_then(|r| r.redirect_target.as_ref()) {
-        Some(TargetFilter::SpecificObject { id }) => Some(*id),
+        Some(TargetFilter::SpecificObject { id }) => Some(TargetRef::Object(*id)),
+        Some(TargetFilter::SpecificPlayer { id }) => Some(TargetRef::Player(*id)),
         _ => None,
     }
 }
@@ -1995,9 +2068,13 @@ fn redirect_damage_event(
         });
     }
 
-    let chosen = redirect_chosen_object_for_rid(state, rid);
+    let chosen = redirect_chosen_target_for_rid(state, rid);
     let new_recipient = super::effects::create_damage_replacement::resolve_redirect_recipient(
-        state, recipient, rid.source, chosen,
+        state,
+        recipient,
+        rid.source,
+        source_id,
+        chosen,
     )
     .filter(|new_target| {
         super::effects::create_damage_replacement::redirect_recipient_is_legal(state, new_target)
@@ -2126,6 +2203,7 @@ fn damage_done_applier(
 ) -> ApplyResult {
     // Branch 1: Damage modification (Double, Triple, Plus, Minus)
     if let Some(modification) = damage_modification_for_rid(state, rid) {
+        let counter_removal = damage_counter_removal_for_rid(state, rid);
         // CR 510.2: identity for the combat-damage-batch prevention tally, taken
         // before the event is destructured (mirrors the Branch 2 shield path).
         let applied_key = AppliedReplacementKey::for_event(&event, rid);
@@ -2139,16 +2217,23 @@ fn damage_done_applier(
         {
             // CR 615.1a: typed prevention provenance, captured before the match
             // consumes `modification` (the `Plus`/`SetTo` arms move their
-            // non-`Copy` payload out). ONLY `PreventionMinus` — the CR 615
-            // prevention provenance of the shared subtraction — does prevention
+            // non-`Copy` payload out). ONLY the typed prevention variants —
+            // `PreventionMinus` and `PreventionHalf` — do prevention
             // bookkeeping below; plain arithmetic `Minus` (Benevolent Unicorn's
             // "that much damage minus 1") reduces the amount without preventing
             // anything.
-            let is_minus_prevention =
-                matches!(modification, DamageModification::PreventionMinus { .. });
+            let is_prevention_modification = matches!(
+                modification,
+                DamageModification::PreventionMinus { .. }
+                    | DamageModification::PreventionHalf
+            );
             let new_amount = match modification {
                 DamageModification::Double => amount.saturating_mul(2),
                 DamageModification::Triple => amount.saturating_mul(3),
+                // CR 615.1a + CR 107.1a: Dark Sphere prevents half the damage,
+                // rounded down. The surviving half is the original amount minus
+                // the prevented floor(amount / 2).
+                DamageModification::PreventionHalf => amount.saturating_sub(amount / 2),
                 // CR 614.1a + CR 120 + CR 107.1b: additive damage modification.
                 // The added magnitude is a game quantity resolved each time the
                 // replacement applies, clamped >= 0 (CR 107.1b). A `Fixed` value
@@ -2191,8 +2276,26 @@ fn damage_done_applier(
                 // prevent-all sentinel — yields 0 for any amount and is not
                 // consumed; continuous, not shield-style). Only the prevention
                 // provenance does the `DamagePrevented` bookkeeping below.
-                DamageModification::Minus { value }
-                | DamageModification::PreventionMinus { value } => amount.saturating_sub(value),
+                DamageModification::Minus { value } => amount.saturating_sub(value),
+                DamageModification::PreventionMinus { value } => {
+                    if let Some(counter_type) = counter_removal.as_ref() {
+                        // CR 122.1 + CR 614.1a: Rock Hydra's replacement
+                        // prevents one damage per counter, capped by both the
+                        // event amount and the live counter total. The parser
+                        // uses `u32::MAX` as the ordinary subtraction sentinel;
+                        // this typed resource field supplies the real cap.
+                        let available = state
+                            .objects
+                            .get(&rid.source)
+                            .and_then(|obj| obj.counters.get(counter_type))
+                            .copied()
+                            .unwrap_or(0);
+                        let prevented = amount.min(available);
+                        amount.saturating_sub(prevented)
+                    } else {
+                        amount.saturating_sub(value)
+                    }
+                }
                 // CR 614.1a: Conditional — if amount < source's power, set to power.
                 // References the replacement source's (rid.source) post-layer power.
                 DamageModification::SetToSourcePower => {
@@ -2233,6 +2336,18 @@ fn damage_done_applier(
                     }
                 }
             };
+            if let Some(counter_type) = counter_removal {
+                let prevented = amount.saturating_sub(new_amount);
+                if prevented > 0 {
+                    super::effects::counters::apply_counter_removal(
+                        state,
+                        rid.source,
+                        counter_type,
+                        prevented,
+                        events,
+                    );
+                }
+            }
             // CR 614.5: A one-shot effect-created amount replacement (Desperate
             // Gambit) gets a single opportunity, then is consumed. Continuous
             // statics (Furnace of Rath) keep `ShieldKind::None` and are never
@@ -2240,11 +2355,12 @@ fn damage_done_applier(
             if let Some(ShieldKind::DamageReplacementOneShot) = shield_kind_for_rid(state, rid) {
                 consume_prevention_shield(state, rid, None);
             }
-            // CR 615.1a + CR 702.64b + CR 510.2: `PreventionMinus` is the typed
-            // prevention provenance of the shared `Minus` subtraction — CR 702.64
+            // CR 615.1a + CR 702.64b + CR 510.2: `PreventionMinus` and
+            // `PreventionHalf` are typed prevention provenances. `PreventionMinus`
+            // is the prevention provenance of the shared `Minus` subtraction — CR 702.64
             // Absorb, the bare "prevent N of that damage" statics (Heart-Shaped
             // Herb #5902, Sphere of Purity, Orbs of Warding, ...), and the
-            // `PreventionMinus { value: u32::MAX }` prevent-all sentinel. When it
+            // `PreventionMinus { value: u32::MAX }` prevent-all sentinel. When either
             // actually reduces the event it prevents damage, so it performs the
             // same bookkeeping the `ShieldKind::Prevention` shields do (Branch 2),
             // with the same per-event vs post-batch binding semantics:
@@ -2265,7 +2381,7 @@ fn damage_done_applier(
             // Plain arithmetic `Minus` and the increase/no-op modifications
             // (Double, Triple, Plus, SetTo*, LifeFloor) are not prevention and
             // record nothing.
-            if is_minus_prevention {
+            if is_prevention_modification {
                 let prevented = amount.saturating_sub(new_amount);
                 if prevented > 0 {
                     let mut accumulated_in_batch = false;
@@ -5549,12 +5665,15 @@ fn is_damage_prevention_replacement(
         return false;
     };
 
-    // Ordinary damage modifications are not prevention, but `PreventionMinus`
-    // carries explicit prevention provenance and must be suppressed when damage
-    // can't be prevented.
+    // Ordinary damage modifications are not prevention, but the typed prevention
+    // variants carry explicit provenance and must be suppressed when damage can't
+    // be prevented.
     if matches!(
         repl.damage_modification,
-        Some(DamageModification::PreventionMinus { .. })
+        Some(
+            DamageModification::PreventionMinus { .. }
+                | DamageModification::PreventionHalf,
+        )
     ) {
         return true;
     }
@@ -6129,6 +6248,16 @@ fn evaluate_replacement_condition(
             .objects
             .get(&source_id)
             .is_some_and(|obj| obj.tapped == *tapped),
+        ReplacementCondition::SourceHasCounterAtLeast {
+            counter_type,
+            count,
+        } => state
+            .objects
+            .get(&source_id)
+            .and_then(|obj| obj.counters.get(counter_type))
+            .copied()
+            .unwrap_or(0)
+            >= *count,
         // CR 120.1 + CR 614.1a: Check whether the affected object was dealt
         // damage this turn by a source matching the replacement's source
         // filter. The filter is evaluated relative to the replacement source,
@@ -6761,12 +6890,23 @@ fn object_replacement_candidate_applies(
     }
     if let Some(ref sf) = repl_def.damage_source_filter {
         // CR 614.1a: damage-source filters match the damage source object.
-        if let ProposedEvent::Damage { source_id, .. } = event {
+        if let ProposedEvent::Damage {
+            source_id,
+            target,
+            ..
+        } = event
+        {
             if !matches_target_filter(
                 state,
                 *source_id,
                 sf,
-                &FilterContext::from_source_with_controller(obj.id, replacement_player),
+                &FilterContext {
+                    event_target_id: match target {
+                        TargetRef::Object(id) => Some(*id),
+                        TargetRef::Player(_) => None,
+                    },
+                    ..FilterContext::from_source_with_controller(obj.id, replacement_player)
+                },
             ) {
                 return false;
             }
@@ -7440,7 +7580,12 @@ pub fn find_applicable_replacements(
                     let source_controller =
                         repl_def.source_controller.unwrap_or(state.active_player);
                     if let Some(ref sf) = repl_def.damage_source_filter {
-                        if let ProposedEvent::Damage { source_id, .. } = event {
+                        if let ProposedEvent::Damage {
+                            source_id,
+                            target,
+                            ..
+                        } = event
+                        {
                             // CR 109.4 + CR 614.1a: The pending replacement lives under
                             // the sentinel `ObjectId(0)`, which has no entry in
                             // `state.objects`, so `from_source` cannot derive a
@@ -7448,11 +7593,15 @@ pub fn find_applicable_replacements(
                             // install time (`source_controller`), use it so a
                             // controller-relative source filter ("a source you control")
                             // resolves; otherwise fall back to the bare source context.
-                            let ctx = match repl_def.source_controller {
+                            let mut ctx = match repl_def.source_controller {
                                 Some(pid) => {
                                     FilterContext::from_source_with_controller(ObjectId(0), pid)
                                 }
                                 None => FilterContext::from_source(state, ObjectId(0)),
+                            };
+                            ctx.event_target_id = match target {
+                                TargetRef::Object(id) => Some(*id),
+                                TargetRef::Player(_) => None,
                             };
                             if !matches_target_filter(state, *source_id, sf, &ctx) {
                                 continue;
@@ -9207,10 +9356,13 @@ fn damage_commute_class(modification: &DamageModification) -> CommuteClass {
     match modification {
         DamageModification::Double | DamageModification::Triple => CommuteClass::Multiplicative,
         DamageModification::Plus { .. } => CommuteClass::Additive,
-        // CR 616.1: both provenances of the shared subtraction commute alike.
+        // CR 616.1: both provenances of the shared subtraction commute alike;
+        // halving is non-commuting because the second replacement sees the
+        // first replacement's rounded result.
         DamageModification::Minus { .. } | DamageModification::PreventionMinus { .. } => {
             CommuteClass::Subtractive
         }
+        DamageModification::PreventionHalf => CommuteClass::NonCommuting,
         DamageModification::SetToSourcePower
         | DamageModification::SetTo { .. }
         | DamageModification::LifeFloor { .. } => CommuteClass::NonCommuting,
@@ -10081,17 +10233,21 @@ fn continue_replacement_impl(
         // per-source bookkeeping is needed here.
 
         // Extract the accept/decline effects before applying
-        let (accept_effect, decline_effect, may_cost) = replacement_definition_for_id(state, rid)
+        let (accept_effect, decline_effect, may_cost, payment_record) = replacement_definition_for_id(state, rid)
             .map(|repl| {
                 let accept = repl.execute.clone();
                 let decline = replacement_mode_decline_cloned(&repl.mode);
-                let may_cost = match &repl.mode {
-                    ReplacementMode::MayCost { cost, .. } => Some(cost.clone()),
-                    ReplacementMode::Mandatory | ReplacementMode::Optional { .. } => None,
+                let (may_cost, payment_record) = match &repl.mode {
+                    ReplacementMode::MayCost {
+                        cost,
+                        payment_record,
+                        ..
+                    } => (Some(cost.clone()), *payment_record),
+                    ReplacementMode::Mandatory | ReplacementMode::Optional { .. } => (None, None),
                 };
-                (accept, decline, may_cost)
+                (accept, decline, may_cost, payment_record)
             })
-            .unwrap_or((None, None, None));
+            .unwrap_or((None, None, None, None));
 
         // CR 614.12a: on accept, pay the MayCost (skipped on a paid resume). A
         // `PausedForChoice` outcome means the payment surfaced an interactive
@@ -10105,12 +10261,26 @@ fn continue_replacement_impl(
         } else if resuming_after_paid_cost {
             match &remaining_may_cost {
                 None => MayCostOutcome::Paid,
-                Some(cost) => pay_replacement_may_cost(state, payer, rid.source, cost, events),
+                Some(cost) => pay_replacement_may_cost(
+                    state,
+                    payer,
+                    rid.source,
+                    cost,
+                    payment_record,
+                    events,
+                ),
             }
         } else {
             match &may_cost {
                 None => MayCostOutcome::Paid,
-                Some(cost) => pay_replacement_may_cost(state, payer, rid.source, cost, events),
+                Some(cost) => pay_replacement_may_cost(
+                    state,
+                    payer,
+                    rid.source,
+                    cost,
+                    payment_record,
+                    events,
+                ),
             }
         };
 
@@ -11645,6 +11815,7 @@ mod tests {
                 cost: AbilityCost::PayLife {
                     amount: QuantityExpr::Fixed { value: amount },
                 },
+                payment_record: None,
                 decline: Some(Box::new(
                     AbilityDefinition::new(
                         AbilityKind::Spell,
@@ -11683,6 +11854,133 @@ mod tests {
         assert_eq!(state.players[0].life, 18);
     }
 
+    #[test]
+    fn entry_life_payment_records_chosen_amount_on_the_new_permanent() {
+        let repl = crate::parser::oracle_replacement::parse_replacement_line(
+            "As this artifact enters, pay any amount of life.",
+            "Phyrexian Processor",
+        )
+        .expect("Processor entry payment must parse");
+        let object_id = ObjectId(10);
+        let mut state = test_state_with_object(object_id, Zone::Hand, vec![repl]);
+        state.players[0].hand.push_back(object_id);
+        let mut events = Vec::new();
+
+        let proposed = ProposedEvent::zone_change(object_id, Zone::Hand, Zone::Battlefield, None);
+        assert!(matches!(
+            replace_event(&mut state, proposed, &mut events),
+            ReplacementResult::NeedsChoice(PlayerId(0))
+        ));
+
+        let waiting_for = crate::game::engine_replacement::handle_replacement_choice(
+            &mut state,
+            0,
+            &mut events,
+        )
+        .expect("accepting the entry replacement must surface its amount prompt");
+        assert!(matches!(
+            waiting_for,
+            WaitingFor::PayAmountChoice {
+                player: PlayerId(0),
+                resource: crate::types::game_state::PayableResource::Life,
+                min: 0,
+                max: 20,
+                source_id,
+                ..
+            } if source_id == object_id
+        ));
+
+        let outcome = crate::game::engine_resolution_choices::handle_resolution_choice(
+            &mut state,
+            waiting_for,
+            GameAction::SubmitPayAmount { amount: 7 },
+            &mut events,
+        )
+        .expect("the selected entry-life amount must pay and resume the zone move");
+        assert!(matches!(
+            outcome,
+            crate::game::engine_resolution_choices::ResolutionChoiceOutcome::WaitingFor(_)
+        ));
+        assert_eq!(state.players[0].life, 13);
+        assert_eq!(state.objects[&object_id].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&object_id].entry_life_paid, 7);
+        assert!(state.pending_entry_life_payment.is_none());
+
+        let amount = crate::game::quantity::resolve_quantity(
+            &state,
+            &QuantityExpr::Ref {
+                qty: QuantityRef::EntryLifePaid,
+            },
+            PlayerId(0),
+            object_id,
+        );
+        assert_eq!(amount, 7, "later abilities read the entry payment live");
+    }
+
+    #[test]
+    fn sutured_ghoul_any_number_replacement_surfaces_zone_choice() {
+        let repl = crate::parser::oracle_replacement::parse_replacement_line(
+            "As Sutured Ghoul enters, exile any number of creature cards from your graveyard.",
+            "Sutured Ghoul",
+        )
+        .expect("Sutured Ghoul replacement should parse");
+
+        assert_eq!(repl.event, ReplacementEvent::Moved);
+        assert_eq!(repl.valid_card, Some(TargetFilter::SelfRef));
+        assert_eq!(repl.destination_zone, Some(Zone::Battlefield));
+        assert!(matches!(
+            repl.mode,
+            ReplacementMode::MayCost {
+                cost: AbilityCost::Exile {
+                    count: EXILE_COST_ANY_NUMBER,
+                    zone: Some(Zone::Graveyard),
+                    filter: Some(TargetFilter::Typed(_)),
+                },
+                decline: None,
+                ..
+            }
+        ));
+
+        let mut state = test_state_with_object(ObjectId(10), Zone::Hand, vec![repl]);
+        let mut creature = GameObject::new(
+            ObjectId(20),
+            CardId(2),
+            PlayerId(0),
+            "Graveyard Creature".to_string(),
+            Zone::Graveyard,
+        );
+        creature.card_types.core_types.push(CoreType::Creature);
+        creature.base_card_types.core_types.push(CoreType::Creature);
+        state.objects.insert(ObjectId(20), creature);
+        state.players[0].graveyard.push_back(ObjectId(20));
+
+        let mut events = Vec::new();
+        let proposed =
+            ProposedEvent::zone_change(ObjectId(10), Zone::Hand, Zone::Battlefield, None);
+        let result = replace_event(&mut state, proposed, &mut events);
+        assert!(matches!(
+            result,
+            ReplacementResult::NeedsChoice(PlayerId(0))
+        ));
+
+        let result = continue_replacement(&mut state, 0, &mut events);
+        assert!(matches!(result, ReplacementResult::Execute(_)));
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::EffectZoneChoice {
+                count: 1,
+                min_count: 0,
+                up_to: true,
+                is_cost_payment: true,
+                ..
+            }
+        ));
+        assert_eq!(state.objects.get(&ObjectId(10)).unwrap().zone, Zone::Hand);
+        assert_eq!(
+            state.objects.get(&ObjectId(20)).unwrap().zone,
+            Zone::Graveyard
+        );
+    }
     #[test]
     fn may_cost_replacement_decline_applies_decline_branch() {
         let repl = may_cost_tapped_replacement(2);
@@ -11819,6 +12117,7 @@ mod tests {
             from: Zone::Battlefield,
             to: Zone::Graveyard,
             cause: None,
+            putter: None,
             attach_to: None,
             enter_tapped: EtbTapState::Unspecified,
             enters_attacking: false,
@@ -14049,6 +14348,7 @@ mod tests {
             from: Zone::Battlefield,
             to: Zone::Graveyard,
             cause: None,
+            putter: None,
             attach_to: None,
             enter_tapped: EtbTapState::Unspecified,
             enters_attacking: false,
@@ -15269,6 +15569,7 @@ mod tests {
             from: Zone::Hand,
             to: Zone::Battlefield,
             cause: None,
+            putter: None,
             attach_to: None,
             enter_tapped: EtbTapState::Tapped,
             enters_attacking: false,
@@ -15748,6 +16049,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn damage_applier_prevention_half_rounds_prevented_amount_down() {
+        let repl = damage_repl(DamageModification::PreventionHalf)
+            .damage_replacement_oneshot_shield();
+        let mut state = test_state_with_damage_repl(ObjectId(10), PlayerId(0), vec![repl]);
+        let mut events = Vec::new();
+        let rid = ReplacementId {
+            source: ObjectId(10),
+            index: 0,
+        };
+
+        let result = damage_done_applier(damage_event(3), rid, &mut state, &mut events);
+        match result {
+            ApplyResult::Modified(ProposedEvent::Damage { amount, .. }) => {
+                assert_eq!(amount, 2, "3 damage minus floor(3 / 2) prevented")
+            }
+            other => panic!("expected modified damage, got {other:?}"),
+        }
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, GameEvent::DamagePrevented { amount: 1, .. })),
+            "the floored half must be reported as prevented"
+        );
+        assert_eq!(state.last_effect_count, Some(1));
+        assert!(
+            state.objects[&ObjectId(10)].replacement_definitions[0].is_consumed,
+            "Dark Sphere's one-shot shield must be spent"
+        );
+    }
+
     /// CR 614.1a vs CR 615: plain arithmetic `Minus` (Benevolent Unicorn's
     /// "that much damage minus 1") is NOT prevention provenance — it must
     /// reduce the amount WITHOUT emitting `DamagePrevented` and WITHOUT
@@ -16011,6 +16343,95 @@ mod tests {
         assert!(
             !candidates.is_empty(),
             "Should match: source controller matches"
+        );
+    }
+
+    #[test]
+    fn damage_source_filter_can_compare_source_and_recipient_color() {
+        use crate::types::ability::{SharedQuality, SharedQualityRelation, TypedFilter};
+        use crate::types::card_type::CoreType;
+        use crate::types::mana::ManaColor;
+
+        let source_filter = TargetFilter::Typed(
+            TypedFilter::default()
+                .with_type(crate::types::ability::TypeFilter::Creature)
+                .properties(vec![
+                    crate::types::ability::FilterProp::DistinctFrom {
+                        reference: Box::new(TargetFilter::EventTarget),
+                    },
+                    crate::types::ability::FilterProp::SharesQuality {
+                        quality: SharedQuality::Color,
+                        reference: Some(Box::new(TargetFilter::EventTarget)),
+                        relation: SharedQualityRelation::Shares,
+                    },
+                ]),
+        );
+        let repl = ReplacementDefinition::new(ReplacementEvent::DamageDone)
+            .prevention_shield(PreventionAmount::All)
+            .damage_source_filter(source_filter)
+            .damage_target_filter(DamageTargetFilter::CreatureOnly);
+        let mut state = test_state_with_damage_repl(ObjectId(10), PlayerId(0), vec![repl]);
+
+        let mut source = GameObject::new(
+            ObjectId(50),
+            CardId(2),
+            PlayerId(0),
+            "Red Source".to_string(),
+            Zone::Battlefield,
+        );
+        source.card_types.core_types.push(CoreType::Creature);
+        source.color.push(ManaColor::Red);
+        state.objects.insert(ObjectId(50), source);
+        state.battlefield.push_back(ObjectId(50));
+
+        let mut target = GameObject::new(
+            ObjectId(60),
+            CardId(3),
+            PlayerId(1),
+            "Red Target".to_string(),
+            Zone::Battlefield,
+        );
+        target.card_types.core_types.push(CoreType::Creature);
+        target.color.push(ManaColor::Red);
+        state.objects.insert(ObjectId(60), target);
+        state.battlefield.push_back(ObjectId(60));
+
+        let registry = build_replacement_registry();
+        let matching_damage = ProposedEvent::Damage {
+            source_id: ObjectId(50),
+            target: TargetRef::Object(ObjectId(60)),
+            amount: 3,
+            is_combat: false,
+            applied: HashSet::new(),
+        };
+        assert!(
+            !find_applicable_replacements(&state, &matching_damage, &registry).is_empty(),
+            "same-color source and creature recipient should match"
+        );
+
+        state.objects.get_mut(&ObjectId(50)).unwrap().color = vec![ManaColor::Blue];
+        let different_color = ProposedEvent::Damage {
+            source_id: ObjectId(50),
+            target: TargetRef::Object(ObjectId(60)),
+            amount: 3,
+            is_combat: false,
+            applied: HashSet::new(),
+        };
+        assert!(
+            find_applicable_replacements(&state, &different_color, &registry).is_empty(),
+            "different-color source and recipient should not match"
+        );
+
+        let self_damage = ProposedEvent::Damage {
+            source_id: ObjectId(60),
+            target: TargetRef::Object(ObjectId(60)),
+            amount: 3,
+            is_combat: false,
+            applied: HashSet::new(),
+        };
+        assert!(
+            find_applicable_replacements(&state, &self_damage, &registry).is_empty(),
+            "the source must be distinct from the recipient"
         );
     }
 
@@ -18431,6 +18852,7 @@ mod tests {
             from: Zone::Hand,
             to: Zone::Battlefield,
             cause: None,
+            putter: None,
             attach_to: None,
             enter_tapped: EtbTapState::Unspecified,
             enters_attacking: false,
@@ -18479,6 +18901,7 @@ mod tests {
             from: Zone::Hand,
             to: Zone::Battlefield,
             cause: None,
+            putter: None,
             attach_to: None,
             enter_tapped: EtbTapState::Unspecified,
             enters_attacking: false,

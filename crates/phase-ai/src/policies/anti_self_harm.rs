@@ -183,7 +183,7 @@ fn cast_has_unpayable_self_etb_may_cost(ctx: &PolicyContext<'_>) -> bool {
             if replacement.event != ReplacementEvent::Moved {
                 return false;
             }
-            let ReplacementMode::MayCost { cost, decline } = &replacement.mode else {
+            let ReplacementMode::MayCost { cost, decline, .. } = &replacement.mode else {
                 return false;
             };
             decline
@@ -5893,6 +5893,7 @@ mod tests {
             .push(ReplacementDefinition::new(ReplacementEvent::Moved).mode(
                 ReplacementMode::MayCost {
                     cost,
+                    payment_record: None,
                     decline: Some(Box::new(decline)),
                 },
             ));

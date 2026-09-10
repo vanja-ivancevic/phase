@@ -43,7 +43,8 @@
 use std::collections::HashSet;
 
 use crate::types::ability::{
-    AbilityCost, EffectKind, TargetFilter, TypedFilter, REMOVE_COUNTER_COST_ALL,
+    AbilityCost, EffectKind, TargetFilter, TypedFilter, EXILE_COST_ANY_NUMBER,
+    REMOVE_COUNTER_COST_ALL,
 };
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
@@ -1238,7 +1239,8 @@ fn pay_ability_cost_inner(
         } if !matches!(filter, Some(TargetFilter::SelfRef))
             && matches!(scope, PaymentScope::Resolution { .. }) =>
         {
-            let count = *count as usize;
+            let any_number = *count == EXILE_COST_ANY_NUMBER;
+            let count = if any_number { 0 } else { *count as usize };
             let effective_zone = zone.unwrap_or(Zone::Graveyard);
             let eligible = find_eligible_exile_targets(
                 state,
@@ -1247,6 +1249,7 @@ fn pay_ability_cost_inner(
                 effective_zone,
                 filter.as_ref(),
             );
+            let count = if any_number { eligible.len() } else { count };
             if eligible.len() < count {
                 return Ok(payment_failed("not enough cards to exile"));
             }
@@ -1259,7 +1262,7 @@ fn pay_ability_cost_inner(
             // Forced-choice fast path: when the eligible set exactly
             // fills the requirement there is no choice to surface, so the
             // exile executes immediately.
-            if eligible.len() == count
+            if !any_number && eligible.len() == count
                 && matches!(
                     scope,
                     PaymentScope::Resolution {
@@ -1303,7 +1306,7 @@ fn pay_ability_cost_inner(
                     cards: eligible,
                     count,
                     min_count: 0,
-                    up_to: false,
+                    up_to: any_number,
                     source_id,
                     effect_kind: crate::types::ability::EffectKind::PayCost,
                     zone: effective_zone,
@@ -1348,7 +1351,7 @@ fn pay_ability_cost_inner(
         // A replacement on the resulting event can still require a player
         // choice, which parks the payment as `Paused` in the `PutCounter` arm
         // below.
-        AbilityCost::EffectCost { effect } => {
+        AbilityCost::EffectCost { effect, .. } => {
             use crate::types::ability::Effect;
             match effect.as_ref() {
                 Effect::PutCounter {
@@ -2173,7 +2176,7 @@ pub(crate) fn resolution_cost_includes_impossible_event(
             counter_kind,
             count,
         } => player_counter_gain_is_prohibited(state, payer, *counter_kind, *count),
-        AbilityCost::EffectCost { effect } => match effect.as_ref() {
+        AbilityCost::EffectCost { effect, .. } => match effect.as_ref() {
             // CR 614.17b + CR 702.24a: cumulative upkeep's source-counter effect-cost shape.
             Effect::PutCounter {
                 counter_type,
@@ -2336,6 +2339,11 @@ fn can_pay_resolution(
             filter,
             ..
         } if !matches!(filter, Some(TargetFilter::SelfRef)) => {
+            // CR 107.1c: zero is a legal choice for "any number", so this
+            // cost never fails the resolution-time resource pre-gate.
+            if *count == EXILE_COST_ANY_NUMBER {
+                return true;
+            }
             let count = *count as usize;
             let effective_zone = zone.unwrap_or(Zone::Graveyard);
             let eligible = find_eligible_exile_targets(
@@ -2601,6 +2609,7 @@ mod tests {
                     count: QuantityExpr::Fixed { value: 1 },
                     target: TargetFilter::SelfRef,
                 }),
+                player_scope: None,
             },
             AbilityCost::PerCounter { .. } => AbilityCost::PerCounter {
                 counter: CounterType::Age,
@@ -2720,6 +2729,7 @@ mod tests {
                     count: QuantityExpr::Fixed { value: 1 },
                     target: TargetFilter::SelfRef,
                 }),
+                player_scope: None,
             },
             AbilityCost::PerCounter {
                 counter: CounterType::Age,
@@ -3774,6 +3784,7 @@ mod tests {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::SelfRef,
             }),
+            player_scope: None,
         };
 
         // (i) Reach guard: the same cost on the same board is payable before the

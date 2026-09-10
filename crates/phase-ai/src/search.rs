@@ -1779,6 +1779,11 @@ pub fn fallback_action(
         WaitingFor::RepeatDecision { .. } => {
             Some(GameAction::DecideOptionalEffect { accept: false })
         }
+        // CR 701.20e: decline the next paid library look in the fallback path;
+        // the candidate generator still explores accepting it.
+        WaitingFor::RepeatPaidLibraryLookPayment { .. } => {
+            Some(GameAction::DecideOptionalEffect { accept: false })
+        }
 
         // Learn: skip.
         WaitingFor::LearnChoice { .. } => Some(GameAction::LearnDecision {
@@ -1789,6 +1794,12 @@ pub fn fallback_action(
         WaitingFor::TopOrBottomChoice { .. } | WaitingFor::ClashCardPlacement { .. } => {
             Some(GameAction::ChooseTopOrBottom { top: true })
         }
+        // CR 401.2 + CR 701.20e: the reorder prompt requires a complete
+        // permutation. Preserve the engine-provided card set as the
+        // deterministic fallback; tactical candidates may choose another order.
+        WaitingFor::ReorderLibraryChoice { cards, .. } => Some(GameAction::SelectCards {
+            cards: cards.clone(),
+        }),
 
         // CR 702.140c + CR 730.2a: mutate merge side — default to placing the
         // mutating spell on top (the candidate generator still explores bottom).
@@ -7802,6 +7813,8 @@ mod tests {
                     StaticDefinition::new(engine::types::statics::StaticMode::CastFromHandFree {
                         frequency: engine::types::statics::CastFrequency::Unlimited,
                         origin: engine::types::statics::CastFreeOrigin::Hand,
+                        all_players: false,
+                        grants_flash: false,
                     })
                     .affected(TargetFilter::Any),
                 );

@@ -1086,6 +1086,7 @@ mod tests {
     fn fight_cost() -> AbilityCost {
         AbilityCost::EffectCost {
             effect: Box::new(fight_effect()),
+            player_scope: None,
         }
     }
 
@@ -1683,6 +1684,7 @@ mod tests {
                 AbilityKind::Spell,
                 Effect::CreateDrawReplacement {
                     replacement_effect: Box::new(fight_effect()),
+                    replacement_sub_ability: None,
                 },
             ),
         ));
@@ -1785,6 +1787,7 @@ mod tests {
         let mut repl_maycost_cost = ReplacementDefinition::new(ReplacementEvent::ChangeZone);
         repl_maycost_cost.mode = ReplacementMode::MayCost {
             cost: fight_cost(),
+            payment_record: None,
             decline: None,
         };
         cases.push((
@@ -1801,6 +1804,7 @@ mod tests {
         let mut repl_maycost_decline = ReplacementDefinition::new(ReplacementEvent::ChangeZone);
         repl_maycost_decline.mode = ReplacementMode::MayCost {
             cost: AbilityCost::Tap,
+            payment_record: None,
             decline: Some(Box::new(fight_def())),
         };
         cases.push((

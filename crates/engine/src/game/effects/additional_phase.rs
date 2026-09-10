@@ -309,6 +309,7 @@ mod tests {
             copy_count_status: crate::types::ability::CopyCountStatus::Pending,
             forward_result: false,
             unless_pay: None,
+            unless_was_cumulative_upkeep: false,
             distribution: None,
             distribute: None,
             target_selection_mode: crate::types::ability::TargetSelectionMode::Chosen,

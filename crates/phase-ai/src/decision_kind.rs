@@ -224,7 +224,9 @@ pub fn classify(waiting_for: &WaitingFor, action: &GameAction) -> DecisionKind {
         | WaitingFor::RespondToShortcut { .. }
         | WaitingFor::PrecastCopyShortcutOffer { .. }
         | WaitingFor::RespondToPrecastCopyShortcut { .. }
-        | WaitingFor::EntryControllerChoice { .. } => DecisionKind::ActivateAbility,
+        | WaitingFor::EntryControllerChoice { .. }
+        | WaitingFor::RepeatPaidLibraryLookPayment { .. }
+        | WaitingFor::ReorderLibraryChoice { .. } => DecisionKind::ActivateAbility,
     }
 }
 

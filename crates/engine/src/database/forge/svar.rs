@@ -4,6 +4,7 @@ use crate::types::ability::{
     AbilityDefinition, AbilityKind, PlayerScope, QuantityExpr, QuantityRef, RoundingMode,
     TargetFilter,
 };
+use crate::types::counter::parse_counter_type;
 
 use super::effect::translate_effect;
 use super::filter::translate_filter;
@@ -184,7 +185,7 @@ impl<'a> SvarResolver<'a> {
                 Ok(QuantityExpr::Ref {
                     qty: QuantityRef::CountersOn {
                         scope: crate::types::ability::ObjectScope::Source,
-                        counter_type: Some(counter_type),
+                        counter_type: Some(parse_counter_type(&counter_type)),
                     },
                 })
             }

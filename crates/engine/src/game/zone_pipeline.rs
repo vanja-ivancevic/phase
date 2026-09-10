@@ -192,6 +192,9 @@ pub struct ZoneMoveRequest {
     pub object_id: ObjectId,
     pub to: Zone,
     pub cause: ZoneChangeCause,
+    /// CR 110.2a + CR 305.1: player who performed the put action, if known.
+    /// This remains separate from the entrant's resulting controller.
+    pub putter: Option<PlayerId>,
     pub mods: EntryMods,
     /// Library placement; `None` = zone default. Reuses the existing
     /// `LibraryPosition` enum (`move_to_library_position` is its documented
@@ -238,6 +241,7 @@ impl ZoneMoveRequest {
             object_id: self.object_id,
             destination: self.to,
             cause,
+            putter: self.putter,
             enter_tapped: self.mods.enter_tapped,
             enters_attacking: self.mods.enters_attacking,
             enter_transformed: self.mods.enter_transformed,
@@ -283,6 +287,7 @@ impl ZoneMoveRequest {
             object_id: pending.object_id,
             to: pending.destination,
             cause,
+            putter: pending.putter,
             mods: EntryMods {
                 enter_tapped: pending.enter_tapped,
                 enters_attacking: pending.enters_attacking,
@@ -310,6 +315,7 @@ impl ZoneMoveRequest {
             object_id,
             to,
             cause: ZoneChangeCause::Effect { source },
+            putter: None,
             mods: EntryMods::default(),
             placement: None,
             exile_links: ExileLinkSpec::default(),
@@ -324,6 +330,7 @@ impl ZoneMoveRequest {
             object_id,
             to,
             cause: ZoneChangeCause::Cost { source },
+            putter: None,
             mods: EntryMods::default(),
             placement: None,
             exile_links: ExileLinkSpec::default(),
@@ -342,6 +349,7 @@ impl ZoneMoveRequest {
             object_id,
             to,
             cause: ZoneChangeCause::SpellResolutionDefault,
+            putter: None,
             mods: EntryMods::default(),
             placement: None,
             exile_links: ExileLinkSpec::default(),
@@ -356,6 +364,7 @@ impl ZoneMoveRequest {
             object_id,
             to,
             cause: ZoneChangeCause::StateBasedAction,
+            putter: None,
             mods: EntryMods::default(),
             placement: None,
             exile_links: ExileLinkSpec::default(),
@@ -380,6 +389,7 @@ impl ZoneMoveRequest {
             cause: ZoneChangeCause::Draw {
                 seed_applied: seed_applied.clone(),
             },
+            putter: None,
             mods: EntryMods::default(),
             placement: None,
             exile_links: ExileLinkSpec::default(),
@@ -395,6 +405,7 @@ impl ZoneMoveRequest {
             object_id,
             to: Zone::Stack,
             cause: ZoneChangeCause::CastingToStack { source },
+            putter: None,
             mods: EntryMods::default(),
             placement: None,
             exile_links: ExileLinkSpec::default(),
@@ -412,6 +423,7 @@ impl ZoneMoveRequest {
             object_id,
             to,
             cause: ZoneChangeCause::PregameProcedure,
+            putter: None,
             mods: EntryMods::default(),
             placement: None,
             exile_links: ExileLinkSpec::default(),
@@ -427,6 +439,7 @@ impl ZoneMoveRequest {
             object_id,
             to,
             cause: ZoneChangeCause::PlayerLeftGame,
+            putter: None,
             mods: EntryMods::default(),
             placement: None,
             exile_links: ExileLinkSpec::default(),
@@ -444,6 +457,7 @@ impl ZoneMoveRequest {
             object_id,
             to,
             cause: ZoneChangeCause::MergedComponentRouting,
+            putter: None,
             mods: EntryMods::default(),
             placement: None,
             exile_links: ExileLinkSpec::default(),
@@ -458,6 +472,7 @@ impl ZoneMoveRequest {
             object_id,
             to,
             cause: ZoneChangeCause::DebugCommand,
+            putter: None,
             mods: EntryMods::default(),
             placement: None,
             exile_links: ExileLinkSpec::default(),
@@ -854,11 +869,13 @@ pub(crate) fn move_object_with_terminal(
             let mut proposed =
                 ProposedEvent::zone_change(req.object_id, from_zone, Zone::Library, source_id);
             if let ProposedEvent::ZoneChange {
+                putter,
                 applied,
                 chain_referent,
                 ..
             } = &mut proposed
             {
+                *putter = req.putter;
                 *chain_referent = req.mods.chain_referent;
                 *applied = req.replacement_applied.clone();
             }
@@ -934,11 +951,13 @@ pub(crate) fn move_object_with_terminal(
     if let ZoneChangeCause::Draw { seed_applied } = req.cause {
         let mut proposed = ProposedEvent::zone_change(req.object_id, from_zone, req.to, source_id);
         if let ProposedEvent::ZoneChange {
+            putter,
             applied,
             chain_referent,
             ..
         } = &mut proposed
         {
+            *putter = req.putter;
             *chain_referent = req.mods.chain_referent;
             *applied = req.replacement_applied;
             applied.extend(seed_applied);
@@ -1027,6 +1046,7 @@ pub(crate) fn move_object_with_terminal(
         }
         let mut proposed = ProposedEvent::zone_change(req.object_id, from_zone, req.to, source_id);
         if let ProposedEvent::ZoneChange {
+            putter,
             enter_transformed,
             enter_tapped,
             enters_attacking,
@@ -1038,6 +1058,7 @@ pub(crate) fn move_object_with_terminal(
             ..
         } = &mut proposed
         {
+            *putter = req.putter;
             *enter_transformed = req.mods.enter_transformed;
             if !req.mods.enter_tapped.is_unspecified() {
                 *enter_tapped = req.mods.enter_tapped;
@@ -1467,6 +1488,7 @@ fn anticipated_zone_change_delivery(
     let mut expected_event =
         ProposedEvent::zone_change(request.object_id, object.zone, request.to, request.source());
     if let ProposedEvent::ZoneChange {
+        putter,
         enter_tapped,
         enters_attacking,
         enter_transformed,
@@ -1479,6 +1501,7 @@ fn anticipated_zone_change_delivery(
         ..
     } = &mut expected_event
     {
+        *putter = request.putter;
         *enter_tapped = request.mods.enter_tapped;
         *enters_attacking = request.mods.enters_attacking;
         *enter_transformed = request.mods.enter_transformed;
@@ -3371,6 +3394,7 @@ pub(crate) fn deliver_replaced_zone_change(
         from,
         to,
         cause,
+        putter,
         attach_to,
         enter_transformed: should_transform,
         enter_tapped: should_tap,
@@ -3562,6 +3586,7 @@ pub(crate) fn deliver_replaced_zone_change(
         // redundant check below skip re-marking `Full`. `false` for both the
         // library-placement branch and the merge-survivor branch, neither of
         // which is analyzed by that carve-out.
+        let zone_event_start = events.len();
         let took_plain_zone_transfer;
         match (to, library_placement.as_ref()) {
             (Zone::Library, Some(position)) => {
@@ -3622,6 +3647,28 @@ pub(crate) fn deliver_replaced_zone_change(
         // unrelated move. Purely synchronous lifetime (set → consumed → cleared in
         // this one delivery), so it never crosses a pause.
         state.merged_card_component_route = None;
+        // CR 109.5: a zone-change trigger that says a spell or ability "causes"
+        // this move must read the source captured by the accepted delivery, not
+        // infer one from the moved object's later incarnation. Restrict the stamp
+        // to this delivery's event slice so repeated moves of one ObjectId cannot
+        // rebind an earlier record.
+        zones::stamp_zone_change_cause(
+            state,
+            &mut events[zone_event_start..],
+            object_id,
+            cause.or(source_id),
+        );
+        // CR 110.2a + CR 305.1: retain the player who performed the put
+        // action separately from the entrant's resulting controller. This
+        // stamp is scoped to this delivery for the same reason as the causal
+        // source stamp: repeated moves of one ObjectId must not rebind an
+        // earlier event.
+        zones::stamp_zone_change_putter(
+            state,
+            &mut events[zone_event_start..],
+            object_id,
+            putter,
+        );
         // CR 614.1d: determine whether the object actually entered the battlefield.
         // `move_to_zone` rejects a battlefield entry without moving the object when
         // a `CantEnterBattlefieldFrom` static (e.g. Grafdigger's Cage) matches, so
@@ -3631,6 +3678,28 @@ pub(crate) fn deliver_replaced_zone_change(
                 .objects
                 .get(&object_id)
                 .is_some_and(|obj| obj.zone == Zone::Battlefield);
+        // CR 614.12 + CR 400.7: The amount was chosen before the zone change,
+        // while `reset_for_battlefield_entry` creates the new object and clears
+        // old entry history. Bind it immediately after that reset and before any
+        // ETB trigger can observe the permanent. A redirected/blocked entry
+        // consumes the pending record without transferring stale history.
+        if state
+            .pending_entry_life_payment
+            .as_ref()
+            .is_some_and(|payment| payment.object_id == object_id)
+        {
+            let payment = state
+                .pending_entry_life_payment
+                .take()
+                .expect("entry payment was checked above");
+            if entered_battlefield {
+                if let (Some(amount), Some(object)) =
+                    (payment.amount, state.objects.get_mut(&object_id))
+                {
+                    object.entry_life_paid = amount;
+                }
+            }
+        }
         // CR 701.9a + CR 614.1: The inner move has now completed with its
         // final replacement-selected destination. Append one operation-owned
         // result exactly once; a prevented move never reaches this delivery.
@@ -4222,11 +4291,17 @@ fn execute_zone_move_with_applied_terminal(
     }
     let mut proposed = ProposedEvent::zone_change(obj_id, from_zone, dest_zone, Some(source_id));
     if let ProposedEvent::ZoneChange {
+        putter,
         applied,
         chain_referent: ref mut intent,
         ..
     } = &mut proposed
     {
+        // ChangeZone's `exile_controller` parameter is the already-resolved
+        // acting player (`ability.controller`) at every production call site;
+        // raw movers pass `None`. Keep that actor provenance on the proposed
+        // event rather than inferring it from the resulting controller.
+        *putter = exile_controller;
         *applied = replacement_applied;
         *intent = chain_referent;
     }
@@ -6408,5 +6483,56 @@ mod face_down_entry_referent_tests {
                 "the characteristics helper must not touch the referent slot (zone {zone:?})"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod zone_causation_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::identifiers::CardId;
+
+    /// CR 109.5 + CR 603.2: the causal spell/ability identity belongs to the
+    /// exact zone-change event, not to the moved object's post-move state.
+    #[test]
+    fn effect_zone_move_stamps_its_zone_change_record_with_source() {
+        let mut state = GameState::new_two_player(7);
+        let land = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Test Land".to_string(),
+            Zone::Battlefield,
+        );
+        let source = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Opponent Spell".to_string(),
+            Zone::Battlefield,
+        );
+        let mut events = Vec::new();
+
+        assert!(matches!(
+            move_object(
+                &mut state,
+                ZoneMoveRequest::effect(land, Zone::Graveyard, source),
+                &mut events,
+            ),
+            ZoneMoveResult::Done
+        ));
+
+        let record = events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    object_id,
+                    record,
+                    ..
+                } if *object_id == land => Some(record),
+                _ => None,
+            })
+            .expect("effect move must emit a zone-change record");
+        assert_eq!(record.cause_source_id(), Some(source));
     }
 }

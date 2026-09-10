@@ -16,10 +16,11 @@ use super::lower::BOUNDED_TARGET_CARDINALITIES;
 use super::{resolve_it_pronoun, ParseContext};
 use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, ChosenSubtypeKind, ColorChangeMode, ContinuousModification,
-    ControllerRef, Duration, EachDamageRecipient, Effect, EffectScope, FilterProp, MultiTargetSpec,
-    ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr, QuantityRef, StaticCondition,
-    StaticDefinition, TargetFilter, TypedFilter,
+    AbilityDefinition, AbilityKind, AggregateFunction, ChoiceType, ChosenSubtypeKind,
+    ColorChangeMode, ContinuousModification, ControllerRef, Duration, EachDamageRecipient, Effect,
+    EffectScope, FilterProp, MultiTargetSpec, ObjectScope, PlayerFilter, PlayerRelation,
+    PlayerScope, PtValue, QuantityExpr, QuantityRef, StaticCondition, StaticDefinition,
+    TargetFilter, TargetSelectionMode, TypedFilter,
 };
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
@@ -362,7 +363,14 @@ fn extract_subject_text(text: &str) -> Option<String> {
     // by `subject_predicate_ast_from_clause` matches the one parsed inside
     // `try_parse_subject_continuous_clause`. Without this the AST subject falls
     // back to `TargetFilter::Any` (broadcasting the grant to every permanent).
-    let subject = strip_trailing_additive_adverb(text[..verb_start].trim());
+    // CR 608.2c + CR 608.2f: manner adverbs such as "simultaneously" sit
+    // between an anaphoric subject and its predicate (Goblin Welder: "that
+    // player simultaneously sacrifices the artifact"). They modify how the
+    // instruction is performed, not which player is affected. Keep them out of
+    // the subject phrase so the ordinary player-anaphor resolver can bind it;
+    // the imperative parser still receives the full predicate and therefore
+    // retains the simultaneous-action semantics where supported.
+    let subject = strip_trailing_subject_adverb(text[..verb_start].trim());
     if subject.is_empty() {
         None
     } else {
@@ -2720,6 +2728,21 @@ pub(super) fn parse_subject_application(
     {
         return subject_filter_application(TargetFilter::AllPlayers, false);
     }
+    // CR 205.3i + CR 608.2d: Vision Charm's paired land-type mode applies to
+    // every land whose subtype matches the first selected land type. Keep this
+    // as a typed subject predicate so the existing continuous-effect lowering
+    // can reuse its normal layer-4 and duration machinery.
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "each land of the first chosen type",
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        return subject_filter_application(
+            TargetFilter::Typed(TypedFilter::land().properties(vec![FilterProp::IsChosenLandType])),
+            false,
+        );
+    }
     if let Ok((rest_lower, _)) =
         alt((tag::<_, _, OracleError<'_>>("all "), tag("each "))).parse(lower.as_str())
     {
@@ -2850,6 +2873,31 @@ pub(super) fn parse_subject_application(
         if rest.trim().is_empty() && matches!(neighbor_filter, TargetFilter::Neighbor { .. }) {
             return subject_filter_application(neighbor_filter, false);
         }
+    }
+    // CR 119.1 + CR 603.2: Wild Dogs/Ghazban Ogre — the intervening-if
+    // condition establishes a unique maximum, then the player with that life
+    // total receives control of the source. Keep the recipient as a dynamic
+    // PlayerMatching filter so GiveControl resolves the current maximum at
+    // resolution rather than collapsing it to the controller or an opponent.
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "the player with the most life",
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        let player = super::player_with_most_life_filter(
+            PlayerRelation::All,
+            PlayerScope::AllPlayers {
+                aggregate: AggregateFunction::Max,
+                exclude: None,
+            },
+        );
+        return subject_filter_application(
+            TargetFilter::PlayerMatching {
+                player: Box::new(player),
+            },
+            false,
+        );
     }
     // CR 608.2c + CR 117.3a: "that player" / "the player" as subject,
     // optionally carrying a "may" modal ("that player may pay {2}").
@@ -4257,6 +4305,18 @@ fn build_continuous_clause(
         return Some(clause);
     }
 
+    // CR 608.2d + CR 613.1f: "target creature loses first strike or
+    // swampwalk until end of turn" (Urborg) is a resolving keyword choice,
+    // not a pair of simultaneous RemoveKeyword modifications.  The source
+    // must retain the selected keyword so the downstream Layer-6
+    // `RemoveChosenKeyword` modification can remove exactly that ability from
+    // the targeted creature.  Keep this beside the additive keyword-choice
+    // builder so both modal keyword directions share the same typed option
+    // grammar and target binding.
+    if let Some(clause) = build_keyword_choice_loss_clause(&application, &normalized) {
+        return Some(clause);
+    }
+
     // Strip "where X is..." and "for each..." suffixes before extracting duration,
     // so "until end of turn" is found even when followed by these clauses.
     // The full normalized text is still passed to parse_continuous_modifications
@@ -4411,6 +4471,68 @@ fn build_continuous_clause(
         sub_ability: None,
         distribute: None,
         multi_target: None,
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    })
+}
+
+/// CR 608.2d + CR 613.1f: Build the "lose X or Y" keyword-choice class.
+///
+/// The wording is an ordinary subject predicate, so `application.target`
+/// already owns the declared target slot.  The choice itself resolves first;
+/// its sub-ability installs a transient static on that target, reading the
+/// typed keyword persisted on the source by `Effect::Choose`.
+fn build_keyword_choice_loss_clause(
+    application: &SubjectApplication,
+    predicate: &str,
+) -> Option<ParsedEffectClause> {
+    let (predicate_without_duration, duration) = super::strip_trailing_duration(predicate);
+    let lower = predicate_without_duration.to_lowercase();
+    let (choice_text, _) = tag::<_, _, OracleError<'_>>("lose ")
+        .parse(lower.as_str())
+        .ok()?;
+    // A conjunction names every keyword to remove. Only the disjunctive
+    // wording presents a one-of choice (CR 608.2d); routing "lose X and Y"
+    // through the chooser would remove neither fixed keyword unless a player
+    // happened to select an option that was never offered.
+    if !choice_text.contains(" or ") {
+        return None;
+    }
+    let items = super::split_choice_list_items(choice_text.trim())?;
+    if items.len() < 2 {
+        return None;
+    }
+    let options = items
+        .into_iter()
+        .map(parse_granted_keyword_fragment)
+        .collect::<Option<Vec<Keyword>>>()?;
+
+    let duration = duration.or(Some(Duration::UntilEndOfTurn));
+    let affected = static_affected_for_application(application);
+    let apply_effect = Effect::GenericEffect {
+        static_abilities: vec![StaticDefinition::continuous()
+            .affected(affected)
+            .modifications(vec![ContinuousModification::RemoveChosenKeyword])
+            .description(predicate.to_string())],
+        duration: duration.clone(),
+        target: application.target.clone(),
+        end_cost: None,
+    };
+
+    Some(ParsedEffectClause {
+        effect: Effect::Choose {
+            choice_type: ChoiceType::Keyword { options, count: 1 },
+            persist: true,
+            selection: TargetSelectionMode::Chosen,
+        },
+        duration: duration.clone(),
+        sub_ability: Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            apply_effect,
+        ))),
+        distribute: None,
+        multi_target: application.multi_target.clone(),
         condition: None,
         optional: false,
         unless_pay: None,
@@ -4706,6 +4828,34 @@ fn build_become_clause(
     // Must intercept before parse_animation_spec which produces AddSubtype("Night"/"Day").
     if let Some(clause) = try_parse_set_day_night(become_text) {
         return Some(clause);
+    }
+
+    // CR 205.3i + CR 305.7 + CR 608.2d: "becomes the second chosen type"
+    // consumes the second value from a preceding paired land-type choice.  The
+    // source's `ChosenAttribute::BasicLandType` is read by the existing
+    // `SetChosenBasicLandType` layer-4 modification, so this adds no new runtime
+    // effect or card-specific resolver path.
+    if become_text.eq_ignore_ascii_case("the second chosen type") {
+        let affected = static_affected_for_application(&application);
+        let effect = Effect::GenericEffect {
+            static_abilities: vec![StaticDefinition::continuous()
+                .affected(affected)
+                .modifications(vec![ContinuousModification::SetChosenBasicLandType])
+                .description(become_text.to_string())],
+            duration: duration.clone(),
+            target: application.target.clone(),
+            end_cost: None,
+        };
+        return Some(ParsedEffectClause {
+            effect,
+            duration,
+            sub_ability: None,
+            distribute: None,
+            multi_target: None,
+            condition: None,
+            optional: false,
+            unless_pay: None,
+        });
     }
 
     // CR 205.3 / CR 305.7: "become the [type] of your choice" — player chooses a subtype.
@@ -6913,6 +7063,7 @@ pub(crate) fn starts_with_subject_prefix(lower: &str) -> bool {
             // controller of the creature that dealt combat damage. Longest-match
             // before the bare "the player " arm.
             value((), tag("the attacking player ")),
+            value((), tag("the player with the most life ")),
             value((), tag("the player ")),
             // CR 609.7 + CR 615.5: "the source's controller" / "the source's
             // owner" as a subject in a damage-prevention follow-up (Swans of
@@ -7060,6 +7211,25 @@ fn strip_trailing_additive_adverb(subject: &str) -> &str {
     }
 }
 
+/// CR 608.2c + CR 608.2f: remove a manner adverb that is interposed between a
+/// subject and its predicate. Oracle text occasionally places "simultaneously"
+/// there ("that player simultaneously sacrifices …"). It is not part of the
+/// subject's identity, so retaining it makes an otherwise bindable anaphor look
+/// like an unknown subject. This helper is deliberately an end-anchored
+/// allowlist; unrelated words remain untouched and fail closed.
+fn strip_trailing_subject_adverb(subject: &str) -> &str {
+    let lower = subject.to_lowercase();
+    let subject = match lower
+        .strip_suffix(" simultaneously")
+        .map(str::len)
+        .filter(|len| !subject[..*len].trim_end().is_empty())
+    {
+        Some(head_len) => subject[..head_len].trim_end(),
+        None => subject,
+    };
+    strip_trailing_additive_adverb(subject)
+}
+
 fn is_restriction_predicate_verb(token: &str) -> bool {
     // CR 613.1d: "isn't"/"aren't" head a layer-4 type-removal predicate ("~ isn't
     // a creature until end of turn", Blink's Alien Angel token). Recognizing the
@@ -7129,6 +7299,30 @@ mod tests {
     };
     use crate::types::card_type::{CoreType, Supertype};
     use crate::types::statics::BlockExceptionKind;
+
+    #[test]
+    fn keyword_choice_loss_builder_handles_urborg_predicate() {
+        let application =
+            parse_subject_application("target creature", &mut ParseContext::default())
+                .expect("target creature should bind");
+        let clause = build_continuous_clause(
+            application,
+            "loses first strike or swampwalk until end of turn",
+            &ParseContext::default(),
+        )
+        .expect("Urborg loss predicate should lower");
+        assert!(matches!(
+            clause.effect,
+            Effect::Choose {
+                choice_type: ChoiceType::Keyword { options, count: 1 },
+                persist: true,
+                ..
+            } if options == [
+                Keyword::FirstStrike,
+                Keyword::Landwalk("Swamp".to_string())
+            ]
+        ));
+    }
 
     #[test]
     fn they_ignores_controllerless_empty_typed_target_slot() {
@@ -8202,6 +8396,55 @@ mod tests {
         );
         // Bare "also" has no filter to grant against → not stripped to empty.
         assert_eq!(strip_trailing_additive_adverb("also"), "also");
+    }
+
+    /// CR 608.2c + CR 608.2f: an interposed manner adverb belongs to the
+    /// instruction, not to the subject. Goblin Welder's "that player
+    /// simultaneously sacrifices the artifact" must therefore bind the player
+    /// anaphor exactly as the same sentence without "simultaneously" would.
+    #[test]
+    fn interposed_simultaneously_does_not_break_player_anaphor() {
+        assert_eq!(
+            extract_subject_text("that player simultaneously sacrifices the artifact"),
+            Some("that player".to_string())
+        );
+        assert_eq!(
+            strip_trailing_subject_adverb("that player SIMULTANEOUSLY"),
+            "that player"
+        );
+        assert_eq!(strip_trailing_subject_adverb("that player"), "that player");
+
+        let def = super::super::parse_effect_chain(
+            "Choose target artifact a player controls and target artifact card in that player's graveyard. If both targets are still legal as this ability resolves, that player simultaneously sacrifices the artifact and returns the artifact card to the battlefield.",
+            AbilityKind::Activated,
+        );
+        fn collect<'a>(def: &'a AbilityDefinition, out: &mut Vec<&'a Effect>) {
+            out.push(&def.effect);
+            if let Some(sub) = &def.sub_ability {
+                collect(sub, out);
+            }
+            if let Some(else_ability) = &def.else_ability {
+                collect(else_ability, out);
+            }
+        }
+        let mut effects = Vec::new();
+        collect(&def, &mut effects);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Unimplemented { .. })),
+            "Goblin Welder's simultaneous sacrifice must be parsed, got {effects:#?}"
+        );
+        assert!(
+            effects.iter().any(|effect| matches!(
+                effect,
+                Effect::Sacrifice {
+                    target: TargetFilter::ParentTargetSlot { index: 0 },
+                    ..
+                }
+            )),
+            "the sacrifice must use the first declared target slot, got {effects:#?}"
+        );
     }
 
     /// CR 509.1c (issue #4233): "Each creature your opponents control blocks this

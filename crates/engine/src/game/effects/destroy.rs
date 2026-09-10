@@ -47,8 +47,25 @@ pub fn apply_destroy_after_replacement(
                     // to the battlefield (e.g. "would die → return tapped/with
                     // counters") gets the same enter_tapped / enter_with_counters /
                     // ETB-counter-static treatment as any other entry.
+                    // CR 701.8a: a replacement that redirects the destruction
+                    // away from the graveyard means the permanent was not
+                    // destroyed. Keep the semantic Destroyed event honest for
+                    // Karmic Justice-class triggers.
+                    let was_destroyed = matches!(
+                        &zone_event,
+                        ProposedEvent::ZoneChange {
+                            to: Zone::Graveyard,
+                            ..
+                        }
+                    );
                     if !deliver_destruction_zone_change(state, zone_event, source, events) {
                         return false;
+                    }
+                    if was_destroyed {
+                        events.push(GameEvent::CreatureDestroyed {
+                            object_id,
+                            source_id: source,
+                        });
                     }
                 }
                 ReplacementResult::Prevented => {}
@@ -57,7 +74,6 @@ pub fn apply_destroy_after_replacement(
                     return false;
                 }
             }
-            events.push(GameEvent::CreatureDestroyed { object_id });
             true
         }
         ProposedEvent::ZoneChange { .. } => {
@@ -855,9 +871,13 @@ mod tests {
 
         resolve(&mut state, &ability, &mut events).unwrap();
 
-        assert!(events.iter().any(
-            |e| matches!(e, GameEvent::CreatureDestroyed { object_id } if *object_id == obj_id)
-        ));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            GameEvent::CreatureDestroyed {
+                object_id,
+                source_id: Some(source_id),
+            } if *object_id == obj_id && *source_id == ObjectId(100)
+        )));
     }
 
     #[test]

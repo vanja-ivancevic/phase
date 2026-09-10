@@ -285,6 +285,7 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         sibling_condition: _,            // SiblingCondition replication marker, no dynamic read
         distribute: _, // announcement unit tag/string, no resolution-time dynamic read
         parent_target_missing_reason: _, // seam flag
+        unless_was_cumulative_upkeep: _, // unless-payment discriminator, read in engine_payment_choices
     } = a;
 
     let mut acc = scan_effect(effect, mode);
@@ -370,11 +371,13 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
 }
 
 /// CR 608.2c / CR 107.1c: a loop-continuation predicate. Only `WhileCondition`
-/// re-reads game state (per-iteration re-evaluation); the controller-prompted and
-/// boolean-stop variants read no dynamic resource.
+/// re-reads game state (per-iteration re-evaluation); a player-bound prompt
+/// reads only its controller reference, while boolean-stop variants read no
+/// dynamic resource.
 fn scan_repeat_continuation(r: &RepeatContinuation, mode: ScanMode) -> Axes {
     match r {
         RepeatContinuation::ControllerChoice => Axes::NONE,
+        RepeatContinuation::PlayerChoice { player } => scan_controller_ref(player),
         RepeatContinuation::UntilStopConditions {
             stop_on_put_to_hand: _,
             stop_on_duplicate_exiled_names: _,
@@ -674,6 +677,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             }
             acc
         }
+        Effect::LoseAllUnspentMana { player } => scan_target_filter(player, target_ctx, mode),
         Effect::SetTapState {
             target,
             scope: _,
@@ -1429,9 +1433,15 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc
         }
         Effect::CreateDamageReplacement { .. } => Axes::CONSERVATIVE,
-        Effect::CreateDrawReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_effect(replacement_effect, mode));
+            if let Some(sub) = replacement_sub_ability {
+                acc = acc.or(ability_definition_axes(sub, mode));
+            }
             acc
         }
         Effect::LoseTheGame { target } => {
@@ -1953,6 +1963,8 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
         Effect::RedistributeLifeTotals => Axes::NONE,
         Effect::ReverseTurnOrder => Axes::NONE,
         Effect::ChooseOneOf { .. } => Axes::CONSERVATIVE,
+        Effect::RevealChosenLowestManaValueCreatures => Axes::NONE,
+        Effect::RepeatPaidLibraryLook => Axes::NONE,
         Effect::Unimplemented {
             name: _,
             description: _,
@@ -2013,6 +2025,7 @@ fn scan_property_aggregate_source(source: &CardTypeSetSource, mode: ScanMode) ->
 
 fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
     match x {
+        QuantityRef::EntryLifePaid => Axes::NONE,
         QuantityRef::HandSize { player, .. } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_player_scope(player));
@@ -2110,6 +2123,11 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
             acc = acc.or(scan_player_filter(filter, mode));
             acc
         }
+        QuantityRef::TokenSourceCounters { .. } => Axes {
+            event: false,
+            sibling: true,
+            projected: false,
+        },
         QuantityRef::CountersOn { scope, .. } => {
             let mut acc = Axes {
                 event: false,
@@ -2321,6 +2339,7 @@ fn scan_quantity_ref(x: &QuantityRef, mode: ScanMode) -> Axes {
             channel: _,
             aggregate: _,
         } => Axes::NONE,
+        QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue => Axes::NONE,
         QuantityRef::PreviousEffectCount => Axes::NONE,
         QuantityRef::LifeLostThisTurn { player } => {
             let mut acc = Axes {
@@ -3568,6 +3587,16 @@ fn scan_trigger_constraint(x: &TriggerConstraint, mode: ScanMode) -> Axes {
         | TriggerConstraint::AtClassLevel { level: _ }
         | TriggerConstraint::MaxTimesPerTurn { max: _ }
         | TriggerConstraint::OncePerOpponentPerTurn => Axes::NONE,
+        // CR 110.2a + CR 305.1: this gate reads event-owned actor provenance.
+        TriggerConstraint::ZoneChangePutterPresent => Axes {
+            event: true,
+            sibling: false,
+            projected: false,
+        },
+        TriggerConstraint::All { constraints } => constraints
+            .iter()
+            .map(|constraint| scan_trigger_constraint(constraint, mode))
+            .fold(Axes::NONE, Axes::or),
     }
 }
 
@@ -3612,13 +3641,13 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
             acc = acc.or(scan_player_filter(player, mode));
             acc
         }
-        TriggerCondition::SourceEnteredThisTurn | TriggerCondition::SourceAttackedThisCombat => {
-            Axes {
-                event: false,
-                sibling: false,
-                projected: true,
-            }
-        }
+        TriggerCondition::SourceEnteredThisTurn
+        | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAttackedOrBlockedThisCombat => Axes {
+            event: false,
+            sibling: false,
+            projected: true,
+        },
         TriggerCondition::EchoDue => Axes::NONE,
         TriggerCondition::MinCoAttackers { filter, minimum: _ } => {
             let mut acc = Axes::NONE;
@@ -3659,7 +3688,8 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
         TriggerCondition::SourceIsAttacking => Axes::NONE,
         TriggerCondition::CastVariantPaid { variant: _ } => Axes::NONE,
         TriggerCondition::CastVariantPaidPersistent { variant: _ } => Axes::NONE,
-        TriggerCondition::ActivatedAbilityIsNonMana => Axes::NONE,
+        TriggerCondition::ActivatedAbilityIsNonMana
+        | TriggerCondition::SourceAbilityAddedManaThisTurn => Axes::NONE,
         TriggerCondition::DealtDamageBySourceThisTurn => Axes {
             event: false,
             sibling: false,
@@ -3777,7 +3807,8 @@ fn scan_trigger_condition(x: &TriggerCondition, mode: ScanMode) -> Axes {
         TriggerCondition::SourceIsTransformed => Axes::NONE,
         TriggerCondition::SourceIsFaceUp => Axes::NONE,
         TriggerCondition::SourceIsFaceDown => Axes::NONE,
-        TriggerCondition::SourceInZone { zone: _ } => Axes::NONE,
+        TriggerCondition::SourceInZone { zone: _ }
+        | TriggerCondition::SourceInZoneWithAdjacentFilter { .. } => Axes::NONE,
         TriggerCondition::CounterAddedThisTurn => Axes {
             event: false,
             sibling: false,
@@ -4308,6 +4339,7 @@ fn scan_filter_prop(x: &FilterProp, mode: ScanMode) -> Axes {
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
@@ -4696,6 +4728,17 @@ fn scan_replacement_condition(x: &ReplacementCondition, mode: ScanMode) -> Axes 
             kicker_cost: _,
         } => Axes::NONE,
         ReplacementCondition::SourceTappedState { tapped: _ } => Axes::NONE,
+        // CR 122.1: reads the source object's live counter map. It is a
+        // sibling-mutable board resource because the replacement's own damage
+        // payment changes the counter count while the event is processed.
+        ReplacementCondition::SourceHasCounterAtLeast {
+            counter_type: _,
+            count: _,
+        } => Axes {
+            event: false,
+            sibling: true,
+            projected: false,
+        },
         ReplacementCondition::DealtDamageThisTurnBySource { source } => {
             let mut acc = Axes {
                 event: false,
@@ -5088,7 +5131,7 @@ fn scan_ability_cost(cost: &AbilityCost, mode: ScanMode) -> Axes {
             base,
         } => scan_target_filter(target, FilterReadContext::SnapshotOrEvent, mode)
             .or(scan_ability_cost(base, mode)),
-        AbilityCost::EffectCost { effect } => scan_effect(effect, mode),
+        AbilityCost::EffectCost { effect, .. } => scan_effect(effect, mode),
         // Fixed / bounded / structural costs: no dynamic board read (a
         // board-reading tap/exile aggregate that varies the *reduction* is caught
         // by the cost-keyword classifier, not here).
@@ -5716,6 +5759,17 @@ fn scan_mana_production(p: &ManaProduction, mode: ScanMode) -> Axes {
 /// recursion terminates.
 fn scan_continuous_modification(m: &ContinuousModification, mode: ScanMode) -> Axes {
     match m {
+        // A live ordered-zone donor reads its controller reference and card
+        // characteristics. The donor can change whenever the zone top changes,
+        // so conservatively classify its filter under the normal live-board
+        // context rather than treating a copy payload as read-free.
+        ContinuousModification::CopyTopOfZone {
+            controller, filter, ..
+        } => scan_controller_ref(controller).or(scan_target_filter(
+            filter,
+            FilterReadContext::LiveBoardCensus,
+            mode,
+        )),
         // descend the dynamic P/T / dynamic-keyword / enter-counter QuantityExpr
         ContinuousModification::SetDynamicPower { value }
         | ContinuousModification::SetDynamicToughness { value }
@@ -5769,6 +5823,7 @@ fn scan_continuous_modification(m: &ContinuousModification, mode: ScanMode) -> A
         | ContinuousModification::AddToughness { .. }
         | ContinuousModification::SetPower { .. }
         | ContinuousModification::SetToughness { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::RemoveAllAbilities
         | ContinuousModification::AddType { .. }
         | ContinuousModification::RemoveType { .. }
@@ -6010,6 +6065,7 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         // Effect variant is a compile error until classified census-vs-snapshot.
         Effect::GainLife { .. }
         | Effect::LoseLife { .. }
+        | Effect::LoseAllUnspentMana { .. }
         | Effect::StartYourEngines { .. }
         | Effect::ChangeSpeed { .. }
         | Effect::DealDamage { .. }
@@ -6218,6 +6274,8 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         | Effect::RedistributeLifeTotals
         | Effect::ReverseTurnOrder
         | Effect::ChooseOneOf { .. }
+        | Effect::RepeatPaidLibraryLook
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::Unimplemented { .. } => FilterReadContext::SnapshotOrEvent,
     }
 }
@@ -6411,6 +6469,7 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         // scale with the battlefield growth class.
         Effect::GainLife { .. }
         | Effect::LoseLife { .. }
+        | Effect::LoseAllUnspentMana { .. }
         | Effect::StartYourEngines { .. }
         | Effect::ChangeSpeed { .. }
         | Effect::DealDamage { .. }
@@ -6583,6 +6642,8 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::RedistributeLifeTotals
         | Effect::ReverseTurnOrder
         | Effect::ChooseOneOf { .. }
+        | Effect::RepeatPaidLibraryLook
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::Unimplemented { .. } => CensusRole::Relax(RelaxReason::BoundedOrNoPopulation),
     }
 }
@@ -6630,6 +6691,7 @@ pub(crate) fn effect_is_randomness_bearing(e: &Effect) -> bool {
         //     exhaustiveness (every variant named; no wildcard). ---
         Effect::GainLife { .. }
         | Effect::LoseLife { .. }
+        | Effect::LoseAllUnspentMana { .. }
         | Effect::StartYourEngines { .. }
         | Effect::ChangeSpeed { .. }
         | Effect::DealDamage { .. }
@@ -6848,6 +6910,8 @@ pub(crate) fn effect_is_randomness_bearing(e: &Effect) -> bool {
         | Effect::RedistributeLifeTotals
         | Effect::ReverseTurnOrder
         | Effect::ChooseOneOf { .. }
+        | Effect::RepeatPaidLibraryLook
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::Unimplemented { .. } => false,
     }
 }

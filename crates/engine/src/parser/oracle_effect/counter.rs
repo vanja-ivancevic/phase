@@ -3239,6 +3239,60 @@ mod tests {
         );
     }
 
+    /// CR 122.1 + CR 608.2c: the four Clockwork creatures share a legacy
+    /// counter-total rider after their self-targeted "put up to X" effect.
+    /// The rider must fold into the quantity cap, not remain as an
+    /// `unbound_subject` sub-ability or silently disappear.
+    #[test]
+    fn clockwork_counter_total_rider_folds_into_self_capacity() {
+        for (counter_limit, word) in [(4, "four"), (7, "seven")] {
+            let text = format!(
+                "Put up to X +1/+0 counters on this creature. This ability can't cause the total number of +1/+0 counters on this creature to be greater than {word}."
+            );
+            let def = super::super::parse_effect_chain(
+                &text,
+                crate::types::ability::AbilityKind::Activated,
+            );
+            assert!(
+                !chain_has_unimplemented(&def),
+                "counter cap remained unsupported: {def:?}"
+            );
+            let (effect, _) = find_put_counter(&def).expect("expected counter placement");
+            let Effect::PutCounter {
+                counter_type,
+                count,
+                target,
+            } = effect
+            else {
+                panic!("expected PutCounter, got {effect:?}");
+            };
+            assert_eq!(
+                counter_type,
+                CounterType::PowerToughness {
+                    power: 1,
+                    toughness: 0,
+                }
+            );
+            assert_eq!(target, TargetFilter::SelfRef);
+            let QuantityExpr::UpTo { max } = count else {
+                panic!("expected UpTo counter count, got {count:?}");
+            };
+            let QuantityExpr::DivideRounded { inner, divisor, .. } = *max else {
+                panic!("expected min-expression cap, got {max:?}");
+            };
+            assert_eq!(divisor, 2);
+            let rendered = format!("{inner:?}");
+            assert!(
+                rendered.contains(&format!("offset: {counter_limit}")),
+                "counter capacity must retain the printed limit {counter_limit}: {inner:?}"
+            );
+            assert!(
+                rendered.contains("CountersOn"),
+                "counter capacity must read the source's existing counters: {inner:?}"
+            );
+        }
+    }
+
     /// Gap-A NEG (count-side vs target-side "up to"): the leading count strip must
     /// NOT steal the TARGET-side "on up to N target(s)". Count stays `Fixed(1)`; a
     /// `MultiTargetSpec` carries the target-side "up to".

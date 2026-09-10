@@ -282,6 +282,15 @@ pub struct CombatState {
         serialize_with = "crate::types::deterministic_serde::hash_set"
     )]
     pub attacking_incarnations_this_combat: HashSet<ObjectIncarnationRef>,
+    /// CR 400.7 + CR 509.1: exact current-combat blocker ledger for source
+    /// intervening-if conditions. A blocker is recorded by its incarnation so
+    /// a same-id object re-entering the battlefield cannot satisfy the old
+    /// object's condition.
+    #[serde(
+        default,
+        serialize_with = "crate::types::deterministic_serde::hash_set"
+    )]
+    pub blocking_incarnations_this_combat: HashSet<ObjectIncarnationRef>,
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub damage_assignments: HashMap<ObjectId, Vec<DamageAssignment>>,
     pub first_strike_done: bool,
@@ -312,6 +321,7 @@ impl PartialEq for CombatState {
             && self.creature_attacked_defenders_this_combat
                 == other.creature_attacked_defenders_this_combat
             && self.attacking_incarnations_this_combat == other.attacking_incarnations_this_combat
+            && self.blocking_incarnations_this_combat == other.blocking_incarnations_this_combat
             && self.first_strike_done == other.first_strike_done
             && self.first_strike_participants == other.first_strike_participants
     }
@@ -772,6 +782,7 @@ pub fn place_blocking(state: &mut GameState, blocker_id: ObjectId, attacker_id: 
     // The bit is sticky, so its prior value is recorded rather than recomputed.
     let expected_attacker_blocked = info.blocked;
     info.blocked = true;
+    combat.blocking_incarnations_this_combat.insert(reference);
     // CR 509.1g: the creature becomes a blocking creature for the chosen attacker.
     combat
         .blocker_to_attacker
@@ -785,6 +796,7 @@ pub fn place_blocking(state: &mut GameState, blocker_id: ObjectId, attacker_id: 
         .push(blocker_id);
     // CR 509.1a tracking: record the blocker for per-turn "blocked this turn" queries.
     state.creatures_blocked_this_turn.insert(blocker_id);
+    record_block_declaration(state, attacker_id, blocker_id);
     // CR 506.4 + CR 613.1f: a new blocking creature can satisfy Layer 6
     // `FilterProp::Blocking` grants; re-evaluate continuous effects.
     state.layers_dirty.mark_full();
@@ -829,6 +841,7 @@ pub fn mark_attacker_blocked(state: &mut GameState, oid: ObjectId) -> bool {
     // CR 733: journal only the false-to-true transition, so the applier can
     // require the bit is still clear before installing it.
     if let Some(reference) = reference.filter(|_| !already_blocked) {
+        record_attacker_blocked_without_blocker(state, oid);
         record_combat_membership_edit(state, reference, ResolvedCombatMembershipEdit::MarkBlocked);
     }
     true
@@ -934,11 +947,15 @@ pub fn apply_resolved_combat_membership(
                 .or_default()
                 .push(*resulting_attacker);
             combat
+                .blocking_incarnations_this_combat
+                .insert(command.object);
+            combat
                 .blocker_assignments
                 .entry(*resulting_attacker)
                 .or_default()
                 .push(object_id);
             state.creatures_blocked_this_turn.insert(object_id);
+            record_block_declaration(state, *resulting_attacker, object_id);
         }
         ResolvedCombatMembershipEdit::MarkBlocked => {
             let combat = state
@@ -964,6 +981,7 @@ pub fn apply_resolved_combat_membership(
                 );
             }
             info.blocked = true;
+            record_attacker_blocked_without_blocker(state, object_id);
         }
         ResolvedCombatMembershipEdit::Remove {
             expected_participation,
@@ -5099,6 +5117,7 @@ pub(super) fn commit_attack_declaration(
         .map(|attacker| (attacker.object_id, attacker.defending_player))
         .collect();
     combat.attacking_incarnations_this_combat = attacking_incarnations_this_combat;
+    combat.blocking_incarnations_this_combat.clear();
     combat.attacked_defenders_this_combat.clear();
     combat.creature_attacked_defenders_this_combat.clear();
     for (attacker_id, defending_player) in &creature_attacked_defenders {
@@ -5481,7 +5500,57 @@ pub fn declare_blockers_for_player(
         .push(event.clone());
     events.push(event);
 
+    let mut recorded_pairs: Vec<_> = combat
+        .blocker_assignments
+        .iter()
+        .flat_map(|(attacker_id, blocker_ids)| {
+            blocker_ids
+                .iter()
+                .map(move |blocker_id| (*attacker_id, *blocker_id))
+        })
+        .collect();
+    recorded_pairs.sort_unstable();
+    for (attacker_id, blocker_id) in recorded_pairs {
+        record_block_declaration(state, attacker_id, blocker_id);
+    }
+
     Ok(())
+}
+
+/// CR 509.1h + CR 603.4: retain the exact attacker/blocker incarnation and
+/// the blocker's declaration-time colors for post-combat source restrictions.
+fn record_block_declaration(state: &mut GameState, attacker_id: ObjectId, blocker_id: ObjectId) {
+    let Some(attacker) = state.objects.get(&attacker_id) else {
+        return;
+    };
+    let Some(blocker) = state.objects.get(&blocker_id) else {
+        return;
+    };
+    let record = crate::types::game_state::CombatBlockDeclarationRecord {
+        attacker: ObjectIncarnationRef::from_object(attacker),
+        blocker: Some(ObjectIncarnationRef::from_object(blocker)),
+        blocker_colors: blocker.effective_colors(),
+    };
+    if !state.combat_block_declarations_this_turn.contains(&record) {
+        state.combat_block_declarations_this_turn.push(record);
+    }
+}
+
+/// CR 509.1h: A blocking effect can mark an attacker as blocked without a
+/// blocker object. Preserve that historical fact for the unqualified side of
+/// combined "blocked or blocked by a blue creature" restrictions.
+fn record_attacker_blocked_without_blocker(state: &mut GameState, attacker_id: ObjectId) {
+    let Some(attacker) = state.objects.get(&attacker_id) else {
+        return;
+    };
+    let record = crate::types::game_state::CombatBlockDeclarationRecord {
+        attacker: ObjectIncarnationRef::from_object(attacker),
+        blocker: None,
+        blocker_colors: Vec::new(),
+    };
+    if !state.combat_block_declarations_this_turn.contains(&record) {
+        state.combat_block_declarations_this_turn.push(record);
+    }
 }
 
 fn max_blockers_each_combat(state: &GameState) -> Option<u32> {

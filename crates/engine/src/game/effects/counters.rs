@@ -598,7 +598,7 @@ fn apply_pending_counter_post_action(
             super::amass::finalize_amass(state, object_id, &subtype, &ability, events);
             true
         }
-        PendingCounterPostAction::InjectPredefinedTokenAbilities { object_id } => {
+        PendingCounterPostAction::InjectPredefinedTokenAbilities { object_id, putter } => {
             // CR 111.10 + CR 400.7: Incubator tokens get predefined
             // subtype abilities and battlefield-entry bookkeeping after their
             // replacement-processed counters finish.
@@ -616,7 +616,14 @@ fn apply_pending_counter_post_action(
             // zone-change index instead of the `0` placeholder. The authority calls
             // `record_battlefield_entry` itself, so the co-located call that used to sit above is
             // deleted — keeping it would double-count `battlefield_entries_this_turn`.
+            let entry_event_start = events.len();
             crate::game::zones::record_and_emit_entry_from_no_zone(state, object_id, events);
+            crate::game::zones::stamp_zone_change_putter(
+                state,
+                &mut events[entry_event_start..],
+                object_id,
+                putter,
+            );
             true
         }
         PendingCounterPostAction::FinalizeTokenEntry {
@@ -659,7 +666,12 @@ fn apply_pending_counter_post_action(
             // that keeps `restrictions::record_token_created` above from writing a row. See that
             // function's doc for the wrong-trigger-fire measurement this prevents.
             super::token::push_committed_token_entry_events(
-                state, object_id, name, source_id, events,
+                state,
+                object_id,
+                name,
+                source_id,
+                Some(controller),
+                events,
             );
             if matches!(sacrifice_at, Some(Duration::UntilEndOfCombat)) {
                 let sacrifice_token = DelayedTrigger {
@@ -741,7 +753,12 @@ fn apply_pending_counter_post_action(
             // `None` verdict, so it never disagrees with the existence-guarded
             // `record_token_created` ledger write immediately above it.
             super::token::push_committed_token_entry_events(
-                state, object_id, name, source_id, events,
+                state,
+                object_id,
+                name,
+                source_id,
+                Some(controller),
+                events,
             );
             // The anaphora slot has TWO destinations on this route — ledger 3 and the in-flight
             // copy batch's `created_ids`, which `token_copy.rs`'s drain assigns WHOLESALE back onto

@@ -593,6 +593,18 @@ pub struct TriggerSourceContext {
     pub additional_cost_payments: Vec<AdditionalCostInstancePayment>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_cost_paid_object: Option<CostPaidObjectSnapshot>,
+    /// The spell or ability source that caused the zone change carrying this
+    /// record. This is event provenance, not a characteristic of the departing
+    /// object: it is stored in the record-owned context so it survives deferred
+    /// trigger collection, serialization, and a later same-id reincarnation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_change_cause_source_id: Option<ObjectId>,
+    /// CR 110.2a + CR 305.1: the player who performed the action that put the
+    /// object onto the battlefield. This is distinct from the entrant's
+    /// resulting controller, which replacements may change. `None` means the
+    /// producer could not prove the actor and active-voice matching fails closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone_change_putter: Option<PlayerId>,
 }
 
 impl std::fmt::Debug for TriggerSourceContext {
@@ -670,6 +682,11 @@ impl std::fmt::Debug for TriggerSourceContext {
             )
             .field("additional_cost_payments", &self.additional_cost_payments)
             .field("cast_cost_paid_object", &self.cast_cost_paid_object)
+            .field(
+                "zone_change_cause_source_id",
+                &self.zone_change_cause_source_id,
+            )
+            .field("zone_change_putter", &self.zone_change_putter)
             .finish()
     }
 }
@@ -1608,6 +1625,42 @@ pub struct ZoneChangeRecord {
 }
 
 impl ZoneChangeRecord {
+    /// CR 109.5: The spell or ability source that caused this zone change, if
+    /// the authoritative delivery carried one. Legacy or synthetic records
+    /// without a record-owned source context deliberately answer `None`.
+    pub fn cause_source_id(&self) -> Option<ObjectId> {
+        self.trigger_source_context
+            .as_ref()
+            .and_then(|context| context.zone_change_cause_source_id)
+    }
+
+    /// Stamps event provenance after the single zone-delivery authority emits
+    /// this record. The cause cannot be reconstructed later from a current
+    /// object: that object may have changed zones or reincarnated already.
+    pub(crate) fn stamp_cause_source_id(&mut self, source_id: Option<ObjectId>) {
+        if let Some(context) = &mut self.trigger_source_context {
+            context.zone_change_cause_source_id = source_id;
+        }
+    }
+
+    /// Stamps the event-time actor after authoritative delivery emits this
+    /// record. Controller is intentionally not a fallback: an ETB replacement
+    /// can make the entrant's controller differ from the player who performed
+    /// the put action.
+    pub(crate) fn stamp_zone_change_putter(&mut self, putter: Option<PlayerId>) {
+        if let Some(context) = &mut self.trigger_source_context {
+            context.zone_change_putter = putter;
+        }
+    }
+
+    /// Returns the event-time player who performed the put action, if the
+    /// delivery producer supplied authoritative provenance.
+    pub fn zone_change_putter(&self) -> Option<PlayerId> {
+        self.trigger_source_context
+            .as_ref()
+            .and_then(|context| context.zone_change_putter)
+    }
+
     /// Returns the owned source context captured with this exact event record.
     /// Callers must not reconstruct a source from a current object or from an
     /// ObjectId-keyed LKI cache when this is absent. The sole compatibility
@@ -1731,6 +1784,19 @@ pub struct AttackDeclarationRecord {
     /// CR 903.3d: Commander identity at declaration time.
     #[serde(default)]
     pub is_commander: bool,
+}
+
+/// CR 509.1h + CR 603.4: A declaration-time attacker/blocker relation that
+/// remains queryable after combat ends. The blocker colors are captured at the
+/// declaration, so a later color-changing effect cannot rewrite a historical
+/// "was blocked by a blue creature" condition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CombatBlockDeclarationRecord {
+    pub attacker: ObjectIncarnationRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocker: Option<ObjectIncarnationRef>,
+    #[serde(default)]
+    pub blocker_colors: Vec<ManaColor>,
 }
 
 /// CR 603.10a: Snapshot of a single attachment on a leaving-battlefield object
@@ -5411,6 +5477,10 @@ pub struct PendingBatchZoneMoveRequest {
     pub object_id: ObjectId,
     pub destination: Zone,
     pub cause: PendingBatchZoneChangeCause,
+    /// CR 110.2a + CR 305.1: event-time player who performed the put action,
+    /// preserved while a simultaneous move is paused for replacement choices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub putter: Option<PlayerId>,
     #[serde(default, skip_serializing_if = "EtbTapState::is_unspecified")]
     pub enter_tapped: EtbTapState,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -6215,6 +6285,11 @@ pub struct PendingTokenBattlefieldEntry {
     /// The `TokenCreated` display name (the token's OWN name, not the copied source's).
     pub name: String,
     pub source_id: ObjectId,
+    /// CR 110.2a + CR 305.1: the player whose effect put the token onto the
+    /// battlefield. This is retained across replacement-choice pauses rather
+    /// than inferred from the token's resulting controller.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub putter: Option<PlayerId>,
 }
 
 /// CR 707.2 + CR 614.1c: everything the non-liminal copy-token entry tail still
@@ -6266,6 +6341,10 @@ pub enum PendingCounterPostAction {
     },
     InjectPredefinedTokenAbilities {
         object_id: ObjectId,
+        /// CR 110.2a + CR 305.1: the incubating effect's actor, retained until
+        /// counter replacement choices finish and the entry is emitted.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        putter: Option<PlayerId>,
     },
     FinalizeTokenEntry {
         object_id: ObjectId,
@@ -6860,6 +6939,15 @@ fn default_origin_zone() -> Zone {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum DeferredLifeCostResume {
+    /// Resume a repeated paid-library-look after a life-loss replacement has
+    /// settled. The life cost was already paid; only its ordered bottom choice
+    /// remains, so the payment must never be replayed.
+    RepeatPaidLibraryLook {
+        player: PlayerId,
+        source_id: ObjectId,
+        cards: Vec<ObjectId>,
+        resume_at_resolution_depth: usize,
+    },
     /// Continue a spell cast or activated-ability payment without replaying the
     /// life payment. Mana-payment callers set `cost` to `NoCost` and preserve
     /// the amount already spent in `prepaid_actual_mana_spent`.
@@ -6901,7 +6989,11 @@ pub enum DeferredLifeCostResume {
 impl DeferredLifeCostResume {
     pub fn resume_at_resolution_depth(&self) -> usize {
         match self {
-            DeferredLifeCostResume::Cast {
+            DeferredLifeCostResume::RepeatPaidLibraryLook {
+                resume_at_resolution_depth,
+                ..
+            }
+            | DeferredLifeCostResume::Cast {
                 resume_at_resolution_depth,
                 ..
             }
@@ -12372,6 +12464,26 @@ pub enum WaitingFor {
         #[serde(default)]
         enters_attacking: bool,
     },
+    /// CR 701.20e + CR 118.3: The player may pay life to repeat a private
+    /// library look. `cards` is the exact current look; accepting leads to an
+    /// ordered bottom-placement prompt, while declining leads to the final
+    /// shuffle/top-placement prompt.
+    RepeatPaidLibraryLookPayment {
+        player: PlayerId,
+        source_id: ObjectId,
+        cards: Vec<ObjectId>,
+        life_payment: u32,
+    },
+    /// CR 401.2 + CR 701.20e: Submit the complete looked-at group in its
+    /// chosen order. `top = false` appends it to the library bottom; `top =
+    /// true` places it on top after the Vault-family final shuffle.
+    ReorderLibraryChoice {
+        player: PlayerId,
+        cards: Vec<ObjectId>,
+        top: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<ObjectId>,
+    },
     SurveilChoice {
         player: PlayerId,
         cards: Vec<ObjectId>,
@@ -14439,6 +14551,8 @@ impl WaitingFor {
             WaitingFor::RedistributeLifeTotals { .. } => "RedistributeLifeTotals",
             WaitingFor::CoinFlipKeepChoice { .. } => "CoinFlipKeepChoice",
             WaitingFor::DigChoice { .. } => "DigChoice",
+            WaitingFor::RepeatPaidLibraryLookPayment { .. } => "RepeatPaidLibraryLookPayment",
+            WaitingFor::ReorderLibraryChoice { .. } => "ReorderLibraryChoice",
             WaitingFor::SurveilChoice { .. } => "SurveilChoice",
             WaitingFor::RevealChoice { .. } => "RevealChoice",
             WaitingFor::SearchChoice { .. } => "SearchChoice",
@@ -14596,6 +14710,8 @@ impl WaitingFor {
             | WaitingFor::RedistributeLifeTotals { player, .. }
             | WaitingFor::CoinFlipKeepChoice { player, .. }
             | WaitingFor::DigChoice { player, .. }
+            | WaitingFor::RepeatPaidLibraryLookPayment { player, .. }
+            | WaitingFor::ReorderLibraryChoice { player, .. }
             | WaitingFor::SurveilChoice { player, .. }
             | WaitingFor::RevealChoice { player, .. }
             | WaitingFor::SearchChoice { player, .. }
@@ -15042,6 +15158,7 @@ impl WaitingFor {
                 | WaitingFor::ArrangePlanarDeckTopChoice { .. }
                 | WaitingFor::SurveilChoice { .. }
                 | WaitingFor::DigChoice { .. }
+                | WaitingFor::ReorderLibraryChoice { .. }
         )
     }
 
@@ -17005,6 +17122,8 @@ declare_game_state! {
 
     // Replacement effects
     pub pending_replacement: Option<PendingReplacement>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_entry_life_payment: Option<PendingEntryLifePayment>,
     /// CR 510.2 + CR 616.1: see [`PendingCombatLifelink`]. Boxed like its
     /// `pending_discard_batch` sibling — `GameState` is moved by value through
     /// the server action and AI paths and has a hard stack budget
@@ -18032,6 +18151,15 @@ declare_game_state! {
         with = "tuple_key_map"
     )]
     pub ability_resolutions_this_turn: HashMap<(ObjectId, usize), u32>,
+    /// CR 106.3 + CR 603.4: Exact printed abilities that actually added one
+    /// or more mana during this turn. Keyed by `(source_id, ability_index)` so
+    /// a condition such as Carpet of Flowers' "with this ability" does not
+    /// accidentally observe another mana ability on the same permanent.
+    /// Object ids change on zone changes (CR 400.7), naturally resetting the
+    /// marker for a new incarnation; the whole set is cleared at turn start.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+    pub mana_added_by_abilities_this_turn: HashSet<(ObjectId, usize)>,
     /// CR 601.2a: Tracks which graveyard-cast permission sources have been
     /// used this turn. Keyed by the granting permanent's ObjectId.
     /// CR 400.7: Zone change creates new ObjectId, naturally resetting.
@@ -18256,6 +18384,11 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub creatures_blocked_this_turn: HashSet<ObjectId>,
+    /// CR 509.1h + CR 603.4: declaration-time attacker/blocker relations for
+    /// post-combat source restrictions such as Sea Troll's "was blocked by a
+    /// blue creature" rider.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub combat_block_declarations_this_turn: Vec<CombatBlockDeclarationRecord>,
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
     pub players_who_created_token_this_turn: HashSet<PlayerId>,
@@ -18656,6 +18789,15 @@ declare_game_state! {
     /// (safe — always cleared at comparison boundaries).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_effect_excess_amount: Option<i32>,
+
+    /// CR 608.2c + CR 120.3: Target-derived ceiling for the immediately
+    /// preceding damage instruction's Drain Life-class life gain. Captured
+    /// before damage mutates the target's life, toughness-relevant state, or
+    /// loyalty, and reset at the start of each top-level resolution. This is
+    /// transient resolution bookkeeping and follows `last_effect_amount`'s
+    /// PartialEq-omission convention.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_damage_target_pre_damage_life_gain_cap: Option<i32>,
 
     /// CR 706.2 + CR 706.4: The actual scalar result available to the current
     /// ability resolution. During a results-table roll, `roll_die::resolve`
@@ -20272,6 +20414,16 @@ pub struct PendingReplacement {
     /// before the replacement is applied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub may_cost_remaining: Option<AbilityCost>,
+}
+
+/// CR 614.12 + CR 119.4: A life-payment choice made while a permanent is
+/// entering. The delivery seam consumes the resolved amount only after the
+/// object has become its new CR 400.7 incarnation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingEntryLifePayment {
+    pub object_id: ObjectId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<u32>,
 }
 
 /// CR 701.21a: The subject and controller of a sacrifice whose inner zone
@@ -23151,6 +23303,7 @@ impl GameState {
             max_lands_per_turn: 1,
             priority_pass_count: 0,
             pending_replacement: None,
+            pending_entry_life_payment: None,
             pending_combat_lifelink: None,
             liminal_entries: HashMap::new(),
             pending_liminal_entry_resume: None,
@@ -23248,6 +23401,7 @@ impl GameState {
             object_counter_placement_count_this_turn: std::collections::HashMap::new(),
             pending_attack_trigger_events: Vec::new(),
             ability_resolutions_this_turn: HashMap::new(),
+            mana_added_by_abilities_this_turn: HashSet::new(),
             graveyard_cast_permissions_used: HashSet::new(),
             graveyard_cast_permissions_used_per_type: HashSet::new(),
             pending_permanent_type_slot: None,
@@ -23279,6 +23433,7 @@ impl GameState {
             creatures_attacked_this_turn: HashSet::new(),
             attacker_declarations_this_turn: Vec::new(),
             creatures_blocked_this_turn: HashSet::new(),
+            combat_block_declarations_this_turn: Vec::new(),
             players_who_created_token_this_turn: HashSet::new(),
             created_tokens_this_turn: im::Vector::new(),
             counter_added_this_turn: Vec::new(),
@@ -23339,6 +23494,7 @@ impl GameState {
             player_actions_this_way: HashSet::new(),
             last_effect_amount: None,
             last_effect_excess_amount: None,
+            last_damage_target_pre_damage_life_gain_cap: None,
             die_result_this_resolution: None,
             last_effect_count: None,
             last_effect_counts_by_player: HashMap::new(),
@@ -25154,6 +25310,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         max_lands_per_turn: _,
         priority_pass_count: _,
         pending_replacement: _,
+        pending_entry_life_payment: _,
         //   - `pending_combat_lifelink`: COMPARED (hand-written `impl PartialEq` conjunct) — the
         //     parked tail of one CR 510.2 combat-damage batch. `remaining` only SHRINKS and
         //     `batch_events` only GROWS within a batch, so two states differing in this field are
@@ -25274,6 +25431,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         object_counter_placement_count_this_turn: _,
         pending_attack_trigger_events: _,
         ability_resolutions_this_turn: _,
+        mana_added_by_abilities_this_turn: _,
         graveyard_cast_permissions_used: _,
         graveyard_cast_permissions_used_per_type: _,
         pending_permanent_type_slot: _,
@@ -25305,6 +25463,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         creatures_attacked_this_turn: _,
         attacker_declarations_this_turn: _,
         creatures_blocked_this_turn: _,
+        combat_block_declarations_this_turn: _,
         players_who_created_token_this_turn: _,
         created_tokens_this_turn: _,
         counter_added_this_turn: _,
@@ -25357,6 +25516,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         player_actions_this_way: _,
         last_effect_amount: _,
         last_effect_excess_amount: _,
+        last_damage_target_pre_damage_life_gain_cap: _,
         die_result_this_resolution: _,
         last_effect_count: _,
         last_effect_counts_by_player: _,
@@ -25521,6 +25681,7 @@ impl PartialEq for GameState {
             && self.max_lands_per_turn == other.max_lands_per_turn
             && self.priority_pass_count == other.priority_pass_count
             && self.pending_replacement == other.pending_replacement
+            && self.pending_entry_life_payment == other.pending_entry_life_payment
             && self.deferred_entry_events == other.deferred_entry_events
             && self.pending_token_battlefield_entry == other.pending_token_battlefield_entry
             && self.layers_dirty == other.layers_dirty
@@ -25602,6 +25763,7 @@ impl PartialEq for GameState {
                 == other.loyalty_abilities_activated_this_turn
             && self.extra_loyalty_activations_this_turn == other.extra_loyalty_activations_this_turn
             && self.ability_resolutions_this_turn == other.ability_resolutions_this_turn
+            && self.mana_added_by_abilities_this_turn == other.mana_added_by_abilities_this_turn
             && self.graveyard_cast_permissions_used == other.graveyard_cast_permissions_used
             && self.graveyard_cast_permissions_used_per_type
                 == other.graveyard_cast_permissions_used_per_type
@@ -25635,6 +25797,8 @@ impl PartialEq for GameState {
             && self.creatures_attacked_this_turn == other.creatures_attacked_this_turn
             && self.attacker_declarations_this_turn == other.attacker_declarations_this_turn
             && self.creatures_blocked_this_turn == other.creatures_blocked_this_turn
+            && self.combat_block_declarations_this_turn
+                == other.combat_block_declarations_this_turn
             && self.players_who_created_token_this_turn == other.players_who_created_token_this_turn
             && self.created_tokens_this_turn == other.created_tokens_this_turn
             && self.counter_added_this_turn == other.counter_added_this_turn

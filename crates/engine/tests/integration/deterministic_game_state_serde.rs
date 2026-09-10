@@ -209,6 +209,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "revealed_cards",
         "player_actions_this_way",
         "city_blessing",
+        "mana_added_by_abilities_this_turn",
     ] {
         add_spec(
             &mut specs,
@@ -672,6 +673,14 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
             "CombatState",
             None,
             "attacking_incarnations_this_combat",
+            "HashSet",
+            Classification::Canonical(HASH_SET),
+        ),
+        (
+            "src/game/combat.rs",
+            "CombatState",
+            None,
+            "blocking_incarnations_this_combat",
             "HashSet",
             Classification::Canonical(HASH_SET),
         ),

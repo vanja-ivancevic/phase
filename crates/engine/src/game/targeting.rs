@@ -209,6 +209,36 @@ fn find_legal_targets_with_context(
         return targets;
     }
 
+    // CR 102.1 + CR 109.5: `PlayerMatching` is a player-only target filter
+    // whose predicate must be evaluated against the ability's scoped player
+    // when present (for example, Oath of Druids during the non-controller's
+    // upkeep). Keep the source controller for targeting restrictions such as
+    // hexproof, but bind the PlayerFilter relation/count anchor to the scoped
+    // player. This is the same matcher used during target re-validation.
+    if matches!(filter, TargetFilter::PlayerMatching { .. }) {
+        let scope_controller = target_ctx
+            .ability
+            .and_then(|ability| ability.scoped_player)
+            .or(target_ctx.scoped_iteration_player)
+            .unwrap_or(source_controller);
+        for player in &state.players {
+            if !player_is_legal_target(state, player.id, source_id, source_controller) {
+                continue;
+            }
+            if super::filter::player_matches_target_filter_in_state_with_scope(
+                state,
+                filter,
+                player.id,
+                Some(source_controller),
+                Some(source_id),
+                Some(scope_controller),
+            ) {
+                targets.push(TargetRef::Player(player.id));
+            }
+        }
+        return targets;
+    }
+
     // Typed filter with no type_filters AND no properties targets players, not
     // permanents. e.g. "target opponent" → Typed { type_filters: [], controller:
     // Opponent }. A non-empty `properties` list (e.g. `FilterProp::Token` for
@@ -1051,13 +1081,20 @@ fn target_ref_matches_resolved_filter_with_context(
             ),
             None => false,
         },
-        TargetRef::Player(player) => super::filter::player_matches_target_filter_in_state(
-            state,
-            target_filter,
-            *player,
-            ctx.source_controller,
-            Some(ctx.source_id),
-        ),
+        TargetRef::Player(player) => {
+            let scope_controller = ctx
+                .ability
+                .and_then(|ability| ability.scoped_player)
+                .or(ctx.scoped_iteration_player);
+            super::filter::player_matches_target_filter_in_state_with_scope(
+                state,
+                target_filter,
+                *player,
+                ctx.source_controller,
+                Some(ctx.source_id),
+                scope_controller,
+            )
+        }
     }
 }
 
@@ -1658,7 +1695,7 @@ pub(crate) fn extract_source_from_event(
         GameEvent::Evolved { object_id } => Some(*object_id),
         GameEvent::CounterRemoved { object_id, .. } => Some(*object_id),
         GameEvent::TokenCreated { object_id, .. } => Some(*object_id),
-        GameEvent::CreatureDestroyed { object_id } => Some(*object_id),
+        GameEvent::CreatureDestroyed { object_id, .. } => Some(*object_id),
         GameEvent::PermanentSacrificed { object_id, .. } => Some(*object_id),
         GameEvent::Unattached {
             old_target: TargetRef::Object(object_id),
@@ -1756,6 +1793,12 @@ pub(crate) fn extract_target_object_from_event(
             target: TargetRef::Object(id),
             ..
         } => Some(*id),
+        // CR 509.3d: a filtered block event has two named object roles.  The
+        // blocker is the TriggeringSource; the attacker is its EventTarget.
+        // Keeping this orientation here lets an effect body refer to either
+        // "the blocking creature" or "the attacking creature" without
+        // guessing from a generic BlockersDeclared assignment.
+        GameEvent::AttackerBecameBlockedByFilteredBlocker { attacker, .. } => Some(*attacker),
         GameEvent::DamageDealt {
             target: TargetRef::Player(_),
             ..
@@ -1823,7 +1866,6 @@ pub(crate) fn extract_target_object_from_event(
         | GameEvent::AttackersDeclared { .. }
         | GameEvent::BlockersDeclared { .. }
         | GameEvent::AttackerBecameBlockedByEffect { .. }
-        | GameEvent::AttackerBecameBlockedByFilteredBlocker { .. }
         | GameEvent::CombatTaxPaid { .. }
         | GameEvent::CombatTaxDeclined { .. }
         | GameEvent::VehicleCrewed { .. }
@@ -1845,6 +1887,7 @@ pub(crate) fn extract_target_object_from_event(
         | GameEvent::PlayerPerformedAction { .. }
         | GameEvent::CardPredicateGuessMade { .. }
         | GameEvent::Regenerated { .. }
+        | GameEvent::CumulativeUpkeepNotPaid { .. }
         | GameEvent::CreatureSuspected { .. }
         | GameEvent::CreatureNoLongerSuspected { .. }
         | GameEvent::Detained { .. }
@@ -1934,6 +1977,9 @@ pub(crate) fn extract_player_from_event(
         // `TriggeringPlayer` / "that player" binds to the activating player
         // carried on the event.
         GameEvent::AbilityActivated { player_id, .. } => Some(*player_id),
+        // CR 702.24a: "that player" in a cumulative-upkeep rider trigger is the
+        // player who didn't pay the upkeep cost.
+        GameEvent::CumulativeUpkeepNotPaid { player, .. } => Some(*player),
         GameEvent::PermanentSacrificed { player_id, .. } => Some(*player_id),
         GameEvent::Unattached {
             old_target: TargetRef::Player(player_id),
@@ -1985,6 +2031,14 @@ pub(crate) fn extract_player_from_event(
         // TriggeringPlayer` fell back to the ability controller, hitting the
         // wrong player (Suture Priest #560, Bloodchief Ascension #546).
         GameEvent::ZoneChanged { record, .. } => Some(record.controller),
+        // CR 701.8a + CR 603.2 + CR 608.2c: an active-voice destruction trigger
+        // such as Karmic Justice binds "that opponent" to the controller of the
+        // spell or ability that destroyed the permanent, retained as event
+        // provenance even after that source has left the stack.
+        GameEvent::CreatureDestroyed {
+            source_id: Some(source_id),
+            ..
+        } => state.objects.get(source_id).map(|object| object.controller),
         // CR 122.1 + CR 603.7c: "that player" / `TriggeringPlayer` on a
         // counter-placement trigger is the player who put the counters.
         GameEvent::CounterAdded { actor, .. } => Some(*actor),
@@ -2853,6 +2907,19 @@ mod tests {
             Some(object)
         );
         assert_eq!(extract_target_object_from_event(&player_event), None);
+
+        let attacker = ObjectId(52);
+        let blocker = ObjectId(53);
+        let filtered_block_event =
+            GameEvent::AttackerBecameBlockedByFilteredBlocker { attacker, blocker };
+        assert_eq!(
+            extract_source_from_event(&filtered_block_event),
+            Some(blocker)
+        );
+        assert_eq!(
+            extract_target_object_from_event(&filtered_block_event),
+            Some(attacker)
+        );
     }
 
     /// A `SpecificPlayer` controller scope matches a stack ability by comparing

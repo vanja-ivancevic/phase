@@ -2,12 +2,12 @@ use crate::types::ability::{
     is_variable_remove_counter_cost_count, AbilityBlockKind, AbilityBlockReason, AbilityCondition,
     AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, ActivationManaPaymentRestriction,
     AdditionalCost, BoardWideCostModifier, CardPlayMode, CardSelectionMode, CardTypeSetSource,
-    CastTimingPermission, CastingPermission, ChoiceType, ContinuousModification, CostObjectCount,
-    CostPaidObjectSnapshot, CounterCostSelection, Duration, Effect, EffectKind, FilterProp,
-    GameRestriction, ModalSelectionCondition, ObjectScope, PlayerFilter, PlayerScope,
-    ProhibitedActivity, QuantityExpr, QuantityRef, ResolvedAbility, RestrictionExpiry,
-    RestrictionPlayerScope, StaticCondition, StaticDefinition, SubAbilityLink,
-    TapCreaturesRequirement, TargetFilter, TargetRef, TypeFilter,
+    CastTimingPermission, CastingPermission, CastingRestriction, ChoiceType,
+    ContinuousModification, CostObjectCount, CostPaidObjectSnapshot, CounterCostSelection,
+    Duration, Effect, EffectKind, FilterProp, GameRestriction, ModalSelectionCondition,
+    ObjectScope, PlayerFilter, PlayerScope, ProhibitedActivity, QuantityExpr, QuantityRef,
+    ResolvedAbility, RestrictionExpiry, RestrictionPlayerScope, StaticCondition, StaticDefinition,
+    SubAbilityLink, TapCreaturesRequirement, TargetFilter, TargetRef, TypeFilter,
 };
 use crate::types::actions::{AlternativeCastDecision, GameAction};
 use crate::types::card::LayoutKind;
@@ -26,6 +26,7 @@ use crate::types::keywords::{FlashbackCost, Keyword, KeywordKind};
 use crate::types::mana::{
     ActivationManaColorConstraint, ManaColor, ManaCost, ManaCostShard, ManaSourceOutput,
     ManaSourceSelection, ManaSpellGrant, ManaType, PaymentContext, SpecialAction, SpellMeta,
+    XManaPaymentRestriction,
 };
 use crate::types::player::PlayerId;
 use crate::types::resolved_commands::ManaPaymentRecipient;
@@ -1113,6 +1114,7 @@ pub(crate) fn is_blocked_by_cant_play_lands(
                         // not a deferred triggered-source read.
                         trigger_source: None,
                         recipient_id: None,
+                        event_target_id: None,
                         scoped_iteration_player: None,
                     },
                 ),
@@ -5762,20 +5764,39 @@ fn iter_cast_free_permission_source_ids(state: &GameState) -> impl Iterator<Item
         .copied()
 }
 
+/// One admitted `CastFromHandFree` permission.  Keep the recipient decision and
+/// its flash rider together so callers cannot authorize a free cast for one
+/// player while accidentally applying the rider for another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct HandCastFreePermission {
+    frequency: CastFrequency,
+    grants_flash: bool,
+}
+
 fn cast_free_permission_from_source(
     state: &GameState,
     player: PlayerId,
     obj: &crate::game::game_object::GameObject,
     source_id: ObjectId,
-) -> Option<CastFrequency> {
+) -> Option<HandCastFreePermission> {
     let src_obj = state.objects.get(&source_id)?;
-    if src_obj.controller != player {
-        return None;
-    }
     active_static_definitions(state, src_obj).find_map(|s| {
-        let StaticMode::CastFromHandFree { frequency, origin } = s.mode else {
+        let StaticMode::CastFromHandFree {
+            frequency,
+            origin,
+            all_players,
+            grants_flash,
+        } = s.mode
+        else {
             return None;
         };
+        // CR 109.5 + CR 601.2b: ordinary free-cast permissions are controlled
+        // by the source's controller; Aluren's explicit "any player" wording
+        // is the narrow opt-out.  Do not infer this from the spell filter — a
+        // type-only Omniscience filter is still controller-only.
+        if !all_players && src_obj.controller != player {
+            return None;
+        }
         // CR 601.2b: Skip if this source's once-per-turn slot was already used.
         if frequency == CastFrequency::OncePerTurn
             && state.hand_cast_free_permissions_used.contains(&source_id)
@@ -5790,9 +5811,15 @@ fn cast_free_permission_from_source(
             state,
             obj.id,
             filter,
-            &super::filter::FilterContext::from_source_with_controller(source_id, player),
+            &super::filter::FilterContext::from_source_with_controller(
+                source_id,
+                src_obj.controller,
+            ),
         ) {
-            Some(frequency)
+            Some(HandCastFreePermission {
+                frequency,
+                grants_flash,
+            })
         } else {
             None
         }
@@ -5811,7 +5838,7 @@ pub(crate) fn hand_cast_free_permission_source(
 ) -> Option<(ObjectId, CastFrequency)> {
     iter_cast_free_permission_source_ids(state).find_map(|src_id| {
         cast_free_permission_from_source(state, player, obj, src_id)
-            .map(|frequency| (src_id, frequency))
+            .map(|permission| (src_id, permission.frequency))
     })
 }
 
@@ -5828,7 +5855,22 @@ fn unlimited_hand_cast_free_source(
 ) -> Option<ObjectId> {
     iter_cast_free_permission_source_ids(state).find(|&src_id| {
         cast_free_permission_from_source(state, player, obj, src_id)
-            == Some(CastFrequency::Unlimited)
+            .is_some_and(|permission| permission.frequency == CastFrequency::Unlimited)
+    })
+}
+
+/// CR 601.3b + CR 702.8a: whether an applicable free-cast permission also
+/// grants flash to this particular cast.  The check shares the admission
+/// authority with the no-cost path, so Aluren cannot accidentally grant flash
+/// to a spell/player it did not permit to be cast for free.
+fn hand_cast_free_permission_grants_flash(
+    state: &GameState,
+    player: PlayerId,
+    obj: &crate::game::game_object::GameObject,
+) -> bool {
+    iter_cast_free_permission_source_ids(state).any(|src_id| {
+        cast_free_permission_from_source(state, player, obj, src_id)
+            .is_some_and(|permission| permission.grants_flash)
     })
 }
 
@@ -7705,7 +7747,8 @@ fn prepare_spell_cast_with_variant_override_inner(
     let has_granted_flash =
         effective_spell_keyword_kinds_for(state, player, object_id, is_fuse_variant)
             .contains(&KeywordKind::Flash)
-            || exile_static_permission_grants_flash(state, player, object_id);
+            || exile_static_permission_grants_flash(state, player, object_id)
+            || hand_cast_free_permission_grants_flash(state, player, obj);
     let cast_outside_sorcery_timing = !restrictions::is_sorcery_speed_window(state, player);
     // CR 304.1: Instants can be cast any time a player has priority.
     // CR 301.1 / CR 306.1: Artifacts and planeswalkers are cast at sorcery speed.
@@ -8094,7 +8137,7 @@ pub(super) fn recompute_pending_mana_total(
     let Some(base) = pending.base_cost.as_ref() else {
         let mut cost = pending.cost.clone();
         if let Some(x) = x {
-            cost.concretize_x(x);
+            concretize_pending_x(&mut cost, x);
         }
         if !casting_costs::cost_has_x(&cost) {
             apply_cost_floor(state, player, pending.object_id, &mut cost);
@@ -8106,12 +8149,13 @@ pub(super) fn recompute_pending_mana_total(
                 &mut cost,
             );
         }
+        apply_pending_x_mana_payment_restriction(state, pending, &mut cost, x);
         return cost;
     };
 
     let mut cost = base.clone();
     if let Some(x) = x {
-        cost.concretize_x(x);
+        concretize_pending_x(&mut cost, x);
     }
     for addition in &pending.declared_mana_additions {
         cost = super::restrictions::add_mana_cost(&cost, addition);
@@ -8141,6 +8185,7 @@ pub(super) fn recompute_pending_mana_total(
             &mut cost,
         );
     }
+    apply_pending_x_mana_payment_restriction(state, pending, &mut cost, x);
     cost
 }
 
@@ -8198,7 +8243,7 @@ pub(super) fn apply_post_x_cost_modifiers(
             // Legacy / in-flight saved game without a captured base: behavior
             // identical to the pre-change floor-only post-X pass.
             let mut cost = pending.cost.clone();
-            cost.concretize_x(x);
+            concretize_pending_x(&mut cost, x);
             apply_cost_floor(state, caster, object_id, &mut cost);
             apply_cost_floor_with_selected_targets(
                 state,
@@ -8207,12 +8252,137 @@ pub(super) fn apply_post_x_cost_modifiers(
                 &pending.ability,
                 &mut cost,
             );
+            apply_pending_x_mana_payment_restriction(state, pending, &mut cost, Some(x));
             cost
         }
     };
     debug_assert!(!casting_costs::cost_has_x(&new_cost));
     if let Some(pending) = state.pending_cast.as_mut() {
         pending.cost = new_cost;
+    }
+}
+
+/// CR 107.1b: Determine X as generic mana before CR 601.2f cost modifiers.
+/// A color rider is applied only after the total is locked by
+/// [`apply_pending_x_mana_payment_restriction`].
+pub(crate) fn concretize_pending_x(cost: &mut ManaCost, value: u32) {
+    cost.concretize_x(value);
+}
+
+pub(crate) fn pending_x_mana_payment_restriction(
+    state: &GameState,
+    pending: &PendingCast,
+) -> Option<XManaPaymentRestriction> {
+    if let Some(ability_index) = pending.activation_ability_index {
+        return activation_ability_definition(state, pending.object_id, ability_index).and_then(
+            |ability| match ability.activation_mana_payment_restriction {
+                Some(ActivationManaPaymentRestriction::OnlyColorsOnX(restriction)) => {
+                    Some(restriction)
+                }
+                _ => None,
+            },
+        );
+    }
+
+    state.objects.get(&pending.object_id).and_then(|object| {
+        object
+            .casting_restrictions
+            .iter()
+            .find_map(|restriction| match restriction {
+                CastingRestriction::OnlyColorsOnX(restriction) => Some(*restriction),
+                _ => None,
+            })
+    })
+}
+
+/// CR 107.1b + CR 118.3: Convert only the X portion that survives the full
+/// total-cost calculation into color-restricted payment shards. Keeping the
+/// X count separate from the post-modifier `generic` total lets a generic cost
+/// reduction reduce X when it must, without allowing off-color mana to pay the
+/// remaining portion.
+fn apply_pending_x_mana_payment_restriction(
+    state: &GameState,
+    pending: &PendingCast,
+    cost: &mut ManaCost,
+    chosen_x: Option<u32>,
+) {
+    let (Some(chosen_x), Some(restriction)) =
+        (chosen_x, pending_x_mana_payment_restriction(state, pending))
+    else {
+        return;
+    };
+    let x_shards = pending_x_shard_count(state, pending);
+    cost.restrict_generic_x_payment(chosen_x.saturating_mul(x_shards), restriction);
+}
+
+fn pending_x_shard_count(state: &GameState, pending: &PendingCast) -> u32 {
+    fn count(cost: &ManaCost) -> u32 {
+        match cost {
+            ManaCost::Cost { shards, .. } => shards
+                .iter()
+                .filter(|shard| matches!(shard, ManaCostShard::X))
+                .count() as u32,
+            _ => 0,
+        }
+    }
+
+    if let Some(base) = pending.base_cost.as_ref() {
+        return count(base);
+    }
+    pending
+        .activation_ability_index
+        .and_then(|index| activation_ability_definition(state, pending.object_id, index))
+        .and_then(|ability| {
+            ability
+                .cost
+                .as_ref()
+                .and_then(casting_costs::extract_x_mana_cost)
+        })
+        .map_or(0, |(cost, _)| count(&cost))
+}
+
+/// CR 107.1b + CR 118.3: Exact affordability predicate for a pending X value
+/// whose Oracle text constrains the colors assigned to X. This is deliberately
+/// a full payment probe, not a mana-pool color count: floating restricted mana,
+/// mana abilities, and the source's own activation-payment context all remain
+/// visible to the existing payment authority.
+pub(crate) fn pending_x_value_is_payable(
+    state: &GameState,
+    pending: &PendingCast,
+    player: PlayerId,
+    value: u32,
+) -> bool {
+    let mut trial = pending.clone();
+    trial.ability.set_chosen_x_recursive(value);
+    trial.cost = if trial.base_cost.is_some() {
+        recompute_pending_mana_total(state, player, &trial, Some(value))
+    } else {
+        let mut cost = trial.cost.clone();
+        concretize_pending_x(&mut cost, value);
+        apply_pending_x_mana_payment_restriction(state, &trial, &mut cost, Some(value));
+        cost
+    };
+
+    let mut simulated = state.clone();
+    if trial.activation_ability_index.is_some() {
+        super::layers::flush_layers(&mut simulated);
+        let activation_context =
+            activation_payment_context(&simulated, trial.object_id, trial.activation_ability_index);
+        let context = activation_context.as_payment_context();
+        can_pay_mana_cost_after_auto_tap_with_context_and_cache(
+            &mut simulated,
+            player,
+            Some(trial.object_id),
+            &trial.cost,
+            Some(&context),
+            &HashSet::new(),
+            AutoTapProbeOptions {
+                source_cache: None,
+                explicit_tap_payment_mode: None,
+            },
+        )
+    } else {
+        can_pay_pending_cast_after_auto_tap_in_scratch(&mut simulated, &trial)
     }
 }
 
@@ -11717,7 +11887,7 @@ pub fn handle_cast_spell_for_free_with_payment_mode(
     // active and filter-matched. Source-specific validation avoids accepting a
     // stale legal action for one source only because an earlier battlefield
     // source also matches the spell.
-    let frequency =
+    let permission =
         cast_free_permission_from_source(state, player, obj, source_id).ok_or_else(|| {
             EngineError::ActionNotAllowed(
                 "Named CastFromHandFree permission source does not admit this spell".to_string(),
@@ -11725,7 +11895,7 @@ pub fn handle_cast_spell_for_free_with_payment_mode(
         })?;
     let variant = CastingVariant::HandPermission {
         source: source_id,
-        frequency,
+        frequency: permission.frequency,
     };
     let mut prepared =
         prepare_spell_cast_with_variant_override(state, player, object_id, Some(variant))?;
@@ -14690,31 +14860,41 @@ pub fn hand_cast_free_candidates_with_probe(
 ) -> Vec<(ObjectId, ObjectId, CastFrequency)> {
     // CR 601.2b + CR 400.7: Collect active (source_id, frequency, filter)
     // triples for OncePerTurn permissions that haven't been consumed this turn.
-    let sources: Vec<(ObjectId, TargetFilter, CastFrequency, CastFreeOrigin)> =
-        iter_cast_free_permission_source_ids(state)
-            .filter_map(|src_id| {
-                let src_obj = state.objects.get(&src_id)?;
-                if src_obj.controller != player {
-                    return None;
-                }
-                active_static_definitions(state, src_obj).find_map(|s| match s.mode {
-                    StaticMode::CastFromHandFree { frequency, origin } => {
-                        if frequency == CastFrequency::OncePerTurn
-                            && state.hand_cast_free_permissions_used.contains(&src_id)
-                        {
-                            None
-                        } else if frequency == CastFrequency::OncePerTurn {
-                            s.affected
-                                .as_ref()
-                                .map(|f| (src_id, f.clone(), frequency, origin))
-                        } else {
-                            None
-                        }
+    let sources: Vec<(
+        ObjectId,
+        PlayerId,
+        TargetFilter,
+        CastFrequency,
+        CastFreeOrigin,
+    )> = iter_cast_free_permission_source_ids(state)
+        .filter_map(|src_id| {
+            let src_obj = state.objects.get(&src_id)?;
+            active_static_definitions(state, src_obj).find_map(|s| match s.mode {
+                StaticMode::CastFromHandFree {
+                    frequency,
+                    origin,
+                    all_players,
+                    ..
+                } => {
+                    if !all_players && src_obj.controller != player {
+                        return None;
                     }
-                    _ => None,
-                })
+                    if frequency == CastFrequency::OncePerTurn
+                        && state.hand_cast_free_permissions_used.contains(&src_id)
+                    {
+                        None
+                    } else if frequency == CastFrequency::OncePerTurn {
+                        s.affected
+                            .as_ref()
+                            .map(|f| (src_id, src_obj.controller, f.clone(), frequency, origin))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
             })
-            .collect();
+        })
+        .collect();
 
     if sources.is_empty() {
         return Vec::new();
@@ -14725,14 +14905,17 @@ pub fn hand_cast_free_candidates_with_probe(
         return out;
     };
     for &hand_id in &player_data.hand {
-        for (src_id, filter, frequency, origin) in &sources {
+        for (src_id, source_controller, filter, frequency, origin) in &sources {
             let Some(obj) = state.objects.get(&hand_id) else {
                 continue;
             };
             if !cast_free_origin_admits_object(state, player, obj, *origin) {
                 continue;
             }
-            let ctx = super::filter::FilterContext::from_source_with_controller(*src_id, player);
+            let ctx = super::filter::FilterContext::from_source_with_controller(
+                *src_id,
+                *source_controller,
+            );
             if !super::filter::matches_target_filter(state, hand_id, filter, &ctx) {
                 continue;
             }
@@ -17926,6 +18109,13 @@ pub(super) fn activation_payment_context(
             .chosen_color()
             .map(ActivationManaColorConstraint::Only)
             .unwrap_or(ActivationManaColorConstraint::Impossible),
+        // This restriction is applied after CR 601.2f total-cost calculation:
+        // only the surviving announced X portion is colored. The remaining
+        // fixed activation cost stays normally payable, so the general
+        // activation context is not color-constrained here.
+        Some(ActivationManaPaymentRestriction::OnlyColorsOnX(_)) => {
+            ActivationManaColorConstraint::Unrestricted
+        }
     };
     ActivationPaymentContext {
         source_types,
@@ -18104,6 +18294,7 @@ fn apply_mana_spell_grants(
                 // operation, not a delayed triggered source.
                 trigger_source: None,
                 recipient_id: None,
+                event_target_id: None,
                 scoped_iteration_player: None,
             };
             if !crate::game::filter::matches_target_filter(state, spell_id, filter, &filter_ctx) {
@@ -18832,9 +19023,13 @@ fn activation_cost_for_affordability(
 /// equip costs from card-data export into `AbilityCost::OneOf`.
 fn normalize_activation_cost(cost: AbilityCost) -> AbilityCost {
     match cost {
-        AbilityCost::EffectCost { effect } => {
-            disjunctive_effect_cost_as_one_of(&effect).unwrap_or(AbilityCost::EffectCost { effect })
-        }
+        AbilityCost::EffectCost {
+            effect,
+            player_scope,
+        } => disjunctive_effect_cost_as_one_of(&effect).unwrap_or(AbilityCost::EffectCost {
+            effect,
+            player_scope,
+        }),
         AbilityCost::Composite { costs } => AbilityCost::Composite {
             costs: costs.into_iter().map(normalize_activation_cost).collect(),
         },

@@ -1839,7 +1839,7 @@ mod tests {
     #[test]
     fn unchanged_copy_across_recomputation_keeps_copy_slots() {
         let values = trigger_copiable_values();
-        let copy_effect = crate::types::ability::CopyEffectInstanceRef {
+        let copy_effect = crate::types::ability::CopyEffectInstanceRef::Transient {
             continuous_effect_id: 17,
             modification_index: 2,
         };
@@ -1877,11 +1877,11 @@ mod tests {
     #[test]
     fn replacement_copy_and_copy_of_copy_receive_new_recipient_copy_refs() {
         let values = trigger_copiable_values();
-        let first_copy = crate::types::ability::CopyEffectInstanceRef {
+        let first_copy = crate::types::ability::CopyEffectInstanceRef::Transient {
             continuous_effect_id: 17,
             modification_index: 2,
         };
-        let replacement_copy = crate::types::ability::CopyEffectInstanceRef {
+        let replacement_copy = crate::types::ability::CopyEffectInstanceRef::Transient {
             continuous_effect_id: 18,
             modification_index: 2,
         };
@@ -1894,7 +1894,7 @@ mod tests {
 
         assert_ne!(first_occurrence, replacement_occurrence);
 
-        let copy_of_copy_effect = crate::types::ability::CopyEffectInstanceRef {
+        let copy_of_copy_effect = crate::types::ability::CopyEffectInstanceRef::Transient {
             continuous_effect_id: 19,
             modification_index: 2,
         };
@@ -3349,6 +3349,7 @@ mod tests {
                 library_position: None,
                 library_players: None,
             }),
+            player_scope: None,
         });
         def.unless_pay = Some(UnlessPayModifier {
             cost: AbilityCost::EffectCost {
@@ -3364,6 +3365,7 @@ mod tests {
                     library_position: None,
                     library_players: None,
                 }),
+                player_scope: None,
             },
             payer: TargetFilter::Controller,
         });
@@ -3544,6 +3546,7 @@ mod tests {
                     library_position: None,
                     library_players: None,
                 }),
+                player_scope: None,
             },
             payer: TargetFilter::Controller,
         });
@@ -3578,7 +3581,9 @@ mod tests {
                     library_position: None,
                     library_players: None,
                 }),
+                player_scope: None,
             },
+            payment_record: None,
             decline: Some(Box::new(conjure_ability(
                 "repl_maycost_decline",
                 Zone::Hand,
@@ -3610,6 +3615,7 @@ mod tests {
                 library_position: None,
                 library_players: None,
             }),
+            replacement_sub_ability: None,
         };
         walk_effect(&draw_repl, &mut names);
 

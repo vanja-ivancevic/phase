@@ -808,6 +808,12 @@ pub(crate) fn parse_cda_quantity_with_context(
 ) -> Option<QuantityExpr> {
     let text = text.trim().trim_end_matches('.');
 
+    if let Ok((rest, qty)) = nom_quantity::parse_entry_life_paid_ref(text) {
+        if rest.is_empty() {
+            return Some(QuantityExpr::Ref { qty });
+        }
+    }
+
     // CR 101.4 + CR 608.2d: "the highest number" / "the lowest number" — the
     // cross-player extremum of the numbers players secretly chose earlier in THIS
     // ability (Wheel of Misfortune, Menacing Ogre, Life at Stake).
@@ -827,6 +833,11 @@ pub(crate) fn parse_cda_quantity_with_context(
         ctx.pending_choice_type,
         Some(crate::types::ability::ChoiceType::NumberRange { .. })
     ) {
+        if let Ok((rest, qty)) = nom_quantity::parse_resolution_chosen_number_ref(text) {
+            if rest.is_empty() {
+                return Some(QuantityExpr::Ref { qty });
+            }
+        }
         if let Ok((rest, qty)) = nom_quantity::parse_extreme_chosen_number_ref(text) {
             if rest.is_empty() {
                 return Some(QuantityExpr::Ref { qty });
@@ -2272,43 +2283,22 @@ fn parse_possessive_participle(input: &str) -> OracleResult<'_, ()> {
 /// (`"legendary creature"`, `"snow land"`, `"basic land"`) without
 /// enumerating verbatim multi-word strings.
 ///
-/// The bare type word is a *singular* card type or the `token` referent:
-///
-/// - Card types per CR 205.2/205.3: `creature`, `artifact`, `enchantment`,
-///   `card`, `spell`, `permanent`, `planeswalker`, `land`, `battle`,
-///   `instant`, `sorcery`.
-/// - Token referent per CR 109.1 / CR 110.5: a non-card object that can still
-///   anchor a possessive reference. Not a CR 205 type, so listed explicitly.
-///
-/// Plural forms (`creatures'`) are rejected — Oracle text possessives are
-/// always singular (`the sacrificed creature's`). Plurals also cannot reach
-/// this combinator through `parse_event_context_quantity` because the caller
-/// splits on `"'s "` (apostrophe + s + space), and `creatures' power` has
-/// `s' ` (no `'s ` substring) — but listing only singular forms here pins the
-/// invariant at the parser layer, not the caller.
+/// The bare type word is parsed by the shared type-word grammar. That includes
+/// singular card types, supertypes, and creature subtypes such as `Wall`, all
+/// of which can appear in old Oracle possessives ("that Wall's mana value").
+/// The caller still splits on `"'s "`, so ordinary plural possessives
+/// (`creatures' power`) cannot reach this helper.
 fn parse_possessive_object_type(input: &str) -> OracleResult<'_, ()> {
     // Optional supertype prefix consumes a trailing space.
     let (rest, _) = opt(nom_target::parse_supertype_prefix).parse(input)?;
-    // Singular object-type words. Order matters where one is a prefix of
-    // another: none of these share a prefix, so any order works.
-    value(
-        (),
-        alt((
-            tag("creature"),
-            tag("artifact"),
-            tag("enchantment"),
-            tag("planeswalker"),
-            tag("permanent"),
-            tag("battle"),
-            tag("instant"),
-            tag("sorcery"),
-            tag("land"),
-            tag("spell"),
-            tag("card"),
-            tag("token"),
-        )),
-    )
-    .parse(rest)
+    // CR 109.1 / CR 110.5: tokens are objects but are not card types, so the
+    // shared card-type parser intentionally does not recognize the bare noun.
+    // Keep it in this object-referent grammar without widening ordinary type
+    // filters elsewhere.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("token").parse(rest) {
+        return Ok((rest, ()));
+    }
+    nom_target::parse_type_filter_word(rest).map(|(rest, _)| (rest, ()))
 }
 
 /// CR 400.7 + CR 608.2c: Match "<noun> exiled from <possessive> hand this way"
@@ -6407,17 +6397,17 @@ mod tests {
     }
 
     /// Negative guard for `classify_possessive_referent`'s `bare_types`
-    /// allowlist — an unknown type word ("wizard") must NOT silently classify
+    /// allowlist — an unknown type word ("artifactoid") must NOT silently classify
     /// as anaphoric just because it follows a `"that "` / `"the "` determiner.
     /// Pairs with the positive `parse_event_context_possessive_that_card_*`
     /// tests to lock both sides of the classifier.
     #[test]
     fn parse_event_context_possessive_unknown_type_returns_none() {
         assert_eq!(
-            parse_event_context_quantity("that wizard's mana value"),
+            parse_event_context_quantity("that artifactoid's mana value"),
             None
         );
-        assert_eq!(parse_event_context_quantity("the wizard's power"), None);
+        assert_eq!(parse_event_context_quantity("the artifactoid's power"), None);
     }
 
     /// Negative guard for the participle word-boundary fix: a prefix like
@@ -8811,8 +8801,21 @@ mod tests {
             parse_cda_quantity("the number of Forests sacrificed as it entered"),
             None
         );
-        // Minion of the Wastes — "the life paid as it entered" (ETB snapshot)
-        assert_eq!(parse_cda_quantity("the life paid as it entered"), None);
+        // Minion of the Wastes uses the pronoun form; Phyrexian Processor's
+        // normalized Oracle line uses `~`. Both are the same entry-history
+        // quantity, not an ordinary resolution-local "that much" value.
+        for phrase in [
+            "the life paid as it entered",
+            "the life paid as ~ entered",
+        ] {
+            assert_eq!(
+                parse_cda_quantity(phrase),
+                Some(QuantityExpr::Ref {
+                    qty: QuantityRef::EntryLifePaid,
+                }),
+                "entry-life phrase must parse: {phrase}"
+            );
+        }
     }
 
     /// CR 402.1 + CR 109.5 (issue #5637): "for each opponent who has one or fewer

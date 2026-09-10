@@ -266,6 +266,8 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
             push(TriggerEventKey::LeaveBattlefield(narrow));
             push(TriggerEventKey::Dies(narrow));
         }
+        TriggerMode::Regenerated => push(TriggerEventKey::Regenerated),
+        TriggerMode::CumulativeUpkeepNotPaid => push(TriggerEventKey::CumulativeUpkeepNotPaid),
         TriggerMode::Taps | TriggerMode::TapAll => push(TriggerEventKey::Taps),
         TriggerMode::TapsForMana => push(TriggerEventKey::TapsForMana),
         TriggerMode::Untaps | TriggerMode::UntapAll => push(TriggerEventKey::Untaps),
@@ -673,8 +675,9 @@ pub(crate) fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         GameEvent::CrimeCommitted { .. } => push(TriggerEventKey::PlayerActionPerformed),
         GameEvent::Cycled { .. } => {}
         GameEvent::PlayerPerformedAction { .. } => push(TriggerEventKey::PlayerActionPerformed),
-        GameEvent::Regenerated { .. }
-        | GameEvent::CreatureSuspected { .. }
+        GameEvent::Regenerated { .. } => push(TriggerEventKey::Regenerated),
+        GameEvent::CumulativeUpkeepNotPaid { .. } => push(TriggerEventKey::CumulativeUpkeepNotPaid),
+        GameEvent::CreatureSuspected { .. }
         | GameEvent::CreatureNoLongerSuspected { .. }
         | GameEvent::Detained { .. }
         | GameEvent::BecamePrepared { .. }
@@ -775,7 +778,7 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         EffectKind::Monstrosity => push(TriggerEventKey::BecomesMonstrous),
         EffectKind::ManifestDread => push(TriggerEventKey::ManifestDreadResolved),
         EffectKind::DayTimeChange => push(TriggerEventKey::DayNightChanged),
-        EffectKind::PutSticker | EffectKind::ApplySticker => {}
+        EffectKind::PutSticker | EffectKind::ApplySticker | EffectKind::LoseAllUnspentMana => {}
         // All other variants: not dispatched on by any production
         // EffectResolved matcher (verified against `trigger_matchers.rs` 1-3216).
         // Explicit `&[]`-equivalent arms — a future contributor who adds a
@@ -1024,7 +1027,9 @@ fn keys_from_effect_kind(kind: EffectKind, push: &mut impl FnMut(TriggerEventKey
         | EffectKind::CrankContraptions
         | EffectKind::ReassembleContraption
         | EffectKind::AssembleContraptionOnSprocket
-        | EffectKind::ReassembleContraptionOnSprocket => {}
+        | EffectKind::RevealChosenLowestManaValueCreatures
+        | EffectKind::ReassembleContraptionOnSprocket
+        | EffectKind::RepeatPaidLibraryLook => {}
     }
 }
 

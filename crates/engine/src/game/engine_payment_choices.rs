@@ -1722,7 +1722,7 @@ pub(super) fn handle_unless_payment(
                     }
                 }
             }
-            AbilityCost::EffectCost { effect } => match effect.as_ref() {
+            AbilityCost::EffectCost { effect, .. } => match effect.as_ref() {
                 Effect::DealDamage { .. } => {
                     let mut damage_ability = pending_effect.as_ref().clone();
                     damage_ability.effect = *effect.clone();
@@ -1782,6 +1782,30 @@ pub(super) fn handle_unless_payment(
             )?;
             return Ok(action_result(events, waiting_for));
         }
+    }
+
+    // CR 702.24a: A declined-or-failed cumulative-upkeep payment is observed by
+    // printed rider triggers ("When a player doesn't pay ~'s cumulative
+    // upkeep, ..."). Emitted before the unpaid epilogue resolves the default
+    // sacrifice so the rider queues through the ordinary event pipeline; the
+    // flag rides on `pending_effect` because the interceptor cleared
+    // `unless_pay` before prompting.
+    if pending_effect.unless_was_cumulative_upkeep {
+        let cu_event = GameEvent::CumulativeUpkeepNotPaid {
+            source_id: pending_effect.source_id,
+            player,
+        };
+        // CR 702.24a: The UnlessPayment reducer arm returns without a
+        // post-action pipeline pass over its event stream, so the rider must
+        // be collected here — the same pattern the cost-payment paths use —
+        // or a printed rider trigger would never reach the deferred queue.
+        // Collected BEFORE the unpaid epilogue resolves the default
+        // sacrifice, so both riders of one non-payment order as one batch.
+        crate::game::triggers::collect_triggers_into_deferred(
+            state,
+            std::slice::from_ref(&cu_event),
+        );
+        events.push(cu_event);
     }
 
     finish_unless_payment(
@@ -3404,6 +3428,7 @@ mod tests {
                     count: QuantityExpr::Fixed { value: 1 },
                     target: TargetFilter::OriginalController,
                 }),
+                player_scope: None,
             },
             pending_effect: Box::new(pending),
             trigger_event: None,

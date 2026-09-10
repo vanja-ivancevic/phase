@@ -2077,6 +2077,8 @@ fn starts_prefix_clause(current_lower: &str) -> bool {
         // reaches `strip_temporal_prefix` instead of splitting at the comma
         // (Fortune, Loyal Steed: "at end of combat, exile it and …").
         tag("at end of combat"),
+        // CR 603.7a + CR 502.2: this temporal prefix also owns its comma.
+        tag("during your next untap step"),
         tag("for as long as "),
         // CR 508.6: "During any turn [you attacked with X], [effect]" — temporal
         // attack-history gate (Neyali, Neriv, Boros Strike-Captain). Keep the
@@ -2461,6 +2463,9 @@ fn is_inside_temporal_prefix(lower: &str) -> bool {
         tag::<_, _, OracleError<'_>>("at the beginning of the next "),
         tag("at the beginning of your next "),
         tag("at the end of "),
+        // CR 603.7a + CR 502.2: keep Undiscovered Paradise's delayed-return
+        // prefix intact through its internal comma.
+        tag("during your next untap step"),
     ))
     .parse(trimmed)
     .is_ok()
@@ -2811,6 +2816,11 @@ fn starts_bare_and_clause_lower(s: &str) -> bool {
         // each clause reaches the effect dispatcher independently.
         value((), tag("transform ")),
     ))
+    // A player subject can govern a list of conjugated actions: "target player
+    // reveals their hand and discards ...". The continuation must be a separate
+    // chunk so the carried player subject is injected by the effect-chain
+    // lowerer instead of losing the discard instruction.
+    .or(value((), tag("discards ")))
     .or(value((), tag("cast ")))
     .or(value((), tag("cloak ")))
     .or(value((), tag("convert ")))
@@ -5096,6 +5106,18 @@ pub(super) fn apply_clause_continuation(
                 enter_with_counters.push((counter_type, count));
             }
         }
+        ContinuationAst::TokenStaticAbilities { static_abilities } => {
+            let Some(previous) = defs.last_mut() else {
+                return;
+            };
+            if let Effect::Token {
+                static_abilities: existing,
+                ..
+            } = &mut *previous.effect
+            {
+                existing.extend(static_abilities);
+            }
+        }
         ContinuationAst::TokenSourcePowerToughness {
             power: followup_power,
             toughness: followup_toughness,
@@ -5575,6 +5597,7 @@ pub(super) fn continuation_absorbs_current(
         ContinuationAst::EntersTappedAttacking { .. } => true,
         ContinuationAst::TokenEntersWithCounters { .. } => true,
         ContinuationAst::TokenSourcePowerToughness { .. } => true,
+        ContinuationAst::TokenStaticAbilities { .. } => true,
         ContinuationAst::DigFromAmong { .. } => true,
         ContinuationAst::FaceDownProfileSpec { .. } => true,
         ContinuationAst::GrantExtraTurnAfterControlledTurn => true,
@@ -6518,6 +6541,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         // CR 708.2a: turning a permanent face down is its own resolving effect,
         // not a Dig-lookback-transparent clause.
         Effect::TurnFaceDown { .. } => false,
+        Effect::RevealChosenLowestManaValueCreatures => false,
         Effect::StartYourEngines { .. }
         | Effect::EpicCopy { .. }
         | Effect::ChangeSpeed { .. }
@@ -6536,6 +6560,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         | Effect::Token { .. }
         | Effect::GainLife { .. }
         | Effect::LoseLife { .. }
+        | Effect::LoseAllUnspentMana { .. }
         // CR 701.26a/b: all tap/untap scopes are treated identically here.
         | Effect::SetTapState { .. }
         | Effect::RemoveCounter { .. }
@@ -6752,6 +6777,7 @@ pub(super) fn clause_is_dig_lookback_transparent(effect: &Effect) -> bool {
         // resolving effects, not Dig-lookback-transparent.
         | Effect::ChooseCounterKind { .. }
         | Effect::PutChosenCounter { .. }
+        | Effect::RepeatPaidLibraryLook
         | Effect::Unimplemented { .. } => false,
     }
 }
@@ -7814,6 +7840,10 @@ pub(super) fn parse_followup_continuation_ast(
             .map(|(power, toughness)| ContinuationAst::TokenSourcePowerToughness {
                 power,
                 toughness,
+            })
+            .or_else(|| {
+                super::token::parse_token_static_ability_followup(&lower)
+                    .map(|static_abilities| ContinuationAst::TokenStaticAbilities { static_abilities })
             })
             .or_else(|| try_parse_token_enters_with_counters(&lower))
             .or_else(|| try_parse_put_counters_on_token_followup(&lower)),
@@ -12517,6 +12547,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn temporal_prefix_next_untap_keeps_its_internal_commas() {
+        // CR 603.7a + CR 502.2: the "as you untap your permanents" wording is
+        // part of the delayed-trigger condition, not a standalone `during`
+        // effect. The full clause must reach the shared temporal lowerer.
+        let chunks = clause_texts(
+            "during your next untap step, as you untap your permanents, return this land to its owner's hand",
+        );
+        assert_eq!(
+            chunks,
+            vec![
+                "during your next untap step, as you untap your permanents, return this land to its owner's hand"
+            ]
+        );
+    }
+
     // --- Token enters with counters continuation ---
 
     /// The parser accepts both the "the token enters with " and "it enters with "
@@ -14053,6 +14099,31 @@ mod tests {
         assert!(
             result.is_none(),
             "reflexive attach gate must not re-patch the Dig, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn token_static_source_cda_followup_is_absorbed() {
+        let text = r#"create a green Saproling creature token. It has "This token's power and toughness are each equal to the number of fade counters on ~.""#;
+        let def = super::super::parse_effect_chain(text, AbilityKind::Spell);
+        let Effect::Token {
+            static_abilities, ..
+        } = &*def.effect
+        else {
+            panic!("expected token effect, got {def:?}");
+        };
+        assert_eq!(
+            static_abilities.len(),
+            1,
+            "token CDA must be absorbed into the token effect: {def:?}"
+        );
+        assert!(
+            format!("{static_abilities:?}").contains("TokenSourceCounters"),
+            "token CDA must read the creating permanent's counters: {def:?}"
+        );
+        assert!(
+            def.sub_ability.is_none(),
+            "the sentence-form token CDA must not remain as an unimplemented sibling: {def:?}"
         );
     }
 }

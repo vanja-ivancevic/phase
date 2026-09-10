@@ -730,6 +730,9 @@ fn effect_projection(effect: &Effect) -> Projection {
             let (a, _) = count_seed(amount);
             b.add_life(target_player_opt(target), -a, AxisMagnitude::Fixed(0));
         }
+        // Mana loss changes a transient pool, not a modeled persistent resource
+        // axis. It is intentionally unmodeled for combo-resource projection.
+        Effect::LoseAllUnspentMana { .. } => {}
         // ----- TOKEN family (CR 111.1) — a token entry IS an ETB (CR 603.6a) -----
         Effect::Token { count, .. }
         | Effect::CopyTokenOf { count, .. }
@@ -1040,6 +1043,8 @@ fn effect_projection(effect: &Effect) -> Projection {
         // runtime choice) — Unmodeled, like the other choice effects.
         | Effect::ChooseCounterKind { .. }
         | Effect::PutChosenCounter { .. }
+        | Effect::RevealChosenLowestManaValueCreatures
+        | Effect::RepeatPaidLibraryLook
         | Effect::Unimplemented { .. } => return Projection::Unmodeled,
     }
     b.finish()
@@ -1085,6 +1090,12 @@ fn trigger_axis(trig: &TriggerDefinition) -> Option<AxisKey> {
         TriggerMode::LeavesBattlefield => Some(AxisKey::Ltb),
         // CR 700.4: a dies/destroyed trigger consumes the Death event.
         TriggerMode::Destroyed => Some(AxisKey::Death),
+        // CR 701.19: regeneration is emitted by the replacement layer, but no
+        // resource-producer axis models that event yet.
+        TriggerMode::Regenerated => None,
+        // CR 702.24a: the non-payment rider is emitted by the unless-payment
+        // resolver; no resource-producer axis models that event yet.
+        TriggerMode::CumulativeUpkeepNotPaid => None,
         // CR 701.21: a sacrifice trigger consumes the Sac event.
         TriggerMode::Sacrificed | TriggerMode::SacrificedOnce => Some(AxisKey::Sac),
         // CR 119.3: life-gain / life-loss / pay-life triggers consume the Life axis.
@@ -1347,8 +1358,16 @@ fn collect_effects_in_effect<'a>(effect: &'a Effect, out: &mut Vec<&'a Effect>) 
         // `AbilityDefinition` payload), so it is invisible to the sibling recursions
         // above. Descend it too — otherwise a randomness effect nested inside a
         // replacement install escapes every `collect_effects` consumer.
-        Effect::CreateDrawReplacement { replacement_effect }
-        | Effect::CreatePlaneswalkReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
+            collect_effects_in_effect(replacement_effect, out);
+            if let Some(sub) = replacement_sub_ability {
+                collect_effects(sub, out);
+            }
+        }
+        Effect::CreatePlaneswalkReplacement { replacement_effect } => {
             collect_effects_in_effect(replacement_effect, out);
         }
         _ => {}
@@ -1538,7 +1557,7 @@ fn fold_cost(acc: &mut NodeAcc, cost: &AbilityCost) {
             }
         },
         // CR 118.12: an effect performed as a cost is projected the same way.
-        AbilityCost::EffectCost { effect } => fold_projection(acc, effect_projection(effect)),
+        AbilityCost::EffectCost { effect, .. } => fold_projection(acc, effect_projection(effect)),
         // CR 601.2h: a Composite cost is conjunctive — every sub-cost is part of
         // the total cost and all are paid (partial payments are not allowed), so
         // the branches AND-fold (sum) into the node.

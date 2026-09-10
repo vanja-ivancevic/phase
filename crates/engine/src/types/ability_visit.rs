@@ -335,7 +335,7 @@ where
     // The mode carries the decline continuation (and, for MayCost, a cost),
     // either of which may conjure. Descend into both.
     match &replacement.mode {
-        ReplacementMode::MayCost { cost, decline } => {
+        ReplacementMode::MayCost { cost, decline, .. } => {
             visit_cost_scoped(cost, scope, visit)?;
             if let Some(decline) = decline {
                 visit_ability_def_scoped(decline, scope, visit)?;
@@ -416,6 +416,7 @@ where
         // from the provider objects at layer collection time, not nested here.
         ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
         | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
+        | ContinuousModification::CopyTopOfZone { .. }
         // CR 707.2c (Metamorphic Alteration): inert parse-time copy marker — no
         // nested ability/effect carrier to walk (the copy grant is the runtime TCE).
         | ContinuousModification::CopyChosen
@@ -428,6 +429,7 @@ where
         | ContinuousModification::AddKeyword { .. }
         | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::RemoveAllAbilities
         | ContinuousModification::AddType { .. }
         | ContinuousModification::RemoveType { .. }
@@ -519,7 +521,7 @@ where
     F: FnMut(&Effect) -> ControlFlow<()>,
 {
     match cost {
-        AbilityCost::EffectCost { effect } => visit_effect_scoped(effect, scope, visit)?,
+        AbilityCost::EffectCost { effect, .. } => visit_effect_scoped(effect, scope, visit)?,
         AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
             for sub in costs {
                 visit_cost_scoped(sub, scope, visit)?;
@@ -588,6 +590,7 @@ where
 {
     visit(effect)?;
     match effect {
+        Effect::RevealChosenLowestManaValueCreatures => {}
         Effect::Intensify { .. } => {}
         Effect::ApplyPerpetual { .. } => {}
         // CR 614.11: A one-shot draw replacement nests its substitute Effect
@@ -603,9 +606,15 @@ where
         // effect of a resolving spell or ability replacing "that spell or
         // ability's own effect(s)"), so CR 605.1a's closing carve-out does not
         // reach it and the substitute effect is not part of THIS resolution.
-        Effect::CreateDrawReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
             if scope == ResolutionScope::IncludeRegisteredLater {
-                visit_effect_scoped(replacement_effect, scope, visit)?
+                visit_effect_scoped(replacement_effect, scope, visit)?;
+                if let Some(sub) = replacement_sub_ability {
+                    visit_ability_def_scoped(sub, scope, visit)?;
+                }
             }
         }
         // CR 614.1a: A planeswalk replacement nests its substitute Effect (Fixed
@@ -808,6 +817,7 @@ where
         | Effect::CounterAll { .. }
         | Effect::GainLife { .. }
         | Effect::LoseLife { .. }
+        | Effect::LoseAllUnspentMana { .. }
         | Effect::ExchangeLifeWithStat { .. }
         | Effect::ExchangeLifeTotals { .. }
         // CR 701.26a/b: all tap/untap scopes are leaf effects here.
@@ -1026,6 +1036,7 @@ where
         | Effect::ChooseCounterKind { .. }
         | Effect::PutChosenCounter { .. }
         | Effect::ReproduceEventCounters { .. }
+        | Effect::RepeatPaidLibraryLook
         | Effect::Unimplemented { .. } => {}
     }
     ControlFlow::Continue(())

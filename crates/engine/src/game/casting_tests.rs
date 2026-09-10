@@ -3,18 +3,21 @@ use super::*;
 use crate::game::zones;
 use crate::game::zones::create_object;
 use crate::parser::oracle_effect::parse_effect_chain;
-use crate::parser::oracle_static::parse_static_line;
+use crate::parser::oracle_static::{
+    parse_discard_matching_color_alternative_cost, parse_static_line,
+};
 use crate::types::ability::{
-    AbilityCost, AbilityTag, ActivationRestriction, AdditionalCost, AggregateFunction,
-    BasicLandType, CastPermissionConstraint, CastVariantPaid, CastingPermission, ChosenAttribute,
-    ChosenSubtypeKind, Comparator, ContinuousModification, ControllerRef, CostCategory, CountScope,
-    EffectScope, FilterProp, GameRestriction, KickerVariant, ManaContribution, ManaProduction,
-    ManaSpendPermission, ManaSpendRestriction, ModalChoice, ModalSelectionCondition,
-    ModalSelectionConstraint, MultiTargetSpec, ObjectProperty, ProhibitedActivity, PtStat, PtValue,
-    PtValueScope, QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode,
-    RestrictionExpiry, RestrictionPlayerScope, SacrificeCost, SacrificeRequirement,
-    SearchSelectionConstraint, StaticCondition, StaticDefinition, TapStateChange, TargetFilter,
-    TargetRef, TypeFilter, TypedFilter,
+    AbilityCost, AbilityTag, ActivationManaPaymentRestriction, ActivationRestriction,
+    AdditionalCost, AggregateFunction, BasicLandType, CastPermissionConstraint, CastVariantPaid,
+    CastingPermission, CastingRestriction, ChosenAttribute, ChosenSubtypeKind, Comparator,
+    ContinuousModification, ControllerRef, CostCategory, CountScope, EffectScope, FilterProp,
+    GameRestriction, KickerVariant, ManaContribution, ManaProduction, ManaSpendPermission,
+    ManaSpendRestriction, ModalChoice, ModalSelectionCondition, ModalSelectionConstraint,
+    MultiTargetSpec, ObjectProperty, ProhibitedActivity, PtStat, PtValue, PtValueScope,
+    QuantityExpr, QuantityRef, ReplacementDefinition, ReplacementMode, RestrictionExpiry,
+    RestrictionPlayerScope, SacrificeCost, SacrificeRequirement, SearchSelectionConstraint,
+    StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TargetRef, TypeFilter,
+    TypedFilter,
 };
 use crate::types::actions::GameAction;
 use crate::types::card_type::{CoreType, Supertype};
@@ -24,7 +27,7 @@ use crate::types::game_state::{ManaChoice, ManaChoicePrompt, SpellCastRecord};
 use crate::types::keywords::{EmergeCost, EscapeCost, FlashbackCost, Keyword, KeywordKind};
 use crate::types::mana::{
     ManaColor, ManaCost, ManaCostShard, ManaRestriction, ManaSourceSelection, ManaSpellGrant,
-    ManaType, ManaUnit,
+    ManaType, ManaUnit, XManaPaymentRestriction,
 };
 use crate::types::phase::Phase;
 use crate::types::replacements::ReplacementEvent;
@@ -41,6 +44,152 @@ fn setup_game_at_main_phase() -> GameState {
         player: PlayerId(0),
     };
     state
+}
+
+/// CR 601.2b + CR 601.3b + CR 702.8a: Aluren's permission belongs to every
+/// player, not merely its controller, and its free-cast and flash halves must
+/// be admitted together.  P1 is casting during P0's main phase with no mana;
+/// either missing half makes this discriminating scenario fail.
+#[test]
+fn aluren_allows_an_opponent_to_free_cast_an_eligible_creature_at_instant_speed() {
+    let mut state = setup_game_at_main_phase();
+    state.priority_player = PlayerId(1);
+    state.waiting_for = WaitingFor::Priority {
+        player: PlayerId(1),
+    };
+
+    let aluren = create_object(
+        &mut state,
+        CardId(9_900_001),
+        PlayerId(0),
+        "Aluren".to_string(),
+        Zone::Battlefield,
+    );
+    state.objects.get_mut(&aluren).unwrap().static_definitions.push(
+        parse_static_line(
+            "Any player may cast creature spells with mana value 3 or less without paying their mana costs and as though they had flash.",
+        )
+        .expect("Aluren must parse"),
+    );
+
+    let creature = create_object(
+        &mut state,
+        CardId(9_900_002),
+        PlayerId(1),
+        "Opponent's three-drop".to_string(),
+        Zone::Hand,
+    );
+    let creature_obj = state.objects.get_mut(&creature).unwrap();
+    creature_obj.card_types.core_types.push(CoreType::Creature);
+    creature_obj.mana_cost = ManaCost::generic(3);
+    creature_obj.base_mana_cost = creature_obj.mana_cost.clone();
+
+    assert_eq!(
+        effective_spell_cost(&state, PlayerId(1), creature),
+        Some(ManaCost::NoCost),
+        "the opponent must receive Aluren's no-cost permission"
+    );
+    assert!(
+        can_cast_object_now(&state, PlayerId(1), creature),
+        "the same permission must grant flash during the other player's main phase"
+    );
+
+    let mut events = Vec::new();
+    handle_cast_spell(
+        &mut state,
+        PlayerId(1),
+        creature,
+        CardId(9_900_002),
+        &mut events,
+    )
+    .expect("the admitted opponent cast must traverse the normal cast pipeline");
+    assert_eq!(
+        state.objects[&creature].zone,
+        Zone::Stack,
+        "Aluren must carry the opponent's free instant-speed cast through payment into the stack"
+    );
+}
+
+/// CR 118.9 + CR 601.2b: Dream Halls' pitch payment must be offered to either
+/// player only when another hand card shares a color with the pending spell.
+/// The filter source is the pending spell, not Dream Halls, which is the crucial
+/// distinction for both legality and the eventual discard chooser.
+#[test]
+fn dream_halls_offers_only_matching_color_pitch_costs_to_any_player() {
+    let mut state = setup_game_at_main_phase();
+    let dream_halls = create_object(
+        &mut state,
+        CardId(9_900_010),
+        PlayerId(0),
+        "Dream Halls".to_string(),
+        Zone::Battlefield,
+    );
+    state.objects.get_mut(&dream_halls).unwrap().static_definitions.push(
+        parse_discard_matching_color_alternative_cost(
+            "Rather than pay the mana cost for a spell, its controller may discard a card that shares a color with that spell.",
+        )
+        .expect("Dream Halls must parse"),
+    );
+
+    let spell = create_object(
+        &mut state,
+        CardId(9_900_011),
+        PlayerId(1),
+        "Opponent's blue spell".to_string(),
+        Zone::Hand,
+    );
+    {
+        let spell_obj = state.objects.get_mut(&spell).unwrap();
+        spell_obj.color = vec![ManaColor::Blue];
+        spell_obj.mana_cost = ManaCost::generic(5);
+        spell_obj.base_mana_cost = spell_obj.mana_cost.clone();
+    }
+    let matching_discard = create_object(
+        &mut state,
+        CardId(9_900_012),
+        PlayerId(1),
+        "Blue pitch card".to_string(),
+        Zone::Hand,
+    );
+    state.objects.get_mut(&matching_discard).unwrap().color = vec![ManaColor::Blue];
+    let nonmatching_discard = create_object(
+        &mut state,
+        CardId(9_900_013),
+        PlayerId(1),
+        "Red pitch card".to_string(),
+        Zone::Hand,
+    );
+    state.objects.get_mut(&nonmatching_discard).unwrap().color = vec![ManaColor::Red];
+
+    let cost =
+        super::casting_costs::payable_spell_alternative_cost_details(&state, PlayerId(1), spell)
+            .expect("a matching hand card must make Dream Halls payable");
+    assert!(matches!(cost.cost, AbilityCost::Discard { .. }));
+    assert_eq!(
+        super::find_eligible_discard_targets(
+            &state,
+            PlayerId(1),
+            spell,
+            match &cost.cost {
+                AbilityCost::Discard { filter, .. } => filter.as_ref(),
+                _ => unreachable!("Dream Halls costs discard a card"),
+            },
+        ),
+        vec![matching_discard],
+        "only the same-color card may pay the pitch cost"
+    );
+
+    state.players[PlayerId(1).0 as usize]
+        .hand
+        .retain(|id| *id != matching_discard);
+    assert!(
+        super::casting_costs::payable_spell_alternative_cost_details(&state, PlayerId(1), spell)
+            .is_none(),
+        "a mismatched hand card must not make the pitch cost payable"
+    );
+    assert!(state.players[PlayerId(1).0 as usize]
+        .hand
+        .contains(&nonmatching_discard));
 }
 
 fn ability_graph_has_cast_occurrence(
@@ -1639,6 +1788,143 @@ fn x_spell_cap_excludes_mana_restricted_to_activated_abilities() {
         ),
         other => panic!("expected ChooseXValue, got {other:?}"),
     }
+}
+
+/// CR 107.1b + CR 118.3: a spell rider such as Consume Spirit's "Spend only
+/// black mana on X" constrains the selected X units, but not the printed
+/// colored or generic portion of the cost. The full cast path must therefore
+/// cap X from black mana rather than the raw pool total, then spend ordinary
+/// mana for the unrelated generic pip.
+#[test]
+fn x_mana_color_rider_caps_spell_x_and_preserves_fixed_generic_payment() {
+    let mut state = setup_game_at_main_phase();
+    let spell = create_object(
+        &mut state,
+        CardId(9_030),
+        PlayerId(0),
+        "Consume Spirit Stand-In".to_string(),
+        Zone::Hand,
+    );
+    {
+        let obj = state.objects.get_mut(&spell).unwrap();
+        obj.card_types.core_types.push(CoreType::Sorcery);
+        obj.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::X, ManaCostShard::Black],
+            generic: 1,
+        };
+        obj.base_mana_cost = obj.mana_cost.clone();
+        obj.casting_restrictions = vec![CastingRestriction::OnlyColorsOnX(
+            XManaPaymentRestriction::One(ManaColor::Black),
+        )];
+        Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        ));
+    }
+    add_mana(&mut state, PlayerId(0), ManaType::Black, 2);
+    add_mana(&mut state, PlayerId(0), ManaType::Blue, 2);
+
+    apply_as_current(
+        &mut state,
+        GameAction::CastSpell {
+            object_id: spell,
+            card_id: CardId(9_030),
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        },
+    )
+    .expect("Consume Spirit stand-in should enter the X-selection path");
+    match state.waiting_for {
+        WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+            max, 1,
+            "two black and two blue mana pay {{X}}{{B}}{{1}} only at X=1; blue cannot pay X"
+        ),
+        ref other => panic!("expected ChooseXValue, got {other:?}"),
+    }
+    assert!(
+        apply_as_current(&mut state, GameAction::ChooseX { value: 2 }).is_err(),
+        "the engine must reject an X value above the color-restricted cap"
+    );
+
+    apply_as_current(&mut state, GameAction::ChooseX { value: 1 })
+        .expect("the offered maximum must traverse real automatic payment");
+    assert_eq!(
+        state.stack.len(),
+        1,
+        "the spell reaches the stack after payment"
+    );
+    assert_eq!(
+        state.players[0].mana_pool.total(),
+        1,
+        "X and the printed {{B}} spend black, while the fixed {{1}} may spend blue"
+    );
+}
+
+/// CR 602.2b + CR 118.3: the same rider on Crypt Rats-style activated
+/// abilities is governed by the normal activation pipeline, including its
+/// Choose-X cap and automatic payment.
+#[test]
+fn x_mana_color_rider_caps_activated_ability_x() {
+    let mut state = setup_game_at_main_phase();
+    let source = create_object(
+        &mut state,
+        CardId(9_031),
+        PlayerId(0),
+        "Crypt Rats Stand-In".to_string(),
+        Zone::Battlefield,
+    );
+    {
+        let obj = state.objects.get_mut(&source).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        let mut ability = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+        )
+        .cost(AbilityCost::Mana {
+            cost: ManaCost::Cost {
+                shards: vec![ManaCostShard::X],
+                generic: 0,
+            },
+        });
+        ability.activation_mana_payment_restriction =
+            Some(ActivationManaPaymentRestriction::OnlyColorsOnX(
+                XManaPaymentRestriction::One(ManaColor::Black),
+            ));
+        Arc::make_mut(&mut obj.abilities).push(ability);
+    }
+    add_mana(&mut state, PlayerId(0), ManaType::Black, 1);
+    add_mana(&mut state, PlayerId(0), ManaType::Blue, 2);
+
+    apply_as_current(
+        &mut state,
+        GameAction::ActivateAbility {
+            source_id: source,
+            ability_index: 0,
+        },
+    )
+    .expect("Crypt Rats stand-in should enter the X-selection path");
+    match state.waiting_for {
+        WaitingFor::ChooseXValue { max, .. } => assert_eq!(
+            max, 1,
+            "the two blue units cannot inflate an activated ability's black-only X"
+        ),
+        ref other => panic!("expected ChooseXValue, got {other:?}"),
+    }
+
+    apply_as_current(&mut state, GameAction::ChooseX { value: 1 })
+        .expect("the legal activated X value must be payable");
+    assert_eq!(state.stack.len(), 1, "the activation reaches the stack");
+    assert_eq!(
+        state.players[0].mana_pool.total(),
+        2,
+        "the black X payment is consumed while the blue mana remains"
+    );
 }
 
 #[test]
@@ -5985,6 +6271,7 @@ fn legacy_equip_effect_cost_one_of_is_legal_without_mana_when_discard_available(
                 ),
             ],
         }),
+        player_scope: None,
     };
     let source = create_colorless_tap_activated_source(
         &mut state,
@@ -14881,6 +15168,155 @@ fn hand_spell_alternative_pay_life_cost_replaces_mana_cost() {
     );
 }
 
+/// Build a minimal Thwart-shaped instant using the real parser-produced
+/// alternative cost.  The effect itself is deliberately non-targeted so this
+/// test can stop after payment and assert the cast/payment state directly.
+fn create_thwart_with_islands(
+    state: &mut GameState,
+    island_count: usize,
+) -> (ObjectId, Vec<ObjectId>) {
+    let spell_id = create_instant_in_hand(state, PlayerId(0));
+    let option = crate::parser::oracle_casting::parse_spell_casting_option_line(
+        "You may return three Islands you control to their owner's hand rather than pay this spell's mana cost.",
+        "Thwart",
+    )
+    .expect("Thwart alternative-cost line must parse");
+    let spell = state.objects.get_mut(&spell_id).unwrap();
+    spell.name = "Thwart".to_string();
+    spell.mana_cost = ManaCost::Cost {
+        shards: vec![ManaCostShard::Blue, ManaCostShard::Blue],
+        generic: 2,
+    };
+    Arc::make_mut(&mut spell.abilities).clear();
+    Arc::make_mut(&mut spell.abilities).push(AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
+    ));
+    spell.casting_options.clear();
+    spell.casting_options.push(option);
+
+    let mut islands = Vec::with_capacity(island_count);
+    for index in 0..island_count {
+        let island = create_object(
+            state,
+            CardId(0x54_000 + index as u64),
+            PlayerId(0),
+            format!("Island {index}"),
+            Zone::Battlefield,
+        );
+        let object = state.objects.get_mut(&island).unwrap();
+        object.card_types.core_types.push(CoreType::Land);
+        object.card_types.subtypes.push("Island".to_string());
+        islands.push(island);
+    }
+    (spell_id, islands)
+}
+
+/// CR 118.9 + CR 601.2b: two Islands cannot pay Thwart's exact three-Island
+/// alternate cost, and with no mana the spell is not castable at all.
+#[test]
+fn thwart_alternative_cost_requires_three_islands() {
+    let mut state = setup_game_at_main_phase();
+    let (spell_id, _) = create_thwart_with_islands(&mut state, 2);
+
+    assert_eq!(
+        crate::game::casting_costs::payable_spell_alternative_cost_details(
+            &state,
+            PlayerId(0),
+            spell_id,
+        ),
+        None,
+        "two Islands must not expose Thwart's three-Island alternate cost"
+    );
+    assert!(
+        !can_cast_object_now(&state, PlayerId(0), spell_id),
+        "with no mana and only two Islands, Thwart must not be castable"
+    );
+}
+
+/// CR 118.9 + CR 601.2b/h: three eligible Islands expose an interactive
+/// exact-count payment, and selecting them returns all three before the spell
+/// reaches the stack. This guards against the old EffectCost no-op path, which
+/// finalized the alternate-cost cast without moving any Islands.
+#[test]
+fn thwart_alternative_cost_returns_exactly_three_islands_before_cast() {
+    let mut state = setup_game_at_main_phase();
+    let (spell_id, islands) = create_thwart_with_islands(&mut state, 3);
+
+    let details = crate::game::casting_costs::payable_spell_alternative_cost_details(
+        &state,
+        PlayerId(0),
+        spell_id,
+    )
+    .expect("three Islands should expose Thwart's alternate cost");
+    assert!(matches!(
+        details.cost,
+        AbilityCost::ReturnToHand { count: 3, .. }
+    ));
+
+    let mut events = Vec::new();
+    let waiting = handle_cast_spell(&mut state, PlayerId(0), spell_id, CardId(10), &mut events)
+        .expect("three Islands should authorize the alternate-cost cast");
+    state.waiting_for = waiting;
+    assert!(matches!(
+        state.waiting_for,
+        WaitingFor::OptionalCostChoice {
+            cost: AdditionalCost::Choice(AbilityCost::ReturnToHand { count: 3, .. }, _),
+            ..
+        }
+    ));
+
+    apply_as_current(&mut state, GameAction::DecideOptionalCost { pay: true })
+        .expect("accepting Thwart's alternate cost should begin payment");
+    let WaitingFor::PayCost {
+        kind: PayCostKind::ReturnToHand,
+        choices,
+        count,
+        ..
+    } = &state.waiting_for
+    else {
+        panic!(
+            "expected exact three-Island return prompt, got {:?}",
+            state.waiting_for
+        );
+    };
+    assert_eq!(*count, 3);
+    assert_eq!(choices, &islands);
+
+    apply_as_current(
+        &mut state,
+        GameAction::SelectCards {
+            cards: islands.clone(),
+        },
+    )
+    .expect("selecting all three Islands should finish alternate-cost payment");
+
+    assert!(
+        islands.iter().all(|id| state
+            .objects
+            .get(id)
+            .is_some_and(|object| object.zone == Zone::Hand)),
+        "all three selected Islands must be returned to hand"
+    );
+    assert_eq!(
+        state.players[0]
+            .hand
+            .iter()
+            .filter(|id| islands.contains(id))
+            .count(),
+        3,
+        "exactly three Islands must be in the payer's hand"
+    );
+    assert_eq!(
+        state.stack.len(),
+        1,
+        "the spell should reach the stack after payment"
+    );
+}
+
 #[test]
 fn choice_additional_cost_filters_unpayable_casts() {
     let mut state = setup_game_at_main_phase();
@@ -15201,7 +15637,7 @@ fn snuff_out_alt_cost_paid_resolves_destroy_on_chosen_target() {
         "Snuff Out should have destroyed the target creature on resolution"
     );
     assert!(events.iter().any(
-        |e| matches!(e, GameEvent::CreatureDestroyed { object_id } if *object_id == target_id)
+        |e| matches!(e, GameEvent::CreatureDestroyed { object_id, .. } if *object_id == target_id)
     ));
 }
 
@@ -15943,6 +16379,8 @@ mod omniscience_alt_cost_2432 {
                 StaticDefinition::new(StaticMode::CastFromHandFree {
                     frequency: CastFrequency::OncePerTurn,
                     origin: CastFreeOrigin::Hand,
+                    all_players: false,
+                    grants_flash: false,
                 })
                 .affected(TargetFilter::Any),
             );
@@ -54523,7 +54961,7 @@ fn land_grant_alt_cost_offered_with_no_lands_in_hand() {
     assert!(
         matches!(
             land_grant_offered_cost(&state, PlayerId(0), land_grant),
-            Some(AbilityCost::EffectCost { ref effect })
+            Some(AbilityCost::EffectCost { ref effect, .. })
                 if matches!(**effect, Effect::RevealHand { .. })
         ),
         "no land cards in hand meets the gate; reveal-hand alt-cost must be offered"

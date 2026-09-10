@@ -1321,6 +1321,7 @@ fn stamp_retained_mods(mods: &mut [ContinuousModification], slot: usize, kind: P
 /// carry no printed-slot self-reference and resolve to `=> {}`.
 fn stamp_effect_printed_slot(effect: &mut Effect, slot: usize, kind: PrintedItemKind) {
     match effect {
+        Effect::RevealChosenLowestManaValueCreatures => {}
         // ---- Direct Vec<ContinuousModification> carriers ---------------------
         // The "…except it has this ability" copy-except clause (CR 707.9a) lands
         // in one of these on the enclosing trigger/ability.
@@ -1448,6 +1449,7 @@ fn stamp_effect_printed_slot(effect: &mut Effect, slot: usize, kind: PrintedItem
         Effect::CounterAll { .. } => {}
         Effect::GainLife { .. } => {}
         Effect::LoseLife { .. } => {}
+        Effect::LoseAllUnspentMana { .. } => {}
         Effect::SetTapState { .. } => {}
         Effect::RemoveCounter { .. } => {}
         Effect::Sacrifice { .. } => {}
@@ -1667,6 +1669,7 @@ fn stamp_effect_printed_slot(effect: &mut Effect, slot: usize, kind: PrintedItem
         // CR 707.2c (Metamorphic Alteration): no nested printed-slot carrier —
         // the copy is materialized from the chosen donor at resolution.
         Effect::ChoosePermanent { .. } => {}
+        Effect::RepeatPaidLibraryLook => {}
         Effect::Unimplemented { .. } => {}
     }
 }

@@ -4939,6 +4939,7 @@ fn prop_is_arrival_invariant(prop: &crate::types::ability::FilterProp) -> bool {
         | FilterProp::HasColor { .. }
         | FilterProp::PowerGTSource
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
@@ -7322,6 +7323,7 @@ fn ability_has_per_turn_activation_gate(state: &GameState, key: &(ObjectId, usiz
                     r,
                     ActivationRestriction::OnlyOnceEachTurn
                         | ActivationRestriction::MaxTimesEachTurn { .. }
+                        | ActivationRestriction::MaxTimesEachTurnDynamic { .. }
                 )
             })
         })
@@ -28464,7 +28466,12 @@ mod tests {
             "cost=EffectCost(hostile)",
             with_execute_axis(necroblossom_snarl_def(), "cost=EffectCost(hostile)", {
                 let effect = Box::new((*hostile.effect).clone());
-                move |d: &mut AbilityDefinition| d.cost = Some(AbilityCost::EffectCost { effect })
+                move |d: &mut AbilityDefinition| {
+                    d.cost = Some(AbilityCost::EffectCost {
+                        effect,
+                        player_scope: None,
+                    })
+                }
             }),
         ));
 
@@ -29088,6 +29095,7 @@ mod tests {
                         chooser: PlayerFilter::Controller,
                         branches: vec![hostile.clone()],
                     }),
+                    replacement_sub_ability: None,
                 },
             ),
             (

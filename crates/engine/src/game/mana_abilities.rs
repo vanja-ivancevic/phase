@@ -6030,6 +6030,7 @@ mod tests {
         assert!(is_mana_ability(&mana_ability_with_cost(
             AbilityCost::EffectCost {
                 effect: Box::new(wrapped),
+                player_scope: None,
             }
         )));
 
@@ -6082,6 +6083,7 @@ mod tests {
         assert!(!is_mana_ability(&mana_ability_with_cost(
             AbilityCost::EffectCost {
                 effect: Box::new(draw_one()),
+                player_scope: None,
             }
         )));
     }
@@ -6108,6 +6110,7 @@ mod tests {
                 "CreateDrawReplacement",
                 Effect::CreateDrawReplacement {
                     replacement_effect: Box::new(draw_one()),
+                    replacement_sub_ability: None,
                 },
             ),
             (
@@ -7978,6 +7981,7 @@ mod tests {
                 count: QuantityExpr::Fixed { value: 1 },
                 target: TargetFilter::SelfRef,
             }),
+            player_scope: None,
         });
 
         let mut events = Vec::new();
@@ -9366,6 +9370,7 @@ mod tests {
                 expiry: None,
                 target: None,
             }),
+            player_scope: None,
         });
         assert!(!mana_sources::cost_conclusively_payable_by_cheap_gate(
             &effect_cost

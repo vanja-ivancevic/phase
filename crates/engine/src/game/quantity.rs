@@ -1080,7 +1080,8 @@ pub(crate) fn quantity_expr_uses_unspent_mana(expr: &QuantityExpr) -> bool {
 fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
     match qty {
         QuantityRef::UnspentMana { .. } => true,
-        QuantityRef::HandSize { .. }
+        QuantityRef::EntryLifePaid
+        | QuantityRef::HandSize { .. }
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::GraveyardSize { .. }
         | QuantityRef::LifeAboveStarting
@@ -1094,6 +1095,7 @@ fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
         | QuantityRef::PlayerCount { .. }
         | QuantityRef::EventContextPlayerCount { .. }
         | QuantityRef::CountersOn { .. }
+        | QuantityRef::TokenSourceCounters { .. }
         | QuantityRef::CountersOnObjects { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::TargetControllerCounter { .. }
@@ -1123,6 +1125,7 @@ fn quantity_ref_uses_unspent_mana(qty: &QuantityRef) -> bool {
         | QuantityRef::FilteredTrackedSetSize { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::PartySize { .. }
@@ -1204,6 +1207,7 @@ pub(crate) fn continuous_modification_dynamic_quantity(
         // magnitude. Enumerated explicitly (no wildcard) so a future
         // QuantityExpr-carrying variant forces a decision here.
         ContinuousModification::CopyValues { .. }
+        | ContinuousModification::CopyTopOfZone { .. }
         // CR 707.2c (Metamorphic Alteration): inert copy marker — no dynamic magnitude.
         | ContinuousModification::CopyChosen
         | ContinuousModification::SetName { .. }
@@ -1217,6 +1221,7 @@ pub(crate) fn continuous_modification_dynamic_quantity(
         // mana cost, not a `QuantityExpr` magnitude — no dynamic value here.
         | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::GrantAbility { .. }
         | ContinuousModification::GrantAllActivatedAbilitiesOf { .. }
         | ContinuousModification::GrantAllTriggeredAbilitiesOf { .. }
@@ -1421,7 +1426,8 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         }
         // Player-level, single-object, history-record, payment, and choice
         // references: unaffected by another object's battlefield entry/exit.
-        QuantityRef::HandSize { .. }
+        QuantityRef::EntryLifePaid
+        | QuantityRef::HandSize { .. }
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::UnspentMana { .. }
         | QuantityRef::GraveyardSize { .. }
@@ -1433,6 +1439,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::PlayerCount { .. }
         | QuantityRef::EventContextPlayerCount { .. }
         | QuantityRef::CountersOn { .. }
+        | QuantityRef::TokenSourceCounters { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::TargetControllerCounter { .. }
         | QuantityRef::Variable { .. }
@@ -1455,6 +1462,7 @@ fn quantity_ref_uses_object_count(qty: &QuantityRef) -> bool {
         | QuantityRef::FilteredTrackedSetSize { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::Speed { .. }
@@ -1733,7 +1741,8 @@ fn quantity_ref_characteristic_reads(qty: &QuantityRef, depth: u32) -> Character
         // characteristics), payments, choices, and the FROZEN per-turn /
         // per-game history journals described in the doc comment. Enumerated
         // explicitly (no wildcard).
-        QuantityRef::HandSize { .. }
+        QuantityRef::EntryLifePaid
+        | QuantityRef::HandSize { .. }
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::GraveyardSize { .. }
         | QuantityRef::LifeAboveStarting
@@ -1744,6 +1753,7 @@ fn quantity_ref_characteristic_reads(qty: &QuantityRef, depth: u32) -> Character
         | QuantityRef::PlayerCount { .. }
         | QuantityRef::EventContextPlayerCount { .. }
         | QuantityRef::CountersOn { .. }
+        | QuantityRef::TokenSourceCounters { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::Variable { .. }
         // Digital-only Alchemy counter-like value; no layer writes it.
@@ -1753,6 +1763,7 @@ fn quantity_ref_characteristic_reads(qty: &QuantityRef, depth: u32) -> Character
         | QuantityRef::TrackedSetSize
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::UnspentMana { .. }
@@ -1986,7 +1997,8 @@ fn entered_object_perturbs_quantity_ref(
         // Player-level, single-object, history-record, payment, and choice refs:
         // an object's battlefield entry/exit cannot change their value. Identical
         // enumeration to the `false` arm of `quantity_ref_uses_object_count`.
-        QuantityRef::HandSize { .. }
+        QuantityRef::EntryLifePaid
+        | QuantityRef::HandSize { .. }
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::UnspentMana { .. }
         | QuantityRef::GraveyardSize { .. }
@@ -1998,6 +2010,7 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::PlayerCount { .. }
         | QuantityRef::EventContextPlayerCount { .. }
         | QuantityRef::CountersOn { .. }
+        | QuantityRef::TokenSourceCounters { .. }
         | QuantityRef::PlayerCounter { .. }
         | QuantityRef::TargetControllerCounter { .. }
         | QuantityRef::Variable { .. }
@@ -2020,6 +2033,7 @@ fn entered_object_perturbs_quantity_ref(
         | QuantityRef::FilteredTrackedSetSize { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::Speed { .. }
@@ -3693,6 +3707,9 @@ fn resolve_ref(
             scope,
             counter_type,
         } => resolve_counters_on_scope(state, *scope, ctx, targets, ability, counter_type.as_ref()),
+        QuantityRef::TokenSourceCounters { counter_type } => {
+            resolve_token_source_counters(state, source_id, counter_type.as_ref())
+        }
         // CR 107.3a + CR 601.2b + CR 107.3i: "X" resolves to the value chosen at
         // cast time, carried on the resolving ability's `chosen_x`
         // (CR 601.2b announcement; CR 107.3i makes all instances share the value).
@@ -4273,6 +4290,21 @@ fn resolve_ref(
                 DamageChannel::Excess => state.last_effect_excess_amount.unwrap_or(0),
             }
         }
+        // CR 608.2c + CR 120.3: Drain Life's second instruction reads the
+        // actual damage published by the immediately preceding instruction,
+        // but cannot gain more life than that target's pre-damage value. Both
+        // operands are resolution-local snapshots: replacement/prevention has
+        // already shaped `last_effect_amount`, and damage application captured
+        // the target value before it changed.
+        QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue => state
+            .last_effect_amount
+            .unwrap_or(0)
+            .min(
+                state
+                    .last_damage_target_pre_damage_life_gain_cap
+                    .unwrap_or(0),
+            )
+            .max(0),
         // Read the preceding continuation-local effect count directly.
         // An unavailable count resolves to zero.
         QuantityRef::PreviousEffectCount => state.last_effect_count.unwrap_or(0),
@@ -4376,6 +4408,11 @@ fn resolve_ref(
         //      continuation fallbacks (e.g. "discard up to N, then draw that
         //      many"; "dealt excess damage this way, add that much {R}").
         //   6. `0` — undefined.
+        QuantityRef::EntryLifePaid => state
+            .objects
+            .get(&source_id)
+            .map(|object| object.entry_life_paid as i32)
+            .unwrap_or(0),
         QuantityRef::EventContextAmount => state
             // CR 614.1a: Moonlit-scoped "that many" copy count — highest priority,
             // un-shadowable. `Some` only while a `CopyTokenOf` substitution
@@ -6041,6 +6078,42 @@ fn resolve_counters_on_live_or_lki_scope(
         }
     }
     live.map(|obj| counter_count_from_map(&obj.counters, counter_type))
+        .unwrap_or(0)
+}
+
+/// CR 111.3 + CR 208.2: resolve a token CDA that refers to the permanent
+/// which created that token. The creator id is carried by the token's
+/// `entered_via_ability_source` provenance while the token is on the
+/// battlefield; unlike an ordinary `Source` quantity this must hop through
+/// that relation before reading the creator's counters.
+fn resolve_token_source_counters(
+    state: &GameState,
+    token_id: ObjectId,
+    counter_type: Option<&CounterType>,
+) -> i32 {
+    let Some(creator_id) = state
+        .objects
+        .get(&token_id)
+        .and_then(|token| token.entered_via_ability_source)
+    else {
+        return 0;
+    };
+    let live = state.objects.get(&creator_id);
+    if live.is_some_and(|object| object.zone == Zone::Battlefield) {
+        return live
+            .map(|object| counter_count_from_map(&object.counters, counter_type))
+            .unwrap_or(0);
+    }
+
+    // CR 400.7: a departed Saproling Burst's mutable object is retained in a
+    // non-battlefield zone with its counters cleared, while the departure LKI
+    // preserves the counters its token CDA must continue to use. Only prefer a
+    // live object when it is still the creator's battlefield incarnation.
+    state
+        .lki_cache
+        .get(&creator_id)
+        .map(|snapshot| counter_count_from_map(&snapshot.counters, counter_type))
+        .or_else(|| live.map(|object| counter_count_from_map(&object.counters, counter_type)))
         .unwrap_or(0)
 }
 
@@ -13939,6 +14012,70 @@ mod tests {
         assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), source), 3);
     }
 
+    /// CR 111.3 + CR 208.2 + CR 400.7: Saproling Burst's token CDA reads the
+    /// creating Burst while it remains on the battlefield, then its departure
+    /// LKI after it leaves. The retained graveyard object has its counters
+    /// cleared, so it must not outrank that LKI.
+    #[test]
+    fn token_source_counters_use_creator_lki_after_creator_leaves_battlefield() {
+        let mut state = GameState::new_two_player(42);
+        let creator = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Saproling Burst".to_string(),
+            Zone::Battlefield,
+        );
+        let token = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Saproling".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&creator)
+            .unwrap()
+            .counters
+            .insert(CounterType::Fade, 3);
+        state
+            .objects
+            .get_mut(&token)
+            .unwrap()
+            .entered_via_ability_source = Some(creator);
+
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::TokenSourceCounters {
+                counter_type: Some(CounterType::Fade),
+            },
+        };
+        assert_eq!(resolve_quantity(&state, &expr, PlayerId(0), token), 3);
+
+        let lki = state.objects[&creator].snapshot_for_mana_spent();
+        state.lki_cache.insert(creator, lki);
+        state
+            .objects
+            .get_mut(&creator)
+            .unwrap()
+            .counters
+            .insert(CounterType::Fade, 2);
+        assert_eq!(
+            resolve_quantity(&state, &expr, PlayerId(0), token),
+            2,
+            "the still-live creator outranks an older LKI"
+        );
+
+        let creator = state.objects.get_mut(&creator).unwrap();
+        creator.zone = Zone::Graveyard;
+        creator.counters.clear();
+        assert_eq!(
+            resolve_quantity(&state, &expr, PlayerId(0), token),
+            3,
+            "the departed creator's LKI outranks its cleared zone object"
+        );
+    }
+
     #[test]
     fn resolve_quantity_counters_on_event_source_falls_back_to_lki_after_zone_change() {
         let mut state = GameState::new_two_player(42);
@@ -16767,8 +16904,10 @@ mod tests {
                 attachments: Vec::new(),
             },
         );
-        state.current_trigger_event =
-            Some(crate::types::events::GameEvent::CreatureDestroyed { object_id: dead_id });
+        state.current_trigger_event = Some(crate::types::events::GameEvent::CreatureDestroyed {
+            object_id: dead_id,
+            source_id: None,
+        });
         let expr = QuantityExpr::Ref {
             qty: QuantityRef::Power {
                 scope: ObjectScope::CostPaidObject,

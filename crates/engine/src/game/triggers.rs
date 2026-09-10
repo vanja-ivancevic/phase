@@ -2442,12 +2442,13 @@ fn collect_matching_triggers_inner(
                     // event — the batch-level event is the wrong context.
                     let skip_early_condition = matches!(trig_def.mode, TriggerMode::Attacks);
                     if !skip_early_condition
-                        && !check_trigger_condition_with_source(
+                        && !check_trigger_condition_with_source_and_ability_index(
                             state,
                             condition,
                             controller,
                             Some(&source_context),
                             Some(event),
+                            Some(trig_idx),
                         )
                     {
                         continue;
@@ -2460,6 +2461,8 @@ fn collect_matching_triggers_inner(
                 &source_context,
                 definition_ref.as_ref(),
             );
+            stamp_zone_change_putter_scope(&mut ability, trig_def, event);
+            stamp_cumulative_upkeep_non_payer_scope(&mut ability, trig_def, event);
             // CR 603.4: Stamp the printed-trigger index so per-turn resolution
             // tracking (`AbilityCondition::NthResolutionThisTurn`) can identify
             // "this ability" at resolution time.
@@ -2700,12 +2703,13 @@ fn collect_matching_triggers_inner(
                 // instead of the declaration that caused the trigger.
                 if !trig_def.batched {
                     if let Some(ref condition) = trig_def.condition {
-                        if !check_trigger_condition_with_source(
+                        if !check_trigger_condition_with_source_and_ability_index(
                             state,
                             condition,
                             controller,
                             Some(&source_context),
                             Some(&trigger_event),
+                            Some(trig_idx),
                         ) {
                             continue;
                         }
@@ -4023,6 +4027,8 @@ fn collect_latched_batched_zone_triggers(
             source_context,
             Some(&latched.definition_ref),
         );
+        stamp_zone_change_putter_scope(&mut ability, &latched.definition, first_event);
+        stamp_cumulative_upkeep_non_payer_scope(&mut ability, &latched.definition, first_event);
         ability.ability_index = Some(trig_idx);
         let (modal, mode_abilities) = latched
             .definition
@@ -9063,6 +9069,7 @@ fn resolve_accepted_triggered_mana_body(
             trigger_event: trigger.trigger_event.as_ref(),
             subject_match_count: trigger.subject_match_count,
             die_result: trigger.die_result,
+            ability_index: trigger.ability.ability_index,
         }),
         Some(trigger_events.to_vec()),
     );
@@ -11057,6 +11064,7 @@ fn player_scope_unbound_at_fire_time(scope: &PlayerScope) -> bool {
 /// while a wrong `false` deletes a real ability off the stack.
 fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
     match qty {
+        QuantityRef::EntryLifePaid => false,
         QuantityRef::CountersOn { scope, .. }
         | QuantityRef::Power { scope }
         | QuantityRef::BasePower { scope }
@@ -11162,6 +11170,7 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         | QuantityRef::FilteredTrackedSetSize { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::TimesCostPaidThisResolution
         // CR 608.2c: the secret-number ledger is populated BY the
@@ -11229,6 +11238,7 @@ fn quantity_ref_binding_diverges(qty: &QuantityRef) -> bool {
         | QuantityRef::ColorsInCommandersColorIdentity
         | QuantityRef::CommanderCastFromCommandZoneCount
         | QuantityRef::CommanderManaValue { .. } => false,
+        QuantityRef::TokenSourceCounters { .. } => false,
     }
 }
 
@@ -11642,6 +11652,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         // read live from the same place on both legs — the prop-level
         // counterpart of `TargetFilter::HasChosenName`.
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::ControllerChoseLabel { .. }
@@ -12926,6 +12937,18 @@ fn check_trigger_constraint_with_ref(
     };
 
     match constraint {
+        TriggerConstraint::All { constraints } => constraints.iter().all(|nested| {
+            let mut nested_definition = trig_def.clone();
+            nested_definition.constraint = Some(nested.clone());
+            check_trigger_constraint_with_ref(
+                state,
+                &nested_definition,
+                definition_ref,
+                source_context,
+                controller,
+                event,
+            )
+        }),
         // A legacy synthetic off-zone trigger has no ledger identity until the
         // occurrence reconciler materializes it. That limits only the
         // identity-keyed "once" bookkeeping; all semantic constraints below
@@ -12968,7 +12991,7 @@ fn check_trigger_constraint_with_ref(
             state.active_player == controller
                 && matches!(state.phase, Phase::PreCombatMain | Phase::PostCombatMain)
         }
-        // CR 109.5 + CR 603.2: Fires only when the triggering discard was caused
+        // CR 109.5 + CR 603.2: Fires only when the triggering event was caused
         // by a spell/ability controlled by `ctrl_ref` relative to the trigger's
         // controller (mirrors the replacement-side `EventSourceControlledBy`).
         TriggerConstraint::EventSourceControlledBy {
@@ -12976,6 +12999,16 @@ fn check_trigger_constraint_with_ref(
         } => {
             let event_source = match event {
                 Some(GameEvent::Discarded {
+                    source_id: Some(source_id),
+                    ..
+                }) => *source_id,
+                Some(GameEvent::ZoneChanged { record, .. }) => {
+                    let Some(source_id) = record.cause_source_id() else {
+                        return false;
+                    };
+                    source_id
+                }
+                Some(GameEvent::CreatureDestroyed {
                     source_id: Some(source_id),
                     ..
                 }) => *source_id,
@@ -12997,6 +13030,14 @@ fn check_trigger_constraint_with_ref(
                 _ => false,
             }
         }
+        // CR 110.2a + CR 305.1: active-voice put triggers require the
+        // record-owned event-time actor. Never infer this from controller or
+        // cause-source provenance.
+        TriggerConstraint::ZoneChangePutterPresent => matches!(
+            event,
+            Some(GameEvent::ZoneChanged { record, .. })
+                if record.zone_change_putter().is_some()
+        ),
         // CR 603.2: Per-caster spell count. The caster is extracted from the SpellCast
         // event; the count comes from the per-player map (not the global counter).
         // When `filter` contains `TypeFilter::Non(Creature)`, use the noncreature counter.
@@ -13075,18 +13116,36 @@ fn matched_trigger_constraint_allows_admission(
     matched: &MatchedTrigger,
     event: &GameEvent,
 ) -> bool {
+    matched.constraint.as_ref().is_none_or(|constraint| {
+        trigger_constraint_allows_admission(state, matched, event, constraint)
+    })
+}
+
+fn trigger_constraint_allows_admission(
+    state: &GameState,
+    matched: &MatchedTrigger,
+    event: &GameEvent,
+    constraint: &crate::types::ability::TriggerConstraint,
+) -> bool {
     use crate::types::ability::TriggerConstraint;
 
-    match matched.constraint.as_ref() {
-        Some(TriggerConstraint::OncePerTurn) => matched
+    match constraint {
+        // CR 603.2: a conjunctive constraint admits only if every nested
+        // constraint admits through the same re-check — `All` can wrap a
+        // counting constraint (OncePerTurn et al.) whose truth the earlier
+        // candidate from this same pass just changed.
+        TriggerConstraint::All { constraints } => constraints
+            .iter()
+            .all(|nested| trigger_constraint_allows_admission(state, matched, event, nested)),
+        TriggerConstraint::OncePerTurn => matched
             .definition_ref
             .as_ref()
             .is_none_or(|key| !state.triggers_fired_this_turn.contains(key)),
-        Some(TriggerConstraint::OncePerGame) => matched
+        TriggerConstraint::OncePerGame => matched
             .definition_ref
             .as_ref()
             .is_none_or(|key| !state.triggers_fired_this_game.contains(key)),
-        Some(TriggerConstraint::OncePerOpponentPerTurn) => {
+        TriggerConstraint::OncePerOpponentPerTurn => {
             let GameEvent::LifeChanged { player_id, .. } = event else {
                 return false;
             };
@@ -13098,7 +13157,7 @@ fn matched_trigger_constraint_allows_admission(
                         .contains(&(key.clone(), *player_id))
                 })
         }
-        Some(TriggerConstraint::MaxTimesPerTurn { max }) => {
+        TriggerConstraint::MaxTimesPerTurn { max } => {
             matched.definition_ref.as_ref().is_none_or(|key| {
                 state
                     .trigger_fire_counts_this_turn
@@ -13108,16 +13167,14 @@ fn matched_trigger_constraint_allows_admission(
                     < *max
             })
         }
-        Some(
-            TriggerConstraint::OnlyDuringYourTurn
-            | TriggerConstraint::OnlyDuringOpponentsTurn
-            | TriggerConstraint::OnlyDuringYourMainPhase
-            | TriggerConstraint::NthSpellThisTurn { .. }
-            | TriggerConstraint::NthDrawThisTurn { .. }
-            | TriggerConstraint::EventSourceControlledBy { .. }
-            | TriggerConstraint::AtClassLevel { .. },
-        )
-        | None => true,
+        TriggerConstraint::OnlyDuringYourTurn
+        | TriggerConstraint::ZoneChangePutterPresent
+        | TriggerConstraint::OnlyDuringOpponentsTurn
+        | TriggerConstraint::OnlyDuringYourMainPhase
+        | TriggerConstraint::NthSpellThisTurn { .. }
+        | TriggerConstraint::NthDrawThisTurn { .. }
+        | TriggerConstraint::EventSourceControlledBy { .. }
+        | TriggerConstraint::AtClassLevel { .. } => true,
     }
 }
 
@@ -13382,6 +13439,28 @@ pub(crate) fn check_trigger_condition_with_source(
     source_context: Option<&TriggerSourceContext>,
     trigger_event: Option<&GameEvent>,
 ) -> bool {
+    check_trigger_condition_with_source_and_ability_index(
+        state,
+        condition,
+        controller,
+        source_context,
+        trigger_event,
+        None,
+    )
+}
+
+/// CR 603.4: Evaluate a trigger condition with the exact printed ability index
+/// that is being checked. Most conditions do not need this extra identity, but
+/// source-ability-relative predicates (for example Carpet of Flowers) must not
+/// collapse distinct abilities on one permanent into a source-wide flag.
+pub(crate) fn check_trigger_condition_with_source_and_ability_index(
+    state: &GameState,
+    condition: &TriggerCondition,
+    controller: PlayerId,
+    source_context: Option<&TriggerSourceContext>,
+    trigger_event: Option<&GameEvent>,
+    ability_index: Option<usize>,
+) -> bool {
     if trigger_event.is_some_and(|event| !zone_changed_condition_provenance_is_coherent(event)) {
         return false;
     }
@@ -13406,6 +13485,13 @@ pub(crate) fn check_trigger_condition_with_source(
     ) {
         return false;
     }
+    // CR 603.4: source-ability-relative leaves are likewise unanswerable
+    // without both the captured source and the exact printed ability index.
+    // Reject the whole tree before boolean combinators can invert a missing
+    // identity into a false-positive trigger.
+    if !trigger_condition_ability_index_resolvable(condition, source_context, ability_index) {
+        return false;
+    }
 
     evaluate_trigger_condition_with_source(
         state,
@@ -13413,7 +13499,29 @@ pub(crate) fn check_trigger_condition_with_source(
         controller,
         source_context,
         trigger_event,
+        ability_index,
     )
+}
+
+fn trigger_condition_ability_index_resolvable(
+    condition: &TriggerCondition,
+    source_context: Option<&TriggerSourceContext>,
+    ability_index: Option<usize>,
+) -> bool {
+    match condition {
+        TriggerCondition::SourceAbilityAddedManaThisTurn => {
+            source_context.is_some() && ability_index.is_some()
+        }
+        TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
+            conditions.iter().all(|inner| {
+                trigger_condition_ability_index_resolvable(inner, source_context, ability_index)
+            })
+        }
+        TriggerCondition::Not { condition } => {
+            trigger_condition_ability_index_resolvable(condition, source_context, ability_index)
+        }
+        _ => true,
+    }
 }
 
 /// CR 603.4 + CR 109.4: boundary predicate — does every designation leaf in this
@@ -13481,6 +13589,7 @@ fn evaluate_trigger_condition_with_source(
     controller: PlayerId,
     source_context: Option<&TriggerSourceContext>,
     trigger_event: Option<&GameEvent>,
+    ability_index: Option<usize>,
 ) -> bool {
     let source_id = source_context.map(|source| source.identity.reference.object_id);
     match condition {
@@ -13528,6 +13637,18 @@ fn evaluate_trigger_condition_with_source(
                     .contains(&source.identity.reference)
             })
         }),
+        TriggerCondition::SourceAttackedOrBlockedThisCombat => {
+            source_context.is_some_and(|source| {
+                state.combat.as_ref().is_some_and(|combat| {
+                    combat
+                        .attacking_incarnations_this_combat
+                        .contains(&source.identity.reference)
+                        || combat
+                            .blocking_incarnations_this_combat
+                            .contains(&source.identity.reference)
+                })
+            })
+        }
         TriggerCondition::EchoDue => {
             source_context.is_some_and(|source| source.source_read(state).echo_due())
         }
@@ -13802,6 +13923,15 @@ fn evaluate_trigger_condition_with_source(
             Some(GameEvent::AbilityActivated { .. }) => true,
             _ => false,
         },
+        // CR 106.3 + CR 603.4: "with this ability" is keyed by the exact
+        // source object and printed ability index, and only a successful mana
+        // addition records the marker. Missing identity is unanswerable and
+        // therefore fails closed.
+        TriggerCondition::SourceAbilityAddedManaThisTurn => source_context
+            .and_then(|source| {
+                ability_index.map(|index| (source.identity.reference.object_id, index))
+            })
+            .is_some_and(|key| state.mana_added_by_abilities_this_turn.contains(&key)),
         // CR 700.4 + CR 120.1: True when the dying creature was dealt damage by the
         // trigger source this turn.
         TriggerCondition::DealtDamageBySourceThisTurn => {
@@ -13809,7 +13939,7 @@ fn evaluate_trigger_condition_with_source(
             // CreatureDestroyed and ZoneChanged (dies = battlefield→graveyard)
             // carry the dying creature — other event shapes are not valid here.
             let dying_creature = trigger_event.and_then(|e| match e {
-                GameEvent::CreatureDestroyed { object_id } => Some(*object_id),
+                GameEvent::CreatureDestroyed { object_id, .. } => Some(*object_id),
                 GameEvent::ZoneChanged { object_id, .. } => Some(*object_id),
                 _ => None,
             });
@@ -13832,7 +13962,7 @@ fn evaluate_trigger_condition_with_source(
         // whose source satisfies the filter (Spider you controlled, etc.).
         TriggerCondition::DealtDamageThisTurnBySource { source } => {
             let dying_creature = trigger_event.and_then(|e| match e {
-                GameEvent::CreatureDestroyed { object_id } => Some(*object_id),
+                GameEvent::CreatureDestroyed { object_id, .. } => Some(*object_id),
                 GameEvent::ZoneChanged { object_id, .. } => Some(*object_id),
                 _ => None,
             });
@@ -14365,6 +14495,41 @@ fn evaluate_trigger_condition_with_source(
                     if object.zone == *zone
             )
         }),
+        // CR 404.1 + CR 603.4: the source must remain the exact live object in
+        // the required owner-scoped zone, and the next card in that owner's
+        // graveyard vector (the card immediately above it) must match the
+        // printed filter. Fail closed when either object or adjacency is absent.
+        TriggerCondition::SourceInZoneWithAdjacentFilter { zone, adjacent } => source_context
+            .is_some_and(|source| {
+                let TriggerSourceRead::ExactLive(object) = source.source_read(state) else {
+                    return false;
+                };
+                if object.zone != *zone {
+                    return false;
+                }
+                if *zone != Zone::Graveyard {
+                    return false;
+                }
+                let owner = object.owner;
+                let Some(graveyard) = state.players.get(owner.0 as usize).map(|p| &p.graveyard)
+                else {
+                    return false;
+                };
+                let Some(position) = graveyard.iter().position(|id| *id == object.id) else {
+                    return false;
+                };
+                let Some(adjacent_id) = graveyard.get(position + 1).copied() else {
+                    return false;
+                };
+                let context = FilterContext::from_trigger_source(source);
+                crate::game::filter::matches_target_filter_for_zone(
+                    state,
+                    adjacent_id,
+                    Zone::Graveyard,
+                    adjacent,
+                    &context,
+                )
+            }),
         // CR 702.104b: True when the Tribute ETB replacement resolved without the
         // chosen opponent placing the +1/+1 counters. Read from the creature's
         // persisted `ChosenAttribute::TributeOutcome` — explicit `Declined` or no
@@ -14518,6 +14683,7 @@ fn evaluate_trigger_condition_with_source(
                 controller,
                 source_context,
                 trigger_event,
+                ability_index,
             )
         }),
         TriggerCondition::Or { conditions } => conditions.iter().any(|c| {
@@ -14527,6 +14693,7 @@ fn evaluate_trigger_condition_with_source(
                 controller,
                 source_context,
                 trigger_event,
+                ability_index,
             )
         }),
         // CR 603.4 + CR 608.2c: Logical negation — invert the wrapped condition's
@@ -14538,6 +14705,7 @@ fn evaluate_trigger_condition_with_source(
             controller,
             source_context,
             trigger_event,
+            ability_index,
         ),
         // CR 309.7: True when the controller has completed a dungeon. `specific: None`
         // matches "any dungeon"; `specific: Some(d)` matches dungeon `d`. Negation
@@ -15032,6 +15200,17 @@ fn record_trigger_fired_with_ref(
     };
 
     match constraint {
+        TriggerConstraint::All { constraints } => {
+            for nested in constraints {
+                record_trigger_fired_with_ref(
+                    state,
+                    Some(nested),
+                    source_context,
+                    definition_ref,
+                    event,
+                );
+            }
+        }
         TriggerConstraint::OncePerTurn => {
             crate::game::ledger::record_trigger_fired(
                 state,
@@ -15078,7 +15257,8 @@ fn record_trigger_fired_with_ref(
         | TriggerConstraint::NthSpellThisTurn { .. }
         | TriggerConstraint::NthDrawThisTurn { .. }
         | TriggerConstraint::EventSourceControlledBy { .. }
-        | TriggerConstraint::AtClassLevel { .. } => {
+        | TriggerConstraint::AtClassLevel { .. }
+        | TriggerConstraint::ZoneChangePutterPresent => {
             // No tracking needed — checked at fire time via game/object/event state
         }
         // Increment the captured fire count for MaxTimesPerTurn tracking.
@@ -15305,6 +15485,7 @@ fn characteristic_source_references_cost_paid_object(source: &CardTypeSetSource)
 /// rather than silently falling through and dropping the snapshot propagation.
 fn quantity_ref_refs_cost_paid_object(qty: &QuantityRef) -> bool {
     match qty {
+        QuantityRef::EntryLifePaid => false,
         // Object-axis refs: read the cost-paid object iff scoped to it.
         QuantityRef::Power { scope }
         | QuantityRef::BasePower { scope }
@@ -15400,6 +15581,7 @@ fn quantity_ref_refs_cost_paid_object(qty: &QuantityRef) -> bool {
         | QuantityRef::TrackedSetSize
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::PartySize { .. }
@@ -15433,6 +15615,7 @@ fn quantity_ref_refs_cost_paid_object(qty: &QuantityRef) -> bool {
         | QuantityRef::CommanderCastFromCommandZoneCount
         | QuantityRef::CommanderManaValue { .. }
         | QuantityRef::VoteCount { .. } => false,
+        QuantityRef::TokenSourceCounters { .. } => false,
     }
 }
 
@@ -15455,6 +15638,62 @@ fn ability_condition_refs_cost_paid_object(condition: &AbilityCondition) -> bool
 /// matched it. The only live reads below are documented game-global event
 /// channels (`announced_source_x` and `active_player`), never a rebind of the
 /// source object by storage id.
+fn trigger_constraint_contains_zone_change_putter(
+    constraint: &crate::types::ability::TriggerConstraint,
+) -> bool {
+    match constraint {
+        crate::types::ability::TriggerConstraint::ZoneChangePutterPresent => true,
+        crate::types::ability::TriggerConstraint::All { constraints } => constraints
+            .iter()
+            .any(trigger_constraint_contains_zone_change_putter),
+        _ => false,
+    }
+}
+
+fn stamp_zone_change_putter_scope(
+    ability: &mut ResolvedAbility,
+    trigger: &TriggerDefinition,
+    event: &GameEvent,
+) {
+    if !trigger
+        .constraint
+        .as_ref()
+        .is_some_and(trigger_constraint_contains_zone_change_putter)
+    {
+        return;
+    }
+    let GameEvent::ZoneChanged { record, .. } = event else {
+        return;
+    };
+    let Some(putter) = record.zone_change_putter() else {
+        return;
+    };
+    // CR 608.2c: effect-body "that player" was lowered to ScopedPlayer by
+    // the active-voice parser. Bind it from the immutable event record at
+    // trigger creation, not from the entrant's post-replacement controller.
+    ability.set_scoped_player_recursive(putter);
+}
+
+/// CR 702.24a: printed rider triggers ("When a player doesn't pay ~'s
+/// cumulative upkeep, that player ...") lower their body "that player" /
+/// "their" to ScopedPlayer. Bind that referent from the non-payment event at
+/// trigger creation so the rider acts on the player who declined or could not
+/// pay — which for Thought Lash is not always the enchantment's controller
+/// path default.
+fn stamp_cumulative_upkeep_non_payer_scope(
+    ability: &mut ResolvedAbility,
+    trigger: &TriggerDefinition,
+    event: &GameEvent,
+) {
+    if !matches!(trigger.mode, TriggerMode::CumulativeUpkeepNotPaid) {
+        return;
+    }
+    let GameEvent::CumulativeUpkeepNotPaid { player, .. } = event else {
+        return;
+    };
+    ability.set_scoped_player_recursive(*player);
+}
+
 pub(super) fn build_triggered_ability_from_context(
     state: &GameState,
     trig_def: &TriggerDefinition,
@@ -15886,6 +16125,130 @@ pub mod tests {
             saga,
             &boundaries
         ));
+    }
+
+    #[test]
+    fn source_zone_adjacent_filter_checks_graveyard_order_and_type() {
+        // CR 404.1 + CR 603.4: the source itself and the card immediately
+        // above it are independent live objects; both facts must be true at
+        // trigger time and at the resolution re-check.
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(0x100),
+            PlayerId(0),
+            "Krovikan Horror".to_string(),
+            Zone::Graveyard,
+        );
+        let adjacent = create_object(
+            &mut state,
+            CardId(0x101),
+            PlayerId(0),
+            "Graveyard Creature".to_string(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&adjacent)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        state.players[0].graveyard.push_back(source);
+        state.players[0].graveyard.push_back(adjacent);
+
+        let condition = TriggerCondition::SourceInZoneWithAdjacentFilter {
+            zone: Zone::Graveyard,
+            adjacent: TargetFilter::Typed(TypedFilter::creature()),
+        };
+        assert!(check_trigger_condition(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(source),
+            None,
+        ));
+
+        // A non-creature directly above the source does not satisfy the rider.
+        state
+            .objects
+            .get_mut(&adjacent)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Land];
+        assert!(!check_trigger_condition(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(source),
+            None,
+        ));
+
+        // With no newer card, the adjacency predicate fails closed.
+        state.players[0].graveyard.pop_back();
+        assert!(!check_trigger_condition(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(source),
+            None,
+        ));
+    }
+
+    #[test]
+    fn graveyard_phase_trigger_with_adjacent_filter_fires() {
+        // CR 603.2 + CR 603.4: a Krovikan-style source in the graveyard is
+        // found by its declared trigger zone and then gated by the live
+        // adjacency condition during phase-trigger collection.
+        let mut state = setup();
+        state.active_player = PlayerId(0);
+        state.phase = Phase::End;
+        let source = create_object(
+            &mut state,
+            CardId(0x110),
+            PlayerId(0),
+            "Krovikan Horror".to_string(),
+            Zone::Graveyard,
+        );
+        let adjacent = create_object(
+            &mut state,
+            CardId(0x111),
+            PlayerId(0),
+            "Graveyard Creature".to_string(),
+            Zone::Graveyard,
+        );
+        state
+            .objects
+            .get_mut(&adjacent)
+            .unwrap()
+            .card_types
+            .core_types = vec![CoreType::Creature];
+        state.players[0].graveyard.push_back(source);
+        state.players[0].graveyard.push_back(adjacent);
+
+        let trigger = TriggerDefinition::new(TriggerMode::Phase)
+            .phase(Phase::End)
+            .valid_target(TargetFilter::Controller)
+            .trigger_zones(vec![Zone::Graveyard])
+            .condition(TriggerCondition::SourceInZoneWithAdjacentFilter {
+                zone: Zone::Graveyard,
+                adjacent: TargetFilter::Typed(TypedFilter::creature()),
+            })
+            .execute(AbilityDefinition::new(
+                AbilityKind::Database,
+                Effect::GainLife {
+                    amount: QuantityExpr::Fixed { value: 1 },
+                    player: TargetFilter::Controller,
+                },
+            ));
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .trigger_definitions
+            .push(trigger);
+
+        process_triggers(&mut state, &[GameEvent::PhaseChanged { phase: Phase::End }]);
+        assert_eq!(state.stack.len(), 1);
     }
 
     #[test]
@@ -17441,6 +17804,221 @@ pub mod tests {
         );
     }
 
+    /// CR 110.2a + CR 305.1: active-voice put triggers must fail closed when
+    /// the delivery did not carry actor provenance, and must not use the
+    /// entrant controller as an implicit substitute.
+    #[test]
+    fn zone_change_putter_constraint_requires_record_owned_provenance() {
+        use crate::types::ability::TriggerConstraint;
+
+        let mut state = setup();
+        let source = make_creature(&mut state, PlayerId(0), "Putter watcher", 1, 1);
+        let mut def = make_trigger(TriggerMode::ChangesZone);
+        def.constraint = Some(TriggerConstraint::ZoneChangePutterPresent);
+
+        let mut record =
+            ZoneChangeRecord::test_minimal(source, Some(Zone::Hand), Zone::Battlefield);
+        record.trigger_source_context = Some(trigger_source_context_for_latch(
+            &state,
+            state.objects.get(&source).expect("watcher exists"),
+        ));
+        let event_without_putter = GameEvent::ZoneChanged {
+            object_id: source,
+            from: Some(Zone::Hand),
+            to: Zone::Battlefield,
+            record: Box::new(record.clone()),
+        };
+        assert!(!check_trigger_constraint(
+            &state,
+            &def,
+            source,
+            0,
+            PlayerId(0),
+            &event_without_putter,
+        ));
+
+        record.stamp_zone_change_putter(Some(PlayerId(1)));
+        let event_with_putter = GameEvent::ZoneChanged {
+            object_id: source,
+            from: Some(Zone::Hand),
+            to: Zone::Battlefield,
+            record: Box::new(record),
+        };
+        assert!(check_trigger_constraint(
+            &state,
+            &def,
+            source,
+            0,
+            PlayerId(0),
+            &event_with_putter,
+        ));
+    }
+
+    /// CR 608.2c: active-voice "that player" is bound when the trigger is
+    /// instantiated, so a later controller change cannot rebind the effect.
+    #[test]
+    fn zone_change_putter_scope_binds_triggered_ability_from_event_record() {
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, Effect, QuantityExpr, TargetFilter, TriggerConstraint,
+        };
+
+        let mut state = setup();
+        let source = make_creature(&mut state, PlayerId(0), "Putter watcher", 1, 1);
+        let mut def = make_trigger(TriggerMode::ChangesZone);
+        def.constraint = Some(TriggerConstraint::All {
+            constraints: vec![
+                TriggerConstraint::ZoneChangePutterPresent,
+                TriggerConstraint::OncePerTurn,
+            ],
+        });
+        def.execute = Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Database,
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::ScopedPlayer,
+            },
+        )));
+
+        let mut record =
+            ZoneChangeRecord::test_minimal(source, Some(Zone::Hand), Zone::Battlefield);
+        record.trigger_source_context = Some(trigger_source_context_for_latch(
+            &state,
+            state.objects.get(&source).expect("watcher exists"),
+        ));
+        record.stamp_zone_change_putter(Some(PlayerId(1)));
+        let event = GameEvent::ZoneChanged {
+            object_id: source,
+            from: Some(Zone::Hand),
+            to: Zone::Battlefield,
+            record: Box::new(record),
+        };
+
+        let mut ability = build_triggered_ability(&state, &def, source, PlayerId(0));
+        stamp_zone_change_putter_scope(&mut ability, &def, &event);
+        assert_eq!(ability.scoped_player, Some(PlayerId(1)));
+    }
+
+    /// CR 701.8a + CR 603.2: Karmic Justice-class destruction triggers reuse
+    /// the event-source controller constraint. The destroyed permanent is the
+    /// event subject; the spell/ability that caused the destruction is its
+    /// separate provenance field, so the two player scopes cannot be confused.
+    #[test]
+    fn event_source_controlled_by_opponent_gates_destroy_trigger() {
+        use crate::types::ability::{ControllerRef, TriggerConstraint};
+        let mut state = setup();
+        let karmic = make_creature(&mut state, PlayerId(0), "Karmic Justice", 0, 0);
+        let victim = make_creature(&mut state, PlayerId(0), "Owned Permanent", 0, 0);
+        let opponent_cause = make_creature(&mut state, PlayerId(1), "Opponent Spell", 0, 0);
+        let own_cause = make_creature(&mut state, PlayerId(0), "Own Spell", 0, 0);
+
+        let mut def = make_trigger(TriggerMode::Destroyed);
+        def.constraint = Some(TriggerConstraint::EventSourceControlledBy {
+            controller: ControllerRef::Opponent,
+        });
+
+        let opponent_destroyed = GameEvent::CreatureDestroyed {
+            object_id: victim,
+            source_id: Some(opponent_cause),
+        };
+        assert!(check_trigger_constraint(
+            &state,
+            &def,
+            karmic,
+            0,
+            PlayerId(0),
+            &opponent_destroyed,
+        ));
+        assert_eq!(
+            crate::game::targeting::extract_player_from_event(&opponent_destroyed, &state),
+            Some(PlayerId(1)),
+            "the destruction event must bind Karmic Justice's ‘that opponent’ to the causing source's controller",
+        );
+
+        let own_destroyed = GameEvent::CreatureDestroyed {
+            object_id: victim,
+            source_id: Some(own_cause),
+        };
+        assert!(!check_trigger_constraint(
+            &state,
+            &def,
+            karmic,
+            0,
+            PlayerId(0),
+            &own_destroyed,
+        ));
+
+        let source_less_destroyed = GameEvent::CreatureDestroyed {
+            object_id: victim,
+            source_id: None,
+        };
+        assert!(!check_trigger_constraint(
+            &state,
+            &def,
+            karmic,
+            0,
+            PlayerId(0),
+            &source_less_destroyed,
+        ));
+    }
+
+    /// CR 109.5 + CR 603.2: Zone-change causation is captured with the event,
+    /// so a later state cannot confuse the moving permanent's controller with
+    /// the spell or ability that caused its move (Sacred Ground).
+    #[test]
+    fn event_source_controlled_by_opponent_gates_zone_change_trigger() {
+        use crate::types::ability::{ControllerRef, TriggerConstraint};
+        let mut state = setup();
+        let source = make_creature(&mut state, PlayerId(0), "Sacred Ground", 0, 0);
+        let land = make_creature(&mut state, PlayerId(0), "Sacred Land", 0, 0);
+        let opponent_cause = make_creature(&mut state, PlayerId(1), "Opponent Spell", 0, 0);
+        let own_cause = make_creature(&mut state, PlayerId(0), "Own Spell", 0, 0);
+
+        let mut def = make_trigger(TriggerMode::ChangesZone);
+        def.constraint = Some(TriggerConstraint::EventSourceControlledBy {
+            controller: ControllerRef::Opponent,
+        });
+
+        let event_with_cause = |cause| {
+            let mut record = state.objects[&land].snapshot_for_zone_change(
+                land,
+                Some(Zone::Battlefield),
+                Zone::Graveyard,
+            );
+            record.stamp_cause_source_id(cause);
+            GameEvent::ZoneChanged {
+                object_id: land,
+                from: Some(Zone::Battlefield),
+                to: Zone::Graveyard,
+                record: Box::new(record),
+            }
+        };
+
+        assert!(check_trigger_constraint(
+            &state,
+            &def,
+            source,
+            0,
+            PlayerId(0),
+            &event_with_cause(Some(opponent_cause)),
+        ));
+        assert!(!check_trigger_constraint(
+            &state,
+            &def,
+            source,
+            0,
+            PlayerId(0),
+            &event_with_cause(Some(own_cause)),
+        ));
+        assert!(!check_trigger_constraint(
+            &state,
+            &def,
+            source,
+            0,
+            PlayerId(0),
+            &event_with_cause(None),
+        ));
+    }
+
     /// Issue #5143 — Anje Falkenrath: intervening-if "if it has madness" must
     /// read the discarded card, not fire for every discard.
     #[test]
@@ -18355,6 +18933,32 @@ pub mod tests {
             ),
             "Tolsimir's observed incarnation attacked during this combat"
         );
+        // A blocker-only source must satisfy the new combined condition while
+        // remaining false for the attacked-only sibling.
+        let mut blocked_only = state.clone();
+        let tolsimir_reference =
+            ObjectIncarnationRef::from_object(&blocked_only.objects[&tolsimir]);
+        let combat = blocked_only.combat.as_mut().expect("combat exists");
+        combat
+            .attacking_incarnations_this_combat
+            .remove(&tolsimir_reference);
+        combat
+            .blocking_incarnations_this_combat
+            .insert(tolsimir_reference);
+        assert!(!check_trigger_condition(
+            &blocked_only,
+            &TriggerCondition::SourceAttackedThisCombat,
+            PlayerId(0),
+            Some(tolsimir),
+            Some(&attack_event),
+        ));
+        assert!(check_trigger_condition(
+            &blocked_only,
+            &TriggerCondition::SourceAttackedOrBlockedThisCombat,
+            PlayerId(0),
+            Some(tolsimir),
+            Some(&attack_event),
+        ));
         let pending = collect_pending_triggers(&mut state, std::slice::from_ref(&attack_event));
         assert_eq!(
             pending.len(),
@@ -28445,6 +29049,7 @@ pub mod tests {
         let condition = TriggerCondition::DealtDamageBySourceThisTurn;
         let event = GameEvent::CreatureDestroyed {
             object_id: dying_creature,
+            source_id: None,
         };
 
         // Matching source + matching dying creature → true
@@ -28469,6 +29074,7 @@ pub mod tests {
         // Non-matching dying creature → false
         let wrong_event = GameEvent::CreatureDestroyed {
             object_id: ObjectId(88),
+            source_id: None,
         };
         assert!(!check_trigger_condition(
             &state,
@@ -28524,6 +29130,7 @@ pub mod tests {
         });
         let other_only_event = GameEvent::CreatureDestroyed {
             object_id: other_only_victim,
+            source_id: None,
         };
         assert!(!check_trigger_condition(
             &state,
@@ -28575,6 +29182,7 @@ pub mod tests {
         let condition = TriggerCondition::DealtDamageBySourceThisTurn;
         let event = GameEvent::CreatureDestroyed {
             object_id: dying_creature,
+            source_id: None,
         };
 
         // Same incarnation still on the battlefield → the record is its own → true.
@@ -28669,7 +29277,10 @@ pub mod tests {
         ));
 
         // A non-tap event → false (only PermanentTapped carries the subject).
-        let non_tap = GameEvent::CreatureDestroyed { object_id: tapped };
+        let non_tap = GameEvent::CreatureDestroyed {
+            object_id: tapped,
+            source_id: None,
+        };
         assert!(!check_trigger_condition(
             &state,
             &condition,
@@ -28961,7 +29572,10 @@ pub mod tests {
                     .controller(ControllerRef::You),
             ),
         };
-        let event = GameEvent::CreatureDestroyed { object_id: victim };
+        let event = GameEvent::CreatureDestroyed {
+            object_id: victim,
+            source_id: None,
+        };
 
         assert!(check_trigger_condition(
             &state,
@@ -28973,6 +29587,7 @@ pub mod tests {
 
         let wrong_victim = GameEvent::CreatureDestroyed {
             object_id: ObjectId(99),
+            source_id: None,
         };
         assert!(!check_trigger_condition(
             &state,
@@ -30095,6 +30710,68 @@ pub mod tests {
             &cond,
             PlayerId(0),
             Some(src),
+            None,
+        ));
+    }
+
+    #[test]
+    fn source_ability_added_mana_tracks_exact_printed_ability_and_fails_closed_without_identity() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Carpet of Flowers".to_string(),
+            Zone::Battlefield,
+        );
+        let source_context = trigger_source_context_for_latch(
+            &state,
+            state.objects.get(&source).expect("source exists"),
+        );
+        let condition = TriggerCondition::Not {
+            condition: Box::new(TriggerCondition::SourceAbilityAddedManaThisTurn),
+        };
+
+        // The ability may fire before it has successfully added mana this turn.
+        assert!(check_trigger_condition_with_source_and_ability_index(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(&source_context),
+            None,
+            Some(0),
+        ));
+
+        // A successful activation of a different printed ability must not close
+        // Carpet's gate ("with this ability" is not source-wide).
+        state.mana_added_by_abilities_this_turn.insert((source, 1));
+        assert!(check_trigger_condition_with_source_and_ability_index(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(&source_context),
+            None,
+            Some(0),
+        ));
+
+        // Once this exact printed ability adds mana, its intervening-if fails.
+        state.mana_added_by_abilities_this_turn.insert((source, 0));
+        assert!(!check_trigger_condition_with_source_and_ability_index(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(&source_context),
+            None,
+            Some(0),
+        ));
+
+        // The compatibility wrapper has no ability identity and must reject the
+        // whole negated condition instead of inverting an unanswerable leaf.
+        assert!(!check_trigger_condition_with_source(
+            &state,
+            &condition,
+            PlayerId(0),
+            Some(&source_context),
             None,
         ));
     }

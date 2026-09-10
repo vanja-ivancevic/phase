@@ -272,8 +272,12 @@ fn may_cost_discard_choice_resume_pays_remaining_composite_suffix() {
             .position(|definition| matches!(definition.mode, ReplacementMode::MayCost { .. }))
             .expect("Mox Diamond replacement should parse as MayCost");
         let replacement = &mut obj.replacement_definitions[replacement_index];
-        let (discard_cost, decline) = match &replacement.mode {
-            ReplacementMode::MayCost { cost, decline } => (cost.clone(), decline.clone()),
+        let (discard_cost, payment_record, decline) = match &replacement.mode {
+            ReplacementMode::MayCost {
+                cost,
+                payment_record,
+                decline,
+            } => (cost.clone(), *payment_record, decline.clone()),
             other => panic!("expected MayCost, got {other:?}"),
         };
         replacement.mode = ReplacementMode::MayCost {
@@ -285,6 +289,7 @@ fn may_cost_discard_choice_resume_pays_remaining_composite_suffix() {
                     },
                 ],
             },
+            payment_record,
             decline,
         };
     }

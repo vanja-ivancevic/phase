@@ -1914,6 +1914,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "patina-old-border-smoke"
+version = "0.71.0"
+dependencies = [
+ "phase-engine",
+]
+
+[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

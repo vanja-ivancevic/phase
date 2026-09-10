@@ -938,6 +938,7 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
             let command = ResolvedTokenCreationCommand {
                 object,
                 owner,
+                putter: Some(spec.controller),
                 entry_timestamp,
                 entry_turn: turn_number,
                 body: ResolvedTokenBody::Spec {
@@ -1073,6 +1074,7 @@ pub(crate) fn apply_create_token_after_replacement_with_created_ids(
             obj_id,
             spec.characteristics.display_name.clone(),
             spec.source_id,
+            Some(spec.controller),
             events,
         );
 
@@ -1251,6 +1253,11 @@ pub fn apply_resolved_token_creation(
         .get(&object_id)
         .expect("the token was materialized above")
         .snapshot_for_zone_change(object_id, None, Zone::Battlefield);
+    // CR 110.2a + CR 305.1: the live entry stamps the player who performed
+    // the put after the snapshot is emitted. Carry that authoritative actor
+    // in the birth command so replay does not silently fall back to the
+    // entrant's controller (which may differ after an ETB replacement).
+    entry_record.stamp_zone_change_putter(command.putter);
     crate::game::restrictions::record_zone_change(state, &mut entry_record);
     // CR 111.1: replay must not hand the same id out again to a later allocation.
     state.next_object_id = state.next_object_id.max(command.resulting_next_object_id);
@@ -1280,6 +1287,10 @@ pub(crate) fn materialize_token_spec_body(
     let ch = &spec.characteristics;
     // CR 111.1: Mark as token for SBA cleanup (CR 704.5d)
     object.is_token = true;
+    // CR 111.3: retain the creating permanent so token characteristic-
+    // defining abilities can resolve references such as "the number of fade
+    // counters on Saproling Burst" continuously while the token exists.
+    object.entered_via_ability_source = Some(spec.source_id);
     // True token from a TokenSpec — image lives in the generic-token
     // database (Treasure, Spirit, Saproling, Soldier, etc.).
     object.display_source = DisplaySource::Token;
@@ -1724,6 +1735,7 @@ pub(crate) fn commit_liminal_token_entry_with_post_actions(
         ResolvedTokenCreationCommand {
             object: ObjectIncarnationRef::from_object(entry.object.projected()),
             owner,
+            putter: Some(entry.controller),
             entry_timestamp: entry.object.projected().timestamp,
             // CR 302.6: the entered-turn the liminal build already stamped, read
             // back off the object rather than re-read from the live turn.
@@ -2019,7 +2031,14 @@ pub(crate) fn finalize_committed_liminal_token_entry_from_action(
     // state at the moment of the move" from a pre-copy 0/0 Shapeshifter.
     match entry_events {
         TokenEntryEventEmission::Emit => {
-            push_committed_token_entry_events(state, object_id, name, source_id, events);
+            push_committed_token_entry_events(
+                state,
+                object_id,
+                name,
+                source_id,
+                Some(controller),
+                events,
+            );
         }
         TokenEntryEventEmission::Suppress => {
             // Overwriting a live parked entry would silently lose its CR 400.7 row AND both of its
@@ -2048,6 +2067,7 @@ pub(crate) fn finalize_committed_liminal_token_entry_from_action(
                 object_id,
                 name,
                 source_id,
+                putter: Some(controller),
             });
         }
     }
@@ -2163,15 +2183,26 @@ pub(crate) fn finalize_committed_liminal_token_entry_from_action(
 /// and `token_copy.rs`'s uninterrupted copy path only; every other caller discards it. Those two
 /// panic on `None` exactly as before — the guard changes only whether an (unobservable, because the
 /// unwinding drops `events` and no engine boundary catches it) `TokenCreated` was pushed first.
+/// CR 110.2a + CR 305.1: emit a token's battlefield entry and retain the
+/// effect actor on the event-time zone-change record. Callers that cannot prove
+/// the actor pass `None`, which fails the active-voice trigger match closed.
 pub(crate) fn push_committed_token_entry_events(
     state: &mut GameState,
     object_id: ObjectId,
     name: String,
     source_id: ObjectId,
+    putter: Option<PlayerId>,
     events: &mut Vec<GameEvent>,
 ) -> Option<crate::types::game_state::ZoneChangeRecord> {
+    let entry_event_start = events.len();
     let record = crate::game::zones::record_and_emit_entry_from_no_zone(state, object_id, events);
     if record.is_some() {
+        crate::game::zones::stamp_zone_change_putter(
+            state,
+            &mut events[entry_event_start..],
+            object_id,
+            putter,
+        );
         events.push(GameEvent::TokenCreated {
             object_id,
             name,
@@ -2339,6 +2370,7 @@ pub(crate) fn flush_pending_token_battlefield_entry(
         pending.object_id,
         pending.name,
         pending.source_id,
+        pending.putter,
         events,
     );
     true
@@ -4711,6 +4743,7 @@ mod tests {
                 object_id,
                 name: "Record Probe".to_string(),
                 source_id: ObjectId(1),
+                putter: Some(PlayerId(0)),
             }),
             "the whole entry is parked on GameState so it survives any number of round trips"
         );
@@ -4769,6 +4802,16 @@ mod tests {
             "realization emits the entry pair exactly once; got {events:?}"
         );
         assert!(state.pending_token_battlefield_entry.is_none());
+        assert_eq!(
+            events
+                .iter()
+                .find_map(|event| match event {
+                    GameEvent::ZoneChanged { record, .. } => record.zone_change_putter(),
+                    _ => None,
+                }),
+            Some(PlayerId(0)),
+            "the liminal token retains its actor through the parked flush"
+        );
 
         let mut second = Vec::new();
         assert!(
@@ -4918,6 +4961,7 @@ mod tests {
             object_id: ObjectId(7),
             name: "Record Probe".to_string(),
             source_id: ObjectId(1),
+            putter: None,
         });
         let encoded = serde_json::to_string(&state).expect("GameState serializes");
         let decoded: GameState = serde_json::from_str(&encoded).expect("GameState deserializes");
@@ -5106,6 +5150,11 @@ mod tests {
         assert_eq!(record.from_zone, None);
         assert_eq!(record.to_zone, Zone::Battlefield);
         assert!(record.is_token, "record should reflect token identity");
+        assert_eq!(
+            record.zone_change_putter(),
+            Some(PlayerId(0)),
+            "the token effect controller is the event-time putter"
+        );
     }
 
     #[test]

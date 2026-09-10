@@ -1859,6 +1859,7 @@ fn legacy_target_constraint(c: &TargetSelectionConstraint) -> bool {
 fn legacy_repeat_continuation(r: &RepeatContinuation) -> bool {
     match r {
         RepeatContinuation::WhileCondition { condition, .. } => legacy_ability_condition(condition),
+        RepeatContinuation::PlayerChoice { player } => legacy_controller_ref(player),
         RepeatContinuation::ControllerChoice | RepeatContinuation::UntilStopConditions { .. } => {
             false
         }
@@ -1905,12 +1906,14 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
         | TriggerCondition::SpellCastWithVariantThisTurn { .. }
         | TriggerCondition::SourceEnteredThisTurn
         | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAttackedOrBlockedThisCombat
         | TriggerCondition::SourceIsHarnessed
         | TriggerCondition::SourceIsAttacking
         | TriggerCondition::SourceIsTransformed
         | TriggerCondition::SourceIsFaceUp
         | TriggerCondition::SourceIsFaceDown
         | TriggerCondition::SourceInZone { .. }
+        | TriggerCondition::SourceInZoneWithAdjacentFilter { .. }
         | TriggerCondition::IsRenowned { .. }
         | TriggerCondition::WasStartingPlayer { .. }
         | TriggerCondition::ZoneChangeObjectMatchesFilter { .. }
@@ -1937,6 +1940,7 @@ fn legacy_trigger_condition(x: &TriggerCondition) -> bool {
         | TriggerCondition::CastVariantPaid { .. }
         | TriggerCondition::CastVariantPaidPersistent { .. }
         | TriggerCondition::ActivatedAbilityIsNonMana
+        | TriggerCondition::SourceAbilityAddedManaThisTurn
         | TriggerCondition::FirstTimeObjectTappedThisTurn
         // Both first-time siblings are terminal here: neither carries a legacy
         // player-filter/quantity ref, so the D5 legacy-batch-prompt flag is
@@ -2154,6 +2158,7 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         QuantityRef::EventContextAmount
         | QuantityRef::EventContextSourceCostX
         | QuantityRef::ManaSpentToCast { .. } => true,
+        QuantityRef::TokenSourceCounters { .. } => false,
         // Object-scope carriers: `ObjectScope::CostPaidObject` is a 12th tag.
         QuantityRef::CountersOn { scope, .. }
         | QuantityRef::Intensity { scope, .. }
@@ -2165,7 +2170,8 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         | QuantityRef::ObjectNameWordCount { scope, .. }
         | QuantityRef::ObjectTypelineComponentCount { scope, .. }
         | QuantityRef::ManaSymbolsInManaCost { scope, .. } => legacy_object_scope(scope),
-        QuantityRef::HandSize { .. }
+        QuantityRef::EntryLifePaid
+        | QuantityRef::HandSize { .. }
         | QuantityRef::LifeTotal { .. }
         | QuantityRef::LifeAboveStarting
         | QuantityRef::StartingLifeTotal
@@ -2200,6 +2206,7 @@ fn legacy_quantity_ref(x: &QuantityRef) -> bool {
         | QuantityRef::FilteredTrackedSetSize { .. }
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::TurnsTaken
         | QuantityRef::CrimesCommittedThisTurn
@@ -2512,6 +2519,7 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
@@ -2794,6 +2802,7 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::ManaSymbolCount { .. }
         | FilterProp::HasSupertype { .. }
         | FilterProp::IsChosenCreatureType
+        | FilterProp::IsChosenLandType
         | FilterProp::IsChosenColor
         | FilterProp::IsChosenCardType
         | FilterProp::MatchesLastChosenCardPredicate
@@ -2868,6 +2877,9 @@ fn legacy_continuous_modification(m: &ContinuousModification) -> bool {
         | ContinuousModification::GrantAllTriggeredAbilitiesOf { source } => {
             legacy_target_filter(source)
         }
+        ContinuousModification::CopyTopOfZone {
+            controller, filter, ..
+        } => legacy_controller_ref(controller) || legacy_target_filter(filter),
         ContinuousModification::SetDynamicPower { value }
         | ContinuousModification::SetDynamicToughness { value }
         | ContinuousModification::SetPowerDynamic { value }
@@ -2891,6 +2903,7 @@ fn legacy_continuous_modification(m: &ContinuousModification) -> bool {
         | ContinuousModification::AddKeyword { .. }
         | ContinuousModification::AddKeywordWithDerivedCost { .. }
         | ContinuousModification::RemoveKeyword { .. }
+        | ContinuousModification::RemoveAllLandwalk
         | ContinuousModification::RemoveAllAbilities
         | ContinuousModification::AddType { .. }
         | ContinuousModification::RemoveType { .. }
@@ -3346,6 +3359,7 @@ fn legacy_effect(x: &Effect) -> bool {
         Effect::Mana { target, .. } => target
             .as_ref()
             .is_some_and(|role| role.declared_filters().any(|(_, f)| legacy_target_filter(f))),
+        Effect::LoseAllUnspentMana { player } => legacy_target_filter(player),
         Effect::LoseTheGame { target } | Effect::WinTheGame { target } => otf(target),
         Effect::ChooseFromZone { filter, .. } => otf(filter),
         Effect::ReduceNextSpellCost { spell_filter, .. }
@@ -3529,7 +3543,15 @@ fn legacy_effect(x: &Effect) -> bool {
         }
         Effect::EpicCopy { spell } => contains_legacy_event_ref(spell),
         Effect::CreateDelayedTrigger { effect, .. } => legacy_definition(effect),
-        Effect::CreateDrawReplacement { replacement_effect } => legacy_effect(replacement_effect),
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
+            legacy_effect(replacement_effect)
+                || replacement_sub_ability
+                    .as_deref()
+                    .is_some_and(legacy_definition)
+        }
         Effect::RollDie { count, results, .. } => {
             legacy_quantity_expr(count) || results.iter().any(|r| legacy_definition(&r.effect))
         }
@@ -3608,6 +3630,8 @@ fn legacy_effect(x: &Effect) -> bool {
         | Effect::ManifestDread
         | Effect::Choose { .. }
         | Effect::ApplyPostReplacementDamage { .. }
+        | Effect::RevealChosenLowestManaValueCreatures
+        | Effect::RepeatPaidLibraryLook
         | Effect::Unimplemented { .. } => false,
     }
 }
@@ -4092,6 +4116,7 @@ fn walk_ability(
         sibling_condition: _, // replication marker, no read/write effect
         replacement_applied: _,
         parent_target_missing_reason: _,
+        unless_was_cumulative_upkeep: _, // unless-payment discriminator, read in engine_payment_choices
     } = a;
 
     // §4.3.2: a definition's own `player_scope` overrides the inherited scope for
@@ -4311,6 +4336,7 @@ fn rw_modal_choice(m: &ModalChoice) -> RwProfile {
 fn rw_repeat_continuation(r: &RepeatContinuation) -> RwProfile {
     match r {
         RepeatContinuation::ControllerChoice => RwProfile::empty(),
+        RepeatContinuation::PlayerChoice { player } => rw_controller_ref(player),
         RepeatContinuation::UntilStopConditions {
             stop_on_put_to_hand: _,
             stop_on_duplicate_exiled_names: _,
@@ -5607,6 +5633,11 @@ fn rw_effect(
             expiry: _,
             target: _,
         } => (writes_pool_profile(), None),
+        Effect::LoseAllUnspentMana { player } => {
+            let mut p = writes_pool_profile();
+            flag_legacy_write_target(&mut p, player);
+            (p, None)
+        }
 
         // ---- Tap ----
         Effect::SetTapState {
@@ -5621,8 +5652,14 @@ fn rw_effect(
             effect,
             uses_tracked_set: _,
         } => (deferred(effect), None),
-        Effect::CreateDrawReplacement { replacement_effect } => {
+        Effect::CreateDrawReplacement {
+            replacement_effect,
+            replacement_sub_ability,
+        } => {
             let (mut b, _) = rw_effect(replacement_effect, None, pscope, chain_move_owner);
+            if let Some(sub) = replacement_sub_ability {
+                b.merge(deferred(sub));
+            }
             b.drop_writes();
             (b, None)
         }
@@ -6072,6 +6109,8 @@ fn rw_effect(
         | Effect::ReassembleContraptionOnSprocket { .. }
         | Effect::ApplySticker { .. }
         | Effect::ProcessRadCounters => (RwProfile::conservative(), None),
+        Effect::RevealChosenLowestManaValueCreatures => (RwProfile::conservative(), None),
+        Effect::RepeatPaidLibraryLook => (RwProfile::conservative(), None),
     }
 }
 
@@ -6184,6 +6223,7 @@ fn rw_choice_type(choice_type: &crate::types::ability::ChoiceType) -> RwProfile 
 
 fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
     match x {
+        QuantityRef::EntryLifePaid => RwProfile::empty(),
         // §4.3.1 (CR 401/402): a hand-size read, refined by its player axis
         // (Rekindled `Opponent` ⇒ Opponents, Brink cond `Controller` ⇒ You).
         QuantityRef::HandSize { player } => {
@@ -6256,6 +6296,7 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
         }
         QuantityRef::PlayerCount { filter: _ } => RwProfile::empty(),
         QuantityRef::EventContextPlayerCount { filter: _ } => reads_event_live(),
+        QuantityRef::TokenSourceCounters { .. } => read_object_scope(&ObjectScope::Source, StateKind::ObjectCounters),
         QuantityRef::CountersOn { scope, .. } | QuantityRef::Intensity { scope, .. } => {
             read_object_scope(scope, StateKind::ObjectCounters)
         }
@@ -6340,6 +6381,7 @@ fn rw_quantity_ref(x: &QuantityRef) -> RwProfile {
         // (member-invariant under uniformity).
         QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::TurnsTaken
         | QuantityRef::CrimesCommittedThisTurn
@@ -6674,12 +6716,14 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         TriggerCondition::DuringPlayersTurn { player } => rw_player_filter(player),
         TriggerCondition::SourceEnteredThisTurn
         | TriggerCondition::SourceAttackedThisCombat
+        | TriggerCondition::SourceAttackedOrBlockedThisCombat
         | TriggerCondition::SourceIsHarnessed
         | TriggerCondition::SourceIsAttacking
         | TriggerCondition::SourceIsTransformed
         | TriggerCondition::SourceIsFaceUp
         | TriggerCondition::SourceIsFaceDown
         | TriggerCondition::SourceInZone { .. }
+        | TriggerCondition::SourceInZoneWithAdjacentFilter { .. }
         | TriggerCondition::IsRenowned { .. }
         | TriggerCondition::WasStartingPlayer { .. } => frozen_source_read(),
         TriggerCondition::ZoneChangeObjectMatchesFilter { .. }
@@ -6695,6 +6739,13 @@ fn rw_trigger_condition(x: &TriggerCondition) -> RwProfile {
         | TriggerCondition::TriggeringSpellMatchesFilter { .. } => reads_event_live(),
         TriggerCondition::ManaColorSpent { .. } | TriggerCondition::ManaSpentCondition { .. } => {
             reads_player_of(StateKind::JournalCast)
+        }
+        // CR 106.3 + CR 603.4: the exact-ability mana ledger is mutable
+        // per-turn state with no narrower existing StateKind. Conservatively
+        // classify it as `Other` so sibling-order analysis never assumes that
+        // a mana-producing ability commutes with a trigger that reads this gate.
+        TriggerCondition::SourceAbilityAddedManaThisTurn => {
+            reads_board_of(StateKind::Other)
         }
         TriggerCondition::And { conditions } | TriggerCondition::Or { conditions } => {
             let mut p = RwProfile::empty();

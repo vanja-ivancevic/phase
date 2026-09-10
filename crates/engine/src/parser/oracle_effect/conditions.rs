@@ -2298,6 +2298,49 @@ fn parse_target_possessive_pt_comparison_text(text: &str) -> Option<AbilityCondi
     parsed
 }
 
+/// CR 115.1 + CR 208.1 + CR 608.2c: target-scoped P/T comparison in the
+/// definite-target form — "target creature has toughness 5 or greater".
+/// Unlike the possessive anaphor above, this wording appears as the leading
+/// condition of a conditional effect (Blood Lust), so the target's creature
+/// filter must be retained alongside the P/T property.
+fn parse_target_has_pt_comparison(input: &str) -> OracleResult<'_, AbilityCondition> {
+    let (rest, _) = tag("target ").parse(input)?;
+    let (filter, remainder) = parse_type_phrase(rest);
+    let rest = remainder.trim_start();
+    let (rest, _) = tag("has ").parse(rest)?;
+    let (rest, stat) = parse_reflexive_pt_stat(rest)?;
+    let (rest, (comparator, value)) = parse_threshold_with_exactly(rest)?;
+    let TargetFilter::Typed(mut typed) = filter else {
+        return Err(nom::Err::Error(OracleError::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    };
+    typed.properties.push(FilterProp::PtComparison {
+        stat,
+        scope: PtValueScope::Current,
+        comparator,
+        value: QuantityExpr::Fixed { value },
+    });
+    Ok((
+        rest,
+        AbilityCondition::TargetMatchesFilter {
+            filter: TargetFilter::Typed(typed),
+            use_lki: false,
+            subject_slot: None,
+        },
+    ))
+}
+
+fn parse_target_has_pt_comparison_text(text: &str) -> Option<AbilityCondition> {
+    let lower = text.trim().trim_end_matches('.').to_ascii_lowercase();
+    let parsed = all_consuming(parse_target_has_pt_comparison)
+        .parse(lower.as_str())
+        .ok()
+        .map(|(_, condition)| condition);
+    parsed
+}
+
 /// CR 201.5 + CR 208.1 + CR 608.2c: source-referential "if its/her/his power or
 /// toughness is exactly N" — the possessive subject names the ability's own
 /// source (Amalia Benavides Aguirre: "destroy all other creatures if its power is
@@ -2399,14 +2442,17 @@ pub(super) fn strip_property_conditional(
         if let Some((before, after)) = tp.rsplit_around(&pattern) {
             let after = after.lower.trim_end_matches('.');
 
-            if let Some((comparator, value)) = parse_comparison_suffix(after) {
+            if let Some((comparator, value)) = parse_quantity_comparison(after).or_else(|| {
+                parse_comparison_suffix(after)
+                    .map(|(comparator, value)| (comparator, QuantityExpr::Fixed { value }))
+            }) {
                 return (
                     Some(AbilityCondition::QuantityCheck {
                         lhs: QuantityExpr::Ref {
                             qty: qty_ref.clone(),
                         },
                         comparator,
-                        rhs: QuantityExpr::Fixed { value },
+                        rhs: value,
                     }),
                     before.original.to_string(),
                 );
@@ -2986,6 +3032,23 @@ pub(super) fn strip_target_supertype_conditional(text: &str) -> (Option<AbilityC
         );
     }
 
+    // CR 205.4a + CR 608.2c: preserve positive land supertypes in a leading
+    // rider such as Thermokarst's "If that land was a snow land, ...".  The
+    // target has already left the battlefield when the rider resolves, so the
+    // condition must use last-known information just like the nonbasic form.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("if that land was a ").parse(lower.as_str())
+    {
+        if let Ok((rest, supertype)) = parse_supertype_word(rest) {
+            if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(" land, ").parse(rest) {
+                let body_start = text.len() - rest.len();
+                return (
+                    Some(target_land_supertype_lki_condition(supertype)),
+                    text[body_start..].to_string(),
+                );
+            }
+        }
+    }
+
     if let Some((before, after)) = tp.rsplit_around(" if that land was ") {
         if all_consuming(alt((
             tag::<_, _, OracleError<'_>>("nonbasic."),
@@ -2998,6 +3061,29 @@ pub(super) fn strip_target_supertype_conditional(text: &str) -> (Option<AbilityC
                 Some(nonbasic_land_lki_condition()),
                 before.original.trim_end_matches('.').trim().to_string(),
             );
+        }
+    }
+
+    // CR 205.4a + CR 608.2c: target-land supertype riders such as
+    // "If that land was a snow land, ..." read the land's last-known
+    // information after the preceding destroy/bounce effect.  Preserve both
+    // the land type and the supertype in the typed condition so the chained
+    // rider is not silently made unconditional.
+    if let Some((before, after)) = tp.rsplit_around(" if that land was ") {
+        let suffix = after.lower.trim_end_matches('.').trim();
+        // The existing nonbasic form above is intentionally kept separate:
+        // "nonbasic" is a negated supertype, not a positive one.
+        if let Some(suffix) = suffix.strip_prefix("a ") {
+            if let Some(supertype_name) = suffix.strip_suffix(" land") {
+                if let Ok((rest, supertype)) = parse_supertype_word(supertype_name) {
+                    if rest.trim().is_empty() {
+                        return (
+                            Some(target_land_supertype_lki_condition(supertype)),
+                            before.original.trim_end_matches('.').trim().to_string(),
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -3043,6 +3129,16 @@ fn nonbasic_land_lki_condition() -> AbilityCondition {
                 value: Supertype::Basic,
             },
         ])),
+        use_lki: true,
+        subject_slot: None,
+    }
+}
+
+fn target_land_supertype_lki_condition(supertype: Supertype) -> AbilityCondition {
+    AbilityCondition::TargetMatchesFilter {
+        filter: TargetFilter::Typed(
+            TypedFilter::land().properties(vec![FilterProp::HasSupertype { value: supertype }]),
+        ),
         use_lki: true,
         subject_slot: None,
     }
@@ -5479,6 +5575,59 @@ fn keyword_presence_kind(keyword: &Keyword) -> Option<crate::types::keywords::Ke
     keyword.kind_identifies_ability().then(|| keyword.kind())
 }
 
+/// CR 115.1 + CR 115.9a/c + CR 608.2c: a targeted spell has exactly one
+/// target, and that target is this ability's source. The target spell remains
+/// a normal announced target; this is deliberately a resolution-time rider so
+/// a response may make the condition true or false after the ability is
+/// activated (Quicksilver Dragon).
+///
+/// The target-side constraints reuse the generic stack-entry filter machinery:
+/// `HasSingleTarget` counts declared target instances, while `TargetsOnly`
+/// evaluates every one against `SelfRef` in the resolving ability's context.
+fn parse_target_spell_single_targeting_source_condition(
+    input: &str,
+) -> OracleResult<'_, AbilityCondition> {
+    let (input, _) = tag("target spell has only one target and that target is ").parse(input)?;
+    // `parse_oracle_ir` canonicalizes source references before activated-ability
+    // routing, while this parser is also used directly by unnormalized callers.
+    // Both spellings name the same source object; accept either at this shared
+    // condition boundary rather than forcing individual callers to special-case
+    // Quicksilver Dragon's resolution-time guard.
+    let (input, _) = alt((tag("this creature"), tag("~"))).parse(input)?;
+    Ok((
+        input,
+        AbilityCondition::TargetMatchesFilter {
+            filter: TargetFilter::And {
+                filters: vec![
+                    TargetFilter::StackSpell,
+                    TargetFilter::Typed(TypedFilter {
+                        properties: vec![
+                            FilterProp::HasSingleTarget,
+                            FilterProp::TargetsOnly {
+                                filter: Box::new(TargetFilter::SelfRef),
+                            },
+                        ],
+                        ..Default::default()
+                    }),
+                ],
+            },
+            use_lki: false,
+            subject_slot: None,
+        },
+    ))
+}
+
+fn parse_target_spell_single_targeting_source_condition_text(
+    text: &str,
+) -> Option<AbilityCondition> {
+    let lower = text.trim().trim_end_matches('.').to_ascii_lowercase();
+    let parsed = all_consuming(parse_target_spell_single_targeting_source_condition)
+        .parse(lower.as_str())
+        .ok()
+        .map(|(_, condition)| condition);
+    parsed
+}
+
 pub(super) fn try_nom_condition_as_ability_condition(
     text: &str,
     ctx: &mut ParseContext,
@@ -5486,6 +5635,12 @@ pub(super) fn try_nom_condition_as_ability_condition(
     use crate::parser::oracle_nom::condition::parse_inner_condition;
 
     let lower = text.to_lowercase();
+
+    if let Some(condition) =
+        parse_target_spell_single_targeting_source_condition_text(lower.as_str())
+    {
+        return Some(condition);
+    }
 
     // CR 508.4 + CR 608.2c + CR 701.42: attacking meld-pair conditions are
     // resolution-time leading conditions. Keep them in the shared condition
@@ -5558,6 +5713,13 @@ pub(super) fn try_nom_condition_as_ability_condition(
     // parameterized object characteristic (dealt-damage, combat status, mana
     // value, P/T), so it must not preempt the type/color recognizers.
     if let Some(condition) = parse_target_reflexive_property_condition_text(lower.as_str()) {
+        return Some(condition);
+    }
+
+    // CR 115.1 + CR 208.1 + CR 608.2c: definite-target P/T comparison —
+    // "target creature has toughness 5 or greater". This must run before the
+    // generic quantity parser, which cannot preserve the target object scope.
+    if let Some(condition) = parse_target_has_pt_comparison_text(lower.as_str()) {
         return Some(condition);
     }
 
@@ -6109,6 +6271,45 @@ pub(super) fn try_nom_condition_as_ability_condition(
                     negated,
                 ));
             }
+        }
+    }
+
+    // CR 201.2 + CR 608.2c: "that card/it has the chosen name" — the
+    // anaphoric result of a preceding random/selected reveal is compared with
+    // the name chosen on the resolving source (Cursed Scroll and the same
+    // choose-name/reveal-result family). Use the existing HasChosenName filter
+    // so the runtime reads the source's chosen-name attribute and remains
+    // case-insensitive. Keep both polarities typed; an unrecognized suffix
+    // falls through to the honest unsupported-condition path.
+    if let Ok((rest, negated)) = alt((
+        value(
+            true,
+            alt((
+                tag::<_, _, OracleError<'_>>("that card doesn't have "),
+                tag("that card does not have "),
+                tag("it doesn't have "),
+                tag("it does not have "),
+            )),
+        ),
+        value(
+            false,
+            alt((
+                tag::<_, _, OracleError<'_>>("that card has "),
+                tag("it has "),
+            )),
+        ),
+    ))
+    .parse(lower.as_str())
+    {
+        if rest.trim().trim_end_matches('.').trim() == "the chosen name" {
+            return Some(maybe_negate(
+                AbilityCondition::TargetMatchesFilter {
+                    filter: TargetFilter::HasChosenName,
+                    use_lki: false,
+                    subject_slot: None,
+                },
+                negated,
+            ));
         }
     }
 
@@ -8088,6 +8289,33 @@ mod tests {
         assert!(
             parse_target_possessive_pt_comparison_text("that creature had power 2 or less")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn target_has_pt_comparison_binds_definite_target_scope() {
+        let expected = AbilityCondition::TargetMatchesFilter {
+            filter: TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                FilterProp::PtComparison {
+                    stat: PtStat::Toughness,
+                    scope: PtValueScope::Current,
+                    comparator: Comparator::GE,
+                    value: QuantityExpr::Fixed { value: 5 },
+                },
+            ])),
+            use_lki: false,
+            subject_slot: None,
+        };
+        assert_eq!(
+            parse_target_has_pt_comparison_text("target creature has toughness 5 or greater"),
+            Some(expected.clone())
+        );
+        assert_eq!(
+            try_nom_condition_as_ability_condition(
+                "target creature has toughness 5 or greater",
+                &mut ParseContext::default()
+            ),
+            Some(expected)
         );
     }
 

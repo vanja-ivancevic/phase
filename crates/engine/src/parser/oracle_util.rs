@@ -1741,7 +1741,8 @@ fn mask_card_name_keyword_action(text: &str, card_name: &str) -> Option<(String,
     // masking, the leading verb collapses to the self-reference `~` and the
     // effect ("Regenerate target creature.") parses to a bare, verbless
     // `~ target creature`.
-    const KEYWORD_ACTIONS: &[&str] = &["manifest dread", "cloak", "manifest", "regenerate"];
+    const KEYWORD_ACTIONS: &[&str] =
+        &["manifest dread", "cloak", "manifest", "regenerate", "exile"];
     let name_lower = card_name.trim().to_ascii_lowercase();
     // allow-noncombinator: Iterator::find over the keyword-action table (slice
     // selection), not string-dispatch parsing.
@@ -2491,7 +2492,8 @@ pub fn normalize_card_name_refs(text: &str, card_name: &str) -> String {
                         | "away"
                         | "off"
                         | "next"
-                );
+                )
+                || super::oracle_nom::primitives::is_verb_word(&lower_short);
             // CR 201.3a: a card's "of"-derived short name normalizes to `~`
             // (interchangeable name reference). Suppress this ONLY when the
             // short name is a creature subtype AND the text adds that subtype to

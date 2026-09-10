@@ -108,6 +108,8 @@ pub mod energy;
 pub mod epic;
 pub mod exile_resolving_spell;
 pub mod put_chosen_counter;
+pub mod repeat_paid_library_look;
+pub mod reveal_chosen_lowest_mana_value_creatures;
 // Tests for `epic` live in a sibling file (declared here, not in `epic.rs`, so
 // `epic.rs` stays implementation-only).
 #[cfg(test)]
@@ -156,6 +158,7 @@ pub mod investigate;
 pub mod learn;
 pub mod life;
 pub mod mana;
+pub mod mana_loss;
 pub mod manifest;
 pub mod manifest_dread;
 pub mod mill;
@@ -1183,13 +1186,15 @@ fn drain_active_repeat_until(state: &mut GameState) {
     };
     let crate::types::game_state::PendingRepeatUntil { ability } = pending;
     match &ability.repeat_until {
-        // CR 107.1c: the iteration's choice has resolved — prompt the
-        // controller whether to repeat the process.
-        Some(RepeatContinuation::ControllerChoice) => {
-            state.waiting_for = WaitingFor::RepeatDecision {
-                player: ability.controller,
-                ability,
-            };
+        // CR 107.1c + CR 109.4: the iteration's choice has resolved — prompt
+        // the controller or the player the process bound as its repeat actor.
+        Some(
+            choice @ (RepeatContinuation::ControllerChoice
+            | RepeatContinuation::PlayerChoice { .. }),
+        ) => {
+            if let Some(player) = repeat_choice_player(state, &ability, choice) {
+                state.waiting_for = WaitingFor::RepeatDecision { player, ability };
+            }
         }
         Some(RepeatContinuation::UntilStopConditions {
             stop_on_put_to_hand,
@@ -2984,6 +2989,21 @@ fn apply_parent_chain_context(
     state: &mut GameState,
 ) {
     child.context = parent.context.clone();
+    // Result-object conditions consume the producer's result for one immediate
+    // child. Do not let a later grandchild inherit it accidentally; the producer
+    // branch below stamps it back onto the direct condition consumer.
+    child.context.resolution_result_context = None;
+    if effect_writes_last_revealed_ids(&parent.effect)
+        && !state.last_revealed_ids.is_empty()
+        && child
+            .condition
+            .as_ref()
+            .is_some_and(condition_depends_on_result_object)
+    {
+        child.context.resolution_result_context = Some(Box::new(
+            ForwardedResultContext::from_object_ids(state, &state.last_revealed_ids),
+        ));
+    }
     // CR 120.1 + CR 608.2b: The damage-subject binding names the object THIS
     // hand-off supplies (or fails to supply) to the immediate child's damage
     // clause. It is one-hop by construction — a grandchild's subject slot is a
@@ -3595,6 +3615,7 @@ fn quantity_ref_counts_population_matching(
     filter_pred: &dyn Fn(&TargetFilter) -> bool,
 ) -> bool {
     match qty {
+        QuantityRef::EntryLifePaid => false,
         // Owned `TargetFilter` naming the counted population.
         QuantityRef::ObjectCount { filter }
         | QuantityRef::ObjectCountDistinct { filter, .. }
@@ -3671,6 +3692,7 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::TrackedSetSize
         | QuantityRef::ExiledFromHandThisResolution
         | QuantityRef::PreviousEffectAmount { .. }
+        | QuantityRef::PreviousDamageAmountCappedByTargetPreDamageValue
         | QuantityRef::PreviousEffectCount
         | QuantityRef::LifeLostThisTurn { .. }
         | QuantityRef::PartySize { .. }
@@ -3705,6 +3727,7 @@ fn quantity_ref_counts_population_matching(
         | QuantityRef::CommanderCastFromCommandZoneCount
         | QuantityRef::CommanderManaValue { .. }
         | QuantityRef::VoteCount { .. } => false,
+        QuantityRef::TokenSourceCounters { .. } => false,
     }
 }
 
@@ -3906,7 +3929,8 @@ fn condition_reads_filter_population(
 
 /// CR 608.2c + CR 400.7j: Whether a condition reads the parent's *suspended-
 /// selection result object* — the found/revealed card that a `SearchLibrary`
-/// injects as the continuation target only after the player responds
+/// injects as the continuation target (or a prompted `RevealHand` supplies it
+/// only after the player responds)
 /// (`engine_resolution_choices.rs`, `cont.chain.targets = continuation_targets`).
 /// A `TargetMatchesFilter` or `RevealedHasCardType` gate on "that card" ("the
 /// revealed card is the chosen type" / "if it's a land card") cannot be evaluated
@@ -4025,6 +4049,14 @@ fn effect_writes_last_revealed_ids(effect: &Effect) -> bool {
             // a chained "If it's a creature card, …" rider and an anaphoric
             // "turn it face up" follow-up read it (Hauntwoods Shrieker).
             | Effect::Reveal { .. }
+            // CR 701.9a + CR 701.20a: a random card selected from a hand is a
+            // concrete result object for a chained condition or anaphoric
+            // follow-up (Cursed Scroll), while an ordinary whole-hand reveal
+            // remains a population rather than a singular result object.
+            | Effect::RevealHand {
+                selection: crate::types::ability::CardSelectionMode::Random,
+                ..
+            }
     )
 }
 
@@ -5246,6 +5278,7 @@ pub fn resolve_effect(
         Effect::Token { .. } => token::resolve(state, ability, events),
         Effect::GainLife { .. } => life::resolve_gain(state, ability, events),
         Effect::LoseLife { .. } => life::resolve_lose(state, ability, events),
+        Effect::LoseAllUnspentMana { .. } => mana_loss::resolve(state, ability, events),
         // CR 701.26a/b: scope (Single vs All) and state (Tap vs Untap) are
         // dispatched inside `resolve_set_tap_state`.
         Effect::SetTapState { .. } => tap_untap::resolve_set_tap_state(state, ability, events),
@@ -5261,6 +5294,7 @@ pub fn resolve_effect(
         Effect::ChangeZone { .. } => return change_zone::resolve(state, ability, events),
         Effect::ChangeZoneAll { .. } => change_zone::resolve_all(state, ability, events),
         Effect::Dig { .. } => dig::resolve(state, ability, events),
+        Effect::RepeatPaidLibraryLook => repeat_paid_library_look::resolve(state, ability, events),
         Effect::GainControl { .. } => gain_control::resolve(state, ability, events),
         Effect::GainControlAll { .. } => gain_control::resolve_all(state, ability, events),
         Effect::Goad { .. } | Effect::GoadAll { .. } => goad::resolve(state, ability, events),
@@ -5498,6 +5532,9 @@ pub fn resolve_effect(
         }
         Effect::EachPlayerCopyChosen { .. } => {
             each_player_copy_chosen::resolve(state, ability, events)
+        }
+        Effect::RevealChosenLowestManaValueCreatures => {
+            reveal_chosen_lowest_mana_value_creatures::resolve(state, ability, events)
         }
         Effect::Exploit { .. } => exploit::resolve(state, ability, events),
         Effect::GainEnergy { .. } => energy::resolve_gain(state, ability, events),
@@ -6473,7 +6510,7 @@ fn affected_objects_from_events(
         Effect::Destroy { .. } | Effect::DestroyAll { .. } => events
             .iter()
             .filter_map(|event| match event {
-                GameEvent::CreatureDestroyed { object_id } => Some(*object_id),
+                GameEvent::CreatureDestroyed { object_id, .. } => Some(*object_id),
                 _ => None,
             })
             .collect(),
@@ -10600,6 +10637,9 @@ pub fn resolve_ability_chain(
         state.last_effect_amount = None;
         // CR 120.10: resolution-local excess channel resets with its total twin.
         state.last_effect_excess_amount = None;
+        // CR 608.2c + CR 120.3: Drain Life's target-derived ceiling belongs to
+        // this one resolution, just like the preceding-effect damage amount.
+        state.last_damage_target_pre_damage_life_gain_cap = None;
         // NOTE: `state.die_result_this_resolution` is intentionally NOT cleared
         // here. `roll_die::resolve` stamps it AFTER this depth-0 prelude runs
         // (the prelude runs once at chain top, before `RollDie` executes), so
@@ -10741,7 +10781,10 @@ pub fn resolve_ability_chain(
     );
     match ability.repeat_until.clone() {
         None => resolve_chain_body(state, ability, events, depth),
-        Some(RepeatContinuation::ControllerChoice) => {
+        Some(
+            choice @ (RepeatContinuation::ControllerChoice
+            | RepeatContinuation::PlayerChoice { .. }),
+        ) => {
             let initial_waiting_for = state.waiting_for.clone();
             let stack_depth_before_iteration = state.resolution_stack.capture_child_boundary();
             resolve_chain_body(state, ability, events, depth)?;
@@ -10756,12 +10799,14 @@ pub fn resolve_ability_chain(
                     stack_depth_before_iteration,
                 );
             } else {
-                // CR 107.1c: after the iteration fully resolved, prompt the
-                // controller to repeat the process or stop.
-                state.waiting_for = WaitingFor::RepeatDecision {
-                    player: ability.controller,
-                    ability: Box::new(ability.clone()),
-                };
+                // CR 107.1c + CR 109.4: after the iteration fully resolved,
+                // prompt the controller or process-bound player to repeat.
+                if let Some(player) = repeat_choice_player(state, ability, &choice) {
+                    state.waiting_for = WaitingFor::RepeatDecision {
+                        player,
+                        ability: Box::new(ability.clone()),
+                    };
+                }
             }
             Ok(())
         }
@@ -10844,6 +10889,30 @@ pub fn resolve_ability_chain(
                 }
             }
         }
+    }
+}
+
+/// CR 608.2c + CR 109.4: resolve who owns a repeat-process decision from the
+/// retained resolving ability. `PlayerChoice` deliberately uses the same
+/// controller-reference authority as effect recipients, so a declared target
+/// remains stable when the chain is re-entered instead of falling back to the
+/// spell controller.
+fn repeat_choice_player(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    continuation: &RepeatContinuation,
+) -> Option<PlayerId> {
+    match continuation {
+        RepeatContinuation::ControllerChoice => Some(ability.controller),
+        RepeatContinuation::PlayerChoice { player } => crate::game::filter::controller_ref_player(
+            state,
+            ability.source_id,
+            Some(ability.controller),
+            Some(ability),
+            player,
+        ),
+        RepeatContinuation::UntilStopConditions { .. }
+        | RepeatContinuation::WhileCondition { .. } => None,
     }
 }
 
@@ -12173,6 +12242,19 @@ fn resolve_chain_body(
                 .and_then(|head| unless_payers[head..].split_first())
             {
                 let mut pending = ability.clone();
+                // CR 702.24a: Preserve the cumulative-upkeep discriminator
+                // before the clear — a printed rider trigger ("When a player
+                // doesn't pay ~'s cumulative upkeep") needs to observe the
+                // non-payment at the resolve step, and the cleared unless_pay
+                // can no longer answer whether this prompt was the upkeep tax.
+                pending.unless_was_cumulative_upkeep = matches!(
+                    &unless_pay.cost,
+                    AbilityCost::PerCounter {
+                        counter: crate::types::counter::CounterType::Age,
+                        target: TargetFilter::SelfRef,
+                        ..
+                    }
+                );
                 pending.unless_pay = None;
                 // CR 118.12a: A disjunctive unless-cost (`OneOf`) surfaces a
                 // sub-cost choice first; the chosen single cost re-enters
@@ -12718,6 +12800,20 @@ fn resolve_chain_body(
     // discard accounting so controller-only "discard your hand, then draw that
     // many" chains (Tolarian Winds) stamp `last_effect_count`.
     let parent_events = &events[events_before..];
+    // CR 608.2c + CR 120.3: the Drain Life quantity is licensed only by one
+    // immediately preceding damage event. `apply_damage_after_replacement`
+    // captures a target ceiling at damage time; discard it here when this
+    // parent produced no damage, or a multi-target/multi-recipient batch for
+    // which one scalar ceiling would be ambiguous. This prevents a later
+    // unrelated previous-effect quantity from inheriting a stale target value.
+    if parent_events
+        .iter()
+        .filter(|event| matches!(event, GameEvent::DamageDealt { .. }))
+        .count()
+        != 1
+    {
+        state.last_damage_target_pre_damage_life_gain_cap = None;
+    }
     let counts_by_player = previous_effect_counts_by_player_from_events(
         EffectKind::from(&ability.effect),
         ability.source_id,
@@ -13396,6 +13492,9 @@ fn resolve_chain_body(
                         && condition_depends_on_graveyard_size(condition))
                     || condition_depends_on_last_created(condition)
                     || matches!(condition, AbilityCondition::WhenYouDo)
+                    || (matches!(ability.effect, Effect::RevealHand { .. })
+                        && matches!(state.waiting_for, WaitingFor::RevealChoice { .. })
+                        && condition_depends_on_result_object(condition))
                     || (matches!(state.waiting_for, WaitingFor::SearchChoice { .. })
                         && condition_depends_on_result_object(condition))
                     || condition_awaits_resolution_only_referent(condition, state, ability))
@@ -14485,7 +14584,7 @@ pub(crate) fn evaluate_condition(
                     .current_trigger_event
                     .as_ref()
                     .and_then(|event| match event {
-                        GameEvent::CreatureDestroyed { object_id }
+                        GameEvent::CreatureDestroyed { object_id, .. }
                         | GameEvent::ZoneChanged { object_id, .. } => Some(*object_id),
                         _ => None,
                     })
@@ -15045,32 +15144,48 @@ pub(crate) fn evaluate_condition(
             // Mirror the `ParentTargetController` fallback (targeting.rs): when
             // `targets` has no object, resolve the anaphor against
             // `TriggeringSource` from the current trigger event.
-            let target_id = if let Some(index) = subject_slot {
-                match crate::game::targeting::resolve_parent_slot_from_root(state, ability, *index)
-                {
-                    Some(TargetRef::Object(id)) => Some(id),
-                    _ => None,
-                }
-            } else {
+            let result_target_id =
                 ability
-                    .targets
-                    .iter()
-                    .find_map(|t| match t {
-                        TargetRef::Object(id) => Some(*id),
-                        _ => None,
-                    })
-                    .or_else(|| {
-                        crate::game::targeting::resolve_event_context_target(
-                            state,
-                            &TargetFilter::TriggeringSource,
-                            ability.source_id,
-                        )
-                        .and_then(|t| match t {
-                            TargetRef::Object(id) => Some(id),
-                            TargetRef::Player(_) => None,
+                    .context
+                    .resolution_result_context
+                    .as_ref()
+                    .and_then(|context| {
+                        context.targets.iter().find_map(|target| match target {
+                            TargetRef::Object(id) if context.object_pin_is_current(*id, state) => {
+                                Some(*id)
+                            }
+                            _ => None,
                         })
-                    })
-            };
+                    });
+            let target_id = result_target_id.or_else(|| {
+                if let Some(index) = subject_slot {
+                    match crate::game::targeting::resolve_parent_slot_from_root(
+                        state, ability, *index,
+                    ) {
+                        Some(TargetRef::Object(id)) => Some(id),
+                        _ => None,
+                    }
+                } else {
+                    ability
+                        .targets
+                        .iter()
+                        .find_map(|t| match t {
+                            TargetRef::Object(id) => Some(*id),
+                            _ => None,
+                        })
+                        .or_else(|| {
+                            crate::game::targeting::resolve_event_context_target(
+                                state,
+                                &TargetFilter::TriggeringSource,
+                                ability.source_id,
+                            )
+                            .and_then(|t| match t {
+                                TargetRef::Object(id) => Some(id),
+                                TargetRef::Player(_) => None,
+                            })
+                        })
+                }
+            });
             let matched = if let Some(id) = target_id {
                 if *use_lki {
                     if let Some(GameEvent::ZoneChanged { record, .. }) =
@@ -15644,7 +15759,10 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
         // counter placement once for every age counter. Scaling its quantity
         // keeps it a single deterministic effect-cost payment, so the shared
         // counter replacement pipeline sees the complete payment at once.
-        AbilityCost::EffectCost { effect } => match effect.as_ref() {
+        AbilityCost::EffectCost {
+            effect,
+            player_scope,
+        } => match effect.as_ref() {
             Effect::PutCounter {
                 counter_type,
                 count,
@@ -15655,6 +15773,7 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
                     count: count.scaled_by(n),
                     target: TargetFilter::SelfRef,
                 }),
+                player_scope: player_scope.clone(),
             },
             // CR 702.24a: Every age counter requires a separate instance of
             // the fixed mana-producing cost. Combining its fixed color vector
@@ -15676,8 +15795,20 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
                 *colors = colors.repeat(n as usize);
                 AbilityCost::EffectCost {
                     effect: Box::new(scaled_effect),
+                    player_scope: player_scope.clone(),
                 }
             }
+            // CR 702.24a + CR 121.1: Psychic Vortex draws once for each age
+            // counter. Keep the payer-relative controller target and scale the
+            // draw count so the existing deterministic EffectCost draw branch
+            // can pay the expanded cost in one resolution step.
+            Effect::Draw { count, target } => AbilityCost::EffectCost {
+                effect: Box::new(Effect::Draw {
+                    count: count.scaled_by(n),
+                    target: target.clone(),
+                }),
+                player_scope: player_scope.clone(),
+            },
             _ => AbilityCost::Composite {
                 costs: vec![base.clone(); n as usize],
             },
@@ -18469,6 +18600,30 @@ mod tests {
                 filter: None,
             }
         );
+    }
+
+    #[test]
+    fn expand_per_counter_draw_scales_count() {
+        // CR 702.24a + CR 121.1: Psychic Vortex's "draw a card" cost is
+        // repeated once per age counter, not left as an unsupported composite.
+        let base = AbilityCost::EffectCost {
+            effect: Box::new(Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            }),
+            player_scope: None,
+        };
+        let expanded = expand_per_counter(&base, 3);
+        let AbilityCost::EffectCost { effect, .. } = expanded else {
+            panic!("expected EffectCost");
+        };
+        assert!(matches!(
+            effect.as_ref(),
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 3 },
+                target: TargetFilter::Controller,
+            }
+        ));
     }
 
     #[test]
@@ -24369,6 +24524,66 @@ mod tests {
             state.players[0].life,
             start_life + 3,
             "initial iteration + 2 accepted = 3 resolutions, each gaining 1 life",
+        );
+    }
+
+    /// CR 608.2c + CR 109.4: a repeat-process decision may be assigned to a
+    /// declared player target. Trade Secrets uses this shape: its targeted
+    /// opponent, rather than the spell's controller, accepts or declines each
+    /// later pass of the full process.
+    #[test]
+    fn repeat_until_targeted_opponent_prompts_and_repeats_for_that_opponent() {
+        let mut state = GameState::new_two_player(42);
+        let opponent = PlayerId(1);
+        let start_life = state.players[1].life;
+
+        let mut ability = ResolvedAbility::new(
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Player,
+            },
+            vec![TargetRef::Player(opponent)],
+            ObjectId(100),
+            PlayerId(0),
+        );
+        ability.repeat_until = Some(RepeatContinuation::PlayerChoice {
+            player: ControllerRef::TargetOpponent,
+        });
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::RepeatDecision { player, .. } if player == opponent
+        ));
+        assert_eq!(state.players[1].life, start_life + 1);
+
+        crate::game::engine::apply(
+            &mut state,
+            opponent,
+            crate::types::actions::GameAction::DecideOptionalEffect { accept: true },
+        )
+        .unwrap();
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::RepeatDecision { player, .. } if player == opponent
+        ));
+        assert_eq!(
+            state.players[1].life,
+            start_life + 2,
+            "the accepted repeat re-runs the target-player process"
+        );
+
+        crate::game::engine::apply(
+            &mut state,
+            opponent,
+            crate::types::actions::GameAction::DecideOptionalEffect { accept: false },
+        )
+        .unwrap();
+        assert!(
+            !matches!(state.waiting_for, WaitingFor::RepeatDecision { .. }),
+            "the target opponent may end the repeat loop"
         );
     }
 

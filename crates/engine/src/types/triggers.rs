@@ -84,6 +84,10 @@ pub enum TriggerEventKey {
     Sacrificed,
     /// CR 701.8: A permanent was destroyed.
     Destroyed,
+    /// CR 701.19: A permanent regenerated after a regeneration shield was used.
+    Regenerated,
+    /// CR 702.24a: A cumulative upkeep payment was not made.
+    CumulativeUpkeepNotPaid,
     /// CR 611.3 (continuous-effect rules covering control-changing statics)
     /// — a permanent's controller changed via a `GainControl` effect.
     /// NOTE: Administrative control transfers on player elimination
@@ -321,6 +325,8 @@ pub enum TriggerMode {
     SacrificedOnce,
     /// CR 701.8: Triggers when a permanent is destroyed.
     Destroyed,
+    /// CR 701.19: Triggers when a permanent regenerates.
+    Regenerated,
     /// CR 701.26: Triggers when a permanent becomes tapped.
     Taps,
     /// CR 106.12a: Triggers when a permanent is tapped for mana.
@@ -361,6 +367,11 @@ pub enum TriggerMode {
     PayLife,
     /// CR 702.24: Cumulative upkeep trigger.
     PayCumulativeUpkeep,
+    /// CR 702.24a: A printed rider trigger — "When a player doesn't pay ~'s
+    /// cumulative upkeep, ...". Fires on `GameEvent::CumulativeUpkeepNotPaid`
+    /// in addition to (not instead of) the default sacrifice the same event
+    /// drives.
+    CumulativeUpkeepNotPaid,
     /// CR 702.30: Echo trigger.
     PayEcho,
 
@@ -712,6 +723,7 @@ impl FromStr for TriggerMode {
             "DamagePreventedOnce" => TriggerMode::DamagePreventedOnce,
             "DayTimeChanges" => TriggerMode::DayTimeChanges,
             "Destroyed" => TriggerMode::Destroyed,
+            "Regenerated" => TriggerMode::Regenerated,
             "Devoured" => TriggerMode::Devoured,
             "Discarded" => TriggerMode::Discarded,
             "DiscardedAll" => TriggerMode::DiscardedAll,
@@ -766,6 +778,7 @@ impl FromStr for TriggerMode {
             "ExhaustAbilityActivated" => TriggerMode::KeywordAbilityActivated(AbilityTag::Exhaust),
             "OutlastAbilityActivated" => TriggerMode::KeywordAbilityActivated(AbilityTag::Outlast),
             "PayCumulativeUpkeep" => TriggerMode::PayCumulativeUpkeep,
+            "CumulativeUpkeepNotPaid" => TriggerMode::CumulativeUpkeepNotPaid,
             "PayEcho" => TriggerMode::PayEcho,
             "PayLife" => TriggerMode::PayLife,
             "Phase" => TriggerMode::Phase,
@@ -1108,6 +1121,7 @@ mod tests {
             "OutlastAbilityActivated",
             // These three deserialize into KeywordAbilityActivated(tag) — all are valid
             "PayCumulativeUpkeep",
+            "CumulativeUpkeepNotPaid",
             "PayEcho",
             "PayLife",
             "Phase",
