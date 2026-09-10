@@ -601,6 +601,7 @@ pub(crate) fn chain_offers_choice(a: &ResolvedAbility) -> bool {
         sub_link: _, // SubAbilityLink kind tag
         sibling_condition: _, // SiblingCondition replication marker, no resolution-time choice
         parent_target_missing_reason: _, // seam flag
+        unless_was_cumulative_upkeep: _, // unless-payment discriminator, read in engine_payment_choices
     } = a;
 
     // CR 603.5 + CR 608.2d: an optional effect / optional targeting /

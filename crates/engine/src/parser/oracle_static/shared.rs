@@ -1405,9 +1405,7 @@ fn parse_repeated_conditional_statics(text: &str) -> Option<Vec<StaticDefinition
     let mut definitions = Vec::with_capacity(conjuncts.len());
     for conjunct in conjuncts {
         let body = strip_continuous_verb(conjunct)?;
-        if body.split_around_outside_quotes(" as long as ").is_none() {
-            return None;
-        }
+        body.split_around_outside_quotes(" as long as ")?;
         let definition =
             super::anthem::parse_continuous_gets_has(conjunct.original, affected.clone(), text)?;
         if definition.condition.is_none()

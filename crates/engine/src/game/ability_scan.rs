@@ -285,6 +285,7 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         sibling_condition: _,            // SiblingCondition replication marker, no dynamic read
         distribute: _, // announcement unit tag/string, no resolution-time dynamic read
         parent_target_missing_reason: _, // seam flag
+        unless_was_cumulative_upkeep: _, // unless-payment discriminator, read in engine_payment_choices
     } = a;
 
     let mut acc = scan_effect(effect, mode);

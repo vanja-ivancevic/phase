@@ -12091,6 +12091,19 @@ fn resolve_chain_body(
                 .and_then(|head| unless_payers[head..].split_first())
             {
                 let mut pending = ability.clone();
+                // CR 702.24a: Preserve the cumulative-upkeep discriminator
+                // before the clear — a printed rider trigger ("When a player
+                // doesn't pay ~'s cumulative upkeep") needs to observe the
+                // non-payment at the resolve step, and the cleared unless_pay
+                // can no longer answer whether this prompt was the upkeep tax.
+                pending.unless_was_cumulative_upkeep = matches!(
+                    &unless_pay.cost,
+                    AbilityCost::PerCounter {
+                        counter: crate::types::counter::CounterType::Age,
+                        target: TargetFilter::SelfRef,
+                        ..
+                    }
+                );
                 pending.unless_pay = None;
                 // CR 118.12a: A disjunctive unless-cost (`OneOf`) surfaces a
                 // sub-cost choice first; the chosen single cost re-enters

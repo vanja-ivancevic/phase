@@ -1887,6 +1887,7 @@ pub(crate) fn extract_target_object_from_event(
         | GameEvent::PlayerPerformedAction { .. }
         | GameEvent::CardPredicateGuessMade { .. }
         | GameEvent::Regenerated { .. }
+        | GameEvent::CumulativeUpkeepNotPaid { .. }
         | GameEvent::CreatureSuspected { .. }
         | GameEvent::CreatureNoLongerSuspected { .. }
         | GameEvent::Detained { .. }
@@ -1976,6 +1977,9 @@ pub(crate) fn extract_player_from_event(
         // `TriggeringPlayer` / "that player" binds to the activating player
         // carried on the event.
         GameEvent::AbilityActivated { player_id, .. } => Some(*player_id),
+        // CR 702.24a: "that player" in a cumulative-upkeep rider trigger is the
+        // player who didn't pay the upkeep cost.
+        GameEvent::CumulativeUpkeepNotPaid { player, .. } => Some(*player),
         GameEvent::PermanentSacrificed { player_id, .. } => Some(*player_id),
         GameEvent::Unattached {
             old_target: TargetRef::Player(player_id),

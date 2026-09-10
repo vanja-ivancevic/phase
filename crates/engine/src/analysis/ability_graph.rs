@@ -1093,6 +1093,9 @@ fn trigger_axis(trig: &TriggerDefinition) -> Option<AxisKey> {
         // CR 701.19: regeneration is emitted by the replacement layer, but no
         // resource-producer axis models that event yet.
         TriggerMode::Regenerated => None,
+        // CR 702.24a: the non-payment rider is emitted by the unless-payment
+        // resolver; no resource-producer axis models that event yet.
+        TriggerMode::CumulativeUpkeepNotPaid => None,
         // CR 701.21: a sacrifice trigger consumes the Sac event.
         TriggerMode::Sacrificed | TriggerMode::SacrificedOnce => Some(AxisKey::Sac),
         // CR 119.3: life-gain / life-loss / pay-life triggers consume the Life axis.

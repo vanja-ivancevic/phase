@@ -267,6 +267,7 @@ pub(crate) fn keys_from_trigger_def(def: &TriggerDefinition) -> (Keys, bool) {
             push(TriggerEventKey::Dies(narrow));
         }
         TriggerMode::Regenerated => push(TriggerEventKey::Regenerated),
+        TriggerMode::CumulativeUpkeepNotPaid => push(TriggerEventKey::CumulativeUpkeepNotPaid),
         TriggerMode::Taps | TriggerMode::TapAll => push(TriggerEventKey::Taps),
         TriggerMode::TapsForMana => push(TriggerEventKey::TapsForMana),
         TriggerMode::Untaps | TriggerMode::UntapAll => push(TriggerEventKey::Untaps),
@@ -675,6 +676,7 @@ pub(crate) fn keys_from_event(event: &GameEvent, state: &GameState) -> Keys {
         GameEvent::Cycled { .. } => {}
         GameEvent::PlayerPerformedAction { .. } => push(TriggerEventKey::PlayerActionPerformed),
         GameEvent::Regenerated { .. } => push(TriggerEventKey::Regenerated),
+        GameEvent::CumulativeUpkeepNotPaid { .. } => push(TriggerEventKey::CumulativeUpkeepNotPaid),
         GameEvent::CreatureSuspected { .. }
         | GameEvent::CreatureNoLongerSuspected { .. }
         | GameEvent::Detained { .. }

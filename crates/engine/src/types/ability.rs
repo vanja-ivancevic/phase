@@ -28539,6 +28539,16 @@ pub struct ResolvedAbility {
     /// When set, the payer is offered a choice before this effect executes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unless_pay: Option<UnlessPayModifier>,
+    /// CR 702.24a: This ability's cleared `unless_pay` was a cumulative-upkeep
+    /// payment (`PerCounter { Age, SelfRef }`). The unless-pay interceptor
+    /// clears `unless_pay` before prompting, but a printed rider trigger
+    /// ("When a player doesn't pay ~'s cumulative upkeep") must observe the
+    /// non-payment at the resolve step, and this flag is what survives the
+    /// clear — through the OneOf choose-cost re-entry path too — so
+    /// `handle_unless_payment` can emit `GameEvent::CumulativeUpkeepNotPaid`
+    /// when the payer declines or cannot pay.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub unless_was_cumulative_upkeep: bool,
     /// CR 601.2d: Pre-assigned distribution from casting time ("divide N damage among").
     /// Each entry maps a target to its assigned portion. Read at resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -28775,6 +28785,7 @@ impl ResolvedAbility {
             copy_count_status: CopyCountStatus::Pending,
             forward_result: false,
             unless_pay: None,
+            unless_was_cumulative_upkeep: false,
             distribution: None,
             distribute: None,
             player_scope: None,

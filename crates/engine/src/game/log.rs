@@ -230,7 +230,8 @@ fn importance(event: &GameEvent) -> LogImportance {
         | GameEvent::Specialized { .. }
         | GameEvent::Clash { .. }
         | GameEvent::VoteCast { .. }
-        | GameEvent::VoteResolved { .. } => LogImportance::Detail,
+        | GameEvent::VoteResolved { .. }
+        | GameEvent::CumulativeUpkeepNotPaid { .. } => LogImportance::Detail,
     }
 }
 
@@ -279,7 +280,8 @@ fn tone(event: &GameEvent) -> LogTone {
         | GameEvent::Waterbend { .. }
         | GameEvent::Clash { .. }
         | GameEvent::VoteCast { .. }
-        | GameEvent::VoteResolved { .. } => LogTone::Informational,
+        | GameEvent::VoteResolved { .. }
+        | GameEvent::CumulativeUpkeepNotPaid { .. } => LogTone::Informational,
         // CR 701.17a + CR 400.2: the mill's library departure is hidden
         // information; grouped with `HiddenSearchViewed` as engine-consumed,
         // never narrated (`should_exclude_event` drops it).
@@ -581,6 +583,7 @@ fn categorize(event: &GameEvent) -> LogCategory {
         | GameEvent::CounterRemoved { .. }
         | GameEvent::ControllerChanged { .. }
         | GameEvent::Transformed { .. }
+        | GameEvent::CumulativeUpkeepNotPaid { .. }
         // CR 710.4: flipping is an object-status change, grouped with transform
         // and face up/down.
         | GameEvent::Flipped { .. }
@@ -676,6 +679,10 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
     match event {
         GameEvent::GameStarted => vec![text("Game started")],
         GameEvent::HiddenSearchViewed { .. } => vec![],
+        // CR 702.24a: the non-payment is narrated by the effects it drives
+        // (the default sacrifice, and any printed rider trigger); the bare
+        // event itself adds no line.
+        GameEvent::CumulativeUpkeepNotPaid { .. } => vec![],
         // CR 701.17a + CR 400.2: never narrated — the library departure it
         // reports is hidden information (`should_exclude_event` drops it).
         GameEvent::Milled { .. } => vec![],

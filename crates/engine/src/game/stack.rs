@@ -3388,6 +3388,7 @@ fn self_counter_ability_is_batch_candidate(ability: &ResolvedAbility) -> bool {
         modal,
         mode_abilities,
         parent_target_missing_reason,
+        unless_was_cumulative_upkeep: _, // unless-payment discriminator, not part of these predicates
     } = ability;
 
     let self_counter = matches!(
@@ -3618,6 +3619,7 @@ fn fixed_controller_gain_life_ability_is_batch_candidate(ability: &ResolvedAbili
         modal,
         mode_abilities,
         parent_target_missing_reason,
+        unless_was_cumulative_upkeep: _, // unless-payment discriminator, not part of these predicates
     } = ability;
 
     let fixed_controller_gain_life = matches!(
@@ -3828,6 +3830,7 @@ fn fixed_opponent_effect_ability_is_batch_candidate(ability: &ResolvedAbility) -
         modal,
         mode_abilities,
         parent_target_missing_reason,
+        unless_was_cumulative_upkeep: _, // unless-payment discriminator, not part of these predicates
     } = ability;
 
     let fixed_opponent_effect = matches!(
@@ -4310,6 +4313,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         modal: a_modal,
         mode_abilities: a_mode_abilities,
         parent_target_missing_reason: a_parent_target_missing_reason,
+        unless_was_cumulative_upkeep: _, // transient payment discriminator, ignored for inert equality
         selected_target_incarnations: a_selected_target_incarnations,
     } = a;
     let ResolvedAbility {
@@ -4383,6 +4387,7 @@ fn inert_trigger_abilities_eq_ignoring_provenance(
         modal: b_modal,
         mode_abilities: b_mode_abilities,
         parent_target_missing_reason: b_parent_target_missing_reason,
+        unless_was_cumulative_upkeep: _, // transient payment discriminator, ignored for inert equality
         selected_target_incarnations: b_selected_target_incarnations,
     } = b;
 

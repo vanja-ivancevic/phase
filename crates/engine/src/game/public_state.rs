@@ -533,6 +533,9 @@ pub fn mark_public_state_from_events(state: &mut GameState, events: &[GameEvent]
             | GameEvent::CrimeCommitted { .. }
             | GameEvent::PlayerPerformedAction { .. }
             | GameEvent::Regenerated { .. }
+            // CR 702.24a: non-payment alone changes no displayed field; the
+            // sacrifice/rider it drives arrive as their own events.
+            | GameEvent::CumulativeUpkeepNotPaid { .. }
             | GameEvent::CreatureSuspected { .. }
             | GameEvent::CreatureNoLongerSuspected { .. }
             | GameEvent::BecamePrepared { .. }

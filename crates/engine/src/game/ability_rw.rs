@@ -4114,6 +4114,7 @@ fn walk_ability(
         sibling_condition: _, // replication marker, no read/write effect
         replacement_applied: _,
         parent_target_missing_reason: _,
+        unless_was_cumulative_upkeep: _, // unless-payment discriminator, read in engine_payment_choices
     } = a;
 
     // §4.3.2: a definition's own `player_scope` overrides the inherited scope for

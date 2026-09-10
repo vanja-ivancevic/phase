@@ -31830,3 +31830,50 @@ fn ogre_marauder_attack_trigger_carries_defending_player_unless_sacrifice() {
         "the body must not fall through to a parser gap"
     );
 }
+
+// CR 702.24a: printed cumulative-upkeep rider triggers — Thought Lash /
+// Heart of Bogardan. The head names the non-payment event; the payload's
+// "that player" binds to the non-paying player (TriggeringPlayer).
+#[test]
+fn cumulative_upkeep_not_paid_rider_printed_possessor_parses() {
+    let trigger = parse_trigger_line(
+        "When a player doesn't pay this enchantment's cumulative upkeep, \
+         that player exiles all cards from their library.",
+        "Thought Lash",
+    );
+    assert_eq!(trigger.mode, TriggerMode::CumulativeUpkeepNotPaid);
+    assert_eq!(
+        trigger.trigger_zones,
+        vec![crate::types::zones::Zone::Battlefield]
+    );
+    let execute = trigger.execute.as_deref().expect("rider body must parse");
+    assert!(
+        !format!("{:?}", execute.effect).contains("Unimplemented"),
+        "the rider body must not fall through to a parser gap"
+    );
+    assert!(
+        format!("{:?}", execute.effect).contains("ScopedPlayer"),
+        "body 'that player' must lower to the ScopedPlayer referent, got {:?}",
+        execute.effect
+    );
+}
+
+#[test]
+fn cumulative_upkeep_not_paid_rider_normalized_possessor_parses() {
+    let trigger = parse_trigger_line(
+        "When a player doesn't pay ~'s cumulative upkeep, that player exiles all cards from their library.",
+        "Thought Lash",
+    );
+    assert_eq!(trigger.mode, TriggerMode::CumulativeUpkeepNotPaid);
+}
+
+#[test]
+fn cumulative_upkeep_not_paid_rider_fails_closed_on_other_costs() {
+    // A non-cumulative-upkeep "doesn't pay" head must not be claimed by the
+    // rider parser — it stays an Unknown trigger so coverage stays red.
+    let trigger = parse_trigger_line(
+        "When a player doesn't pay ~'s echo cost, that player discards a card.",
+        "Not A Card",
+    );
+    assert_ne!(trigger.mode, TriggerMode::CumulativeUpkeepNotPaid);
+}

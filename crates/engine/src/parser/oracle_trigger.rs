@@ -1768,7 +1768,10 @@ fn append_payment_rider(original: &str, mut cleaned: String) -> String {
         return cleaned;
     };
     let body_start = unless_pos + relative_start + ". if you pay, ".len();
-    let body = original.get(body_start..).map(str::trim).unwrap_or_default();
+    let body = original
+        .get(body_start..)
+        .map(str::trim)
+        .unwrap_or_default();
     if body.is_empty() {
         return cleaned;
     }
@@ -4633,8 +4636,7 @@ fn parse_unless_they_pay_life(input: &str) -> Option<(AbilityCost, &str)> {
     // to its toughness", `its` names the object targeted by the surrounding
     // effect, not the source ability. Preserve the target-relative quantity
     // for the shared resolution payment path.
-    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("life equal to its toughness")
-        .parse(input)
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("life equal to its toughness").parse(input)
     {
         return Some((
             AbilityCost::PayLife {
@@ -10521,6 +10523,10 @@ pub(crate) fn parse_trigger_condition(
         return result;
     }
 
+    if let Some(result) = try_parse_cumulative_upkeep_not_paid_trigger(&lower) {
+        return result;
+    }
+
     if let Some(result) = try_parse_special_trigger_pattern(&lower) {
         return result;
     }
@@ -13734,6 +13740,42 @@ fn try_parse_event(
     }
 
     None
+}
+
+/// CR 702.24a: Printed cumulative-upkeep rider triggers — "When a player
+/// doesn't pay ~'s cumulative upkeep, ..." (Heart of Bogardan) and "When a
+/// player doesn't pay this enchantment's cumulative upkeep, ..." (Thought
+/// Lash). The head names the non-payment event; the payload after the comma
+/// is the rider effect, parsed by the ordinary body pipeline with
+/// `relative_player_scope` bound to the non-paying player. The trigger fires
+/// on `GameEvent::CumulativeUpkeepNotPaid`, emitted by the unless-payment
+/// resolver — in addition to the default sacrifice the same non-payment
+/// drives (CR 702.24a keeps the sacrifice; the rider is a separate ability).
+/// Possessor spellings accepted: the normalized "~'s", the printed
+/// "this <single-word type>'s", and "its" — anything else fails closed.
+fn try_parse_cumulative_upkeep_not_paid_trigger(
+    lower: &str,
+) -> Option<(TriggerMode, TriggerDefinition)> {
+    let rest = lower
+        .strip_prefix("whenever ")
+        .or_else(|| lower.strip_prefix("when "))?;
+    let rest = rest.strip_prefix("a player doesn't pay ")?;
+    let this_type_form = rest.strip_prefix("this ").and_then(|after| {
+        let type_word = after.strip_suffix("'s cumulative upkeep")?;
+        (!type_word.is_empty() && !type_word.contains(' ')).then_some("cumulative upkeep")
+    });
+    let after_possessor = this_type_form
+        .or_else(|| rest.strip_prefix("~'s "))
+        .or_else(|| rest.strip_prefix("its "))?;
+    // The head is exactly the possessive plus the cost name — anything after
+    // it on the same clause is a shape this parser does not claim.
+    if after_possessor != "cumulative upkeep" {
+        return None;
+    }
+    let mut def = make_base();
+    def.mode = TriggerMode::CumulativeUpkeepNotPaid;
+    def.trigger_zones = vec![Zone::Battlefield];
+    Some((TriggerMode::CumulativeUpkeepNotPaid, def))
 }
 
 fn try_parse_named_trigger_mode(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {

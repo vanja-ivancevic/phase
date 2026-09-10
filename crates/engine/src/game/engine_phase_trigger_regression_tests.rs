@@ -6379,3 +6379,84 @@ fn jotun_owl_keeper_one_of_x_n_pays_combined_mana() {
         "combined {{W}}{{U}} cost drains both colored mana units from the pool"
     );
 }
+
+/// CR 702.24a: Thought Lash's printed rider — "When a player doesn't pay this
+/// enchantment's cumulative upkeep, that player exiles all cards from their
+/// library." The rider is a separate triggered ability on top of the default
+/// sacrifice: declining the exile-top payment must sacrifice the enchantment
+/// AND fire the rider, exiling the non-paying player's whole library. The
+/// rider is installed through the real parser so the runtime test also
+/// validates the parsed shape end to end.
+#[test]
+fn cumulative_upkeep_not_paid_rider_exiles_library_on_decline() {
+    let (mut state, source, library_cards) = setup_top_library_exile_upkeep_state(1, 3);
+    {
+        let rider = crate::parser::oracle_trigger::parse_trigger_line(
+            "When a player doesn't pay this enchantment's cumulative upkeep, \
+             that player exiles all cards from their library.",
+            "Thought Lash",
+        );
+        assert_eq!(
+            rider.mode,
+            crate::types::triggers::TriggerMode::CumulativeUpkeepNotPaid,
+            "the parser must recognize the printed rider head"
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .trigger_definitions
+            .push(rider);
+    }
+
+    advance_to_unless_payment_prompt(&mut state);
+
+    let decline_result = apply_as_current(&mut state, GameAction::PayUnlessCost { pay: false })
+        .expect("declining the upkeep payment is a legal action");
+    let mut all_events = decline_result.events;
+    assert!(
+        all_events.iter().any(|e| matches!(
+            e,
+            crate::types::events::GameEvent::CumulativeUpkeepNotPaid { .. }
+        )),
+        "the non-payment event must be emitted on decline; got {:?}",
+        all_events
+    );
+
+    // Drain priority passes until the rider has resolved (cap 16 — fail loudly
+    // rather than proceed silently if the rider path wedges).
+    let cap = 16;
+    let mut drained = false;
+    for _ in 0..cap {
+        if matches!(state.waiting_for, WaitingFor::Priority { .. })
+            && state.stack.is_empty()
+            && state.deferred_triggers.is_empty()
+        {
+            drained = true;
+            break;
+        }
+        match apply_as_current(&mut state, GameAction::PassPriority) {
+            Ok(r) => all_events.extend(r.events),
+            Err(_) => {
+                drained = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        drained,
+        "drain loop exceeded {cap} iterations without reaching Priority + empty stack"
+    );
+    for (index, card) in library_cards.iter().enumerate() {
+        assert_eq!(
+            state.objects[card].zone,
+            Zone::Exile,
+            "rider must exile library card {} (that player = the non-payer)",
+            index + 1
+        );
+    }
+    assert!(
+        state.players[0].library.is_empty(),
+        "the whole library is exiled by the rider"
+    );
+}

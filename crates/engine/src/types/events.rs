@@ -1441,6 +1441,16 @@ pub enum GameEvent {
     Regenerated {
         object_id: ObjectId,
     },
+    /// CR 702.24a: A cumulative upkeep payment was not made. Emitted by the
+    /// unless-payment resolver when the payer declines or cannot pay the
+    /// per-age-counter cost, so the default sacrifice AND a printed rider
+    /// trigger ("When a player doesn't pay ~'s cumulative upkeep, ...") both
+    /// observe the non-payment. `source_id` is the permanent carrying the
+    /// cumulative upkeep; `player` is the player who didn't pay.
+    CumulativeUpkeepNotPaid {
+        source_id: ObjectId,
+        player: PlayerId,
+    },
     /// CR 701.60a: A creature was suspected.
     CreatureSuspected {
         object_id: ObjectId,

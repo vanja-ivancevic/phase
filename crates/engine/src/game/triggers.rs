@@ -2444,6 +2444,7 @@ fn collect_matching_triggers_inner(
                 definition_ref.as_ref(),
             );
             stamp_zone_change_putter_scope(&mut ability, trig_def, event);
+            stamp_cumulative_upkeep_non_payer_scope(&mut ability, trig_def, event);
             // CR 603.4: Stamp the printed-trigger index so per-turn resolution
             // tracking (`AbilityCondition::NthResolutionThisTurn`) can identify
             // "this ability" at resolution time.
@@ -3941,6 +3942,7 @@ fn collect_latched_batched_zone_triggers(
             Some(&latched.definition_ref),
         );
         stamp_zone_change_putter_scope(&mut ability, &latched.definition, first_event);
+        stamp_cumulative_upkeep_non_payer_scope(&mut ability, &latched.definition, first_event);
         ability.ability_index = Some(trig_idx);
         let (modal, mode_abilities) = latched
             .definition
@@ -15467,6 +15469,26 @@ fn stamp_zone_change_putter_scope(
     // the active-voice parser. Bind it from the immutable event record at
     // trigger creation, not from the entrant's post-replacement controller.
     ability.set_scoped_player_recursive(putter);
+}
+
+/// CR 702.24a: printed rider triggers ("When a player doesn't pay ~'s
+/// cumulative upkeep, that player ...") lower their body "that player" /
+/// "their" to ScopedPlayer. Bind that referent from the non-payment event at
+/// trigger creation so the rider acts on the player who declined or could not
+/// pay — which for Thought Lash is not always the enchantment's controller
+/// path default.
+fn stamp_cumulative_upkeep_non_payer_scope(
+    ability: &mut ResolvedAbility,
+    trigger: &TriggerDefinition,
+    event: &GameEvent,
+) {
+    if !matches!(trigger.mode, TriggerMode::CumulativeUpkeepNotPaid) {
+        return;
+    }
+    let GameEvent::CumulativeUpkeepNotPaid { player, .. } = event else {
+        return;
+    };
+    ability.set_scoped_player_recursive(*player);
 }
 
 pub(super) fn build_triggered_ability_from_context(

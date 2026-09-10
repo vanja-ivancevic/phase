@@ -68,6 +68,7 @@ pub fn trigger_matcher(mode: TriggerMode) -> Option<TriggerMatcher> {
         TriggerMode::Sacrificed | TriggerMode::SacrificedOnce => match_sacrificed,
         TriggerMode::Destroyed => match_destroyed,
         TriggerMode::Regenerated => match_regenerated,
+        TriggerMode::CumulativeUpkeepNotPaid => match_cumulative_upkeep_not_paid,
         TriggerMode::TokenCreated | TriggerMode::TokenCreatedOnce => match_token_created,
         TriggerMode::TurnBegin => match_turn_begin,
         TriggerMode::Phase | TriggerMode::PayEcho | TriggerMode::PayCumulativeUpkeep => match_phase,
@@ -281,6 +282,10 @@ pub fn build_trigger_registry() -> HashMap<TriggerMode, TriggerMatcher> {
     r.insert(TriggerMode::SacrificedOnce, match_sacrificed);
     r.insert(TriggerMode::Destroyed, match_destroyed);
     r.insert(TriggerMode::Regenerated, match_regenerated);
+    r.insert(
+        TriggerMode::CumulativeUpkeepNotPaid,
+        match_cumulative_upkeep_not_paid,
+    );
     r.insert(TriggerMode::TokenCreated, match_token_created);
     r.insert(TriggerMode::TokenCreatedOnce, match_token_created);
     r.insert(TriggerMode::TurnBegin, match_turn_begin);
@@ -1070,6 +1075,9 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::Cycled { .. }
         | GameEvent::PlayerPerformedAction { .. }
         | GameEvent::Regenerated { .. }
+        // CR 702.24a: the rider trigger's subject is its own source, matched by
+        // the dedicated matcher — nothing to count for the generic filter helper.
+        | GameEvent::CumulativeUpkeepNotPaid { .. }
         | GameEvent::CreatureSuspected { .. }
         | GameEvent::CreatureNoLongerSuspected { .. }
         | GameEvent::Detained { .. }
@@ -2699,6 +2707,22 @@ pub(super) fn match_regenerated(
 ) -> bool {
     if let GameEvent::Regenerated { object_id } = event {
         valid_card_matches(trigger, state, *object_id, source_context)
+    } else {
+        false
+    }
+}
+
+/// CR 702.24a: Printed cumulative-upkeep rider triggers fire only on their own
+/// source's non-payment — the event's `source_id` is the permanent carrying
+/// the cumulative upkeep, which is also the trigger's source.
+pub(super) fn match_cumulative_upkeep_not_paid(
+    event: &GameEvent,
+    trigger: &TriggerDefinition,
+    source_context: &TriggerSourceContext,
+    state: &GameState,
+) -> bool {
+    if let GameEvent::CumulativeUpkeepNotPaid { source_id, .. } = event {
+        valid_card_matches(trigger, state, *source_id, source_context)
     } else {
         false
     }
