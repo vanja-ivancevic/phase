@@ -1699,6 +1699,42 @@ pub(super) fn handle_unless_payment(
             // CR 118.3: Deterministic effect-cost payments use the single
             // resolution payment authority. Its shared support predicate
             // covers source counters and fixed mana without a prompt.
+            // CR 702.24a + CR 118.12: Infernal Darkness's "Pay {B} and 1 life"
+            // — a PayCost-wrapped composite of deterministic Mana/PayLife
+            // leaves. Leaves are sequenced in printed order through the single
+            // payment authority; a leaf that cannot be paid fails the whole
+            // cumulative-upkeep payment (CR 118.3: no partial costs).
+            AbilityCost::EffectCost { effect, .. }
+                if matches!(
+                    effect.as_ref(),
+                    Effect::PayCost { cost, .. } if cost.is_deterministic_pay_cost()
+                ) =>
+            {
+                let Effect::PayCost { cost: inner, .. } = effect.as_ref() else {
+                    unreachable!("matched PayCost guard")
+                };
+                match pay_deterministic_pay_cost_leaves(
+                    state,
+                    player,
+                    inner,
+                    pending_effect.as_ref(),
+                    events,
+                )? {
+                    PaymentOutcome::Paid => {}
+                    PaymentOutcome::Failed { .. } => payment_failed = true,
+                    PaymentOutcome::Paused { .. } => {
+                        state.pending_cost_move_resume =
+                            Some(PendingCostMoveResume::CounterAdditionUnlessPayment {
+                                cost: poll_cost.clone(),
+                                pending_effect: pending_effect.clone(),
+                                trigger_event: trigger_event.clone(),
+                                effect_description: effect_description.clone(),
+                                remaining: remaining.clone(),
+                            });
+                        return Ok(action_result(events, state.waiting_for.clone()));
+                    }
+                }
+            }
             AbilityCost::EffectCost { .. } if cost.supports_effect_cost_payment() => {
                 match costs::pay_ability_cost_for_resolution(
                     state,
@@ -1820,6 +1856,47 @@ pub(super) fn handle_unless_payment(
         post_action_event_start,
         events,
     )
+}
+
+/// CR 702.24a + CR 118.12: Pay a `is_deterministic_pay_cost` pay-cost tree
+/// leaf by leaf, in printed order, through the single payment authority.
+/// Every leaf is Mana or PayLife by construction (see
+/// `AbilityCost::is_deterministic_pay_cost`); a Composite pays all members
+/// and fails on the first member that cannot be paid (CR 118.3: the cost is
+/// paid in full or not at all — leaves already paid before a failure stay
+/// paid, matching printed-order payment of "Pay 1 life and {B}").
+fn pay_deterministic_pay_cost_leaves(
+    state: &mut GameState,
+    player: PlayerId,
+    cost: &AbilityCost,
+    pending_effect: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> Result<PaymentOutcome, EngineError> {
+    match cost {
+        AbilityCost::Mana { .. } | AbilityCost::PayLife { .. } => {
+            costs::pay_ability_cost_for_resolution(state, player, cost, pending_effect, events)
+        }
+        AbilityCost::Composite { costs } => {
+            for member in costs {
+                let outcome = pay_deterministic_pay_cost_leaves(
+                    state,
+                    player,
+                    member,
+                    pending_effect,
+                    events,
+                )?;
+                if !matches!(outcome, PaymentOutcome::Paid) {
+                    return Ok(outcome);
+                }
+            }
+            Ok(PaymentOutcome::Paid)
+        }
+        _ => Ok(PaymentOutcome::Failed {
+            reason: crate::game::costs::PaymentFailure {
+                reason: "non-deterministic pay-cost leaf".to_string(),
+            },
+        }),
+    }
 }
 
 /// CR 118.12 + CR 118.12a: The DECLINED-or-FAILED epilogue for every

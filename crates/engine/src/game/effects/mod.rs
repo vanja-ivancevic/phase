@@ -15605,6 +15605,22 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
                 }),
                 player_scope: player_scope.clone(),
             },
+            // CR 702.24a + CR 118.12: Infernal Darkness's "Pay {B} and 1 life"
+            // scales every leaf of the wrapped pay cost by the age-counter
+            // multiplier, keeping the result one deterministic PayCost
+            // payment. Only leaves the deterministic gate admits (Mana,
+            // PayLife) can appear here — anything else fell to the
+            // unsupported-cost arm below.
+            Effect::PayCost { cost, scale, payer } if cost.is_deterministic_pay_cost() => {
+                AbilityCost::EffectCost {
+                    effect: Box::new(Effect::PayCost {
+                        cost: expand_per_counter(cost, n),
+                        scale: scale.clone(),
+                        payer: payer.clone(),
+                    }),
+                    player_scope: player_scope.clone(),
+                }
+            }
             _ => AbilityCost::Composite {
                 costs: vec![base.clone(); n as usize],
             },
@@ -18304,6 +18320,51 @@ mod tests {
                 filter: None,
             }
         );
+    }
+
+    #[test]
+    fn expand_per_counter_pay_cost_scales_composite_leaves() {
+        // CR 702.24a + CR 118.12: Infernal Darkness's wrapped pay cost scales
+        // every deterministic leaf with the age-counter multiplier.
+        let base = AbilityCost::EffectCost {
+            effect: Box::new(Effect::PayCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Mana {
+                            cost: ManaCost::generic(1),
+                        },
+                        AbilityCost::PayLife {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            }),
+            player_scope: None,
+        };
+        let expanded = expand_per_counter(&base, 2);
+        let AbilityCost::EffectCost { effect, .. } = expanded else {
+            panic!("expected EffectCost");
+        };
+        let Effect::PayCost { cost, .. } = effect.as_ref() else {
+            panic!("expected PayCost");
+        };
+        let AbilityCost::Composite { costs } = cost else {
+            panic!("expected Composite of scaled leaves, got {cost:?}");
+        };
+        assert!(matches!(
+            &costs[0],
+            AbilityCost::Mana {
+                cost: ManaCost::Cost { generic: 2, .. }
+            }
+        ));
+        assert!(matches!(
+            &costs[1],
+            AbilityCost::PayLife {
+                amount: QuantityExpr::Fixed { value: 2 }
+            }
+        ));
     }
 
     #[test]

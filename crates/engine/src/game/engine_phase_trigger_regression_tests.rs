@@ -6460,3 +6460,113 @@ fn cumulative_upkeep_not_paid_rider_exiles_library_on_decline() {
         "the whole library is exiled by the rider"
     );
 }
+
+/// CR 702.24a + CR 118.12: Infernal Darkness's "Cumulative upkeep—Pay {B} and
+/// 1 life." The wrapped PayCost composite is sequenced through the payment
+/// authority: with both mana and life available the payment succeeds and the
+/// enchantment survives; without the black mana the whole cost is unpayable
+/// and the default sacrifice fires.
+#[test]
+fn cumulative_upkeep_pay_cost_composite_pays_mana_and_life_in_order() {
+    let (mut state, source, _library_cards) = setup_top_library_exile_upkeep_state(1, 0);
+    {
+        let obj = state.objects.get_mut(&source).unwrap();
+        obj.trigger_definitions.clear();
+        obj.trigger_definitions
+            .push(crate::database::synthesis::build_cumulative_upkeep_trigger(
+                AbilityCost::EffectCost {
+                    effect: Box::new(Effect::PayCost {
+                        cost: AbilityCost::Composite {
+                            costs: vec![
+                                AbilityCost::Mana {
+                                    cost: ManaCost::Cost {
+                                        shards: vec![crate::types::mana::ManaCostShard::Black],
+                                        generic: 0,
+                                    },
+                                },
+                                AbilityCost::PayLife {
+                                    amount: QuantityExpr::Fixed { value: 1 },
+                                },
+                            ],
+                        },
+                        scale: None,
+                        payer: TargetFilter::Controller,
+                    }),
+                    player_scope: None,
+                },
+            ));
+    }
+    advance_to_unless_payment_prompt(&mut state);
+    // CR 500.5: mana pools empty between phases, so the payment is provided
+    // AFTER the upkeep prompt settles (same ordering as the Mystic Remora
+    // test). 1 preloaded age counter + the upkeep tick = 2 counters, so the
+    // expanded cost is {B}{B} and 2 life (CR 702.24a: pay the upkeep cost for
+    // EACH age counter) — provide both black mana units.
+    let p0 = state
+        .players
+        .iter_mut()
+        .find(|p| p.id == PlayerId(0))
+        .expect("PlayerId(0)");
+    for _ in 0..2 {
+        p0.mana_pool
+            .add(ManaUnit::new(ManaType::Black, ObjectId(0), false, vec![]));
+    }
+
+    apply_as_current(&mut state, GameAction::PayUnlessCost { pay: true })
+        .expect("the composite pay cost should be payable with black mana available");
+
+    assert_eq!(
+        state.objects[&source].zone,
+        Zone::Battlefield,
+        "paying both composite leaves keeps the permanent"
+    );
+    let p0 = &state.players[0];
+    assert_eq!(p0.life, 18, "the doubled PayLife leaf loses two life");
+    assert_eq!(
+        p0.mana_pool.count_color(ManaType::Black),
+        0,
+        "the doubled Mana leaf consumes both black mana"
+    );
+}
+
+#[test]
+fn cumulative_upkeep_pay_cost_composite_sacrifices_when_mana_member_unpayable() {
+    let (mut state, source, _library_cards) = setup_top_library_exile_upkeep_state(1, 0);
+    {
+        let obj = state.objects.get_mut(&source).unwrap();
+        obj.trigger_definitions.clear();
+        obj.trigger_definitions
+            .push(crate::database::synthesis::build_cumulative_upkeep_trigger(
+                AbilityCost::EffectCost {
+                    effect: Box::new(Effect::PayCost {
+                        cost: AbilityCost::Composite {
+                            costs: vec![
+                                AbilityCost::Mana {
+                                    cost: ManaCost::Cost {
+                                        shards: vec![crate::types::mana::ManaCostShard::Black],
+                                        generic: 0,
+                                    },
+                                },
+                                AbilityCost::PayLife {
+                                    amount: QuantityExpr::Fixed { value: 1 },
+                                },
+                            ],
+                        },
+                        scale: None,
+                        payer: TargetFilter::Controller,
+                    }),
+                    player_scope: None,
+                },
+            ));
+    }
+
+    advance_to_unless_payment_prompt(&mut state);
+    apply_as_current(&mut state, GameAction::PayUnlessCost { pay: true })
+        .expect("declining-equivalent unpayable cost still resolves the action");
+
+    assert_eq!(
+        state.objects[&source].zone,
+        Zone::Graveyard,
+        "no black mana means the composite cost is unpayable; the default sacrifice fires"
+    );
+}
