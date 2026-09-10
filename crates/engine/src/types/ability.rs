@@ -11950,6 +11950,19 @@ impl AbilityCost {
                 filter: None,
                 ..
             } => true,
+            // CR 702.24a + CR 121.1: Psychic Vortex's cumulative upkeep is
+            // "Draw a card". The unless-payment resolver already executes a
+            // deterministic controller draw; it is deliberately kept outside
+            // `supports_effect_cost_payment`, whose narrower predicate gates
+            // the generic resolution cost payer.
+            AbilityCost::EffectCost { effect, .. }
+                if matches!(
+                    effect.as_ref(),
+                    Effect::Draw {
+                        target: TargetFilter::Controller,
+                        ..
+                    }
+                ) => true,
             AbilityCost::EffectCost { .. } if self.supports_effect_cost_payment() => true,
             // CR 118.12a: OneOf at the base must be a disjunction of mana
             // costs; mixed-shape disjunctions are not yet expanded into a
@@ -31578,6 +31591,17 @@ mod tests {
             count: 1,
             zone: Some(Zone::Graveyard),
             filter: None,
+        }
+        .supports_cumulative_upkeep_payment());
+
+        // CR 702.24a + CR 121.1: Psychic Vortex's deterministic controller
+        // draw is paid by the existing unless-payment draw resolver.
+        assert!(AbilityCost::EffectCost {
+            effect: Box::new(Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            }),
+            player_scope: None,
         }
         .supports_cumulative_upkeep_payment());
     }

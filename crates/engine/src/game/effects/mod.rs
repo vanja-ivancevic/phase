@@ -15581,6 +15581,17 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
                     player_scope: player_scope.clone(),
                 }
             }
+            // CR 702.24a + CR 121.1: Psychic Vortex draws once for each age
+            // counter. Keep the payer-relative controller target and scale the
+            // draw count so the existing deterministic EffectCost draw branch
+            // can pay the expanded cost in one resolution step.
+            Effect::Draw { count, target } => AbilityCost::EffectCost {
+                effect: Box::new(Effect::Draw {
+                    count: count.scaled_by(n),
+                    target: target.clone(),
+                }),
+                player_scope: player_scope.clone(),
+            },
             _ => AbilityCost::Composite {
                 costs: vec![base.clone(); n as usize],
             },
@@ -18280,6 +18291,30 @@ mod tests {
                 filter: None,
             }
         );
+    }
+
+    #[test]
+    fn expand_per_counter_draw_scales_count() {
+        // CR 702.24a + CR 121.1: Psychic Vortex's "draw a card" cost is
+        // repeated once per age counter, not left as an unsupported composite.
+        let base = AbilityCost::EffectCost {
+            effect: Box::new(Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            }),
+            player_scope: None,
+        };
+        let expanded = expand_per_counter(&base, 3);
+        let AbilityCost::EffectCost { effect, .. } = expanded else {
+            panic!("expected EffectCost");
+        };
+        assert!(matches!(
+            effect.as_ref(),
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 3 },
+                target: TargetFilter::Controller,
+            }
+        ));
     }
 
     #[test]
