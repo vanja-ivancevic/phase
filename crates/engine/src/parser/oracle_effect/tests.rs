@@ -19502,6 +19502,57 @@ fn strip_temporal_suffix_next_turns_upkeep() {
     );
 }
 
+/// CR 603.7a + CR 107.3i: Hazezon Tamar's delayed token creation evaluates
+/// the controlled-land count at the next upkeep, not when the ETB ability
+/// resolves. The existing delayed-trigger and token paths should therefore
+/// compose without a card-specific runtime variant.
+#[test]
+fn hazezon_tamar_delayed_sand_warriors_bind_lands_at_that_time() {
+    let def = parse_effect_chain(
+        "create X 1/1 Sand Warrior creature tokens that are red, green, and white at the beginning of your next upkeep, where X is the number of lands you control at that time",
+        AbilityKind::Spell,
+    );
+    let Effect::CreateDelayedTrigger {
+        condition,
+        effect: delayed,
+        ..
+    } = def.effect.as_ref()
+    else {
+        panic!("expected delayed token creation, got {:?}", def.effect);
+    };
+    assert_eq!(
+        *condition,
+        DelayedTriggerCondition::AtNextPhaseForPlayer {
+            phase: Phase::Upkeep,
+            player: crate::types::player::PlayerId(0),
+            gate: crate::types::ability::TurnGate::None,
+        }
+    );
+    let Effect::Token { count, colors, .. } = delayed.effect.as_ref() else {
+        panic!("expected delayed Token effect, got {:?}", delayed.effect);
+    };
+    assert_eq!(
+        colors,
+        &vec![
+            crate::types::mana::ManaColor::Red,
+            crate::types::mana::ManaColor::Green,
+            crate::types::mana::ManaColor::White,
+        ]
+    );
+    let QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount {
+            filter: TargetFilter::Typed(filter),
+        },
+    } = count
+    else {
+        panic!("expected controlled-land count, got {count:?}");
+    };
+    assert_eq!(filter.controller, Some(ControllerRef::You));
+    assert!(filter
+        .type_filters
+        .contains(&crate::types::ability::TypeFilter::Land));
+}
+
 /// CR 505.1 + CR 603.7a: "at the beginning of your next main phase" produces
 /// `AtNextPhaseForPlayer` — controller-scoped variant. The `player` field
 /// is a `PlayerId(0)` placeholder rewritten by

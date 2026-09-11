@@ -677,6 +677,15 @@ fn parse_token_description_with_context(
     let (mut colors, rest) = parse_token_color_prefix(rest);
     let (descriptor, suffix) = split_token_head(rest)?;
     let (name_override, suffix) = parse_token_name_clause(suffix);
+    // CR 105.1 + CR 608.2c: Some token descriptions put the color list after
+    // the token identity — "Sand Warrior creature tokens that are red, green,
+    // and white" — instead of using the usual color-prefix position.  Treat
+    // this exact terminal relative clause as the same characteristic channel;
+    // an unrecognized remainder stays available to the keyword parser.
+    let (suffix, trailing_colors) = strip_token_color_suffix(suffix);
+    if let Some(trailing_colors) = trailing_colors {
+        colors.extend(trailing_colors);
+    }
     // CR 105.1 + CR 105.2: "that's all colors" (Mechtitan Core, etc.) makes the
     // token each of the five colors. Strip the clause before keyword parsing so
     // the trailing keyword ("... and haste that's all colors") still survives,
@@ -1111,7 +1120,14 @@ fn parse_token_color_prefix(mut text: &str) -> (Vec<ManaColor>, &str) {
         let trimmed = text.trim_start();
         let trimmed_lower = trimmed.to_lowercase();
         if let Some((_, rest)) = nom_on_lower(trimmed, &trimmed_lower, |i| {
-            alt((value((), tag("and ")), value((), tag(", ")))).parse(i)
+            // Check the Oxford-comma connector before the plain comma; the
+            // latter would consume `", "` and leave `and <color>` stranded.
+            alt((
+                value((), tag(", and ")),
+                value((), tag("and ")),
+                value((), tag(", ")),
+            ))
+            .parse(i)
         }) {
             text = rest;
             continue;
@@ -1120,6 +1136,28 @@ fn parse_token_color_prefix(mut text: &str) -> (Vec<ManaColor>, &str) {
     }
 
     (colors, text.trim_start())
+}
+
+/// Parse a terminal `that are/is red, green, and white` token characteristic
+/// clause.  The whole suffix must be a color list so a future keyword or
+/// continuation is never swallowed by the color recognizer.
+fn strip_token_color_suffix(text: &str) -> (&str, Option<Vec<ManaColor>>) {
+    let text = text.trim_start();
+    let lower = text.to_ascii_lowercase();
+    for prefix in ["that are ", "that is ", "that's ", "thats "] {
+        let Some(after_lower) = lower.strip_prefix(prefix) else {
+            continue;
+        };
+        let consumed = lower.len() - after_lower.len();
+        let after = &text[consumed..];
+        let color_text = after.trim();
+        let (colors, remainder) = parse_token_color_prefix(color_text);
+        if !remainder.trim().is_empty() || color_text.len() == remainder.len() {
+            continue;
+        }
+        return ("", Some(colors));
+    }
+    (text, None)
 }
 
 /// Strip a lowercase color word from the start of text, returning the parsed
@@ -1135,7 +1173,7 @@ fn strip_color_word(text: &str) -> Option<(Option<ManaColor>, &str)> {
     if let Some((_, rest)) =
         nom_on_lower(text, &text_lower, |i| value((), tag("colorless")).parse(i))
     {
-        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with(',') {
             return Some((None, rest.trim_start()));
         }
     }
@@ -1143,8 +1181,8 @@ fn strip_color_word(text: &str) -> Option<(Option<ManaColor>, &str)> {
     // nom's parse_color expects lowercase, and we match only lowercase here
     // (Oracle text preserves original casing in token descriptions).
     if let Ok((rest, color)) = nom_primitives::parse_color.parse(text) {
-        // Word boundary: color word must be followed by whitespace or end
-        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        // Word boundary: color word must be followed by whitespace, comma, or end
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) || rest.starts_with(',') {
             return Some((Some(color), rest.trim_start()));
         }
     }
@@ -1788,6 +1826,16 @@ mod tests {
         ObjectScope, PlayerFilter, QuantityExpr, QuantityRef, RoundingMode, TypeFilter,
     };
     use crate::types::card_type::CoreType;
+
+    #[test]
+    fn terminal_oxford_comma_color_clause_is_extracted() {
+        let (rest, colors) = strip_token_color_suffix("that are red, green, and white");
+        assert_eq!(rest, "");
+        assert_eq!(
+            colors,
+            Some(vec![ManaColor::Red, ManaColor::Green, ManaColor::White])
+        );
+    }
 
     #[test]
     fn extract_token_pt_expression_covers_base_and_are_is_copula_classes() {

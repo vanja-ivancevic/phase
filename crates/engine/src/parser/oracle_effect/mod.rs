@@ -35484,7 +35484,13 @@ pub(crate) fn parse_effect_chain_ir(
             continue;
         }
 
-        let (text_no_temporal, delayed_condition) = strip_temporal_suffix(&text);
+        // Use the where-X-stripped surface for temporal suffix detection.  A
+        // deferred effect may print its binding after the temporal phrase
+        // (Hazezon Tamar: "... at the beginning of your next upkeep, where X
+        // is ... at that time").  The binding is carried separately on the
+        // chunk, so leaving it in this probe would hide the real temporal
+        // suffix behind the trailing where-clause.
+        let (text_no_temporal, delayed_condition) = strip_temporal_suffix(&text_without_where_x);
         let (text_no_qty, mut multi_target) = strip_any_number_quantifier(text_no_temporal);
         let retained_type_clause = {
             let lower = text_no_qty.to_lowercase();

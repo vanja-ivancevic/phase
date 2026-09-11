@@ -9489,6 +9489,20 @@ fn parse_amount_of_mana_paid_this_way(input: &str) -> OracleResult<'_, ()> {
 
 pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Option<QuantityExpr> {
     let expression = where_x_expression.trim().trim_end_matches('.');
+    // CR 107.3i + CR 603.7a: a deferred definition may explicitly anchor its
+    // value to the time the delayed effect resolves (Hazezon Tamar: "where X
+    // is the number of lands you control at that time").  The delayed payload
+    // already evaluates its quantity when it resolves, so this natural-language
+    // qualifier carries no additional IR axis.  Strip only the exact trailing
+    // qualifier; keeping it in the expression makes the otherwise-supported
+    // object-count grammar fail closed and drops the whole delayed effect.
+    let expression = {
+        let lower = expression.to_ascii_lowercase();
+        lower
+            .strip_suffix(" at that time")
+            .map(|_| expression[..expression.len() - " at that time".len()].trim_end())
+            .unwrap_or(expression)
+    };
     let expression_lower = expression.to_ascii_lowercase();
     // CR 702.51c + CR 603.3: Knight-Errant of Eos reads the number of
     // creatures that convoked the spell which became this permanent. The
@@ -13298,6 +13312,30 @@ mod where_x_tests {
             "the number-of phrase must route through parse_cda_quantity, not the \
              event-context delegation"
         );
+    }
+
+    /// CR 107.3i + CR 603.7a: Hazezon Tamar's delayed token count is evaluated
+    /// when the next upkeep effect resolves. "At that time" is a temporal
+    /// qualifier, not a second quantity axis, so it must preserve the ordinary
+    /// current controlled-land object count.
+    #[test]
+    fn where_x_number_of_lands_at_that_time_binds_controlled_land_count() {
+        let parsed =
+            parse_where_x_quantity_expression("the number of lands you control at that time");
+        let Some(QuantityExpr::Ref {
+            qty:
+                QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(filter),
+                },
+        }) = parsed
+        else {
+            panic!("expected controlled-land object count, got {parsed:?}");
+        };
+        assert_eq!(
+            filter.controller,
+            Some(crate::types::ability::ControllerRef::You)
+        );
+        assert!(filter.type_filters.contains(&TypeFilter::Land));
     }
 
     /// CR 107.3i + CR 115.1: a where-X count may depend on objects controlled
