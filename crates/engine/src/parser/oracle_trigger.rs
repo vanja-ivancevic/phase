@@ -3453,6 +3453,28 @@ fn extract_unless_pay_modifier(
 ) -> (String, Option<UnlessPayModifier>) {
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
+
+    // CR 118.12a + CR 608.2c: Older Oracle wording can put the alternative
+    // cost before the effect: "unless you pay {B}, tap this creature".  The
+    // ordinary suffix extractor below intentionally searches for ` unless `,
+    // so this prefix form previously reached effect-chain parsing as an empty
+    // placeholder with the real body attached as a sub-ability.  Parse the
+    // prefix through the same alternative-cost authority and return the body
+    // as the trigger's actual execute effect.
+    if let Some(after_unless) = tp.strip_prefix("unless ") {
+        if let Some((cost_text, body_text)) = after_unless.split_around(", ") {
+            if let Some(cost) = parse_unless_alt_cost(cost_text.lower.trim()) {
+                return (
+                    body_text.original.trim().to_string(),
+                    Some(UnlessPayModifier {
+                        cost,
+                        payer: TargetFilter::Controller,
+                    }),
+                );
+            }
+        }
+    }
+
     let Some(unless_pos) = tp.find(" unless ") else {
         return (text.to_string(), None);
     };
