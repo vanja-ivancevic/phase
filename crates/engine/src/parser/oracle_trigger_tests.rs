@@ -13442,6 +13442,54 @@ fn trigger_unless_you_pay_mana() {
     );
 }
 
+/// CR 118.12a + CR 608.2c: Legacy Oracle wording may put the unless payment
+/// before the mandatory effect. The payment belongs to the real execute root;
+/// it must not leave an `Unimplemented("empty")` placeholder above the body.
+#[test]
+fn trigger_leading_unless_payment_uses_body_as_execute_root() {
+    let cases = [
+        (
+            "At the beginning of your upkeep, unless you pay {B}{B}{B}, tap this creature and sacrifice a land of an opponent's choice.",
+            "Demonic Hordes",
+            true,
+        ),
+        (
+            "At the beginning of your upkeep, unless you sacrifice an Island, sacrifice this creature and it deals 6 damage to you.",
+            "Elder Spawn",
+            false,
+        ),
+        (
+            "At the beginning of each combat, unless you pay {R}, whenever this creature blocks or becomes blocked by a creature this combat, that creature gains first strike until end of turn.",
+            "Goblin Flotilla",
+            true,
+        ),
+    ];
+
+    for (text, card_name, expect_mana) in cases {
+        let def = parse_trigger_line(text, card_name);
+        let unless_pay = def
+            .unless_pay
+            .as_ref()
+            .unwrap_or_else(|| panic!("{card_name} should have a leading unless payment"));
+        assert_eq!(unless_pay.payer, TargetFilter::Controller);
+        if expect_mana {
+            assert!(matches!(unless_pay.cost, AbilityCost::Mana { .. }));
+        } else {
+            assert!(matches!(unless_pay.cost, AbilityCost::Sacrifice(_)));
+        }
+
+        let execute = def
+            .execute
+            .as_ref()
+            .unwrap_or_else(|| panic!("{card_name} should have an execute body"));
+        assert!(
+            !matches!(*execute.effect, Effect::Unimplemented { .. }),
+            "{card_name} must use the parsed body as execute root, got {:?}",
+            execute.effect
+        );
+    }
+}
+
 #[test]
 fn trigger_unless_you_pay_energy() {
     let def = parse_trigger_line(
