@@ -7801,7 +7801,14 @@ pub(crate) fn resolve_player_count(
                             comparator,
                             count,
                         } => {
-                            let threshold = resolve_quantity(state, count, controller, source_id);
+                            // CR 603.4 + CR 109.5: a comparative count may
+                            // read the triggering event's scoped player (for
+                            // example, "that player controls more lands than
+                            // each other player"). Preserve the full quantity
+                            // context instead of dropping `scoped_player` at
+                            // this nested threshold boundary.
+                            let threshold =
+                                resolve_quantity_with_ctx(state, count, controller, ctx.clone());
                             crate::game::players::matches_relation(
                                 state, p.id, controller, *relation,
                             ) && crate::game::effects::player_control_count_compares(
@@ -13677,6 +13684,87 @@ mod tests {
             resolve_quantity(&state, &at_least_you, PlayerId(0), ObjectId(1)),
             2,
             "GE includes the tied opponent — confirms the GT result is comparator-sensitive"
+        );
+    }
+
+    /// CR 603.4 + CR 109.5: nested comparative counts retain the triggering
+    /// event's scoped player. With P1 at three lands, P0 at one, and P2 at two,
+    /// exactly one player has at least as many lands as scoped P1. Tying P2 at
+    /// three makes the strict-maximum predicate false.
+    #[test]
+    fn resolve_player_count_controls_count_preserves_scoped_player_context() {
+        use crate::types::ability::{
+            Comparator, ControllerRef, PlayerRelation, TypeFilter, TypedFilter,
+        };
+        use crate::types::format::FormatConfig;
+
+        let mut state = GameState::new(FormatConfig::commander(), 3, 42);
+        let source = create_object(
+            &mut state,
+            CardId(890),
+            PlayerId(0),
+            "Greener Pastures".to_string(),
+            Zone::Battlefield,
+        );
+        let add_land = |state: &mut GameState, owner: PlayerId, id: u64| {
+            let land = create_object(
+                state,
+                CardId(id),
+                owner,
+                format!("Land {id}"),
+                Zone::Battlefield,
+            );
+            state
+                .objects
+                .get_mut(&land)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Land);
+        };
+        add_land(&mut state, PlayerId(0), 891);
+        for id in 892..895 {
+            add_land(&mut state, PlayerId(1), id);
+        }
+        for id in 895..897 {
+            add_land(&mut state, PlayerId(2), id);
+        }
+
+        let expression = QuantityExpr::Ref {
+            qty: QuantityRef::PlayerCount {
+                filter: PlayerFilter::ControlsCount {
+                    relation: PlayerRelation::All,
+                    filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Land)),
+                    comparator: Comparator::GE,
+                    count: Box::new(QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount {
+                            filter: TargetFilter::Typed(
+                                TypedFilter::land().controller(ControllerRef::ScopedPlayer),
+                            ),
+                        },
+                    }),
+                },
+            },
+        };
+        let context = QuantityContext {
+            entering: None,
+            source,
+            trigger_source: None,
+            recipient: None,
+            scoped_player: Some(PlayerId(1)),
+            damage_source: None,
+        };
+        assert_eq!(
+            resolve_quantity_with_ctx(&state, &expression, PlayerId(0), context.clone()),
+            1,
+            "only scoped P1 has at least as many lands as scoped P1"
+        );
+
+        add_land(&mut state, PlayerId(2), 897);
+        assert_eq!(
+            resolve_quantity_with_ctx(&state, &expression, PlayerId(0), context),
+            2,
+            "a tied maximum must make the strict-maximum test fail"
         );
     }
 
