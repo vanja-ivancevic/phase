@@ -2802,6 +2802,17 @@ pub(super) fn try_parse_multi_zone_same_name_exile(
                 (),
                 tag::<_, _, OracleError<'_>>(" with that name and exile them"),
             ),
+            // CR 201.2 + CR 608.2c: Lobotomy's "the chosen card" is the
+            // physical card selected from the revealed hand. The choice
+            // handler publishes it as the chained ParentTarget, so this
+            // lowers through the same `SameNameAsParentTarget` authority as
+            // the explicit "that creature/card" forms.
+            value(
+                (),
+                tag::<_, _, OracleError<'_>>(
+                    " with the same name as the chosen card and exile them",
+                ),
+            ),
             value(
                 (),
                 (
@@ -20890,6 +20901,11 @@ mod tests {
             (
                 "search its owner's graveyard, hand, and library for all cards with the same name as that card and exile them",
                 ControllerRef::ParentTargetOwner,
+                All,
+            ),
+            (
+                "search that player's graveyard, hand, and library for all cards with the same name as the chosen card and exile them",
+                ControllerRef::TargetPlayer,
                 All,
             ),
             // Interactive — object-relative possessives only (R1). Deadly Cover-Up,

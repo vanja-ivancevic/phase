@@ -43534,6 +43534,10 @@ fn name_hate_spells_parse_multi_zone_same_name_exile_chain() {
                 "Counterbore",
                 "Counter target spell. Search its controller's graveyard, hand, and library for all cards with the same name as that spell and exile them. Then that player shuffles.",
             ),
+            (
+                "Lobotomy",
+                "Target player reveals their hand. You choose a nonland card from it. Search that player's graveyard, hand, and library for all cards with the same name as the chosen card and exile them. Then that player shuffles.",
+            ),
         ] {
             let def = parse_effect_chain(text, AbilityKind::Spell);
             assert!(
