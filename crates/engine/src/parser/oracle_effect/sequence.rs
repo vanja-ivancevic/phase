@@ -1254,8 +1254,9 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
                         // is a single compound search-and-exile action — keep it together so
                         // the imperative dispatcher can recognize the multi-zone pattern.
                         // Accepts "search ..." and "then search ..." prefixes, and either
-                        // "with that name" or "with the same name as that {card,creature,…}"
-                        // suffixes (Eradicate / Counterbore / Surgical Extraction class).
+                        // "with that name", "with the chosen name", or "with the
+                        // same name as that/chosen {card,creature,…}" suffixes
+                        // (Eradicate / Counterbore / Surgical Extraction / Lobotomy class).
                         let has_search_prefix =
                             nom_primitives::scan_contains(&before_lower, "search ");
                         let search_with_that_name = has_search_prefix
@@ -1696,6 +1697,7 @@ fn parse_search_exile_name_suffix(input: &str) -> Result<(&str, ()), nom::Err<Or
     let (rest, _) = alt((
         value((), tag::<_, _, OracleError<'_>>("with that name")),
         value((), tag("with the chosen name")),
+        value((), tag("with the same name as the chosen card")),
         value(
             (),
             (
@@ -9132,6 +9134,16 @@ mod tests {
         // standalone ChangeZone.
         let chunks = clause_texts(
             "search target opponent's graveyard, hand, and library for any number of cards with the chosen name and exile them",
+        );
+        assert_eq!(chunks.len(), 1, "unexpected split: {chunks:?}");
+    }
+
+    #[test]
+    fn bare_and_keeps_chosen_card_search_exile_compound() {
+        // CR 201.2 + CR 701.23a + CR 701.18a: Lobotomy's physical chosen-card
+        // referent must stay in one search/exile compound.
+        let chunks = clause_texts(
+            "search that player's graveyard, hand, and library for all cards with the same name as the chosen card and exile them",
         );
         assert_eq!(chunks.len(), 1, "unexpected split: {chunks:?}");
     }
