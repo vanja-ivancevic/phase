@@ -250,6 +250,7 @@ fn parse_during_their_untap_step_suffix(input: &str) -> OracleResult<'_, ()> {
             tag("during "),
             alt((
                 tag("their"),
+                tag("your"),
                 tag("each player's"),
                 tag("each player\u{2019}s"),
             )),
@@ -299,7 +300,15 @@ fn parse_max_untap_per_type_static(tp: &TextPair<'_>, text: &str) -> Option<Stat
         return Some(def);
     }
 
-    let rest = nom_tag_tp(tp, "players can't untap more than ")?;
+    let (rest, controller_only) =
+        if let Some(rest) = nom_tag_tp(tp, "players can't untap more than ") {
+            (rest, false)
+        } else {
+            // CR 502.3 + CR 109.5: "you can't untap more than ..." limits the
+            // controller of the source permanent (Mungha Wurm), unlike the
+            // player-global "players can't ..." Orb/Smoke family.
+            (nom_tag_tp(tp, "you can't untap more than ")?, true)
+        };
     let (after_count, count) = nom_primitives::parse_number(rest.lower).ok()?;
     let (filter, remainder) = parse_type_phrase(after_count.trim_start());
     parse_during_their_untap_step_suffix(remainder).ok()?;
@@ -309,10 +318,13 @@ fn parse_max_untap_per_type_static(tp: &TextPair<'_>, text: &str) -> Option<Stat
     if !matches!(&filter, TargetFilter::Typed(_)) {
         return None;
     }
-    Some(
-        StaticDefinition::new(StaticMode::MaxUntapPerType { filter, max: count })
-            .description(text.to_string()),
-    )
+    let mut def = StaticDefinition::new(StaticMode::MaxUntapPerType { filter, max: count });
+    if controller_only {
+        // The cap's affected set is used as the scope marker by the untap
+        // turn-based-action evaluator; it is not an object-selection filter.
+        def = def.affected(TargetFilter::Controller);
+    }
+    Some(def.description(text.to_string()))
 }
 
 fn parse_each_other_players_untap_step_suffix(input: &str) -> OracleResult<'_, ()> {
@@ -1967,6 +1979,44 @@ pub(crate) fn parse_static_line_inner(
 
     if let Some(def) = parse_subject_rule_static(&text) {
         return Some(def);
+    }
+
+    // CR 702.10 + CR 611.3a: Chaos Lord's old-border wording uses
+    // "This creature can attack as though it had haste" rather than the
+    // keyword-grant forms handled by the attached-subject grammar below.
+    // Keep the subject restricted to the source object and accept the one
+    // established conditional rider, "unless it entered this turn".
+    if let Some((TargetFilter::SelfRef, after_subject)) =
+        nom_on_lower(&text, &lower, nom_target::parse_self_reference)
+    {
+        if let Some(rest) = nom_tag_lower(
+            after_subject,
+            after_subject,
+            " can attack as though it had haste",
+        ) {
+            let tail = rest.trim().trim_end_matches('.').trim();
+            let condition = match tail {
+                "" => Some(None),
+                "unless it entered this turn" | "unless ~ entered this turn" => {
+                    Some(Some(StaticCondition::Not {
+                        condition: Box::new(StaticCondition::SourceEnteredThisTurn),
+                    }))
+                }
+                _ => None,
+            };
+            if let Some(condition) = condition {
+                let mut def = StaticDefinition::continuous()
+                    .affected(TargetFilter::SelfRef)
+                    .modifications(vec![ContinuousModification::AddKeyword {
+                        keyword: Keyword::Haste,
+                    }])
+                    .description(text.to_string());
+                if let Some(condition) = condition {
+                    def.condition = Some(condition);
+                }
+                return Some(def);
+            }
+        }
     }
 
     // --- "~ is the chosen type in addition to its other types" ---

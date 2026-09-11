@@ -3720,8 +3720,10 @@ pub(crate) fn rebind_source_object_quantity_ref_to_recipient(qty: QuantityRef) -
 /// attacking.
 ///
 /// `affected` is `Option` because `StaticDefinition::affected` is: a static with
-/// no affected set (`MaxUntapPerType`) is categorically not SelfRef and must not
-/// be coerced into a literal it does not carry.
+/// no affected set (the global `MaxUntapPerType` family) is categorically not
+/// SelfRef and must not be coerced into a literal it does not carry. The
+/// controller-scoped `MaxUntapPerType` family uses `Controller`, not `SelfRef`,
+/// as a source-controller scope marker and is likewise not a subject binding.
 ///
 /// Authority for that binding decision within the three static-gate helpers
 /// `parse_unless_static_condition`, `parse_as_long_as_static_condition` and
@@ -3749,10 +3751,11 @@ pub(crate) fn rebind_source_object_quantity_ref_to_recipient(qty: QuantityRef) -
 /// and it always applies the rewrite. That is not an oversight and must not be
 /// "fixed" by routing it through this helper. The two are reconciled by scope,
 /// not precedence: this helper reads binding off `affected`, and
-/// `MaxUntapPerType` never sets `affected` (`StaticDefinition::new` defaults it
-/// to `None`), so the helper correctly declines — while that same structural
-/// fact, not any rule, is why the static has no attached-subject variant and why
-/// its gate is always a state check on the cap's own source.
+/// Global `MaxUntapPerType` sets no `affected` value (`StaticDefinition::new`
+/// defaults it to `None`), so the helper correctly declines. The controller-
+/// scoped form sets `Controller`, which is also intentionally not rewritten.
+/// That structural fact, not any rule, is why the static has no attached-subject
+/// variant and why its gate is always a state check on the cap's own source.
 /// Adding a second pre-rewriting caller requires re-running the census of
 /// SelfRef-affected statics first. These are the only two production callers of
 /// `rewrite_self_pronoun_subject`.

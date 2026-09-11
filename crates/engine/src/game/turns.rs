@@ -1713,7 +1713,7 @@ pub fn execute_untap_with_choices(
     // is the authoritative enforcement: it holds whether or not the player was
     // prompted to determine which untap (AI / auto-play paths may not decline).
     let mut max_untap_skipped: HashSet<ObjectId> = HashSet::new();
-    let restrictions = max_untap_restrictions(state);
+    let restrictions = max_untap_restrictions_for_player(state, active);
     if !restrictions.is_empty() {
         let mut already_skipped: HashSet<ObjectId> = HashSet::new();
         already_skipped.extend(chosen_not_to_untap.iter().copied());
@@ -1829,15 +1829,32 @@ pub fn execute_untap_with_choices(
     super::layers::prune_controller_untap_step_effects(state, active);
 }
 
-/// CR 502.3: Collect the active `MaxUntapPerType` restrictions (Smoke /
-/// Damping Field / Winter Orb class). Each governs the untap turn-based action
-/// globally for the active player, so the source's controller is irrelevant —
-/// any live source contributes its `(filter, max)` cap. Returns `(filter, max)`
-/// pairs cloned out of the statics so the caller can mutate `state` afterward.
-fn max_untap_restrictions(state: &GameState) -> Vec<(crate::types::ability::TargetFilter, u32)> {
+/// CR 502.3 + CR 109.5: return the active untap caps that apply to `player`.
+/// Global caps (the printed "players can't ..." family) have no affected-set
+/// scope marker; controller-scoped caps ("you can't ...", e.g. Mungha Wurm)
+/// carry `TargetFilter::Controller` on their static definition and contribute
+/// only during that source controller's untap step.
+fn max_untap_restrictions_for_player(
+    state: &GameState,
+    player: PlayerId,
+) -> Vec<(crate::types::ability::TargetFilter, u32)> {
+    max_untap_restrictions_for_player_inner(state, Some(player))
+}
+
+fn max_untap_restrictions_for_player_inner(
+    state: &GameState,
+    player: Option<PlayerId>,
+) -> Vec<(crate::types::ability::TargetFilter, u32)> {
     super::functioning_abilities::battlefield_active_statics(state)
-        .filter_map(|(_, def)| match &def.mode {
-            StaticMode::MaxUntapPerType { filter, max } => Some((filter.clone(), *max)),
+        .filter_map(|(source, def)| match &def.mode {
+            StaticMode::MaxUntapPerType { filter, max }
+                if !matches!(
+                    def.affected,
+                    Some(crate::types::ability::TargetFilter::Controller)
+                ) || player.is_none_or(|player| source.controller == player) =>
+            {
+                Some((filter.clone(), *max))
+            }
             _ => None,
         })
         .collect()
@@ -1920,11 +1937,11 @@ pub fn max_untap_subset_prompt(
     // so bail before the O(N) `untap_excluded_ids` CantUntap scan — the common
     // every-turn case has no cap and would otherwise pay for a scan whose result
     // is discarded.
-    if max_untap_restrictions(state).is_empty() {
+    if max_untap_restrictions_for_player(state, player).is_empty() {
         return None;
     }
     let cant_untap = untap_excluded_ids(state, player);
-    for (filter, max) in max_untap_restrictions(state) {
+    for (filter, max) in max_untap_restrictions_for_player(state, player) {
         let group =
             max_untap_eligible_group(state, player, &filter, chosen_not_to_untap, &cant_untap);
         if group.len() > max as usize {
@@ -5863,6 +5880,71 @@ mod tests {
         id
     }
 
+    fn create_tapped_land(
+        state: &mut GameState,
+        card_id: u64,
+        owner: PlayerId,
+        name: &str,
+    ) -> ObjectId {
+        use crate::types::card_type::CoreType;
+        let id = create_object(
+            state,
+            CardId(card_id),
+            owner,
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Land);
+        obj.tapped = true;
+        id
+    }
+
+    /// CR 502.3 + CR 109.5: a controller-scoped max-untap cap restricts only
+    /// the source controller's untap step. The same battlefield must leave P1's
+    /// lands unrestricted while limiting P0 to one land.
+    #[test]
+    fn controller_scoped_max_untap_cap_does_not_restrict_other_players() {
+        let mut state = setup();
+        let wurm = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Mungha Wurm".to_string(),
+            Zone::Battlefield,
+        );
+        let defs = crate::parser::oracle_static::parse_static_line_multi(
+            "You can't untap more than one land during your untap step.",
+        );
+        let source = state.objects.get_mut(&wurm).unwrap();
+        for def in &defs {
+            source.static_definitions.push(def.clone());
+        }
+        Arc::make_mut(&mut source.base_static_definitions).extend(defs);
+
+        let p0_a = create_tapped_land(&mut state, 2, PlayerId(0), "P0 Land A");
+        let p0_b = create_tapped_land(&mut state, 3, PlayerId(0), "P0 Land B");
+        let p1_a = create_tapped_land(&mut state, 4, PlayerId(1), "P1 Land A");
+        let p1_b = create_tapped_land(&mut state, 5, PlayerId(1), "P1 Land B");
+        crate::game::layers::evaluate_layers(&mut state);
+
+        let (group, max) = max_untap_subset_prompt(&state, PlayerId(0), &HashSet::new())
+            .expect("Mungha Wurm must cap its controller's over-limit land group");
+        assert_eq!(max, 1);
+        assert_eq!(group.len(), 2);
+        assert!(
+            max_untap_subset_prompt(&state, PlayerId(1), &HashSet::new()).is_none(),
+            "Mungha Wurm must not cap another player's untap step"
+        );
+
+        state.active_player = PlayerId(1);
+        execute_untap(&mut state, &mut Vec::new());
+        assert!(!state.objects[&p1_a].tapped);
+        assert!(!state.objects[&p1_b].tapped);
+        assert!(state.objects[&p0_a].tapped);
+        assert!(state.objects[&p0_b].tapped);
+    }
+
     /// CR 502.3 + CR 604.1: GAP-1 guard. The every-turn untap of K tapped
     /// active-player permanents on a restriction-free board must NOT perform any
     /// whole-battlefield `check_static_ability` scan — the hoisted CantUntap
@@ -6000,7 +6082,7 @@ mod tests {
 
         crate::game::layers::evaluate_layers(&mut state);
         assert!(
-            max_untap_restrictions(&state).is_empty(),
+            max_untap_restrictions_for_player_inner(&state, None).is_empty(),
             "cap must be inactive while Winter Orb is tapped"
         );
         assert!(
@@ -6010,7 +6092,7 @@ mod tests {
 
         state.objects.get_mut(&winter_orb).unwrap().tapped = false;
         crate::game::layers::evaluate_layers(&mut state);
-        let restrictions = max_untap_restrictions(&state);
+        let restrictions = max_untap_restrictions_for_player_inner(&state, None);
         assert_eq!(
             restrictions.len(),
             1,
@@ -6059,7 +6141,7 @@ mod tests {
         install_conditional_max_untap_static(&mut state, untapped_orb, false);
 
         crate::game::layers::evaluate_layers(&mut state);
-        let restrictions = max_untap_restrictions(&state);
+        let restrictions = max_untap_restrictions_for_player_inner(&state, None);
         assert_eq!(
             restrictions.len(),
             1,

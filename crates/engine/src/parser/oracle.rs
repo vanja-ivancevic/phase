@@ -5303,6 +5303,65 @@ pub(crate) fn parse_oracle_ir(
             }
         }
 
+        // CR 603.1 + CR 508.1d: pre-modern Oracle used a bare leading
+        // "If <event>, <effect>" for several permanent attack requirements
+        // that modern Oracle writes as "Whenever <event>, <effect>".  These
+        // are triggered abilities, not resolving conditional effects: Ekundu
+        // Cyclops, Viashino Bey, and the first ability of Magnetic Web all
+        // need to fire from the attack event and then install the existing
+        // forced-attack machinery.  Normalize only the narrow attack-if-able
+        // shape and let the normal trigger parser remain the single lowering
+        // authority for both halves.
+        if lower.starts_with("if ") {
+            if let Some((event, body)) = line.split_once(',') {
+                let body = body.trim().trim_end_matches('.').trim();
+                let body_lower = body.to_lowercase();
+                let legacy_attack_suffix = [
+                    // CR 603.1: "also" is connective prose from the old
+                    // template, not part of the attack requirement grammar.
+                    // Drop it while preserving the printed subject so the
+                    // existing imperative attack parser can lower the body.
+                    (" also attacks if able", " attacks this combat if able."),
+                    (" attacks if able", " attacks this combat if able."),
+                    (" attack if able", " attack this combat if able."),
+                ]
+                .iter()
+                .find_map(|(suffix, replacement)| {
+                    body_lower
+                        .strip_suffix(suffix)
+                        .map(|_| (*suffix, *replacement))
+                });
+                if let Some((suffix, replacement)) = legacy_attack_suffix {
+                    if scan_contains(&event.to_lowercase(), "attacks") {
+                        // The suffixes are ASCII and therefore have the same byte
+                        // width in the original body and its lowercase copy. Keep
+                        // the subject's original spelling while replacing only the
+                        // legacy verb/window tail.
+                        let subject_end = body.len() - suffix.len();
+                        let subject = body[..subject_end].trim_end();
+                        let normalized_body = format!("{subject}{replacement}");
+                        let modern = format!("Whenever {}, {normalized_body}", &event[3..]);
+                        let triggers = parse_trigger_lines_at_index_ir(
+                            &modern,
+                            card_name,
+                            Some(PrintedTriggerIndex::placeholder()),
+                            &mut ctx,
+                        );
+                        if !triggers.is_empty() {
+                            i += 1;
+                            for __item in triggers {
+                                emitter.trigger_ir_at(
+                                    item_line,
+                                    TriggerNodeIr::Parsed(Box::new(__item)),
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         // CR 603.7a-b: Instant/sorcery text like "Whenever [event] this turn, ..."
         // or "At the beginning of your next upkeep, ..." creates a delayed
         // triggered ability during resolution. It is not a permanent's printed

@@ -24007,6 +24007,135 @@ fn rith_chosen_color_population_survives_full_oracle_routing() {
     );
 }
 
+/// CR 105.2 + CR 613.1e: a self-named chosen-color static must enter the
+/// static parser from the full document router. Without the classifier seam,
+/// Alloy Golem's "This creature is the chosen color" line is misclassified as
+/// an effect sentence and leaves an `effect_structure` coverage gap even though
+/// `parse_static_line` already knows how to lower `AddChosenColor`.
+#[test]
+fn alloy_golem_chosen_color_static_routes_without_gap() {
+    let parsed = parse(
+        "As this creature enters, choose a color.\nThis creature is the chosen color. (It's still an artifact.)",
+        "Alloy Golem",
+        &[],
+        &["Artifact", "Creature"],
+        &[],
+    );
+
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Alloy Golem's chosen-color static must be supported: {parsed:#?}"
+    );
+    assert!(
+        parsed.statics.iter().any(|definition| {
+            definition.modifications.iter().any(|modification| {
+                matches!(modification, ContinuousModification::AddChosenColor { .. })
+            })
+        }),
+        "expected AddChosenColor static: {parsed:#?}"
+    );
+}
+
+/// CR 702.10: the old-border Chaos Lord wording is a static permission, not a
+/// resolving effect. Its static parser already lowers the haste-like attack
+/// permission and the full router must send the line there.
+#[test]
+fn chaos_lord_attack_as_haste_static_routes_without_gap() {
+    let parsed = parse(
+        "This creature can attack as though it had haste unless it entered this turn.",
+        "Chaos Lord",
+        &[],
+        &["Creature"],
+        &["Lord"],
+    );
+
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Chaos Lord's haste-like attack permission must be supported: {parsed:#?}"
+    );
+    assert!(
+        parsed.statics.iter().any(|definition| {
+            definition.modifications.iter().any(|modification| {
+                matches!(
+                    modification,
+                    ContinuousModification::AddKeyword {
+                        keyword: Keyword::Haste
+                    }
+                )
+            })
+        }),
+        "expected haste-like static lowering: {parsed:#?}"
+    );
+}
+
+/// CR 509.1b + CR 611.3a: Spectral Cloak's evasion is conditional on the
+/// enchanted creature remaining untapped. The condition must be recipient-
+/// scoped so the Aura's own tap state is irrelevant.
+#[test]
+fn spectral_cloak_recipient_untapped_condition_routes_without_gap() {
+    let parsed = parse(
+        "Enchant creature\nEnchanted creature can't be blocked as long as it's untapped.",
+        "Spectral Cloak",
+        &[],
+        &["Enchantment"],
+        &["Aura"],
+    );
+
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Spectral Cloak's recipient-scoped evasion must be supported: {parsed:#?}"
+    );
+    assert!(
+        parsed.statics.iter().any(|definition| {
+            definition.mode == StaticMode::CantBeBlocked
+                && matches!(
+                    definition.condition.as_ref(),
+                    Some(StaticCondition::RecipientMatchesFilter { .. })
+                )
+        }),
+        "expected recipient-scoped CantBeBlocked static: {parsed:#?}"
+    );
+}
+
+/// CR 603.1: old-border printings used "If <attack event>, <forced attack>"
+/// instead of the modern "Whenever" trigger spelling. The document router
+/// normalizes that bounded legacy form into the regular trigger parser.
+#[test]
+fn legacy_if_attack_requirements_route_as_triggers() {
+    for (name, text, types, subtypes) in [
+        (
+            "Ekundu Cyclops",
+            "If a creature you control attacks, this creature also attacks if able.",
+            vec!["Creature"],
+            vec!["Cyclops"],
+        ),
+        (
+            "Viashino Bey",
+            "If this creature attacks, all creatures you control attack if able.",
+            vec!["Creature"],
+            vec!["Viashino"],
+        ),
+        (
+            "Magnetic Web",
+            "If a creature with a magnet counter on it attacks, all creatures with magnet counters on them attack if able.",
+            vec!["Artifact"],
+            vec![],
+        ),
+    ] {
+        let type_refs: Vec<&str> = types;
+        let subtype_refs: Vec<&str> = subtypes;
+        let parsed = parse(text, name, &[], &type_refs, &subtype_refs);
+        assert!(
+            !parsed_has_unimplemented(&parsed),
+            "{name}'s legacy attack requirement must parse: {parsed:#?}"
+        );
+        assert!(
+            parsed.triggers.iter().any(|trigger| trigger.execute.is_some()),
+            "{name} must expose a parsed attack trigger: {parsed:#?}"
+        );
+    }
+}
+
 #[test]
 fn activated_draw_for_each_color_among_permanents_uses_distinct_colors_quantity() {
     let parsed = parse(

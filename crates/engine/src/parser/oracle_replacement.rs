@@ -12642,15 +12642,16 @@ pub(crate) fn prevented_this_way_rider_source_gate(fragment: &str) -> Option<Opt
     .parse(fragment.trim_start())
     .ok()?;
 
-    // Qualified form: "... from a[n] <type> source is prevented this way,".
-    if let Ok((after_source, type_filter)) = parse_prevented_source_type_qualifier(rest) {
+    // Qualified form: "... from a[n] <type|color> source is prevented this
+    // way," — a type word gates on the source's type axis, a color word on
+    // its color axis (CR 120.1: a damage source's color is the source
+    // object's color).
+    if let Ok((after_source, source_filter)) = parse_prevented_source_qualifier(rest) {
         if tag::<_, _, OracleError<'_>>(" is prevented this way,")
             .parse(after_source)
             .is_ok()
         {
-            return Some(Some(TargetFilter::Typed(
-                TypedFilter::default().with_type(type_filter),
-            )));
+            return Some(Some(TargetFilter::Typed(source_filter)));
         }
         return None;
     }
@@ -12662,28 +12663,78 @@ pub(crate) fn prevented_this_way_rider_source_gate(fragment: &str) -> Option<Opt
         .then_some(None)
 }
 
-/// CR 120.1 + CR 205.2a: Parse the " from a[n] `<type>` source" qualifier on a
-/// prevented-this-way rider into a `TypeFilter`. "noncreature" negates via
-/// `TypeFilter::Non`; core types map directly. Mirrors the head-noun spellings
-/// of the `DamageDone` source grammar (`oracle_trigger.rs`).
-fn parse_prevented_source_type_qualifier(input: &str) -> OracleResult<'_, TypeFilter> {
+/// CR 120.1 + CR 205.2a + CR 105.3: Parse the " from a[n] `<type|color>`
+/// source" qualifier on a prevented-this-way rider into a `TypedFilter`.
+/// "noncreature" negates via `TypeFilter::Non`; core types map directly; the
+/// five color words gate on the source object's color via `FilterProp::HasColor`
+/// (Honorable Passage's red-source rider, Shadowbane's black-source rider).
+/// Mirrors the head-noun spellings of the `DamageDone` source grammar
+/// (`oracle_trigger.rs`).
+fn parse_prevented_source_qualifier(input: &str) -> OracleResult<'_, TypedFilter> {
     let (input, _) = tag(" from a").parse(input)?;
     let (input, _) = opt(tag("n")).parse(input)?;
     let (input, _) = tag(" ").parse(input)?;
-    let (input, type_filter) = alt((
+    let (input, source_filter) = alt((
         value(
-            TypeFilter::Non(Box::new(TypeFilter::Creature)),
+            TypedFilter::default().with_type(TypeFilter::Non(Box::new(
+                TypeFilter::Creature,
+            ))),
             tag("noncreature"),
         ),
-        value(TypeFilter::Creature, tag("creature")),
-        value(TypeFilter::Artifact, tag("artifact")),
-        value(TypeFilter::Enchantment, tag("enchantment")),
-        value(TypeFilter::Planeswalker, tag("planeswalker")),
-        value(TypeFilter::Land, tag("land")),
+        value(
+            TypedFilter::default().with_type(TypeFilter::Creature),
+            tag("creature"),
+        ),
+        value(
+            TypedFilter::default().with_type(TypeFilter::Artifact),
+            tag("artifact"),
+        ),
+        value(
+            TypedFilter::default().with_type(TypeFilter::Enchantment),
+            tag("enchantment"),
+        ),
+        value(
+            TypedFilter::default().with_type(TypeFilter::Planeswalker),
+            tag("planeswalker"),
+        ),
+        value(
+            TypedFilter::default().with_type(TypeFilter::Land),
+            tag("land"),
+        ),
+        value(
+            TypedFilter::default().properties(vec![FilterProp::HasColor {
+                color: ManaColor::White,
+            }]),
+            tag("white"),
+        ),
+        value(
+            TypedFilter::default().properties(vec![FilterProp::HasColor {
+                color: ManaColor::Blue,
+            }]),
+            tag("blue"),
+        ),
+        value(
+            TypedFilter::default().properties(vec![FilterProp::HasColor {
+                color: ManaColor::Black,
+            }]),
+            tag("black"),
+        ),
+        value(
+            TypedFilter::default().properties(vec![FilterProp::HasColor {
+                color: ManaColor::Red,
+            }]),
+            tag("red"),
+        ),
+        value(
+            TypedFilter::default().properties(vec![FilterProp::HasColor {
+                color: ManaColor::Green,
+            }]),
+            tag("green"),
+        ),
     ))
     .parse(input)?;
     let (input, _) = tag(" source").parse(input)?;
-    Ok((input, type_filter))
+    Ok((input, source_filter))
 }
 
 /// CR 615.5 + CR 120.1: In a prevented-this-way rider, the reflection anaphor
@@ -16231,6 +16282,76 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// CR 105.3 + CR 615.5: Honorable Passage's color-gated rider — the
+    /// red-source gate lowers to `PostReplacementDamageSourceMatchesFilter`
+    /// with a `HasColor` property, and the reflection targets the source's
+    /// controller.
+    #[test]
+    fn honorable_passage_red_source_rider_gates_on_color() {
+        use crate::types::ability::AbilityCondition;
+        let parsed = parse_oracle_text(
+            "The next time a source of your choice would deal damage to any target this turn, \
+             prevent that damage. If damage from a red source is prevented this way, Honorable \
+             Passage deals that much damage to the source's controller.",
+            "Honorable Passage",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        );
+        let prevent = &parsed.abilities[0];
+        assert!(matches!(*prevent.effect, Effect::PreventDamage { .. }));
+        let rider = prevent.sub_ability.as_ref().expect("rider present");
+        assert!(matches!(
+            rider.condition.as_ref(),
+            Some(AbilityCondition::PostReplacementDamageSourceMatchesFilter {
+                filter: TargetFilter::Typed(tf)
+            }) if tf.properties == vec![FilterProp::HasColor { color: ManaColor::Red }]
+                && tf.type_filters.is_empty()
+        ));
+        assert!(
+            rider.condition.is_some(),
+            "the red-source gate must be present, got {:?}",
+            rider.condition
+        );
+        assert!(matches!(
+            &*rider.effect,
+            Effect::DealDamage {
+                target: TargetFilter::PostReplacementSourceController,
+                ..
+            }
+        ));
+    }
+
+    /// CR 105.3 + CR 615.5: Shadowbane's black-source rider gates the life gain.
+    #[test]
+    fn shadowbane_black_source_rider_gates_life_gain() {
+        use crate::types::ability::AbilityCondition;
+        let parsed = parse_oracle_text(
+            "The next time a source of your choice would deal damage to you and/or creatures \
+             you control this turn, prevent that damage. If damage from a black source is \
+             prevented this way, you gain that much life.",
+            "Shadowbane",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        );
+        let prevent = &parsed.abilities[0];
+        assert!(matches!(*prevent.effect, Effect::PreventDamage { .. }));
+        let rider = prevent.sub_ability.as_ref().expect("rider present");
+        assert!(matches!(
+            rider.condition.as_ref(),
+            Some(AbilityCondition::PostReplacementDamageSourceMatchesFilter {
+                filter: TargetFilter::Typed(tf)
+            }) if tf.properties == vec![FilterProp::HasColor { color: ManaColor::Black }]
+        ));
+        assert!(
+            rider.condition.is_some(),
+            "the black-source gate must be present, got {:?}",
+            rider.condition
+        );
+        assert!(matches!(&*rider.effect, Effect::GainLife { .. }));
     }
 
     /// CR 608.2c + CR 615.5: when a source-type-gated reflection rider ALSO

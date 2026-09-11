@@ -365,6 +365,7 @@ fn parse_remaining_state_presence_conditions(input: &str) -> OracleResult<'_, St
         parse_defending_player_more_life_than_another_opponent,
         parse_defending_player_comparison_conditions,
         parse_target_opponent_controls_more_comparison,
+        parse_that_player_controls_more_than_each_player,
         parse_that_player_controls_more_comparison,
         parse_no_opponent_comparison_conditions,
         parse_triggering_player_has_unattacked_opponent,
@@ -1825,6 +1826,28 @@ fn parse_top_of_library_condition(input: &str) -> OracleResult<'_, StaticConditi
 /// to the combat combinator.
 fn parse_recipient_is_filter_condition(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("it").parse(input)?;
+    // CR 611.3a + CR 110.5b: attached-subject statics use the same anaphoric
+    // "it" for the recipient's status as for its characteristics. Spectral
+    // Cloak's "enchanted creature ... as long as it's untapped" must therefore
+    // gate on the enchanted creature, not on the Aura source. Keep this narrow
+    // status arm before the generic copula/filter grammar; `untapped` is a
+    // FilterProp, but it is not a characteristic quality accepted by the bare
+    // predicate parser.
+    if let Ok((rest, _)) = alt((
+        tag::<_, _, OracleError<'_>>("'s untapped"),
+        tag(" is untapped"),
+    ))
+    .parse(rest)
+    {
+        return Ok((
+            rest,
+            StaticCondition::RecipientMatchesFilter {
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::Untapped]),
+                ),
+            },
+        ));
+    }
     // Negated copulae (" isn't ", " is not ") MUST be tried before the affirmative
     // " is " so " is not " is not greedily split into " is " + "not …".
     let (rest, negated) = alt((
@@ -9080,6 +9103,56 @@ fn parse_that_player_controls_more_comparison(input: &str) -> OracleResult<'_, S
     ))
 }
 
+/// CR 109.4 + CR 109.5 + CR 603.4: Parse
+/// "that player controls more [type] than each other player".
+///
+/// The phase-trigger subject is the player named by the triggering event, not
+/// the source controller.  A strict maximum is expressed without a new AST
+/// leaf: count every player whose matching-permanent count is at least the
+/// scoped player's count, then require that population to contain exactly one
+/// player.  The scoped player is included in that population, so equality to
+/// one is equivalent to "strictly more than every other player" and correctly
+/// rejects tied maxima.
+fn parse_that_player_controls_more_than_each_player(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("that player controls more ").parse(input)?;
+    let (rest, type_text) = take_until(" than each other player").parse(rest)?;
+    let (rest, _) = tag(" than each other player").parse(rest)?;
+    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any | TargetFilter::None) {
+        return Err(oracle_err(type_text));
+    }
+
+    let scoped_filter = match filter.clone() {
+        TargetFilter::Typed(typed) => {
+            TargetFilter::Typed(typed.controller(ControllerRef::ScopedPlayer))
+        }
+        other => other,
+    };
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::PlayerCount {
+                    filter: PlayerFilter::ControlsCount {
+                        relation: PlayerRelation::All,
+                        filter,
+                        comparator: Comparator::GE,
+                        count: Box::new(QuantityExpr::Ref {
+                            qty: QuantityRef::ObjectCount {
+                                filter: scoped_filter,
+                            },
+                        }),
+                    },
+                },
+            },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        },
+    ))
+}
+
 /// Parse "defending player controls more [type] than you" → QuantityComparison.
 ///
 /// CR 508.1b + CR 603.4: Attack triggers can carry intervening-if clauses
@@ -16178,6 +16251,54 @@ mod tests {
                     filter: TargetFilter::Typed(TypedFilter::creature()),
                     aggregate: AggregateFunction::Max,
                     relation: PlayerRelation::Opponent,
+                },
+            }
+        );
+    }
+
+    /// CR 603.4: phase triggers use the event player as the comparison anchor.
+    /// The strict-maximum lowering counts all players at or above that
+    /// player's land count and accepts only a unique maximum.
+    #[test]
+    fn test_that_player_controls_more_lands_than_each_other_player() {
+        let (rest, condition) =
+            parse_inner_condition("that player controls more lands than each other player")
+                .unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            lhs,
+            comparator,
+            rhs,
+        } = condition
+        else {
+            panic!("expected quantity comparison");
+        };
+        assert_eq!(comparator, Comparator::EQ);
+        assert_eq!(rhs, QuantityExpr::Fixed { value: 1 });
+        let QuantityExpr::Ref {
+            qty:
+                QuantityRef::PlayerCount {
+                    filter:
+                        PlayerFilter::ControlsCount {
+                            relation: PlayerRelation::All,
+                            filter,
+                            comparator: inner_comparator,
+                            count,
+                        },
+                },
+        } = lhs
+        else {
+            panic!("expected all-player ControlsCount maximum test");
+        };
+        assert_eq!(inner_comparator, Comparator::GE);
+        assert_eq!(filter, TargetFilter::Typed(TypedFilter::land()));
+        assert_eq!(
+            *count,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(
+                        TypedFilter::land().controller(ControllerRef::ScopedPlayer),
+                    ),
                 },
             }
         );

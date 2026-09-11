@@ -12239,6 +12239,15 @@ impl AbilityCost {
                         ..
                     }
                 ) => true,
+            // CR 702.24a + CR 118.12: Infernal Darkness's "Pay {B} and 1 life"
+            // lowers to an EffectCost wrapping a PayCost whose leaves are all
+            // deterministic Mana/PayLife payments; the unless-payment resolver
+            // sequences them in printed order.
+            AbilityCost::EffectCost { effect, .. }
+                if matches!(
+                    effect.as_ref(),
+                    Effect::PayCost { cost, .. } if cost.is_deterministic_pay_cost()
+                ) => true,
             AbilityCost::EffectCost { .. } if self.supports_effect_cost_payment() => true,
             // CR 118.12a: OneOf at the base must be a disjunction of mana
             // costs; mixed-shape disjunctions are not yet expanded into a
@@ -12251,6 +12260,23 @@ impl AbilityCost {
             // sub-cost payment before they can be installed safely.
             AbilityCost::Composite { costs } => {
                 !costs.is_empty() && costs.iter().all(|c| matches!(c, AbilityCost::Mana { .. }))
+            }
+            _ => false,
+        }
+    }
+
+    /// CR 118.12 + CR 702.24a: True for a `PayCost`-shaped payment — or a
+    /// `Composite` of such payments — whose every leaf is a deterministic
+    /// Mana or PayLife cost. This is Infernal Darkness's
+    /// "Cumulative upkeep—Pay {B} and 1 life." shape: the unless-payment
+    /// resolver sequences the leaves in printed order with no player choice
+    /// beyond the ordinary mana payment itself. Anything else (interactive
+    /// choices, nested non-pay shapes) stays fail-closed false.
+    pub fn is_deterministic_pay_cost(&self) -> bool {
+        match self {
+            AbilityCost::Mana { .. } | AbilityCost::PayLife { .. } => true,
+            AbilityCost::Composite { costs } => {
+                !costs.is_empty() && costs.iter().all(|c| c.is_deterministic_pay_cost())
             }
             _ => false,
         }
@@ -31861,6 +31887,10 @@ mod tests {
         }
         .supports_cumulative_upkeep_payment());
 
+        // A bare mixed Composite is not a shape the oracle parser produces
+        // ("Pay {B} and 1 life" lowers to the PayCost-wrapped EffectCost
+        // above); it stays fail-closed so an unpayable shape can never claim
+        // support.
         assert!(!AbilityCost::Composite {
             costs: vec![
                 AbilityCost::Mana {
@@ -31868,6 +31898,42 @@ mod tests {
                 },
                 AbilityCost::PayLife {
                     amount: QuantityExpr::Fixed { value: 1 },
+                },
+            ],
+        }
+        .supports_cumulative_upkeep_payment());
+        assert!(AbilityCost::EffectCost {
+            effect: Box::new(Effect::PayCost {
+                cost: AbilityCost::Composite {
+                    costs: vec![
+                        AbilityCost::Mana {
+                            cost: ManaCost::Cost {
+                                shards: vec![crate::types::mana::ManaCostShard::Black],
+                                generic: 0,
+                            },
+                        },
+                        AbilityCost::PayLife {
+                            amount: QuantityExpr::Fixed { value: 1 },
+                        },
+                    ],
+                },
+                scale: None,
+                payer: TargetFilter::Controller,
+            }),
+            player_scope: None,
+        }
+        .supports_cumulative_upkeep_payment());
+        // A composite containing an interactive leaf stays fail-closed.
+        assert!(!AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Mana {
+                    cost: ManaCost::generic(1),
+                },
+                AbilityCost::Discard {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    filter: None,
+                    selection: CardSelectionMode::Chosen,
+                    self_scope: DiscardSelfScope::FromHand,
                 },
             ],
         }

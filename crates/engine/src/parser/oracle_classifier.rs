@@ -337,6 +337,12 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     "costs less",
     "costs more",
     "is the chosen type",
+    // CR 105.2 + CR 613.1e: chosen-color characteristic statics whose subject
+    // is a single permanent (Alloy Golem, Shifting Sky variants). The static
+    // parser already owns the typed `AddChosenColor` lowering; the classifier
+    // must route the line there before the generic effect candidate fallback.
+    "is the chosen color",
+    "are the chosen color",
     "lose all abilities",
     "power is equal to",
     "power and toughness are each equal to",
@@ -405,6 +411,10 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     "assigns combat damage equal to its toughness",
     "as though it weren't blocked",
     "attacking doesn't cause",
+    // CR 702.10: a static "can attack as though it had haste" permission
+    // (Chaos Lord) is owned by the static parser, including its optional
+    // conditional tail.
+    "can attack as though it had haste",
     "as though they had flash",
     "as though those creatures had haste",
     "as though that creature had haste",
@@ -1229,6 +1239,21 @@ mod tests {
     fn unquoted_cant_block_static_unchanged() {
         // No quotes → fast path → classification unchanged.
         assert!(is_static_pattern("creatures you control can't block"));
+    }
+
+    #[test]
+    fn chosen_color_subject_static_is_routed_to_static_parser() {
+        // The subject does not use one of the classifier's broad quantifier
+        // prefixes, but the authoritative static parser can lower this to
+        // AddChosenColor. Keep both copula numbers covered because Oracle has
+        // both single-permanent and plural-subject forms.
+        assert!(is_static_pattern("~ is the chosen color."));
+        assert!(is_static_pattern("permanents are the chosen color."));
+    }
+
+    #[test]
+    fn attack_as_haste_static_is_routed_to_static_parser() {
+        assert!(is_static_pattern("~ can attack as though it had haste."));
     }
 
     #[test]
