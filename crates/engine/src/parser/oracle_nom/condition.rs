@@ -1826,6 +1826,28 @@ fn parse_top_of_library_condition(input: &str) -> OracleResult<'_, StaticConditi
 /// to the combat combinator.
 fn parse_recipient_is_filter_condition(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("it").parse(input)?;
+    // CR 611.3a + CR 110.5b: attached-subject statics use the same anaphoric
+    // "it" for the recipient's status as for its characteristics. Spectral
+    // Cloak's "enchanted creature ... as long as it's untapped" must therefore
+    // gate on the enchanted creature, not on the Aura source. Keep this narrow
+    // status arm before the generic copula/filter grammar; `untapped` is a
+    // FilterProp, but it is not a characteristic quality accepted by the bare
+    // predicate parser.
+    if let Ok((rest, _)) = alt((
+        tag::<_, _, OracleError<'_>>("'s untapped"),
+        tag(" is untapped"),
+    ))
+    .parse(rest)
+    {
+        return Ok((
+            rest,
+            StaticCondition::RecipientMatchesFilter {
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::Untapped]),
+                ),
+            },
+        ));
+    }
     // Negated copulae (" isn't ", " is not ") MUST be tried before the affirmative
     // " is " so " is not " is not greedily split into " is " + "not …".
     let (rest, negated) = alt((
@@ -16239,10 +16261,9 @@ mod tests {
     /// player's land count and accepts only a unique maximum.
     #[test]
     fn test_that_player_controls_more_lands_than_each_other_player() {
-        let (rest, condition) = parse_inner_condition(
-            "that player controls more lands than each other player",
-        )
-        .unwrap();
+        let (rest, condition) =
+            parse_inner_condition("that player controls more lands than each other player")
+                .unwrap();
         assert_eq!(rest, "");
         let StaticCondition::QuantityComparison {
             lhs,
@@ -16255,15 +16276,16 @@ mod tests {
         assert_eq!(comparator, Comparator::EQ);
         assert_eq!(rhs, QuantityExpr::Fixed { value: 1 });
         let QuantityExpr::Ref {
-            qty: QuantityRef::PlayerCount {
-                filter:
-                    PlayerFilter::ControlsCount {
-                        relation: PlayerRelation::All,
-                        filter,
-                        comparator: inner_comparator,
-                        count,
-                    },
-            },
+            qty:
+                QuantityRef::PlayerCount {
+                    filter:
+                        PlayerFilter::ControlsCount {
+                            relation: PlayerRelation::All,
+                            filter,
+                            comparator: inner_comparator,
+                            count,
+                        },
+                },
         } = lhs
         else {
             panic!("expected all-player ControlsCount maximum test");

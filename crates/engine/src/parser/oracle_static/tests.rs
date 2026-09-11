@@ -11554,6 +11554,22 @@ fn static_max_untap_one_nonbasic_land() {
     );
 }
 
+/// CR 502.3 + CR 109.5: Mungha Wurm's "you" scope must not become the
+/// global cap used by Winter Orb and Smoke.
+#[test]
+fn static_max_untap_one_land_for_controller() {
+    let def = parse_static_line("You can't untap more than one land during your untap step.")
+        .expect("Mungha Wurm's controller-scoped cap must parse");
+    assert_eq!(
+        def.mode,
+        StaticMode::MaxUntapPerType {
+            filter: TargetFilter::Typed(TypedFilter::land()),
+            max: 1,
+        }
+    );
+    assert_eq!(def.affected, Some(TargetFilter::Controller));
+}
+
 // CR 502.3 + CR 611.3a: Winter Orb. Verbatim Oracle text (Scryfall). Discriminating:
 // before this fix, parsed to a no-op Continuous with modifications: [] (the
 // effect was silently dropped).
@@ -30266,22 +30282,30 @@ fn self_static_resolves_it_pronoun_subject_to_source() {
 }
 
 #[test]
-fn aura_static_does_not_bind_it_pronoun_to_source() {
-    // The Aura's "it" refers to the enchanted creature, NOT the Aura source, so it
-    // must NOT collapse to Not(SourceIsTapped) (which would silently check the
-    // Aura's own untapped state). An honest gap is correct here.
+fn aura_static_binds_it_untapped_to_recipient() {
+    // The Aura's "it" refers to the enchanted creature, NOT the Aura source, so
+    // the condition must be a recipient-scoped untapped check rather than
+    // Not(SourceIsTapped), which would silently check the Aura's own state.
     let defs = parse_static_line_multi("Enchanted creature has shroud as long as it's untapped.");
-    for d in &defs {
-        assert!(
-            !matches!(
-                d.condition.as_ref(),
-                Some(StaticCondition::Not { condition })
-                    if matches!(condition.as_ref(), StaticCondition::SourceIsTapped)
+    let def = defs
+        .iter()
+        .find(|d| {
+            d.modifications
+                .contains(&ContinuousModification::AddKeyword {
+                    keyword: Keyword::Shroud,
+                })
+        })
+        .expect("expected enchanted-creature shroud static");
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::RecipientMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::creature().properties(vec![FilterProp::Untapped]),
             ),
-            "Aura 'it' must not resolve to the source, got {:?}",
-            d.condition
-        );
-    }
+        }),
+        "Aura 'it' must bind to the recipient's untapped state, got {:?}",
+        def.condition
+    );
 }
 
 #[test]

@@ -31404,6 +31404,35 @@ fn have_redirection_fight() {
     );
 }
 
+/// CR 510.1a + CR 608.2d: Cloak of Confusion's "you may have it assign no
+/// combat damage this turn" must preserve the anaphoric creature and produce a
+/// transient AssignNoCombatDamage effect rather than an unsupported bare
+/// imperative.
+#[test]
+fn have_it_assign_no_combat_damage_parses() {
+    let def = parse_effect_chain(
+        "you may have it assign no combat damage this turn",
+        AbilityKind::Spell,
+    );
+    let Effect::GenericEffect {
+        static_abilities,
+        duration,
+        target,
+        ..
+    } = &*def.effect
+    else {
+        panic!("expected GenericEffect, got {:?}", def.effect);
+    };
+    assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
+    assert_eq!(*target, Some(TargetFilter::ParentTarget));
+    assert_eq!(static_abilities.len(), 1);
+    assert_eq!(static_abilities[0].mode, StaticMode::AssignNoCombatDamage);
+    assert_eq!(
+        static_abilities[0].affected,
+        Some(TargetFilter::ParentTarget)
+    );
+}
+
 /// CR 113.1a + CR 608.2c + CR 702.7: Highland Berserker class — Ally
 /// tribal "have <filter> gain <keyword>" causative grant. The trigger's
 /// `you may` strips to the trigger record's `optional: true`, so the

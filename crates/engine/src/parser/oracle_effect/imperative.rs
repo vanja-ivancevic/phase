@@ -14396,6 +14396,12 @@ pub(super) fn try_parse_attack_if_able(lower: &str) -> Option<ImperativeFamilyAs
                     Duration::UntilEndOfCombat,
                     alt((tag("this combat if able"), tag("that combat if able"))),
                 ),
+                // CR 508.1d: pre-modern triggered attack requirements often
+                // omitted both "must" and the modern "this combat" window
+                // ("all creatures ... attack if able"). The enclosing trigger
+                // fires during declare attackers, so the requirement lasts for
+                // the current combat, not the whole turn.
+                value(Duration::UntilEndOfCombat, tag("if able")),
                 // CR 508.1d + CR 511.3: "attacks during its controller's next combat
                 // phase if able" — Trench Behemoth. The forced-attack requirement
                 // persists until the end of the target creature's controller's next

@@ -2123,14 +2123,17 @@ pub enum StaticMode {
     /// Built for the class — `filter` carries the permanent type (creature,
     /// artifact, nonbasic land, …) and `max` the cap, covering Smoke /
     /// Stoic Angel (creature), Damping Field / Imi Statue (artifact), and the
-    /// Winter Orb / nonbasic-land family in one variant. The restriction is a
-    /// global rule modification keyed on the active player, not on the source's
-    /// controller — Smoke restricts every player — so the affected-permanent
-    /// scope rides inline on `filter` rather than `StaticDefinition::affected`
-    /// (mirroring `BlockRestriction` / `CantBeBlockedBy`). Runtime enforcement
-    /// is in `turns::execute_untap_with_choices`, which clamps each matching
-    /// group to `max`, and `turns::untap_choice_candidates`, which surfaces the
-    /// over-cap members for the CR 502.3 player determination.
+    /// Winter Orb / nonbasic-land family in one variant. The printed
+    /// "players can't ..." family is a global rule modification keyed on the
+    /// active player, not on the source's controller — Smoke restricts every
+    /// player — so that form rides inline on `filter` rather than
+    /// `StaticDefinition::affected` (mirroring `BlockRestriction` /
+    /// `CantBeBlockedBy`). The controller-scoped "you can't ..." family uses
+    /// `affected: Controller` as its source-controller scope marker; it still
+    /// carries the permanent-type filter inline here. Runtime enforcement is in
+    /// `turns::execute_untap_with_choices`, which clamps each matching group to
+    /// `max`, and `turns::untap_choice_candidates`, which surfaces the over-cap
+    /// members for the CR 502.3 player determination.
     MaxUntapPerType {
         filter: TargetFilter,
         max: u32,

@@ -12581,10 +12581,16 @@ fn false_cure_scales_life_loss_by_triggering_gain() {
     assert!(r.parse_warnings.is_empty(), "False Cure: {r:#?}");
 
     let Effect::CreateDelayedTrigger { effect, .. } = r.abilities[0].effect.as_ref() else {
-        panic!("expected False Cure delayed trigger, got {:?}", r.abilities[0].effect);
+        panic!(
+            "expected False Cure delayed trigger, got {:?}",
+            r.abilities[0].effect
+        );
     };
     let Effect::LoseLife { amount, .. } = effect.effect.as_ref() else {
-        panic!("expected False Cure LoseLife payload, got {:?}", effect.effect);
+        panic!(
+            "expected False Cure LoseLife payload, got {:?}",
+            effect.effect
+        );
     };
     assert_eq!(
         amount,
@@ -12617,7 +12623,12 @@ fn cabal_conditioning_uses_greatest_mana_value_as_discard_count() {
         );
     };
     assert!(
-        matches!(count, QuantityExpr::Ref { qty: QuantityRef::PropertyAggregate(_) }),
+        matches!(
+            count,
+            QuantityExpr::Ref {
+                qty: QuantityRef::PropertyAggregate(_)
+            }
+        ),
         "expected greatest-mana-value discard count, got {count:?}"
     );
 }
@@ -12636,7 +12647,10 @@ fn essence_vortex_pays_target_toughness_to_prevent_destruction() {
     assert!(r.parse_warnings.is_empty(), "Essence Vortex: {r:#?}");
 
     let Some(unless_pay) = r.abilities[0].unless_pay.as_ref() else {
-        panic!("expected Essence Vortex unless-pay cost, got {:#?}", r.abilities[0]);
+        panic!(
+            "expected Essence Vortex unless-pay cost, got {:#?}",
+            r.abilities[0]
+        );
     };
     assert_eq!(unless_pay.payer, TargetFilter::ParentTargetController);
     assert!(
@@ -12672,20 +12686,24 @@ fn cyclone_preserves_colored_per_counter_unless_cost() {
         panic!("Cyclone trigger lost unless-pay: {:#?}", r.triggers[0]);
     };
     assert_eq!(unless_pay.payer, TargetFilter::Controller);
-    assert!(matches!(
-        &unless_pay.cost,
-        AbilityCost::PerCounter {
-            counter: CounterType::Generic(name),
-            target: TargetFilter::SelfRef,
-            base,
-        } if name == "wind"
-            && matches!(
-                base.as_ref(),
-                AbilityCost::Mana {
-                    cost: ManaCost::Cost { generic: 0, shards }
-                } if shards.as_slice() == [crate::types::mana::ManaCostShard::Green]
-            )
-    ), "expected colored wind-counter cost, got {:?}", unless_pay.cost);
+    assert!(
+        matches!(
+            &unless_pay.cost,
+            AbilityCost::PerCounter {
+                counter: CounterType::Generic(name),
+                target: TargetFilter::SelfRef,
+                base,
+            } if name == "wind"
+                && matches!(
+                    base.as_ref(),
+                    AbilityCost::Mana {
+                        cost: ManaCost::Cost { generic: 0, shards }
+                    } if shards.as_slice() == [crate::types::mana::ManaCostShard::Green]
+                )
+        ),
+        "expected colored wind-counter cost, got {:?}",
+        unless_pay.cost
+    );
 }
 
 #[test]
@@ -23902,6 +23920,135 @@ fn rith_chosen_color_population_survives_full_oracle_routing() {
         !parsed_has_unimplemented(&parsed),
         "Rith's chosen-color token ability must remain executable: {parsed:#?}"
     );
+}
+
+/// CR 105.2 + CR 613.1e: a self-named chosen-color static must enter the
+/// static parser from the full document router. Without the classifier seam,
+/// Alloy Golem's "This creature is the chosen color" line is misclassified as
+/// an effect sentence and leaves an `effect_structure` coverage gap even though
+/// `parse_static_line` already knows how to lower `AddChosenColor`.
+#[test]
+fn alloy_golem_chosen_color_static_routes_without_gap() {
+    let parsed = parse(
+        "As this creature enters, choose a color.\nThis creature is the chosen color. (It's still an artifact.)",
+        "Alloy Golem",
+        &[],
+        &["Artifact", "Creature"],
+        &[],
+    );
+
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Alloy Golem's chosen-color static must be supported: {parsed:#?}"
+    );
+    assert!(
+        parsed.statics.iter().any(|definition| {
+            definition.modifications.iter().any(|modification| {
+                matches!(modification, ContinuousModification::AddChosenColor { .. })
+            })
+        }),
+        "expected AddChosenColor static: {parsed:#?}"
+    );
+}
+
+/// CR 702.10: the old-border Chaos Lord wording is a static permission, not a
+/// resolving effect. Its static parser already lowers the haste-like attack
+/// permission and the full router must send the line there.
+#[test]
+fn chaos_lord_attack_as_haste_static_routes_without_gap() {
+    let parsed = parse(
+        "This creature can attack as though it had haste unless it entered this turn.",
+        "Chaos Lord",
+        &[],
+        &["Creature"],
+        &["Lord"],
+    );
+
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Chaos Lord's haste-like attack permission must be supported: {parsed:#?}"
+    );
+    assert!(
+        parsed.statics.iter().any(|definition| {
+            definition.modifications.iter().any(|modification| {
+                matches!(
+                    modification,
+                    ContinuousModification::AddKeyword {
+                        keyword: Keyword::Haste
+                    }
+                )
+            })
+        }),
+        "expected haste-like static lowering: {parsed:#?}"
+    );
+}
+
+/// CR 509.1b + CR 611.3a: Spectral Cloak's evasion is conditional on the
+/// enchanted creature remaining untapped. The condition must be recipient-
+/// scoped so the Aura's own tap state is irrelevant.
+#[test]
+fn spectral_cloak_recipient_untapped_condition_routes_without_gap() {
+    let parsed = parse(
+        "Enchant creature\nEnchanted creature can't be blocked as long as it's untapped.",
+        "Spectral Cloak",
+        &[],
+        &["Enchantment"],
+        &["Aura"],
+    );
+
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Spectral Cloak's recipient-scoped evasion must be supported: {parsed:#?}"
+    );
+    assert!(
+        parsed.statics.iter().any(|definition| {
+            definition.mode == StaticMode::CantBeBlocked
+                && matches!(
+                    definition.condition.as_ref(),
+                    Some(StaticCondition::RecipientMatchesFilter { .. })
+                )
+        }),
+        "expected recipient-scoped CantBeBlocked static: {parsed:#?}"
+    );
+}
+
+/// CR 603.1: old-border printings used "If <attack event>, <forced attack>"
+/// instead of the modern "Whenever" trigger spelling. The document router
+/// normalizes that bounded legacy form into the regular trigger parser.
+#[test]
+fn legacy_if_attack_requirements_route_as_triggers() {
+    for (name, text, types, subtypes) in [
+        (
+            "Ekundu Cyclops",
+            "If a creature you control attacks, this creature also attacks if able.",
+            vec!["Creature"],
+            vec!["Cyclops"],
+        ),
+        (
+            "Viashino Bey",
+            "If this creature attacks, all creatures you control attack if able.",
+            vec!["Creature"],
+            vec!["Viashino"],
+        ),
+        (
+            "Magnetic Web",
+            "If a creature with a magnet counter on it attacks, all creatures with magnet counters on them attack if able.",
+            vec!["Artifact"],
+            vec![],
+        ),
+    ] {
+        let type_refs: Vec<&str> = types;
+        let subtype_refs: Vec<&str> = subtypes;
+        let parsed = parse(text, name, &[], &type_refs, &subtype_refs);
+        assert!(
+            !parsed_has_unimplemented(&parsed),
+            "{name}'s legacy attack requirement must parse: {parsed:#?}"
+        );
+        assert!(
+            parsed.triggers.iter().any(|trigger| trigger.execute.is_some()),
+            "{name} must expose a parsed attack trigger: {parsed:#?}"
+        );
+    }
 }
 
 #[test]

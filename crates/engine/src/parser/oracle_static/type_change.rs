@@ -2449,14 +2449,6 @@ pub(crate) fn parse_subject_is_color(
         _ => parse_continuous_subject_filter(subject)?,
     };
 
-    // CR 604.3: a self-referential color line ("~ is colorless") is a
-    // characteristic-defining ability owned by `parse_self_subject_is_color_cda`
-    // (it sets `characteristic_defining` and functions in all zones). Decline so
-    // it is never emitted as a plain Layer-5 static.
-    if matches!(affected, TargetFilter::SelfRef) {
-        return None;
-    }
-
     // CR 105.3: "the chosen color" [+ optional additive retain-suffix] reads the
     // source's chosen color attribute. Bare form → set/replace
     // ([`ColorChangeMode::Set`], Shimmerwilds Growth / Shifting Sky). Additive
@@ -2490,6 +2482,15 @@ pub(crate) fn parse_subject_is_color(
                 .modifications(vec![ContinuousModification::AddChosenColor { mode }])
                 .description(description.to_string()),
         );
+    }
+
+    // CR 604.3: a self-referential fixed-color line ("~ is colorless") is a
+    // characteristic-defining ability owned by `parse_self_subject_is_color_cda`
+    // (it sets `characteristic_defining` and functions in all zones). A chosen
+    // color was handled above because it is a Layer-5 characteristic change,
+    // not a CDA; decline only the remaining self-scoped fixed-color forms.
+    if matches!(affected, TargetFilter::SelfRef) {
+        return None;
     }
 
     // Fixed colors / "all colors" / "colorless" (CR 105.1 / CR 105.2 / CR 105.2c),

@@ -7178,6 +7178,49 @@ fn try_parse_have_causative(
     if let Some((_, rest_orig)) = after_have {
         let rest_lower = &tp.lower[tp.lower.len() - rest_orig.len()..];
         let rest = TextPair::new(rest_orig, rest_lower);
+
+        // CR 510.1a + CR 608.2d: "have it assign no combat damage this
+        // turn/combat" is the causative form of the transient assignment
+        // prohibition. The ordinary subject-predicate parser owns the direct
+        // "it assigns no combat damage" spelling; this arm preserves the
+        // anaphoric subject instead of recursing into the bare imperative
+        // "assign", which has no standalone target grammar.
+        if let Some((_, after_assign)) = nom_on_lower(rest.original, rest.lower, |input| {
+            value((), tag("assign no combat damage")).parse(input)
+        }) {
+            let tail = after_assign.trim().trim_end_matches('.').trim();
+            let duration = match tail {
+                "this combat" => Duration::UntilEndOfCombat,
+                "this turn" => Duration::UntilEndOfTurn,
+                _ => return None,
+            };
+            // "have it ..." is an anaphoric effect: the subject is the
+            // target selected by the enclosing effect, even when the local
+            // parser context does not carry that parent target explicitly.
+            let mut application = subject::parse_subject_application("it", ctx)?;
+            application.affected = TargetFilter::ParentTarget;
+            application.target = Some(TargetFilter::ParentTarget);
+            application.inherits_parent = true;
+            let affected = subject::static_affected_for_application(&application);
+            return Some(ParsedEffectClause {
+                effect: Effect::GenericEffect {
+                    static_abilities: vec![StaticDefinition::new(StaticMode::AssignNoCombatDamage)
+                        .affected(affected)
+                        .modifications(vec![ContinuousModification::AssignNoCombatDamage])],
+                    duration: Some(duration.clone()),
+                    target: application.target,
+                    end_cost: None,
+                },
+                duration: Some(duration),
+                sub_ability: None,
+                distribute: None,
+                multi_target: None,
+                condition: None,
+                optional: false,
+                unless_pay: None,
+            });
+        }
+
         // "deal N damage to them" / "deal N damage to that player"
         if let Some(after_deal) = nom_on_lower(rest.original, rest.lower, |i| {
             value((), tag("deal ")).parse(i)
