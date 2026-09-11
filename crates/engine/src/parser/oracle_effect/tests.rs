@@ -28073,6 +28073,47 @@ fn strip_unless_entered_suffix_strips_correctly() {
 }
 
 #[test]
+fn strip_unless_came_under_control_this_turn_uses_control_continuity() {
+    let (strip, text) = strip_unless_entered_suffix(
+        "~ deals 2 damage to you unless it came under your control this turn",
+        &mut ParseContext::default(),
+    );
+    let UnlessSuffixStrip::Parsed(AbilityCondition::QuantityCheck {
+        lhs:
+            QuantityExpr::Ref {
+                qty:
+                    QuantityRef::ObjectCount {
+                        filter: TargetFilter::And { filters },
+                    },
+            },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
+    }) = strip
+    else {
+        panic!("expected control-continuity unless gate, got {strip:?}");
+    };
+    assert!(filters.iter().any(|filter| matches!(
+        filter,
+        TargetFilter::Typed(TypedFilter { properties, .. })
+            if properties.contains(&FilterProp::ControlledContinuouslySinceTurnBegan)
+    )));
+    assert_eq!(text, "~ deals 2 damage to you");
+}
+
+#[test]
+fn parse_erg_raiders_effect_with_control_continuity_unless_gate() {
+    let clause = parse_effect_clause(
+        "~ deals 2 damage to you unless it came under your control this turn",
+        &mut ParseContext::default(),
+    );
+    assert!(
+        clause.condition.is_some(),
+        "expected unless condition, got {clause:?}"
+    );
+    assert!(matches!(clause.effect, Effect::DealDamage { .. }));
+}
+
+#[test]
 fn strip_unless_entered_suffix_no_match() {
     let (strip, text) = strip_unless_entered_suffix("discard a card", &mut ParseContext::default());
     assert!(matches!(strip, UnlessSuffixStrip::Absent));

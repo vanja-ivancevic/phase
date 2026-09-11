@@ -8251,7 +8251,7 @@ fn parse_source_didnt_this_turn(input: &str) -> OracleResult<'_, StaticCondition
             StaticCondition::And {
                 conditions: vec![
                     make_source_history_absence(FilterProp::AttackedThisTurn { defender: None }),
-                    make_source_controlled_continuously_this_turn(),
+                    source_controlled_continuously_this_turn_condition(),
                 ],
             },
             tag("attack or come under your control this turn"),
@@ -8288,7 +8288,7 @@ fn make_source_history_absence(prop: FilterProp) -> StaticCondition {
 /// CR 302.6 + CR 508.1a: the source has remained under its controller's
 /// control continuously since that player's turn began. This is the positive
 /// form of "didn't come under your control this turn".
-fn make_source_controlled_continuously_this_turn() -> StaticCondition {
+pub(crate) fn source_controlled_continuously_this_turn_condition() -> StaticCondition {
     StaticCondition::QuantityComparison {
         lhs: QuantityExpr::Ref {
             qty: QuantityRef::ObjectCount {

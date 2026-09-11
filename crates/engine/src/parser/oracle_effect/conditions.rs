@@ -1034,6 +1034,28 @@ pub(super) fn strip_unless_entered_suffix(
             );
         }
     }
+    // CR 302.6 + CR 603.4: "unless it came under your control this turn"
+    // is the negation of the source's control continuity since its controller's
+    // turn began. Reuse the same runtime fact as the positive half of Mad Dog's
+    // "didn't ... come under your control" intervening-if condition.
+    for pattern in &[
+        "unless it came under your control this turn",
+        "unless ~ came under your control this turn",
+        "unless this creature came under your control this turn",
+        "unless this permanent came under your control this turn",
+    ] {
+        if let Some((before, _)) = tp.split_around(pattern) {
+            if let Some(condition) = static_condition_to_ability_condition(
+                &nom_condition::source_controlled_continuously_this_turn_condition(),
+                ctx,
+            ) {
+                return (
+                    UnlessSuffixStrip::Parsed(condition),
+                    before.original.trim_end_matches('.').trim().to_string(),
+                );
+            }
+        }
+    }
     if let Some((effect_part, condition_part)) = lower.rsplit_once(" unless ") {
         let condition_text = condition_part.trim_end_matches('.');
         if let Some(cond) = try_nom_condition_as_unless(condition_text, ctx) {

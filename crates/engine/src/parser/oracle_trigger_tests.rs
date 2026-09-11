@@ -3277,6 +3277,35 @@ fn mad_dog_intervening_if_preserves_attack_and_control_history() {
 }
 
 #[test]
+fn erg_raiders_damage_trigger_parses_control_continuity_unless_gate() {
+    let def = parse_trigger_line(
+        "At the beginning of your end step, if this creature didn't attack this turn, it deals 2 damage to you unless it came under your control this turn.",
+        "Erg Raiders",
+    );
+    let execute = def.execute.as_deref().expect("Erg Raiders damage effect");
+    assert!(matches!(execute.effect.as_ref(), Effect::DealDamage { .. }));
+    let Some(AbilityCondition::QuantityCheck {
+        lhs:
+            QuantityExpr::Ref {
+                qty:
+                    QuantityRef::ObjectCount {
+                        filter: TargetFilter::And { filters },
+                    },
+            },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
+    }) = execute.condition.as_ref()
+    else {
+        panic!("expected Erg Raiders control-continuity gate, got {execute:?}");
+    };
+    assert!(filters.iter().any(|filter| matches!(
+        filter,
+        TargetFilter::Typed(TypedFilter { properties, .. })
+            if properties.contains(&FilterProp::ControlledContinuouslySinceTurnBegan)
+    )));
+}
+
+#[test]
 fn fyndhorn_druid_intervening_if_preserves_blocked_history() {
     let def = parse_trigger_line(
         "When this creature dies, if it was blocked this turn, you gain 4 life.",
