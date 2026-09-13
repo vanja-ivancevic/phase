@@ -796,6 +796,7 @@ fn resolve_mana_types_impl(
                 land_filter,
                 controller,
                 source_id,
+                ability.as_ref().and_then(|a| a.cost_paid_object.as_ref()),
             );
             let Some(first) = type_options.first().copied() else {
                 return Vec::new();
@@ -2816,6 +2817,7 @@ mod tests {
             &TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You)),
             PlayerId(0),
             ObjectId(100),
+            None,
         );
         assert!(options.contains(&ManaType::White), "union must include W");
         assert!(options.contains(&ManaType::Black), "union must include B");
@@ -2949,6 +2951,7 @@ mod tests {
             &land_filter,
             PlayerId(0),
             ObjectId(9999),
+            None,
         );
         assert!(
             options.contains(&ManaType::Colorless),
@@ -3046,6 +3049,7 @@ mod tests {
             &TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You)),
             PlayerId(1),
             pool,
+            None,
         );
         assert!(
             pool_opts.is_empty(),

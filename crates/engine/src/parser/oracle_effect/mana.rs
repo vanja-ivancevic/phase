@@ -407,6 +407,45 @@ pub(super) fn try_parse_add_mana_effect_with_context(
             });
         }
 
+        // CR 608.2k + CR 106.7: anaphoric referents — "mana of any type
+        // [that] land could produce" (Benthic Explorers' untap-as-cost land)
+        // and "mana of any type the sacrificed land could produce"
+        // (Squandered Resources). Both refer to the object this ability paid
+        // its own cost
+        // with; the payment paths record that identity on
+        // `ResolvedAbility::cost_paid_object`, and production resolves the
+        // type set from the snapshot's LKI so the sacrificed (dead) land
+        // still produces (CR 400.7 LKI).
+        if nom_on_lower(rest, &rest_lower, |i| {
+            value(
+                (),
+                preceded(
+                    tag("mana of any type "),
+                    preceded(
+                        opt(tag("that ")),
+                        terminated(
+                            alt((tag("the sacrificed land"), tag("land"))),
+                            tag(" could produce"),
+                        ),
+                    ),
+                ),
+            )
+            .parse(i)
+        })
+        .is_some()
+        {
+            return Some(Effect::Mana {
+                produced: ManaProduction::AnyTypeProduceableBy {
+                    count,
+                    land_filter: TargetFilter::CostPaidObject,
+                },
+                restrictions: vec![],
+                grants: vec![],
+                expiry: None,
+                target: where_x_target,
+            });
+        }
+
         if let Some((_, after_color)) = nom_on_lower(rest, &rest_lower, |i| {
             alt((
                 value((), tag("mana of any one color")),
@@ -3278,6 +3317,43 @@ mod tests {
             panic!("expected Typed land filter, got {land_filter:?}");
         };
         assert_eq!(typed.controller, Some(ControllerRef::You));
+    }
+
+    /// CR 608.2k + CR 106.7: Squandered Resources — the anaphoric "the
+    /// sacrificed land could produce" referent lowers to AnyTypeProduceableBy
+    /// with `TargetFilter::CostPaidObject`, which the payment paths stamp onto
+    /// `ResolvedAbility::cost_paid_object` at sacrifice completion.
+    #[test]
+    fn sacrificed_land_could_produce_parses_to_cost_paid_object() {
+        use crate::types::ability::TargetFilter;
+        let effect =
+            try_parse_add_mana_effect("Add one mana of any type the sacrificed land could produce")
+                .expect("Squandered Resources clause must parse");
+        let Effect::Mana { produced, .. } = effect else {
+            panic!("expected Effect::Mana, got something else");
+        };
+        let ManaProduction::AnyTypeProduceableBy { count, land_filter } = produced else {
+            panic!("expected AnyTypeProduceableBy, got {produced:?}");
+        };
+        assert_eq!(count, QuantityExpr::Fixed { value: 1 });
+        assert_eq!(land_filter, TargetFilter::CostPaidObject);
+    }
+
+    /// CR 608.2k: Benthic Explorers — "that land could produce" (the land
+    /// untapped as part of the activation cost) uses the same cost-paid
+    /// referent.
+    #[test]
+    fn that_land_could_produce_parses_to_cost_paid_object() {
+        use crate::types::ability::TargetFilter;
+        let effect = try_parse_add_mana_effect("Add one mana of any type that land could produce")
+            .expect("Benthic Explorers clause must parse");
+        let Effect::Mana { produced, .. } = effect else {
+            panic!("expected Effect::Mana, got something else");
+        };
+        let ManaProduction::AnyTypeProduceableBy { land_filter, .. } = produced else {
+            panic!("expected AnyTypeProduceableBy, got {produced:?}");
+        };
+        assert_eq!(land_filter, TargetFilter::CostPaidObject);
     }
 
     /// CR 106.7: Future opponent-scoped "type" printings must dispatch via

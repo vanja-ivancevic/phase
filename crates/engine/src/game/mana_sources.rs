@@ -1717,8 +1717,13 @@ pub fn display_land_mana_pips(
             // a separate `Colorless` pip so the frame faithfully shows the
             // full option set.
             ManaProduction::AnyTypeProduceableBy { land_filter, .. } => {
-                let types =
-                    produceable_mana_types_by_filter(state, land_filter, controller, object_id);
+                let types = produceable_mana_types_by_filter(
+                    state,
+                    land_filter,
+                    controller,
+                    object_id,
+                    None,
+                );
                 let colors: Vec<ManaColor> = types
                     .iter()
                     .copied()
@@ -3034,7 +3039,7 @@ fn mana_options_from_production(
         // CR 106.7 + CR 106.1b: Compute the full type set (incl. Colorless)
         // from lands matching `land_filter` (Reflecting Pool class).
         ManaProduction::AnyTypeProduceableBy { land_filter, .. } => {
-            produceable_mana_types_by_filter(state, land_filter, controller, object_id)
+            produceable_mana_types_by_filter(state, land_filter, controller, object_id, None)
         }
         // CR 605.1a + CR 406.1 + CR 610.3: Compute colors dynamically from cards
         // exiled-with this source via `state.exile_links` (Pit of Offerings).
@@ -3485,6 +3490,7 @@ pub(crate) fn produceable_mana_types_by_filter(
     land_filter: &TargetFilter,
     controller: PlayerId,
     self_source_id: ObjectId,
+    cost_paid: Option<&crate::types::ability::CostPaidObjectSnapshot>,
 ) -> Vec<ManaType> {
     use crate::game::filter::{matches_target_filter, FilterContext};
     // CR 109.4: `ControllerRef::You` resolves against the activator. Anchor the
@@ -3493,6 +3499,30 @@ pub(crate) fn produceable_mana_types_by_filter(
     // costs) or in synthetic test contexts.
     let filter_ctx = FilterContext::from_source_with_controller(self_source_id, controller);
     let mut options = Vec::new();
+    // CR 608.2k + CR 400.7: "mana of any type that [the sacrificed] land could
+    // produce" — the anaphoric referent is this ability's cost-paid object.
+    // The land may already be DEAD (sacrificed as the very cost that paid for
+    // this production), so the battlefield scan below can never see it; read
+    // the type set from the recorded snapshot's LKI instead. Basic-land
+    // subtypes map to their colors; a land with no basic subtype and no
+    // surviving explicit production yields colorless (CR 106.5 fail-closed).
+    if matches!(land_filter, TargetFilter::CostPaidObject) {
+        let Some(snapshot) = cost_paid else {
+            return Vec::new();
+        };
+        let lki = &snapshot.lki;
+        for subtype in &lki.subtypes {
+            if let Some(mana_type) = super::mana_payment::land_subtype_to_mana_type(subtype) {
+                if !options.contains(&mana_type) {
+                    options.push(mana_type);
+                }
+            }
+        }
+        if options.is_empty() {
+            options.push(ManaType::Colorless);
+        }
+        return options;
+    }
     // CR 730.2: iterate the independent-permanent list (excludes absorbed merge components).
     for object_id in state.battlefield.iter() {
         let Some(obj) = state.objects.get(object_id) else {
@@ -3577,6 +3607,66 @@ pub fn mana_type_to_color(mana_type: ManaType) -> Option<ManaColor> {
 
 #[cfg(test)]
 mod tests {
+    /// CR 608.2k + CR 400.7: the CostPaidObject fast path reads the snapshot's
+    /// LKI subtypes — the land is dead (sacrificed) so the battlefield scan
+    /// could never see it. A Plains LKI yields White; a nonbasic land with no
+    /// basic subtype yields colorless; no snapshot yields empty.
+    #[test]
+    fn cost_paid_object_production_reads_snapshot_lki() {
+        use crate::types::ability::CostPaidObjectSnapshot;
+        use crate::types::game_state::LKISnapshot;
+        use crate::types::identifiers::ObjectId;
+        use crate::types::mana::ManaType;
+        use crate::types::player::PlayerId;
+
+        let snapshot = CostPaidObjectSnapshot {
+            object_id: ObjectId(42),
+            lki: LKISnapshot {
+                name: "Plains".to_string(),
+                token_image_ref: None,
+                power: None,
+                toughness: None,
+                base_power: None,
+                base_toughness: None,
+                mana_value: 0,
+                controller: PlayerId(0),
+                owner: PlayerId(0),
+                card_types: vec![crate::types::card_type::CoreType::Land],
+                subtypes: vec!["Plains".to_string()],
+                supertypes: vec![],
+                keywords: vec![],
+                colors: vec![],
+                chosen_attributes: vec![],
+                counters: Default::default(),
+                tapped: false,
+                is_suspected: false,
+                attachments: vec![],
+            },
+        };
+        let state = crate::game::engine::new_game(7);
+        let options = produceable_mana_types_by_filter(
+            &state,
+            &TargetFilter::CostPaidObject,
+            PlayerId(0),
+            ObjectId(1),
+            Some(&snapshot),
+        );
+        assert!(
+            options.contains(&ManaType::White),
+            "a sacrificed Plains must produce White through its LKI, got {options:?}"
+        );
+
+        // No snapshot recorded (cost identity never captured) → fail closed.
+        let none = produceable_mana_types_by_filter(
+            &state,
+            &TargetFilter::CostPaidObject,
+            PlayerId(0),
+            ObjectId(1),
+            None,
+        );
+        assert!(none.is_empty(), "no snapshot must produce nothing");
+    }
+
     use std::sync::Arc;
 
     use super::*;

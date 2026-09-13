@@ -1144,6 +1144,7 @@ pub(crate) fn mana_choice_prompt(
                 land_filter,
                 owner,
                 source_id,
+                None,
             );
             // CR 106.5: An ability that would produce mana of an undefined type
             // produces no mana, so it needs no color choice.
