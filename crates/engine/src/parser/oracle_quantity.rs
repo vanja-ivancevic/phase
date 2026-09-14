@@ -652,6 +652,40 @@ pub(crate) fn parse_quantity_ref_with_context(
                 return Some(canonicalize_quantity_ref(qty));
             }
         }
+        // CR 120.3: "the number of <type> of that [chosen] color that player
+        // controls" (Searing Rays) — the per-player DamageEachPlayer count.
+        // The count filter gains the chosen-color property
+        // (FilterProp::IsChosenColor — the Choose-a-color sibling clause) and
+        // the DamageEachPlayer recipient as controller: ControllerRef::ScopedPlayer,
+        // which resolve_quantity_scoped_with_targets rebinds to each iterated
+        // player. Tried before the bare type-phrase fall-through, which cannot
+        // consume "of that color" and would leave a non-empty remainder.
+        {
+            let lower_rest = rest.to_ascii_lowercase();
+            let suffixes = [
+                "of that color that player controls",
+                "of the chosen color that player controls",
+            ];
+            for suffix in suffixes {
+                if let Some(mid_len) = lower_rest.strip_suffix(suffix).map(|m| m.len()) {
+                    let type_phrase = rest[..mid_len].trim_end();
+                    if type_phrase.is_empty() {
+                        continue;
+                    }
+                    let (filter, remainder) = parse_type_phrase_with_ctx(type_phrase, ctx);
+                    if remainder.trim().is_empty() {
+                        if let TargetFilter::Typed(mut tf) = filter {
+                            tf.properties.push(FilterProp::IsChosenColor);
+                            tf.controller = Some(ControllerRef::ScopedPlayer);
+                            return Some(QuantityRef::ObjectCount {
+                                filter: TargetFilter::Typed(tf),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         let (filter, remainder) = parse_type_phrase_with_ctx(rest, ctx);
         // CR 109.1: `parse_type_phrase_with_ctx` always returns `TargetFilter::Typed`,
         // including the empty-shaped form (no `type_filters`, no `controller`, no
@@ -6407,7 +6441,10 @@ mod tests {
             parse_event_context_quantity("that artifactoid's mana value"),
             None
         );
-        assert_eq!(parse_event_context_quantity("the artifactoid's power"), None);
+        assert_eq!(
+            parse_event_context_quantity("the artifactoid's power"),
+            None
+        );
     }
 
     /// Negative guard for the participle word-boundary fix: a prefix like
@@ -8804,10 +8841,7 @@ mod tests {
         // Minion of the Wastes uses the pronoun form; Phyrexian Processor's
         // normalized Oracle line uses `~`. Both are the same entry-history
         // quantity, not an ordinary resolution-local "that much" value.
-        for phrase in [
-            "the life paid as it entered",
-            "the life paid as ~ entered",
-        ] {
+        for phrase in ["the life paid as it entered", "the life paid as ~ entered"] {
             assert_eq!(
                 parse_cda_quantity(phrase),
                 Some(QuantityExpr::Ref {
@@ -8998,5 +9032,45 @@ mod tests {
                 "unexpected Effect::Unimplemented in trigger: {effect:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod searing_rays_tests {
+    use super::*;
+
+    /// CR 120.3: Searing Rays' per-player count — "the number of creatures of
+    /// that color that player controls" must lower to an ObjectCount whose
+    /// filter carries the chosen-color property and the DamageEachPlayer
+    /// recipient (ScopedPlayer) as controller.
+    #[test]
+    fn searing_rays_chosen_color_per_player_count_lowers() {
+        use crate::parser::oracle_ir::context::ParseContext;
+        use crate::types::ability::{ControllerRef, FilterProp};
+        let mut scoped = ParseContext {
+            relative_player_scope: Some(ControllerRef::ScopedPlayer),
+            ..Default::default()
+        };
+        let qty = parse_cda_quantity_with_context(
+            "the number of creatures of that color that player controls",
+            &mut scoped,
+        )
+        .expect("Searing Rays count must parse");
+        let QuantityExpr::Ref { qty } = qty else {
+            panic!("expected Ref quantity, got {qty:?}");
+        };
+        let QuantityRef::ObjectCount {
+            filter: TargetFilter::Typed(tf),
+        } = qty
+        else {
+            panic!("expected ObjectCount with Typed filter, got {qty:?}");
+        };
+        assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
+        assert!(
+            tf.properties.contains(&FilterProp::IsChosenColor),
+            "the chosen-color property must be present, got {:?}",
+            tf.properties
+        );
+        assert_eq!(tf.controller, Some(ControllerRef::ScopedPlayer));
     }
 }

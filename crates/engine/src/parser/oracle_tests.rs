@@ -29821,3 +29821,52 @@ fn cyclops_gladiator_if_you_do_damage_back_reads_targets_power_not_sources() {
          attacking Cyclops's own power — got {back_amount:?}"
     );
 }
+
+/// CR 120.3: Searing Rays — "deals damage to each player equal to the number
+/// of creatures of that color that player controls" lowers to
+/// DamageEachPlayer whose amount is an ObjectCount over creatures carrying
+/// the chosen-color property, controlled by the DamageEachPlayer recipient
+/// (ScopedPlayer rebinds per player).
+#[test]
+fn searing_rays_each_player_chosen_color_count_lowers() {
+    let parsed = parse_oracle_text(
+        "Choose a color. Searing Rays deals damage to each player equal to the number of \
+         creatures of that color that player controls.",
+        "Searing Rays",
+        &[],
+        &["Instant".to_string()],
+        &[],
+    );
+    let root = parsed.abilities.first().expect("root ability");
+    assert!(matches!(
+        &*root.effect,
+        Effect::Choose {
+            choice_type: ChoiceType::Color { .. },
+            ..
+        }
+    ));
+    let deal = root
+        .sub_ability
+        .as_deref()
+        .expect("damage sibling must be present");
+    let Effect::DamageEachPlayer {
+        amount,
+        player_filter,
+    } = &*deal.effect
+    else {
+        panic!("expected DamageEachPlayer, got {:?}", deal.effect);
+    };
+    let QuantityExpr::Ref { qty } = amount else {
+        panic!("expected Ref amount, got {amount:?}");
+    };
+    let QuantityRef::ObjectCount {
+        filter: TargetFilter::Typed(tf),
+    } = qty
+    else {
+        panic!("expected ObjectCount amount, got {qty:?}");
+    };
+    assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
+    assert!(tf.properties.contains(&FilterProp::IsChosenColor));
+    assert_eq!(tf.controller, Some(ControllerRef::ScopedPlayer));
+    assert_eq!(*player_filter, PlayerFilter::All);
+}
