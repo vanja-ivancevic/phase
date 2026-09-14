@@ -29870,3 +29870,52 @@ fn searing_rays_each_player_chosen_color_count_lowers() {
     assert_eq!(tf.controller, Some(ControllerRef::ScopedPlayer));
     assert_eq!(*player_filter, PlayerFilter::All);
 }
+
+/// CR 120.1 + CR 701.26a: Angel's Trumpet — the end-step trigger's mass tap
+/// publishes its affected set, and the sibling damage sentence counts it via
+/// "the number of creatures tapped this way" (FilteredTrackedSetSize), dealing
+/// to the end-step player (ScopedPlayer).
+#[test]
+fn angels_trumpet_tapped_this_way_damage_lowers() {
+    let parsed = parse_oracle_text(
+        "At the beginning of each player's end step, tap all untapped creatures that player \
+         controls that didn't attack this turn. This artifact deals damage to the player equal \
+         to the number of creatures tapped this way.",
+        "Angel's Trumpet",
+        &[],
+        &["Artifact".to_string()],
+        &[],
+    );
+    let trigger = parsed.triggers.first().expect("end-step trigger");
+    assert_eq!(trigger.mode, TriggerMode::Phase);
+    assert_eq!(trigger.phase, Some(Phase::End));
+    // First effect: the mass tap.
+    let tap = trigger.execute.as_deref().expect("tap effect present");
+    assert!(matches!(
+        &*tap.effect,
+        Effect::SetTapState {
+            scope: EffectScope::All,
+            state: TapStateChange::Tap,
+            ..
+        }
+    ));
+    // Sibling: the damage sentence counting the tapped-this-way set.
+    let deal = tap.sub_ability.as_deref().expect("damage sibling present");
+    let Effect::DealDamage { amount, target, .. } = &*deal.effect else {
+        panic!("expected DealDamage, got {:?}", deal.effect);
+    };
+    let QuantityExpr::Ref { qty } = amount else {
+        panic!("expected Ref amount, got {amount:?}");
+    };
+    let QuantityRef::FilteredTrackedSetSize { filter, .. } = qty else {
+        panic!("expected FilteredTrackedSetSize, got {qty:?}");
+    };
+    let TargetFilter::Typed(tf) = filter.as_ref() else {
+        panic!("expected Typed creature filter, got {filter:?}");
+    };
+    assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
+    assert!(
+        matches!(*target, TargetFilter::ScopedPlayer),
+        "the player = the end-step player, got {target:?}"
+    );
+}

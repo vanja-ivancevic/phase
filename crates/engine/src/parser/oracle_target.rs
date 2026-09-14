@@ -286,6 +286,25 @@ pub fn parse_event_context_ref(text: &str) -> Option<(TargetFilter, &str)> {
             value(TargetFilter::ParentTargetOwner, tag("its owner")),
             value(TargetFilter::ParentTargetOwner, tag("their owner")),
             value(TargetFilter::TriggeringPlayer, tag("that player")),
+            // CR 608.2c: "the player" in trigger context is synonymous with
+            // "that player" — an anaphoric reference to the triggering event's
+            // player (Angel's Trumpet: "deals damage to the player equal to
+            // the number of creatures tapped this way" on a per-player end-step
+            // trigger; the ctx rebinding resolves it to the end-step player).
+            // Composite-guarded: "the player or planeswalker" (Fathom Fleet
+            // Swordjack) is a disjunctive recipient, not a bare anaphor — the
+            // negative lookahead keeps the composite tail out of this arm so
+            // its long-standing diagnostic path is unchanged.
+            value(
+                TargetFilter::TriggeringPlayer,
+                terminated(
+                    tag("the player"),
+                    not(preceded(
+                        tag(" "),
+                        alt((tag("or player"), tag("or planeswalker"))),
+                    )),
+                ),
+            ),
             value(TargetFilter::TriggeringSource, tag("that source")),
             // CR 509.3d: on a per-blocker filtered block event, the blocker is
             // the event source.  This is the definite-article spelling used by

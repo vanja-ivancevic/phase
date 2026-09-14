@@ -637,6 +637,13 @@ pub(crate) fn parse_quantity_ref_with_context(
         if let Some(qty) = parse_filtered_landing_zone_this_way(&rest.to_ascii_lowercase()) {
             return Some(qty);
         }
+        // CR 120.1: "the number of <type> tapped this way" (Angel's Trumpet) —
+        // the mass-tap executor publishes its affected set as the latest
+        // tracked set; count it through the same filtered-tracked-set channel
+        // (cause None: the latest set IS the tap set of this resolution).
+        if let Some(qty) = parse_tapped_this_way_count(&rest.to_ascii_lowercase()) {
+            return Some(qty);
+        }
         // CR 301.5a + CR 303.4: "the number of <type> attached to <source>" counts
         // objects whose `attached_to` is the source ("him"/"her"/"~" all denote the
         // source — Whiplash's "where X is the number of Equipment attached to him";
@@ -2442,29 +2449,6 @@ fn parse_destroyed_or_sacrificed_this_way_filter(
     None
 }
 
-/// CR 608.2c + CR 400.7j + CR 701.8a: "the number of <type> {returned | put into
-/// a graveyard} this way" — count from the tracked set populated by the preceding
-/// bounce/destroy in the sub_ability chain. Mirrors
-/// `parse_destroyed_or_sacrificed_this_way_filter` but with a LANDING-ZONE suffix
-/// table (return-to-hand and put-into-graveyard) and `caused_by: None` — the
-/// tracked-set publication for these zone changes is not action-discriminated.
-///
-/// - "returned this way": Barrel Down Sokenzan ("twice the number of Mountains
-///   returned this way", via the "twice " recursion).
-/// - "put into a graveyard this way": Volcanic Eruption ("the number of Mountains
-///   put into a graveyard this way"). CR 701.8a: destroy moves the permanent to
-///   its owner's graveyard; CR 400.7j: the same effect can find those objects.
-///
-/// The type filter must be SPECIFIC and controller-agnostic to qualify (mirrors
-/// `parse_filtered_tracked_set_this_way`'s triviality rule, with an added
-/// controller guard):
-///
-/// - a generic/typeless "card" (`TypeFilter::Card` / empty) is the unfiltered
-///   count — return `None` so it stays unsupported (Builder's Bane's bare-card
-///   phrasings never silently count the whole set);
-/// - a controller-bearing prefix ("artifacts they controlled") expresses a
-///   per-recipient scope that a fixed tracked-set filter cannot represent, so it
-///   is rejected — Builder's Bane stays `Unimplemented` rather than mis-resolving.
 fn parse_filtered_landing_zone_this_way(lower: &str) -> Option<QuantityRef> {
     // Composed landing-zone tail grammar (one nom production, not a string-table
     // loop): `<type phrase> [that was|that were]? (returned | put into a
@@ -2502,6 +2486,59 @@ fn parse_filtered_landing_zone_this_way(lower: &str) -> Option<QuantityRef> {
     .parse(rest)
     .ok()?;
     let (rest, _) = tag::<_, _, OracleError<'_>>(" this way").parse(rest).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    Some(QuantityRef::FilteredTrackedSetSize {
+        filter: Box::new(filter),
+        caused_by: None,
+    })
+}
+
+/// CR 608.2c + CR 400.7j + CR 701.8a: "the number of <type> {returned | put into
+/// a graveyard} this way" — count from the tracked set populated by the preceding
+/// bounce/destroy in the sub_ability chain. Mirrors
+/// `parse_destroyed_or_sacrificed_this_way_filter` but with a LANDING-ZONE suffix
+/// table (return-to-hand and put-into-graveyard) and `caused_by: None` — the
+/// tracked-set publication for these zone changes is not action-discriminated.
+///
+/// - "returned this way": Barrel Down Sokenzan ("twice the number of Mountains
+///   returned this way", via the "twice " recursion).
+/// - "put into a graveyard this way": Volcanic Eruption ("the number of Mountains
+///   put into a graveyard this way"). CR 701.8a: destroy moves the permanent to
+///   its owner's graveyard; CR 400.7j: the same effect can find those objects.
+///
+/// The type filter must be SPECIFIC and controller-agnostic to qualify (mirrors
+/// `parse_filtered_tracked_set_this_way`'s triviality rule, with an added
+/// controller guard):
+///
+/// - a generic/typeless "card" (`TypeFilter::Card` / empty) is the unfiltered
+///   count — return `None` so it stays unsupported (Builder's Bane's bare-card
+///   phrasings never silently count the whole set);
+/// - a controller-bearing prefix ("artifacts they controlled") expresses a
+///   per-recipient scope that a fixed tracked-set filter cannot represent, so it
+///   is rejected — Builder's Bane stays `Unimplemented` rather than mis-resolving.
+///
+/// CR 120.1 + CR 701.26a: "the number of <type> tapped this way" (Angel's
+/// Trumpet) — count the mass-tap tracked set, filtered by the type phrase.
+/// Requires a concrete type filter (a bare "cards" tail is the unfiltered
+/// count shape and stays unsupported).
+fn parse_tapped_this_way_count(lower: &str) -> Option<QuantityRef> {
+    let (filter, remainder) = crate::parser::oracle_target::parse_type_phrase(lower);
+    match &filter {
+        TargetFilter::Typed(typed)
+            if !typed.type_filters.is_empty()
+                && !typed
+                    .type_filters
+                    .iter()
+                    .all(|t| matches!(t, TypeFilter::Card)) => {}
+        _ => return None,
+    }
+    let rest = remainder.trim_start();
+    let rest = tag::<_, _, OracleError<'_>>("tapped this way")
+        .parse(rest)
+        .ok()?
+        .0;
     if !rest.trim().is_empty() {
         return None;
     }
