@@ -19417,3 +19417,95 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod builders_bane_scoped_count_tests {
+    use super::*;
+    use crate::game::zones::create_object;
+    use crate::types::ability::{
+        ControllerRef, QuantityExpr, QuantityRef, TargetFilter, TypeFilter, TypedFilter,
+    };
+    use crate::types::card_type::CoreType;
+    use crate::types::game_state::LKISnapshot;
+    use crate::types::identifiers::CardId;
+
+    /// CR 120.3: Builder's Bane — the tracked-set count filtered by
+    /// `Typed { controller: ScopedPlayer }` resolves per DamageEachPlayer
+    /// recipient even when every member is dead (LKI path): P0 counts only
+    /// P0's artifact, P1 only P1's.
+    #[test]
+    fn filtered_tracked_set_size_honors_scoped_player_over_lki() {
+        let mut state = crate::game::engine::new_game(11);
+        let a0 = create_object(
+            &mut state,
+            CardId(9001),
+            PlayerId(0),
+            "P0 Artifact".into(),
+            Zone::Battlefield,
+        );
+        let a1 = create_object(
+            &mut state,
+            CardId(9002),
+            PlayerId(1),
+            "P1 Artifact".into(),
+            Zone::Battlefield,
+        );
+        for (id, owner, pname) in [
+            (a0, PlayerId(0), "P0 Artifact"),
+            (a1, PlayerId(1), "P1 Artifact"),
+        ] {
+            if let Some(obj) = state.objects.get_mut(&id) {
+                obj.card_types.core_types.push(CoreType::Artifact);
+            }
+            state.lki_cache.insert(
+                id,
+                LKISnapshot {
+                    name: pname.to_string(),
+                    token_image_ref: None,
+                    power: None,
+                    toughness: None,
+                    base_power: None,
+                    base_toughness: None,
+                    mana_value: 0,
+                    controller: owner,
+                    owner,
+                    card_types: vec![CoreType::Artifact],
+                    subtypes: vec![],
+                    supertypes: vec![],
+                    keywords: vec![],
+                    colors: vec![],
+                    chosen_attributes: vec![],
+                    counters: Default::default(),
+                    tapped: false,
+                    is_suspected: false,
+                    attachments: vec![],
+                },
+            );
+        }
+        // Remove both from play (sacrificed): only LKI remains.
+        for id in [a0, a1] {
+            state.objects.remove(&id);
+            state.battlefield.retain(|&b| b != id);
+        }
+        crate::game::effects::publish_tracked_set(&mut state, vec![a0, a1]);
+
+        let filter = TargetFilter::Typed(
+            TypedFilter::default()
+                .with_type(TypeFilter::Artifact)
+                .controller(ControllerRef::ScopedPlayer),
+        );
+        let expr = QuantityExpr::Ref {
+            qty: QuantityRef::FilteredTrackedSetSize {
+                filter: Box::new(filter),
+                caused_by: None,
+            },
+        };
+
+        let p0_count =
+            resolve_quantity_scoped_with_targets(&state, &expr, ObjectId(1), PlayerId(0), &[]);
+        let p1_count =
+            resolve_quantity_scoped_with_targets(&state, &expr, ObjectId(1), PlayerId(1), &[]);
+        assert_eq!(p0_count, 1, "P0 counts only their own dead artifact");
+        assert_eq!(p1_count, 1, "P1 counts only their own dead artifact");
+    }
+}

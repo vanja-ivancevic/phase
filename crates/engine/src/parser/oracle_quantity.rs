@@ -2457,17 +2457,22 @@ fn parse_filtered_landing_zone_this_way(lower: &str) -> Option<QuantityRef> {
     // over the landing-zone verb phrases, terminated by "this way".
     let (filter, remainder) = crate::parser::oracle_target::parse_type_phrase(lower);
 
-    // Require a specific, controller-agnostic type filter. A typeless or generic
-    // "card" filter is the unfiltered count; a controller-bearing filter is
-    // per-recipient (Builder's Bane) — both stay unsupported.
+    // Require a specific type filter. A typeless or generic "card" filter is
+    // the unfiltered count and stays unsupported. A controller-bearing filter
+    // is accepted ONLY when the controller is the per-recipient anaphor
+    // (ControllerRef::ScopedPlayer — "artifacts they controlled", Builder's
+    // Bane): parse_type_phrase maps the pronoun to ScopedPlayer, and
+    // resolve_quantity_scoped_with_targets threads each DamageEachPlayer
+    // recipient through the tracked-set count. Any other controller stays
+    // fail-closed.
     match &filter {
         TargetFilter::Typed(typed)
-            if typed.controller.is_none()
-                && !typed.type_filters.is_empty()
+            if !typed.type_filters.is_empty()
                 && !typed
                     .type_filters
                     .iter()
-                    .all(|t| matches!(t, TypeFilter::Card)) => {}
+                    .all(|t| matches!(t, TypeFilter::Card))
+                && matches!(typed.controller, None | Some(ControllerRef::ScopedPlayer)) => {}
         _ => return None,
     }
 
@@ -8240,13 +8245,35 @@ mod tests {
         );
     }
 
-    /// NEGATIVE (Builder's Bane guard): a controller-bearing prefix that leaves
-    /// a `parse_type_phrase` remainder must fail cleanly, not produce a
-    /// FilteredTrackedSetSize.
+    /// POSITIVE (Builder's Bane): the per-recipient controller anaphor
+    /// ("they controlled" → ScopedPlayer) now lowers to a real
+    /// FilteredTrackedSetSize — `resolve_quantity_scoped_with_targets` threads
+    /// each DamageEachPlayer recipient through the count.
     #[test]
-    fn artifacts_they_controlled_put_into_graveyard_this_way_is_none() {
+    fn artifacts_they_controlled_put_into_graveyard_this_way_lowers() {
         let result = parse_event_context_quantity(
             "the number of artifacts they controlled that were put into a graveyard this way",
+        );
+        let Some(QuantityExpr::Ref {
+            qty: QuantityRef::FilteredTrackedSetSize { filter, .. },
+        }) = result
+        else {
+            panic!("expected FilteredTrackedSetSize, got {result:?}");
+        };
+        let TargetFilter::Typed(tf) = filter.as_ref() else {
+            panic!("expected Typed filter, got {filter:?}");
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::ScopedPlayer));
+        assert_eq!(tf.type_filters, vec![TypeFilter::Artifact]);
+    }
+
+    /// NEGATIVE: a controller-bearing prefix that does NOT map to the
+    /// per-recipient anaphor (here `you controlled`) stays fail-closed — it
+    /// must not produce a FilteredTrackedSetSize.
+    #[test]
+    fn artifacts_you_controlled_put_into_graveyard_this_way_is_none() {
+        let result = parse_event_context_quantity(
+            "the number of artifacts you controlled that were put into a graveyard this way",
         );
         assert!(
             !matches!(
@@ -8255,7 +8282,7 @@ mod tests {
                     qty: QuantityRef::FilteredTrackedSetSize { .. },
                 })
             ),
-            "controller-bearing prefix must not become a clean FilteredTrackedSetSize, got {result:?}"
+            "non-anaphoric controller prefix must stay unsupported, got {result:?}"
         );
     }
 
@@ -9108,6 +9135,41 @@ mod searing_rays_tests {
             "the chosen-color property must be present, got {:?}",
             tf.properties
         );
+        assert_eq!(tf.controller, Some(ControllerRef::ScopedPlayer));
+    }
+}
+
+#[cfg(test)]
+mod builders_bane_tests {
+    use super::*;
+    use crate::parser::oracle_ir::context::ParseContext;
+    use crate::types::ability::ControllerRef;
+
+    /// CR 120.3: Builder's Bane — "the number of artifacts they controlled
+    /// that were put into a graveyard this way" lowers to
+    /// FilteredTrackedSetSize over artifacts controlled by the DamageEachPlayer
+    /// recipient (ScopedPlayer).
+    #[test]
+    fn builders_bane_per_recipient_landing_zone_count_lowers() {
+        let mut scoped = ParseContext {
+            relative_player_scope: Some(ControllerRef::ScopedPlayer),
+            ..Default::default()
+        };
+        let qty = parse_cda_quantity_with_context(
+            "the number of artifacts they controlled that were put into a graveyard this way",
+            &mut scoped,
+        )
+        .expect("Builder's Bane count must parse");
+        let QuantityExpr::Ref { qty } = qty else {
+            panic!("expected Ref quantity, got {qty:?}");
+        };
+        let QuantityRef::FilteredTrackedSetSize { filter, .. } = qty else {
+            panic!("expected FilteredTrackedSetSize, got {qty:?}");
+        };
+        let TargetFilter::Typed(tf) = filter.as_ref() else {
+            panic!("expected Typed filter, got {filter:?}");
+        };
+        assert_eq!(tf.type_filters, vec![TypeFilter::Artifact]);
         assert_eq!(tf.controller, Some(ControllerRef::ScopedPlayer));
     }
 }
