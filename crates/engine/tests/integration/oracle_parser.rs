@@ -1220,22 +1220,32 @@ fn note_mana_spent_grammar_accepts_a_hypothetical_sibling_wording() {
     );
 }
 
-/// Issue #6504 (coverage-honesty guard): Ice Cauldron prints Jeweled Amulet's
-/// sibling "note the type AND AMOUNT of mana spent..." / "add ... last noted
-/// type and amount of mana" pair, which `parse_note_mana_spent_clause` and
-/// `ManaProduction::NotedType` deliberately do not model (see the doc comment
-/// on `parse_note_mana_spent_clause`). A production-parser assertion — not
-/// just the isolated `parse_note_mana_spent_clause` unit tests — is required
-/// here: it proves the parser actually REACHES both noted-mana clauses
-/// (rather than failing earlier in the sentence for an unrelated reason) and
-/// that each still falls through to `Effect::Unimplemented`, so an upstream
-/// routing/fallback change can't silently start reporting Ice Cauldron as
-/// supported or partially supported. Paired with
-/// `jeweled_amulet_notes_and_reads_back_mana_type`'s positive full-Oracle
-/// assertion that the same grammar area reaches `Effect::NoteManaSpent` for
-/// Jeweled Amulet's singular-type wording.
+/// Issue #6504: Ice Cauldron prints Jeweled Amulet's sibling "note the type
+/// AND AMOUNT of mana spent..." / "add ... last noted type and amount of mana"
+/// pair. Both clauses now lower through the shared noted-mana building blocks:
+/// the note subject reaches `Effect::NoteManaSpent` (which stores the exact
+/// per-unit payment) and the mana clause reaches
+/// `ManaProduction::NotedTypeAndAmount` (which replays every noted unit, so
+/// the noted AMOUNT is `types.len()` rather than a separate field). A
+/// production-parser assertion — not just the isolated
+/// `parse_note_mana_spent_clause` unit tests — is required here so an upstream
+/// routing/fallback change can't silently regress either clause.
+///
+/// The trailing "Spend this mana only to cast the last card exiled with this
+/// artifact" rider is a *separate* source-linked-exile spend restriction the
+/// engine does not model yet, so it must remain an explicit
+/// `Effect::Unimplemented` in the mana ability's chain — otherwise the card
+/// would be reported as fully supported while silently dropping its cast
+/// restriction (coverage honesty).
 #[test]
-fn ice_cauldron_note_type_and_amount_stays_unimplemented() {
+fn ice_cauldron_notes_amount_and_reads_back_full_payment() {
+    use engine::types::ability::{AbilityDefinition, ManaProduction};
+
+    fn any_unimplemented(def: &AbilityDefinition) -> bool {
+        matches!(&*def.effect, Effect::Unimplemented { .. })
+            || def.sub_ability.as_deref().is_some_and(any_unimplemented)
+    }
+
     let result = parse(
         "{X}, {T}: You may exile a nonland card from your hand. You may cast that \
          card for as long as it remains exiled. Put a charge counter on this \
@@ -1272,26 +1282,34 @@ fn ice_cauldron_note_type_and_amount_stays_unimplemented() {
         .as_deref()
         .unwrap_or_else(|| panic!("counter has no note sub-ability: {counter_sub:#?}"));
     assert!(
-        matches!(&*note_sub.effect, Effect::Unimplemented { name, .. } if name == "note"),
-        "Ice Cauldron's 'type AND amount' noted-mana subject must stay \
-         Unimplemented, not be swallowed by parse_note_mana_spent_clause's \
-         singular-type grammar; got {:#?}",
+        matches!(&*note_sub.effect, Effect::NoteManaSpent),
+        "Ice Cauldron's 'type AND amount' noted-mana subject must lower to \
+         Effect::NoteManaSpent (the payment is stored per unit); got {:#?}",
         note_sub.effect
     );
 
-    // Second ability: the mana-producing "add ... last noted type and amount
-    // of mana" must not be matched by `ManaProduction::NotedType`'s
-    // singular-type pattern.
+    // Second ability: "Add this artifact's last noted type and amount of mana"
+    // must reach the full-payment production, not the singular-type one.
     let mana_ability = result
         .abilities
         .iter()
-        .find(|a| matches!(&*a.effect, Effect::Unimplemented { name, .. } if name == "add"))
-        .unwrap_or_else(|| panic!("no 'add' mana ability parsed: {:#?}", result.abilities));
+        .find(|a| matches!(&*a.effect, Effect::Mana { .. }))
+        .unwrap_or_else(|| panic!("no Mana ability parsed: {:#?}", result.abilities));
+    match &*mana_ability.effect {
+        Effect::Mana { produced, .. } => assert!(
+            matches!(produced, ManaProduction::NotedTypeAndAmount),
+            "expected ManaProduction::NotedTypeAndAmount, got {produced:#?}"
+        ),
+        other => unreachable!("filtered to Effect::Mana above, got {other:#?}"),
+    }
+
+    // Coverage honesty: the source-linked-exile cast restriction is not
+    // modelled, so it must still be an explicit Unimplemented somewhere in
+    // the ability's chain rather than silently dropped.
     assert!(
-        matches!(&*mana_ability.effect, Effect::Unimplemented { .. }),
-        "Ice Cauldron's 'last noted type and amount of mana' must stay \
-         Unimplemented, not be matched by ManaProduction::NotedType's \
-         singular-type pattern; got {:#?}",
-        mana_ability.effect
+        any_unimplemented(mana_ability),
+        "Ice Cauldron's 'Spend this mana only to cast the last card exiled \
+         with this artifact' rider must stay explicitly Unimplemented until \
+         the linked-exile spend restriction lands; got {mana_ability:#?}"
     );
 }

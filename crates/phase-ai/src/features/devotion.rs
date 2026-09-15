@@ -356,6 +356,7 @@ fn mana_production_count(
         | MP::ChoiceAmongExiledColors { .. }
         | MP::ChoiceAmongCombinations { .. }
         | MP::DistinctColorsAmongPermanents { .. }
+        | MP::NotedTypeAndAmount
         | MP::TriggerEventManaType => None,
     }
 }

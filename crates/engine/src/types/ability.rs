@@ -2756,6 +2756,12 @@ pub enum ManaProduction {
         #[serde(default = "default_quantity_one")]
         count: QuantityExpr,
     },
+    /// CR 106.1b + CR 608.2k (Ice Cauldron): produce the FULL last-noted
+    /// mana payment — every noted unit, in order, including duplicates and
+    /// colorless. Differs from `NotedType` (which repeats its first noted
+    /// type `count` times): the noted AMOUNT here is `types.len()`, the
+    /// number of units the noting activation actually spent.
+    NotedTypeAndAmount,
     /// CR 106.7: Produce mana of any color that a land an opponent controls could produce.
     /// Colors are computed dynamically at resolution time by inspecting opponent lands.
     OpponentLandColors {
@@ -2895,6 +2901,7 @@ impl ManaProduction {
             | ManaProduction::ChoiceAmongExiledColors { .. }
             | ManaProduction::ChoiceAmongCombinations { .. }
             | ManaProduction::DistinctColorsAmongPermanents { .. }
+            | ManaProduction::NotedTypeAndAmount
             | ManaProduction::TriggerEventManaType => {}
         }
     }
@@ -2969,6 +2976,7 @@ impl<'de> serde::Deserialize<'de> for ManaProduction {
                         #[serde(default = "default_quantity_one")]
                         count: QuantityExpr,
                     },
+                    NotedTypeAndAmount,
                     OpponentLandColors {
                         #[serde(default = "default_quantity_one")]
                         count: QuantityExpr,
@@ -3054,6 +3062,7 @@ impl<'de> serde::Deserialize<'de> for ManaProduction {
                     ManaProductionHelper::NotedType { count } => {
                         ManaProduction::NotedType { count }
                     }
+                    ManaProductionHelper::NotedTypeAndAmount => ManaProduction::NotedTypeAndAmount,
                     ManaProductionHelper::OpponentLandColors { count } => {
                         ManaProduction::OpponentLandColors { count }
                     }

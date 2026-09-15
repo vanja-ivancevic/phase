@@ -30711,6 +30711,7 @@ fn mana_production_with_count(
             filter: filter.clone(),
             contribution: *contribution,
         }),
+        ManaProduction::NotedTypeAndAmount => Some(ManaProduction::NotedTypeAndAmount),
         ManaProduction::Fixed { .. }
         | ManaProduction::Mixed { .. }
         | ManaProduction::ChoiceAmongExiledColors { .. }

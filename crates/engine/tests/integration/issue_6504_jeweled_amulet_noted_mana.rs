@@ -5,6 +5,10 @@
 //! mana). Before the fix, both clauses fell through to `Effect::Unimplemented`
 //! and the second ability produced no mana at all regardless of what was
 //! noted.
+//!
+//! Ice Cauldron's type-AND-amount sibling wording reuses the same building
+//! blocks: its note stores the exact per-unit payment and its mana ability
+//! replays every noted unit (see the Ice Cauldron tests at the bottom).
 
 use engine::game::effects::{bounce, copy_spell};
 use engine::game::scenario::{GameScenario, P0};
@@ -23,6 +27,23 @@ Note the type of mana spent to pay this activation cost. Activate only if there 
 charge counters on this artifact.\n\
 {T}, Remove a charge counter from this artifact: Add one mana of this artifact's last \
 noted type.";
+
+/// Ice Cauldron's type-AND-amount sibling wording: the noting activation's full
+/// per-unit payment must be stored, and the mana ability must replay every
+/// noted unit (`ManaProduction::NotedTypeAndAmount`), including duplicates and
+/// colorless (CR 106.1b + CR 608.2k; ruling: "if you spent {C}{C}{R}{R} on X,
+/// you get {C}{C}{R}{R} later even if X was 6").
+const ICE_CAULDRON_ORACLE: &str = "{R}{G}, {T}: Put a charge counter on this artifact and \
+note the type and amount of mana spent to pay this activation cost.\n\
+{T}, Remove a charge counter from this artifact: Add this artifact's last noted type and \
+amount of mana.";
+
+/// Colorless-capable variant: a {2} activation paid with two colorless units
+/// must note two units and replay two colorless mana.
+const ICE_CAULDRON_COLORLESS_ORACLE: &str = "{2}, {T}: Put a charge counter on this \
+artifact and note the type and amount of mana spent to pay this activation cost.\n\
+{T}, Remove a charge counter from this artifact: Add this artifact's last noted type and \
+amount of mana.";
 
 const CHARGE: fn() -> CounterType = || CounterType::Generic("charge".to_string());
 
@@ -609,5 +630,182 @@ fn jeweled_amulet_copied_activation_does_not_note_original_payment() {
         runner.state().objects[&amulet].noted_mana_spent(),
         Some([ManaType::Red].as_slice()),
         "the original activation must still note its own (red) payment"
+    );
+}
+
+/// Ice Cauldron's "note the type and amount / add the last noted type and
+/// amount" pair: the noting activation's whole per-unit payment must be stored
+/// and replayed in full. {R}{G} paid with one red and one green unit must note
+/// two entries and the mana ability must produce exactly two mana, one of each
+/// noted type — a singular-type read (or a hardcoded amount of one) would
+/// produce only one mana.
+#[test]
+fn ice_cauldron_replays_every_noted_unit_type_and_amount() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cauldron = scenario
+        .add_creature_from_oracle(P0, "Ice Cauldron", 0, 0, ICE_CAULDRON_ORACLE)
+        .as_artifact()
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]),
+            ManaUnit::new(ManaType::Green, ObjectId(0), false, vec![]),
+        ],
+    );
+    let mut runner = scenario.build();
+
+    // Charge: pay {R}{G}; both units are noted, one entry per unit.
+    runner.activate(cauldron, 0).resolve();
+    assert_eq!(
+        charge_counters(&runner, cauldron),
+        1,
+        "the charge ability must place exactly one charge counter"
+    );
+    assert_eq!(
+        pool_total(&runner, P0),
+        0,
+        "reach-guard: the charge must consume both paid units"
+    );
+    let noted = runner.state().objects[&cauldron]
+        .noted_mana_spent()
+        .expect("the charge activation must note its payment")
+        .to_vec();
+    assert_eq!(
+        noted.len(),
+        2,
+        "both paid units must be noted, one per unit (got {noted:?})"
+    );
+    assert!(
+        noted.contains(&ManaType::Red) && noted.contains(&ManaType::Green),
+        "the note must preserve both paid types (got {noted:?})"
+    );
+
+    // Ability 0's own {T} cost tapped the cauldron; untap so the mana
+    // ability's {T} cost is payable (they are unrelated costs on the same
+    // permanent).
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&cauldron)
+        .expect("cauldron must exist")
+        .tapped = false;
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: cauldron,
+            ability_index: 1,
+        })
+        .expect("activate the noted-amount mana ability");
+
+    assert_eq!(
+        pool_color(&runner, P0, ManaType::Red),
+        1,
+        "the noted red unit must be replayed"
+    );
+    assert_eq!(
+        pool_color(&runner, P0, ManaType::Green),
+        1,
+        "the noted green unit must be replayed"
+    );
+    assert_eq!(
+        pool_total(&runner, P0),
+        2,
+        "the noted AMOUNT (two units) must be produced, not a hardcoded one"
+    );
+    assert_eq!(
+        charge_counters(&runner, cauldron),
+        0,
+        "the mana ability must remove the charge counter it noted from"
+    );
+}
+
+/// CR 106.1b: colorless is a mana type, and Ice Cauldron's noted payment must
+/// replay colorless units too ({2} paid with two colorless mana produces two
+/// colorless mana — the ruling's "{C}{C}{R}{R} stays {C}{C}{R}{R}" case).
+#[test]
+fn ice_cauldron_replays_colorless_units() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cauldron = scenario
+        .add_creature_from_oracle(P0, "Ice Cauldron", 0, 0, ICE_CAULDRON_COLORLESS_ORACLE)
+        .as_artifact()
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+            ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+        ],
+    );
+    let mut runner = scenario.build();
+
+    runner.activate(cauldron, 0).resolve();
+    assert_eq!(charge_counters(&runner, cauldron), 1);
+    assert_eq!(
+        runner.state().objects[&cauldron].noted_mana_spent(),
+        Some([ManaType::Colorless, ManaType::Colorless].as_slice()),
+        "a {{2}} cost paid with two colorless units must note both colorless units"
+    );
+
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&cauldron)
+        .expect("cauldron must exist")
+        .tapped = false;
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: cauldron,
+            ability_index: 1,
+        })
+        .expect("activate the noted-amount mana ability");
+
+    assert_eq!(
+        pool_color(&runner, P0, ManaType::Colorless),
+        2,
+        "both noted colorless units must be replayed"
+    );
+}
+
+/// CR 106.5: with nothing noted (no charge activation ever resolved), the
+/// noted-amount production must add zero mana — never a default type or
+/// amount. A charge counter is placed directly so the mana ability's cost is
+/// payable without running the noting ability.
+#[test]
+fn ice_cauldron_produces_no_mana_with_nothing_noted() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cauldron = scenario
+        .add_creature_from_oracle(P0, "Ice Cauldron", 0, 0, ICE_CAULDRON_ORACLE)
+        .as_artifact()
+        .id();
+    scenario.with_counter(cauldron, CHARGE(), 1);
+    let mut runner = scenario.build();
+
+    assert_eq!(
+        pool_total(&runner, P0),
+        0,
+        "reach-guard: pool must start empty"
+    );
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: cauldron,
+            ability_index: 1,
+        })
+        .expect("activate the noted-amount mana ability");
+
+    assert_eq!(
+        pool_total(&runner, P0),
+        0,
+        "CR 106.5: no noted payment must produce no mana"
+    );
+    assert_eq!(
+        charge_counters(&runner, cauldron),
+        0,
+        "the charge counter is still removed even though no mana was produced"
     );
 }

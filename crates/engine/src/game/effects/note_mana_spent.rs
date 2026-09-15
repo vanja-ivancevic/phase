@@ -5,11 +5,11 @@ use crate::types::game_state::GameState;
 /// CR 106.1b + CR 602.2b + CR 608.2c: `Effect::NoteManaSpent` — record the mana
 /// type(s) spent to pay this resolving ability's own activation cost onto its
 /// source as `ChosenAttribute::NotedManaSpent` ("Note the type of mana spent to
-/// pay this activation cost" — Jeweled Amulet). Scoped to the singular-type
-/// wording only: Ice Cauldron's sibling "note the type AND AMOUNT..." needs an
-/// exact stored multiset plus a spend restriction, which this building block
-/// does not model — that text is intentionally left unmatched by the parser
-/// and still reports `Effect::unimplemented`.
+/// pay this activation cost" — Jeweled Amulet; Ice Cauldron's "note the type
+/// AND AMOUNT…" wording lowers to the same effect). The stored value is the
+/// exact per-unit payment, so the reader chooses one type
+/// (`ManaProduction::NotedType`) or every noted unit
+/// (`ManaProduction::NotedTypeAndAmount`).
 ///
 /// Composable building block: cost payment stays in the mana-payment funnel;
 /// `push_ability_entry` (the single authority where an activated ability
@@ -19,7 +19,8 @@ use crate::types::game_state::GameState;
 /// mutable field, so a permanent untapped and reactivated with a different
 /// payment while this ability still sits unresolved on the stack cannot
 /// corrupt what this instance observed. This effect is the persistent writer,
-/// read back by `ManaProduction::NotedType`. Doing the write at resolution —
+/// read back by `ManaProduction::NotedType` / `ManaProduction::NotedTypeAndAmount`.
+/// Doing the write at resolution —
 /// not at payment time — means a countered or otherwise removed-from-stack
 /// ability never notes anything (CR 608.2c: instructions are followed only on
 /// resolution).

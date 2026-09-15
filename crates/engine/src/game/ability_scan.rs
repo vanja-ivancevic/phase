@@ -5689,6 +5689,13 @@ fn scan_mana_production(p: &ManaProduction, mode: ScanMode) -> Axes {
             projected: false,
         }
         .or(scan_quantity_expr(count, mode)),
+        // Same mutable per-object state, read as the full noted payment; the
+        // amount is dynamic (`types.len()`), so there is no `QuantityExpr`.
+        ManaProduction::NotedTypeAndAmount => Axes {
+            event: false,
+            sibling: true,
+            projected: false,
+        },
         // SCOPED-OBJECT (Omnath, Locus of All): a SINGLE scoped object's colors,
         // NOT a board aggregate — the scope's own read surface is the sole sibling
         // source (CR 202.2c). NO own sibling literal.

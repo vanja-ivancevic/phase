@@ -10302,10 +10302,13 @@ fn parse_behold_effect_ast(text: &str, lower: &str) -> Option<ImperativeFamilyAs
     Some(ImperativeFamilyAst::Behold(filter))
 }
 
-/// "Note [the] type of mana spent to pay this [activation] cost", composed
-/// from the instruction, subject, and cost-referent grammar axes. The
-/// type-and-amount wording remains unsupported because it needs a distinct
-/// durable value model.
+/// "Note [the] type [and amount] of mana spent to pay this [activation] cost",
+/// composed from the instruction, subject, and cost-referent grammar axes.
+/// Both the singular-type wording (Jeweled Amulet) and the type-and-amount
+/// wording (Ice Cauldron) lower to `Effect::NoteManaSpent`: the effect records
+/// the exact per-unit payment, so the reader decides whether to use one type
+/// (`ManaProduction::NotedType`) or every noted unit
+/// (`ManaProduction::NotedTypeAndAmount`).
 fn parse_note_mana_spent_clause(input: &str) -> OracleResult<'_, ()> {
     value(
         (),
@@ -10321,7 +10324,13 @@ fn parse_note_mana_spent_clause(input: &str) -> OracleResult<'_, ()> {
 fn parse_note_instruction_prefix(input: &str) -> OracleResult<'_, ()> {
     value(
         (),
-        preceded(tag("note "), preceded(opt(tag("the ")), tag("type"))),
+        preceded(
+            tag("note "),
+            preceded(
+                opt(tag("the ")),
+                terminated(tag("type"), opt(tag(" and amount"))),
+            ),
+        ),
     )
     .parse(input)
 }

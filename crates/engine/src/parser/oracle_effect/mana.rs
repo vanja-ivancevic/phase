@@ -1491,6 +1491,20 @@ fn scan_mana_production_type(
                 },
                 alt((tag("mana of the chosen color"), tag("mana of that color"))),
             ),
+            // CR 106.1b + CR 608.2k (Ice Cauldron): "Add this artifact's last
+            // noted type and amount of mana" (`~` normalized from "this
+            // artifact" upstream). The noted payment stores one entry per unit
+            // actually spent, so production replays every noted unit in order
+            // and the amount is that list's length rather than a separate
+            // field. Tried before the bare `NotedType` arm below.
+            value(
+                ManaProduction::NotedTypeAndAmount,
+                alt((
+                    tag("~'s last noted type and amount of mana"),
+                    tag("~’s last noted type and amount of mana"),
+                    tag("this artifact's last noted type and amount of mana"),
+                )),
+            ),
             // CR 106.1b: "mana of ~'s last noted type" (Jeweled Amulet: "Add
             // one mana of this artifact's last noted type" — `~` normalized
             // from "this artifact" upstream). Engine-set (`Effect::

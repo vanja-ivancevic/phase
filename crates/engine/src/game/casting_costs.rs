@@ -12299,7 +12299,9 @@ pub(crate) fn production_override_for_option(
         // the produced type is fixed by engine-set state read at production
         // time (`noted_mana_type_for`), not chosen per auto-tap option — no
         // override needed, and CR 106.5 governs the no-noted-type case.
+        // `NotedTypeAndAmount` reads the same engine-set state (full payment).
         | crate::types::ability::ManaProduction::NotedType { .. }
+        | crate::types::ability::ManaProduction::NotedTypeAndAmount
         | crate::types::ability::ManaProduction::TriggerEventManaType => None,
     }
 }

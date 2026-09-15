@@ -2953,6 +2953,7 @@ fn lift_mana_production_quantities_to_triggering_source(produced: &mut ManaProdu
         | ManaProduction::ChoiceAmongExiledColors { .. }
         | ManaProduction::ChoiceAmongCombinations { .. }
         | ManaProduction::DistinctColorsAmongPermanents { .. }
+        | ManaProduction::NotedTypeAndAmount
         | ManaProduction::TriggerEventManaType => {}
     }
 }

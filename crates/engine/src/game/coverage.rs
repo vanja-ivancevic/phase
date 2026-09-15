@@ -2111,6 +2111,7 @@ fn fmt_mana_production(mp: &ManaProduction) -> String {
         ManaProduction::NotedType { count } => {
             format!("{} of noted type", fmt_quantity(count))
         }
+        ManaProduction::NotedTypeAndAmount => "last noted type and amount".into(),
         ManaProduction::OpponentLandColors { count } => {
             format!("{} of opponent land colors", fmt_quantity(count))
         }

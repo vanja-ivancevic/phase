@@ -1701,6 +1701,23 @@ pub fn display_land_mana_pips(
                     }
                 }
             }
+            // CR 106.1b + CR 608.2k: the full noted payment (Ice Cauldron
+            // class) — one pip per distinct noted unit type.
+            ManaProduction::NotedTypeAndAmount => {
+                if let Some(units) = state
+                    .objects
+                    .get(&object_id)
+                    .and_then(|obj| obj.noted_mana_spent())
+                {
+                    for &mana_type in units {
+                        if let Some(color) = mana_type_to_color(mana_type) {
+                            push(&mut pips, ManaPip::Color(color));
+                        } else {
+                            push(&mut pips, ManaPip::Colorless);
+                        }
+                    }
+                }
+            }
             // CR 106.7: Dynamically computed from opponent lands.
             ManaProduction::OpponentLandColors { .. } => {
                 let colors: Vec<ManaColor> = opponent_land_color_options(state, controller)
@@ -3033,6 +3050,24 @@ fn mana_options_from_production(
             super::effects::mana::noted_mana_type_for(state, object_id)
                 .into_iter()
                 .collect()
+        }
+        // CR 106.1b + CR 608.2k: the full noted payment (Ice Cauldron class) —
+        // every noted unit's type. Duplicates collapse to one option; the
+        // per-unit amount is carried by the production's own resolution.
+        ManaProduction::NotedTypeAndAmount => {
+            let mut options = Vec::new();
+            if let Some(units) = state
+                .objects
+                .get(&object_id)
+                .and_then(|obj| obj.noted_mana_spent())
+            {
+                for &mana_type in units {
+                    if !options.contains(&mana_type) {
+                        options.push(mana_type);
+                    }
+                }
+            }
+            options
         }
         // CR 106.7: Compute colors dynamically from opponent-controlled lands.
         ManaProduction::OpponentLandColors { .. } => opponent_land_color_options(state, controller),

@@ -575,6 +575,12 @@ fn project_mana_production(p: &ManaProduction) -> (Vec<(usize, i64)>, AxisMagnit
         | ManaProduction::TriggerEventManaType => {
             (vec![(COLORLESS_INDEX, 1)], AxisMagnitude::Fixed(1))
         }
+        // CR 106.1b + CR 608.2k (Ice Cauldron): the amount is the engine-set
+        // noted payment's length — dynamic, like a `count_seed` non-fixed
+        // quantity, so the axis is unbounded.
+        ManaProduction::NotedTypeAndAmount => {
+            (vec![(COLORLESS_INDEX, 1)], AxisMagnitude::Unbounded)
+        }
         ManaProduction::DistinctColorsAmongPermanents { .. } => {
             (vec![(COLORLESS_INDEX, 1)], AxisMagnitude::Unbounded)
         }

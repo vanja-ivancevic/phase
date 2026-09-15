@@ -761,12 +761,13 @@ pub(crate) enum ImperativeFamilyAst {
     Behold(TargetFilter),
     /// CR 701.48a: Learn.
     Learn,
-    /// CR 106.1b + CR 602.2b: "note the type of mana spent to pay this
-    /// activation cost" (Jeweled Amulet). Field-less: there is nothing to
-    /// select — the payment already happened, so the effect is a pure
-    /// readback recorded at resolution. Scoped to the singular-type wording;
-    /// Ice Cauldron's "note the type AND AMOUNT..." sibling is intentionally
-    /// left unmatched (see `parse_imperative_family_ast`).
+    /// CR 106.1b + CR 602.2b: "note the type [and amount] of mana spent to pay
+    /// this activation cost" (Jeweled Amulet, Ice Cauldron). Field-less: there
+    /// is nothing to select — the payment already happened, so the effect is a
+    /// pure readback recorded at resolution. Both wordings lower here: the
+    /// stored value is the exact per-unit payment, and the reader chooses
+    /// `ManaProduction::NotedType` (one type) or
+    /// `ManaProduction::NotedTypeAndAmount` (every noted unit).
     NoteManaSpent,
     /// CR 701.40a: Manifest the top card(s) of library.
     Manifest {

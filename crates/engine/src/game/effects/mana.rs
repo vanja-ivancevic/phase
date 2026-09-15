@@ -751,6 +751,15 @@ fn resolve_mana_types_impl(
                 None => Vec::new(),
             }
         }
+        // CR 106.1b + CR 608.2k (Ice Cauldron): replay the FULL noted payment —
+        // every noted unit in order, duplicates and colorless included. The
+        // amount was noted alongside the types (NotedManaPayment.types holds
+        // one entry per spent unit), so the list length IS the amount.
+        ManaProduction::NotedTypeAndAmount => state
+            .objects
+            .get(&source_id)
+            .and_then(|obj| obj.noted_mana_spent().map(|units| units.to_vec()))
+            .unwrap_or_default(),
         // CR 106.7: Produce mana of any color that a land an opponent controls could produce.
         // Delegates to mana_sources::opponent_land_color_options for the shared computation.
         ManaProduction::OpponentLandColors { count } => {
