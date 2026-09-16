@@ -53432,6 +53432,52 @@ fn cyber_conversion_turn_face_down_with_cyberman_body() {
     );
 }
 
+/// CR 708.2a (Backslide / Master of the Veil / Weaver of Lies): "turn [any
+/// number of] target creature(s) with a morph ability / with morph abilities
+/// [other than this creature] face down" must lower to `Effect::TurnFaceDown`
+/// with the morph-presence filter (`HasKeywordKind(Morph)`) — previously the
+/// unmodeled "with a morph ability" subject remainder fell through to
+/// `Effect::Unimplemented` (fail-closed) rather than silently widening the
+/// legal-target set to every creature.
+#[test]
+fn turn_face_down_with_morph_ability_subject_parses() {
+    // Backslide: singular subject with the article form.
+    let chain = parse_effect_chain(
+        "Turn target creature with a morph ability face down.",
+        AbilityKind::Spell,
+    );
+    let Effect::TurnFaceDown { target, .. } = &*chain.effect else {
+        panic!("expected TurnFaceDown, got: {:?}", chain.effect);
+    };
+    let crate::types::ability::TargetFilter::Typed(typed) = target else {
+        panic!("expected a typed filter, got: {target:?}");
+    };
+    assert!(
+        typed.properties.iter().any(|p| matches!(
+            p,
+            crate::types::ability::FilterProp::HasKeywordKind {
+                value: crate::types::keywords::KeywordKind::Morph,
+            }
+        )),
+        "the subject must carry the morph-presence filter, got {:?}",
+        typed.properties
+    );
+
+    // Weaver of Lies: plural subject, article-less phrase, "other than ~".
+    let chain = parse_effect_chain(
+        "Turn any number of target creatures with morph abilities other than \
+         this creature face down.",
+        AbilityKind::Spell,
+    );
+    let Effect::TurnFaceDown { target, .. } = &*chain.effect else {
+        panic!("expected TurnFaceDown, got: {:?}", chain.effect);
+    };
+    assert!(
+        format!("{target:?}").contains("Morph"),
+        "the plural subject must keep the morph-presence filter, got: {target:?}"
+    );
+}
+
 #[test]
 fn mondassian_colony_ship_turn_face_down_becomes_cyberman_body() {
     // CR 708.2a + CR 205.1a: Mondassian Colony Ship — "Turn target creature

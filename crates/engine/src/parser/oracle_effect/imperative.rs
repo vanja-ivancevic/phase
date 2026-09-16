@@ -19056,16 +19056,18 @@ mod tests {
         );
     }
 
-    /// CR 608.2b: "turn target creature with a morph ability face down" (Backslide)
-    /// carries a target restriction ("with a morph ability") the parser cannot
-    /// model. Rather than silently drop it — which would illegally widen the
-    /// legal-target set to any creature — the verb arm must reject the clause
-    /// (returning `None`) so it falls through to `Unimplemented`. The unrestricted
-    /// "turn target creature face down" still parses, pinning the guard's other
-    /// end.
+    /// CR 608.2b: a turn-face-down subject carrying a target restriction the
+    /// parser cannot model must be REJECTED (returning `None`) so the clause
+    /// falls through to `Unimplemented`, rather than silently dropping the
+    /// restriction — which would illegally widen the legal-target set to any
+    /// creature. "with a morph ability" IS modeled now (Backslide parses to
+    /// `TurnFaceDown` with a `HasKeywordKind(Morph)` filter — see
+    /// `turn_face_down_with_morph_ability_subject_parses`), so the guard uses a
+    /// genuinely unmodeled restriction. The unrestricted "turn target creature
+    /// face down" still parses, pinning the guard's other end.
     #[test]
     fn turn_face_down_with_unmodeled_restriction_falls_through() {
-        let text = "turn target creature with a morph ability face down";
+        let text = "turn target creature with a mythic ability face down";
         let lower = text.to_lowercase();
         let ast = parse_imperative_family_ast(text, &lower, &mut ParseContext::default());
         assert!(

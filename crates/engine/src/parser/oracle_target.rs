@@ -7604,6 +7604,16 @@ fn parse_keyword_match(text: &str) -> Option<KeywordMatch> {
         return Some(KeywordMatch::Kind(kind));
     }
 
+    // CR 708.2a (Backslide / Master of the Veil / Weaver of Lies): "with a
+    // morph ability" / "with morph abilities" — the noun-phrase form of a
+    // keyword-kind presence filter. Morph carries a payload cost, so the
+    // filter must match by discriminant (`HasKeywordKind(Morph)`), the same
+    // reasoning as the foretell/miracle meta-references above. The singular
+    // form takes the article ("a morph ability"), the plural drops it.
+    if matches!(text, "a morph ability" | "morph abilities") {
+        return Some(KeywordMatch::Kind(KeywordKind::Morph));
+    }
+
     let keyword = Keyword::from_str(text).ok()?;
     if matches!(keyword, Keyword::Unknown(_))
         && !matches!(
