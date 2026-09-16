@@ -4192,6 +4192,7 @@ fn scan_static_condition(x: &StaticCondition, mode: ScanMode) -> Axes {
         StaticCondition::DuringYourTurn => Axes::NONE,
         StaticCondition::DuringOpponentsTurn => Axes::NONE,
         StaticCondition::SharesColorWithMostCommonColorAmongPermanents => Axes::NONE,
+        StaticCondition::ColorIsMostCommonAmongPermanents { .. } => Axes::NONE,
         StaticCondition::SourceEnteredThisTurn => Axes {
             event: false,
             sibling: false,

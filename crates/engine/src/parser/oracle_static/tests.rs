@@ -31643,6 +31643,50 @@ fn heroic_defiance_pt_grant_gated_on_most_common_color() {
     );
 }
 
+/// CR 105.2 (Goham/Halam/Ruham/Sulam/Zanam Djinn): the Prophecy djinn P/T
+/// penalty must parse the modification AND attach the fixed-color condition —
+/// "gets -2/-2 as long as black is the most common color among all permanents
+/// or is tied for most common" gates on `ColorIsMostCommonAmongPermanents`.
+/// Both phrasings (with and without the redundant tie tail) lower to the same
+/// condition, and the condition must NOT fall through to `Unrecognized`.
+#[test]
+fn prophecy_djinn_pt_penalty_gated_on_fixed_most_common_color() {
+    for text in [
+        "This creature gets -2/-2 as long as black is the most common color among \
+         all permanents or is tied for most common.",
+        "This creature gets -2/-2 as long as blue is the most common color among \
+         all permanents.",
+    ] {
+        let defs = parse_static_line_multi(text);
+        let penalty = defs
+            .iter()
+            .find(|d| d.mode == StaticMode::Continuous)
+            .unwrap_or_else(|| panic!("a continuous P/T penalty for {text}"));
+        assert!(
+            penalty
+                .modifications
+                .contains(&ContinuousModification::AddPower { value: -2 })
+                && penalty
+                    .modifications
+                    .contains(&ContinuousModification::AddToughness { value: -2 }),
+            "penalty must be -2/-2, got {:?}",
+            penalty.modifications
+        );
+        let expected = if text.contains("black") {
+            ManaColor::Black
+        } else {
+            ManaColor::Blue
+        };
+        assert_eq!(
+            penalty.condition,
+            Some(StaticCondition::ColorIsMostCommonAmongPermanents {
+                color: expected,
+            }),
+            "the -2/-2 must be gated on the fixed-color most-common condition"
+        );
+    }
+}
+
 /// CR 509.1b (#4590 review): a granted ability's OWN inner "unless" must stay
 /// inside the quoted ability — the attached-subject grant parser must not lift it
 /// onto the static grant as a condition. Coral Net grants a triggered ability

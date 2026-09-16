@@ -6,7 +6,8 @@ use crate::game::arithmetic::saturating_pt_add;
 use crate::game::conditions::{
     counter_condition_matches, eval_chosen_label_is, eval_class_level_ge, eval_has_city_blessing,
     eval_has_enduring_story, eval_is_initiative, eval_is_monarch, eval_no_monarch,
-    eval_recipient_attacking_owner_target, eval_shares_color_with_most_common_color,
+    eval_color_is_most_common, eval_recipient_attacking_owner_target,
+    eval_shares_color_with_most_common_color,
     eval_source_entered_this_turn, eval_source_has_dealt_damage, eval_source_in_zone,
     eval_source_is_attacking, eval_source_is_tapped_on_battlefield,
 };
@@ -1085,6 +1086,8 @@ fn static_condition_uses_object_population(condition: &StaticCondition) -> bool 
         StaticCondition::DevotionGE { .. } => true,
         // Reads the color histogram over every battlefield permanent.
         StaticCondition::SharesColorWithMostCommonColorAmongPermanents => true,
+        // Same histogram read, for a FIXED color (Prophecy djinns).
+        StaticCondition::ColorIsMostCommonAmongPermanents { .. } => true,
         // "you control [filter]" / "a [filter] is on the battlefield" — membership
         // is battlefield population. `IsPresent` has no zone field (always a
         // battlefield-presence check), so it is unconditionally population
@@ -1215,6 +1218,9 @@ fn static_condition_characteristic_reads_at(
         }
         // CR 105.1: color histogram over every battlefield permanent.
         StaticCondition::SharesColorWithMostCommonColorAmongPermanents => {
+            CharacteristicKinds::COLOR
+        }
+        StaticCondition::ColorIsMostCommonAmongPermanents { .. } => {
             CharacteristicKinds::COLOR
         }
         // CR 109.4: "you control [filter]" — controller-scoped membership over a
@@ -1379,6 +1385,7 @@ fn entered_object_perturbs_static_condition(
         StaticCondition::ControlsCommander { .. } => true,
         // A colored permanent entering can shift the most-common-color histogram.
         StaticCondition::SharesColorWithMostCommonColorAmongPermanents => true,
+        StaticCondition::ColorIsMostCommonAmongPermanents { .. } => true,
         StaticCondition::And { conditions } | StaticCondition::Or { conditions } => conditions
             .iter()
             .any(|c| entered_object_perturbs_static_condition(state, entered_id, ctx, c)),
@@ -1663,6 +1670,9 @@ fn evaluate_condition_with_context(
         // evaluated without a recipient (the source gate defers to per-recipient).
         StaticCondition::SharesColorWithMostCommonColorAmongPermanents => {
             eval_shares_color_with_most_common_color(state, recipient_id.unwrap_or(source_id))
+        }
+        StaticCondition::ColorIsMostCommonAmongPermanents { color } => {
+            eval_color_is_most_common(state, *color)
         }
         StaticCondition::SourceEnteredThisTurn => eval_source_entered_this_turn(state, source_id),
         // CR 120.3 + CR 120.6 + CR 702.11b: True once the source has actually dealt
@@ -3703,6 +3713,7 @@ fn static_condition_reads_life(condition: &StaticCondition) -> bool {
         | StaticCondition::DuringYourTurn
         | StaticCondition::DuringOpponentsTurn
         | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
+        | StaticCondition::ColorIsMostCommonAmongPermanents { .. }
         | StaticCondition::SourceEnteredThisTurn
         | StaticCondition::SourceHasDealtDamage
         | StaticCondition::WasCast { .. }

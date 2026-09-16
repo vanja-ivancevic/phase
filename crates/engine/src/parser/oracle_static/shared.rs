@@ -3486,6 +3486,14 @@ pub(crate) fn parse_static_condition(text: &str) -> Option<StaticCondition> {
         return Some(condition);
     }
 
+    // CR 105.2: "<color> is the most common color among all permanents[ or is
+    // tied for most common]" (the Prophecy djinns). The tie tail is redundant —
+    // the runtime predicate treats every color at the maximum histogram count
+    // as most-common — so both phrasings map to the same condition.
+    if let Some(condition) = parse_color_is_most_common_color_condition(tp.lower) {
+        return Some(condition);
+    }
+
     // "the chosen color is [color]"
     if let Some(color_name) = nom_tag_lower(tp.lower, tp.lower, "the chosen color is ") {
         let trimmed = color_name.trim().trim_end_matches('.');
@@ -4317,6 +4325,29 @@ pub(crate) fn parse_shares_most_common_color_condition(lower: &str) -> Option<St
     rest.trim()
         .is_empty()
         .then_some(StaticCondition::SharesColorWithMostCommonColorAmongPermanents)
+}
+
+/// CR 105.2: "<color> is the most common color among all permanents[ or is
+/// tied for most common]" (Goham/Halam/Ruham/Sulam/Zanam Djinn) →
+/// `ColorIsMostCommonAmongPermanents { color }`. The optional "or is tied for
+/// most common" tail is redundant — the runtime predicate already treats every
+/// color at the maximum count as most-common — so both phrasings map to the
+/// same condition.
+pub(crate) fn parse_color_is_most_common_color_condition(lower: &str) -> Option<StaticCondition> {
+    let (rest, color) = nom_primitives::parse_color.parse(lower).ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(
+        " is the most common color among all permanents",
+    )
+    .parse(rest)
+    .ok()?;
+    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(
+        " or is tied for most common",
+    ))
+    .parse(rest)
+    .ok()?;
+    rest.trim()
+        .is_empty()
+        .then_some(StaticCondition::ColorIsMostCommonAmongPermanents { color })
 }
 
 /// CR 611.3a: "[N] or more [type] are on the battlefield" → a count

@@ -541,6 +541,7 @@ fn static_condition_to_restriction_condition(
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
         | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
+        | StaticCondition::ColorIsMostCommonAmongPermanents { .. }
         | StaticCondition::SourceHasDealtDamage
         | StaticCondition::WasCast { .. }
         | StaticCondition::IsRingBearer

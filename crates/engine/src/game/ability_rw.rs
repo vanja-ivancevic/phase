@@ -2057,6 +2057,7 @@ fn legacy_static_condition(x: &StaticCondition) -> bool {
         StaticCondition::Not { condition } => legacy_static_condition(condition),
         StaticCondition::DevotionGE { .. }
         | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
+        | StaticCondition::ColorIsMostCommonAmongPermanents { .. }
         | StaticCondition::IsPresent { .. }
         | StaticCondition::DefendingPlayerControls { .. }
         | StaticCondition::HasCounters { .. }
@@ -6794,7 +6795,8 @@ fn rw_static_condition(x: &StaticCondition) -> RwProfile {
         // entirely determined by the monarch subject scope.
         StaticCondition::IsMonarch { player } => rw_player_scope(player),
         StaticCondition::DevotionGE { .. }
-        | StaticCondition::SharesColorWithMostCommonColorAmongPermanents => reads_zone_membership(),
+        | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
+        | StaticCondition::ColorIsMostCommonAmongPermanents { .. } => reads_zone_membership(),
         StaticCondition::IsPresent { filter } => match filter {
             Some(f) => board_membership_read(f),
             None => reads_zone_membership(),

@@ -4716,6 +4716,9 @@ fn fmt_static_condition(cond: &StaticCondition) -> String {
         SC::SharesColorWithMostCommonColorAmongPermanents => {
             "shares a color with the most common color among all permanents".into()
         }
+        SC::ColorIsMostCommonAmongPermanents { .. } => {
+            "color is the most common color among all permanents".into()
+        }
         SC::SourceEnteredThisTurn => "source entered this turn".into(),
         SC::SourceHasDealtDamage => "source has dealt damage".into(),
         SC::WasCast { zone } => match zone {
@@ -8810,6 +8813,9 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::DayNightIs { .. } => ("DayNightIs", Handled),
         StaticCondition::SharesColorWithMostCommonColorAmongPermanents => {
             ("SharesColorWithMostCommonColorAmongPermanents", Handled)
+        }
+        StaticCondition::ColorIsMostCommonAmongPermanents { .. } => {
+            ("ColorIsMostCommonAmongPermanents", Handled)
         }
         StaticCondition::SourceEnteredThisTurn => ("SourceEnteredThisTurn", Handled),
         StaticCondition::SourceHasDealtDamage => ("SourceHasDealtDamage", Handled),

@@ -8,6 +8,7 @@ use crate::game::combat::AttackTarget;
 use crate::game::game_object::{AttachTarget, GameObject};
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterMatch;
+use crate::types::mana::ManaColor;
 use crate::types::game_state::{GameState, LKISnapshot};
 use crate::types::identifiers::ObjectId;
 use crate::types::player::PlayerId;
@@ -208,19 +209,7 @@ pub(crate) fn eval_shares_color_with_most_common_color(
     state: &GameState,
     source_id: ObjectId,
 ) -> bool {
-    use crate::types::mana::ManaColor;
-    use std::collections::HashMap;
-
-    // CR 105.2a: only the five colors count; the histogram is over every colored
-    // battlefield permanent (the source itself included).
-    let mut counts: HashMap<ManaColor, usize> = HashMap::new();
-    for &id in crate::game::targeting::zone_object_ids(state, Zone::Battlefield).iter() {
-        if let Some(obj) = state.objects.get(&id) {
-            for color in &obj.color {
-                *counts.entry(*color).or_insert(0) += 1;
-            }
-        }
-    }
+    let counts = battlefield_color_histogram(state);
     let Some(&max) = counts.values().max() else {
         return false; // no colored permanent — there is no "most common color"
     };
@@ -230,6 +219,36 @@ pub(crate) fn eval_shares_color_with_most_common_color(
         .objects
         .get(&source_id)
         .is_some_and(|source| source.color.iter().any(|c| counts.get(c) == Some(&max)))
+}
+
+/// CR 105.2: True when `color` is the most common color among all battlefield
+/// permanents, including any color tied for most common. Backs
+/// `StaticCondition::ColorIsMostCommonAmongPermanents` (the Prophecy djinns).
+/// With no colored permanent on the battlefield there is no "most common
+/// color", so the predicate is false.
+pub(crate) fn eval_color_is_most_common(state: &GameState, color: ManaColor) -> bool {
+    let counts = battlefield_color_histogram(state);
+    let Some(&max) = counts.values().max() else {
+        return false;
+    };
+    counts.get(&color) == Some(&max)
+}
+
+/// CR 105.2a: the per-color histogram over every colored battlefield permanent
+/// (the source itself included); only the five colors count.
+fn battlefield_color_histogram(state: &GameState) -> std::collections::HashMap<ManaColor, usize> {
+    use crate::types::mana::ManaColor;
+    use std::collections::HashMap;
+
+    let mut counts: HashMap<ManaColor, usize> = HashMap::new();
+    for &id in crate::game::targeting::zone_object_ids(state, Zone::Battlefield).iter() {
+        if let Some(obj) = state.objects.get(&id) {
+            for color in &obj.color {
+                *counts.entry(*color).or_insert(0) += 1;
+            }
+        }
+    }
+    counts
 }
 
 /// CR 301.5 + CR 303.4: True when the source object is attached to a creature
@@ -347,5 +366,39 @@ mod tests {
         // A colorless source never shares a color, even at a tie.
         let colorless = mk(&mut state, 5, vec![]);
         assert!(!eval_shares_color_with_most_common_color(&state, colorless));
+    }
+
+    /// CR 105.2: the fixed-color sibling (Prophecy djinns) — true when the
+    /// named color is the most common among all permanents, ties included.
+    #[test]
+    fn color_is_most_common_handles_majority_ties_and_empty_board() {
+        use crate::types::mana::ManaColor;
+
+        let mut state = GameState::new_two_player(1);
+        let mk = |state: &mut GameState, cid: u64, colors: Vec<ManaColor>| {
+            let id = create_object(
+                &mut *state,
+                CardId(cid),
+                PlayerId(0),
+                "P".to_string(),
+                Zone::Battlefield,
+            );
+            state.objects.get_mut(&id).unwrap().color = colors;
+            id
+        };
+        // Empty battlefield: no colored permanent, so no color is most common.
+        assert!(!eval_color_is_most_common(&state, ManaColor::Black));
+
+        let _a = mk(&mut state, 1, vec![ManaColor::Black]);
+        let _b = mk(&mut state, 2, vec![ManaColor::Black]);
+        let _c = mk(&mut state, 3, vec![ManaColor::Green]);
+        assert!(eval_color_is_most_common(&state, ManaColor::Black));
+        assert!(!eval_color_is_most_common(&state, ManaColor::Green));
+
+        // Tie: Green 2 / Black 2 — both count as most common.
+        let _d = mk(&mut state, 4, vec![ManaColor::Green]);
+        assert!(eval_color_is_most_common(&state, ManaColor::Green));
+        assert!(eval_color_is_most_common(&state, ManaColor::Black));
+        assert!(!eval_color_is_most_common(&state, ManaColor::Red));
     }
 }
