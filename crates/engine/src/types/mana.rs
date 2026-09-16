@@ -354,6 +354,12 @@ pub struct SpellMeta {
     /// (`game::casting::pay_mana_cost_from_pool_with_choices`) withholds all real
     /// (non-convoke) pool units for the duration of the payment when this is set.
     pub cant_spend_mana: bool,
+    /// CR 607.2a + CR 608.2k: the ObjectId of the spell being paid for.
+    /// Consulted by source-linked identity spend restrictions
+    /// ([`ManaRestriction::OnlyForSpellObject`] — Ice Cauldron's "spend this
+    /// mana only to cast the last card exiled with ~"). `None` at payment
+    /// sites with no associated spell object.
+    pub object: Option<crate::types::identifiers::ObjectId>,
 }
 
 /// CR 106.6: Context for a mana-payment decision. Distinguishes "paying for a
@@ -721,6 +727,15 @@ pub enum ManaRestriction {
     /// paying mana. The payment algorithm may consume it for the current spell,
     /// but cast-spent metrics and mana-added triggers must ignore it.
     ConvokePayment,
+    /// CR 607.2a + CR 608.2k (Ice Cauldron): "Spend this mana only to cast the
+    /// last card exiled with ~" — source-linked identity restriction. The
+    /// bound card is resolved at PRODUCTION time from the source's linked-exile
+    /// pool (most recent exile — the ruling ties "last card exiled" to the most
+    /// recent charge), so this leaf carries the concrete ObjectId and the
+    /// payment gate compares it against `SpellMeta.object`. Spell-only: rejects
+    /// ability activations, special actions, and effect payments. Fail-closed
+    /// via `Impossible` at production when the source has no linked exile.
+    OnlyForSpellObject(crate::types::identifiers::ObjectId),
 }
 
 /// CR 605.3b: Semantic classification of an activatable mana source's
@@ -942,6 +957,7 @@ fn cmp_mana_restriction(left: &ManaRestriction, right: &ManaRestriction) -> std:
             ManaRestriction::OnlyForSpecialAction(_) => 17,
             ManaRestriction::Impossible => 18,
             ManaRestriction::ConvokePayment => 19,
+            ManaRestriction::OnlyForSpellObject(_) => 20,
         }
     }
     rank(left).cmp(&rank(right)).then_with(|| match (left, right) {
@@ -1262,6 +1278,11 @@ impl ManaRestriction {
             ManaRestriction::OnlyForSpecialAction(_) => false,
             ManaRestriction::Impossible => false,
             ManaRestriction::ConvokePayment => true,
+            // CR 607.2a + CR 608.2k: source-linked identity gate — only the
+            // bound card's own cast qualifies. `meta.object` is `None` at
+            // payment sites that carry no spell object, which rejects
+            // (fail-closed), never permits.
+            ManaRestriction::OnlyForSpellObject(bound) => meta.object.as_ref() == Some(bound),
         }
     }
 
@@ -1321,6 +1342,9 @@ impl ManaRestriction {
             // X-cost mana can be used for abilities with {X} in their cost.
             // TODO: Check if the ability has {X} in its cost once that data is available.
             ManaRestriction::OnlyForXCosts | ManaRestriction::ConvokePayment => false,
+            // CR 607.2a + CR 608.2k: bound to one spell's cast — never an
+            // ability activation.
+            ManaRestriction::OnlyForSpellObject(_) => false,
         }
     }
 
@@ -1378,7 +1402,8 @@ impl ManaRestriction {
             | ManaRestriction::OnlyForSpellFromZone(_)
             | ManaRestriction::OnlyForFaceDownSpell
             | ManaRestriction::Impossible
-            | ManaRestriction::ConvokePayment => false,
+            | ManaRestriction::ConvokePayment
+            | ManaRestriction::OnlyForSpellObject(_) => false,
         }
     }
 }
@@ -2940,6 +2965,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let instant_spell = SpellMeta {
             types: vec!["Instant".to_string()],
@@ -2952,6 +2978,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let legendary_spell = SpellMeta {
             types: vec!["Legendary".to_string(), "Creature".to_string()],
@@ -2964,6 +2991,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         assert!(restriction.allows_spell(&creature_spell));
         assert!(!restriction.allows_spell(&instant_spell));
@@ -2992,6 +3020,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let omen_spell = SpellMeta {
             types: vec!["Enchantment".to_string(), "Omen".to_string()],
@@ -3004,6 +3033,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let goblin_spell = SpellMeta {
             types: vec!["Creature".to_string()],
@@ -3016,6 +3046,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         // Matches one branch each.
         assert!(restriction.allows_spell(&dragon_spell));
@@ -3066,6 +3097,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let turtle_creature = SpellMeta {
             types: vec!["Creature".to_string()],
@@ -3078,6 +3110,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let goblin_creature = SpellMeta {
             types: vec!["Creature".to_string()],
@@ -3090,6 +3123,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         assert!(restriction.allows_spell(&ninja_creature));
         assert!(!restriction.allows_spell(&turtle_creature));
@@ -3110,6 +3144,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let source_types = vec!["Artifact".to_string()];
         let source_subtypes = Vec::new();
@@ -3138,6 +3173,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let goblin_creature = SpellMeta {
             types: vec!["Creature".to_string()],
@@ -3150,6 +3186,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let elf_instant = SpellMeta {
             types: vec!["Instant".to_string()],
@@ -3162,6 +3199,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         assert!(restriction.allows_spell(&elf_creature));
         assert!(!restriction.allows_spell(&goblin_creature));
@@ -3199,6 +3237,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let spent = pool
             .spend_for(ManaType::Green, &PaymentContext::Spell(&spell))
@@ -3228,6 +3267,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         assert!(pool
             .spend_for(ManaType::Green, &PaymentContext::Spell(&elf_spell))
@@ -3291,6 +3331,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         assert!(pool
             .spend_for(ManaType::Green, &PaymentContext::Spell(&goblin_spell))
@@ -3318,6 +3359,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let tribal_elemental_instant = SpellMeta {
             types: vec!["Tribal".to_string(), "Instant".to_string()],
@@ -3330,6 +3372,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let goblin_creature = SpellMeta {
             types: vec!["Creature".to_string()],
@@ -3342,6 +3385,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let plain_instant = SpellMeta {
             types: vec!["Instant".to_string()],
@@ -3354,6 +3398,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         assert!(restriction.allows_spell(&elemental_creature));
         assert!(restriction.allows_spell(&tribal_elemental_instant));
@@ -3380,6 +3425,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let colored_eldrazi = SpellMeta {
             types: vec!["Creature".to_string()],
@@ -3392,6 +3438,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let colorless_construct = SpellMeta {
             types: vec!["Artifact".to_string(), "Colorless".to_string()],
@@ -3404,6 +3451,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         assert!(restriction.allows_spell(&colorless_eldrazi));
         assert!(!restriction.allows_spell(&colored_eldrazi));
@@ -3460,6 +3508,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let colored_spell = SpellMeta {
             types: vec!["Creature".to_string()],
@@ -3472,6 +3521,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         // Spell half: still gated to the named type.
         assert!(restriction.allows_spell(&colorless_spell));
@@ -3513,6 +3563,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let artifact_creature_spell = SpellMeta {
             types: vec!["Artifact".to_string(), "Creature".to_string()],
@@ -3525,6 +3576,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let instant_spell = SpellMeta {
             types: vec!["Instant".to_string()],
@@ -3537,6 +3589,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let creature_spell = SpellMeta {
             types: vec!["Creature".to_string()],
@@ -3549,6 +3602,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         // Permitted: any artifact spell (incl. artifact creatures).
         assert!(restriction.allows(&PaymentContext::Spell(&artifact_spell)));
@@ -3589,6 +3643,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let creature_spell = SpellMeta {
             types: vec!["Creature".to_string()],
@@ -3601,6 +3656,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let artifact_types = vec!["Artifact".to_string()];
         let creature_types = vec!["Creature".to_string()];
@@ -3805,6 +3861,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let sorcery = SpellMeta {
             types: vec!["Sorcery".to_string()],
@@ -3817,6 +3874,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let creature = SpellMeta {
             types: vec!["Creature".to_string()],
@@ -3829,6 +3887,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         // Manamorphose is an instant — the {R}{R} restricted mana must pay for it.
         assert!(restriction.allows_spell(&instant));
@@ -3873,6 +3932,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let normal_spell = SpellMeta {
             types: vec!["Instant".to_string()],
@@ -3885,6 +3945,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         assert!(restriction.allows_spell(&flashback_spell));
         assert!(!restriction.allows_spell(&normal_spell));
@@ -4507,6 +4568,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         assert!(restriction.allows_spell(&equipment_spell));
         // Non-Equipment artifact spell: REJECTED.
@@ -4521,6 +4583,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         assert!(!restriction.allows_spell(&artifact_spell));
     }

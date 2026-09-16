@@ -554,6 +554,7 @@
     "onlyForSpecialAction": "Gaste apenas em uma ação especial específica",
     "impossible": "Este mana não pode ser gasto",
     "convokePayment": "Pagamento de convocação",
+    "onlyForSpellObject": "Gaste apenas para conjurar o último card exilado com este permanente",
     "grantsProperty": "Concede uma propriedade à mágica",
     "grantCantBeCountered": "Gaste nesta mágica para que ela não possa ser anulada"
   },

@@ -554,6 +554,7 @@
     "onlyForSpecialAction": "Nur für eine bestimmte Sonderaktion ausgeben",
     "impossible": "Dieses Mana kann nicht ausgegeben werden",
     "convokePayment": "Beschwörbeitrag-Bezahlung",
+    "onlyForSpellObject": "Nur ausgeben, um die zuletzt mit diesem Permanent ins Exil gelegte Karte zu wirken",
     "grantsProperty": "Verleiht dem Zauberspruch eine Eigenschaft",
     "grantCantBeCountered": "Für diesen Zauberspruch ausgeben, damit er nicht neutralisiert werden kann"
   },

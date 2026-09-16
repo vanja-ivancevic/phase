@@ -7428,6 +7428,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let goblin_ctx = PaymentContext::Spell(&goblin_spell);
         let mut pool_clone = pool.clone();
@@ -7449,6 +7450,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let elemental_ctx = PaymentContext::Spell(&elemental_spell);
         assert!(

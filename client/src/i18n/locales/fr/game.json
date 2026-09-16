@@ -554,6 +554,7 @@
     "onlyForSpecialAction": "À dépenser uniquement pour une action spéciale spécifique",
     "impossible": "Ce mana ne peut pas être dépensé",
     "convokePayment": "Paiement de la convocation",
+    "onlyForSpellObject": "Dépenser uniquement pour lancer la dernière carte exilée avec ce permanent",
     "grantsProperty": "Accorde une propriété au sort",
     "grantCantBeCountered": "À dépenser pour ce sort afin qu'il ne puisse pas être contrecarré"
   },

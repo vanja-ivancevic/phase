@@ -1232,14 +1232,16 @@ fn note_mana_spent_grammar_accepts_a_hypothetical_sibling_wording() {
 /// routing/fallback change can't silently regress either clause.
 ///
 /// The trailing "Spend this mana only to cast the last card exiled with this
-/// artifact" rider is a *separate* source-linked-exile spend restriction the
-/// engine does not model yet, so it must remain an explicit
-/// `Effect::Unimplemented` in the mana ability's chain — otherwise the card
-/// would be reported as fully supported while silently dropping its cast
-/// restriction (coverage honesty).
+/// artifact" rider lowers into the mana effect's spend-restriction template
+/// (`ManaSpendRestriction::SpellExiledWithSource`), which binds the produced
+/// mana to the concrete card of the source's most recent linked exile at
+/// production time. With all three clauses modelled, NOTHING in the card may
+/// remain `Effect::Unimplemented` — a silently dropped rider would report the
+/// card as fully supported while letting its mana pay for arbitrary casts
+/// (coverage honesty).
 #[test]
 fn ice_cauldron_notes_amount_and_reads_back_full_payment() {
-    use engine::types::ability::{AbilityDefinition, ManaProduction};
+    use engine::types::ability::{AbilityDefinition, ManaProduction, ManaSpendRestriction};
 
     fn any_unimplemented(def: &AbilityDefinition) -> bool {
         matches!(&*def.effect, Effect::Unimplemented { .. })
@@ -1289,27 +1291,41 @@ fn ice_cauldron_notes_amount_and_reads_back_full_payment() {
     );
 
     // Second ability: "Add this artifact's last noted type and amount of mana"
-    // must reach the full-payment production, not the singular-type one.
+    // must reach the full-payment production, and its rider must lower into
+    // the source-linked spend-restriction template — not be dropped.
     let mana_ability = result
         .abilities
         .iter()
         .find(|a| matches!(&*a.effect, Effect::Mana { .. }))
         .unwrap_or_else(|| panic!("no Mana ability parsed: {:#?}", result.abilities));
     match &*mana_ability.effect {
-        Effect::Mana { produced, .. } => assert!(
-            matches!(produced, ManaProduction::NotedTypeAndAmount),
-            "expected ManaProduction::NotedTypeAndAmount, got {produced:#?}"
-        ),
+        Effect::Mana {
+            produced,
+            restrictions,
+            ..
+        } => {
+            assert!(
+                matches!(produced, ManaProduction::NotedTypeAndAmount),
+                "expected ManaProduction::NotedTypeAndAmount, got {produced:#?}"
+            );
+            assert!(
+                matches!(
+                    restrictions.as_slice(),
+                    [ManaSpendRestriction::SpellExiledWithSource]
+                ),
+                "the 'last card exiled with ~' rider must lower to \
+                 ManaSpendRestriction::SpellExiledWithSource; got {restrictions:#?}"
+            );
+        }
         other => unreachable!("filtered to Effect::Mana above, got {other:#?}"),
     }
 
-    // Coverage honesty: the source-linked-exile cast restriction is not
-    // modelled, so it must still be an explicit Unimplemented somewhere in
-    // the ability's chain rather than silently dropped.
+    // Coverage honesty, flipped positive: with the noted-amount production and
+    // the linked-exile rider both modelled, nothing in the card may remain
+    // Unimplemented.
     assert!(
-        any_unimplemented(mana_ability),
-        "Ice Cauldron's 'Spend this mana only to cast the last card exiled \
-         with this artifact' rider must stay explicitly Unimplemented until \
-         the linked-exile spend restriction lands; got {mana_ability:#?}"
+        !result.abilities.iter().any(any_unimplemented),
+        "Ice Cauldron must be fully supported now; got {:#?}",
+        result.abilities
     );
 }

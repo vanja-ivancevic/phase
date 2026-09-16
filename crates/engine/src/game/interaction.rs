@@ -4154,6 +4154,9 @@ fn interaction_mana_restriction(restriction: &ManaRestriction) -> InteractionMan
         }
         ManaRestriction::Impossible => InteractionManaRestriction::Impossible,
         ManaRestriction::ConvokePayment => InteractionManaRestriction::ConvokePayment,
+        // CR 607.2a + CR 608.2k: the bound ObjectId is engine-internal; the
+        // wire payload is the bare tag and the client renders the rider text.
+        ManaRestriction::OnlyForSpellObject(_) => InteractionManaRestriction::OnlyForSpellObject,
     }
 }
 
@@ -8234,6 +8237,9 @@ fn bound_outbound_mana_restriction(
         | InteractionManaRestriction::OnlyForXCosts
         | InteractionManaRestriction::OnlyForFaceDownSpell
         | InteractionManaRestriction::Impossible
+        // CR 607.2a + CR 608.2k: payload-free on the wire (the bound ObjectId
+        // is engine-internal), so nothing extra counts against the budget.
+        | InteractionManaRestriction::OnlyForSpellObject
         | InteractionManaRestriction::ConvokePayment => {}
         InteractionManaRestriction::OnlyForSpellType { spell_type }
         | InteractionManaRestriction::OnlyForCreatureType {

@@ -40,6 +40,7 @@ export const RESTRICTION_LABEL_KEYS: Record<ManaRestrictionTag, string> = {
   OnlyForSpecialAction: "manaPool.onlyForSpecialAction",
   Impossible: "manaPool.impossible",
   ConvokePayment: "manaPool.convokePayment",
+  OnlyForSpellObject: "manaPool.onlyForSpellObject",
 };
 
 export function restrictionTag(restriction: ManaRestriction): ManaRestrictionTag {

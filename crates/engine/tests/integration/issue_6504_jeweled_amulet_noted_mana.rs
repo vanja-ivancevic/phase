@@ -45,6 +45,13 @@ artifact and note the type and amount of mana spent to pay this activation cost.
 {T}, Remove a charge counter from this artifact: Add this artifact's last noted type and \
 amount of mana.";
 
+/// Ice Cauldron's mana ability WITH its printed spend rider: the produced mana
+/// is bound to "the last card exiled with this artifact".
+const ICE_CAULDRON_RIDER_ORACLE: &str = "{2}, {T}: Put a charge counter on this artifact \
+and note the type and amount of mana spent to pay this activation cost.\n\
+{T}, Remove a charge counter from this artifact: Add this artifact's last noted type and \
+amount of mana. Spend this mana only to cast the last card exiled with this artifact.";
+
 const CHARGE: fn() -> CounterType = || CounterType::Generic("charge".to_string());
 
 fn charge_counters(runner: &engine::game::scenario::GameRunner, obj: ObjectId) -> u32 {
@@ -808,4 +815,167 @@ fn ice_cauldron_produces_no_mana_with_nothing_noted() {
         0,
         "the charge counter is still removed even though no mana was produced"
     );
+}
+
+/// CR 607.2a + CR 608.2k: the "Spend this mana only to cast the last card
+/// exiled with ~" rider binds each produced unit to the concrete card of the
+/// source's most recent linked exile. Production reads the push-ordered exile
+/// links, so the LAST link is the bound card, and the payment gate compares it
+/// against the paying spell's object id: the bound card's own cast qualifies;
+/// any other card, an unknown object, and ability activations all reject.
+#[test]
+fn ice_cauldron_rider_binds_mana_to_the_last_exiled_card() {
+    use engine::types::game_state::{ExileLink, ExileLinkKind};
+    use engine::types::mana::{ManaColor, ManaRestriction, PaymentContext, SpellMeta};
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cauldron = scenario
+        .add_artifact_from_oracle(P0, "Ice Cauldron", ICE_CAULDRON_RIDER_ORACLE)
+        .id();
+    let exiled = scenario.add_spell_to_exile(P0, "Lightning Bolt", true).id();
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]),
+            ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]),
+        ],
+    );
+    let mut runner = scenario.build();
+
+    // What the charge ability's exile records: the linked-exile entry the
+    // restriction reads at production time (push-ordered, last = most recent).
+    runner.state_mut().exile_links.push(ExileLink {
+        exiled_id: exiled,
+        source_id: cauldron,
+        kind: ExileLinkKind::TrackedBySource,
+    });
+
+    // Charge {2} with the two red units; the note stores [Red, Red].
+    runner.activate(cauldron, 0).resolve();
+    assert_eq!(charge_counters(&runner, cauldron), 1);
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&cauldron)
+        .expect("cauldron must exist")
+        .tapped = false;
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: cauldron,
+            ability_index: 1,
+        })
+        .expect("activate the noted-amount mana ability");
+
+    let units = &runner.state().players[P0.0 as usize].mana_pool.mana;
+    assert_eq!(
+        units.len(),
+        2,
+        "the full noted payment (two units) must be produced"
+    );
+    for unit in units {
+        assert_eq!(unit.color, ManaType::Red);
+        assert_eq!(
+            unit.restrictions,
+            vec![ManaRestriction::OnlyForSpellObject(exiled)],
+            "each produced unit must be bound to the last exiled card"
+        );
+    }
+
+    // Payment gate: only the bound card's own cast qualifies.
+    let bound = ManaRestriction::OnlyForSpellObject(exiled);
+    let meta_for = |object: Option<ObjectId>| SpellMeta {
+        types: vec!["Instant".to_string()],
+        subtypes: vec![],
+        keyword_kinds: vec![],
+        cast_from_zone: Some(Zone::Exile),
+        mana_value: Some(1),
+        color_count: Some(1),
+        colors: vec![ManaColor::Red],
+        has_x_in_cost: false,
+        is_face_down: false,
+        cant_spend_mana: false,
+        object,
+    };
+    assert!(bound.allows(&PaymentContext::Spell(&meta_for(Some(exiled)))));
+    assert!(!bound.allows(&PaymentContext::Spell(&meta_for(Some(ObjectId(
+        exiled.0 + 1
+    ))))));
+    assert!(!bound.allows(&PaymentContext::Spell(&meta_for(None))));
+    assert!(!bound.allows(&PaymentContext::Activation {
+        source_types: &[],
+        source_subtypes: &[],
+        ability_tag: None,
+        mana_color_constraint: engine::types::mana::ActivationManaColorConstraint::Unrestricted,
+    }));
+}
+
+/// Fail-closed production: with NO linked exile (the charge ability's exile
+/// never ran, or its card left exile), the restriction lowers to `Impossible`
+/// — the mana is produced but unspendable, never accidentally unrestricted.
+#[test]
+fn ice_cauldron_rider_without_linked_exile_produces_unspendable_mana() {
+    use engine::types::mana::{ManaColor, ManaRestriction, PaymentContext, SpellMeta};
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cauldron = scenario
+        .add_artifact_from_oracle(P0, "Ice Cauldron", ICE_CAULDRON_RIDER_ORACLE)
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+            ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+        ],
+    );
+    let mut runner = scenario.build();
+
+    // Charge {2}; nothing is ever exiled, so no exile link exists.
+    runner.activate(cauldron, 0).resolve();
+    assert_eq!(charge_counters(&runner, cauldron), 1);
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&cauldron)
+        .expect("cauldron must exist")
+        .tapped = false;
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: cauldron,
+            ability_index: 1,
+        })
+        .expect("activate the noted-amount mana ability");
+
+    let units = &runner.state().players[P0.0 as usize].mana_pool.mana;
+    assert_eq!(units.len(), 2);
+    for unit in units {
+        assert_eq!(
+            unit.restrictions,
+            vec![ManaRestriction::Impossible],
+            "no linked exile must lower the rider to Impossible, not drop it"
+        );
+        let meta = SpellMeta {
+            types: vec!["Instant".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: Some(Zone::Exile),
+            mana_value: Some(1),
+            color_count: Some(1),
+            colors: vec![ManaColor::Red],
+            has_x_in_cost: false,
+            is_face_down: false,
+            cant_spend_mana: false,
+            object: Some(ObjectId(9_999_999)),
+        };
+        assert!(
+            !unit
+                .restrictions
+                .iter()
+                .any(|r| r.allows(&PaymentContext::Spell(&meta))),
+            "Impossible-restricted mana must not be spendable on any spell"
+        );
+    }
 }

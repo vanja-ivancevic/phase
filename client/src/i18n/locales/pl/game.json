@@ -554,6 +554,7 @@
     "onlyForSpecialAction": "Wydaj tylko na określoną akcję specjalną",
     "impossible": "Ta mana nie może zostać wydana",
     "convokePayment": "Płatność Convoke",
+    "onlyForSpellObject": "Wydaj tylko na rzucenie ostatniej karty wygnanej dzięki tej trwałości",
     "grantsProperty": "Nadaje czarowi właściwość",
     "grantCantBeCountered": "Wydaj na ten czar, aby nie można było go skontrować"
   },

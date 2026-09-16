@@ -51,6 +51,7 @@ describe("mana-source selection wire types", () => {
       { OnlyForSpecialAction: "UnlockDoor" },
       "Impossible",
       "ConvokePayment",
+      "OnlyForSpellObject",
     ];
     const action: GameAction = {
       type: "TapLandForMana",

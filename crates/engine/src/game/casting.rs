@@ -2962,6 +2962,9 @@ pub(super) fn build_spell_meta(
         cant_spend_mana: obj
             .casting_restrictions
             .contains(&crate::types::ability::CastingRestriction::CantSpendMana),
+        // CR 607.2a + CR 608.2k: the paying spell's identity, for
+        // source-linked identity spend restrictions (OnlyForSpellObject).
+        object: Some(object_id),
     })
 }
 

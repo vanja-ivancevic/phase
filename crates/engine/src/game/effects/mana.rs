@@ -601,6 +601,19 @@ pub(crate) fn resolve_restrictions(
                     crate::types::mana::SpecialAction::TurnFaceUp,
                 ))
             }
+            // CR 607.2a + CR 608.2k (Ice Cauldron): bind the spend to the
+            // concrete card of this source's most recent linked exile. The
+            // ruling ties "the last card exiled" to the most recent charge,
+            // and the exile links are push-ordered, so the LAST snapshot is
+            // the bound card. A source with no linked exile (or none still in
+            // exile) lowers to `Impossible` — the mana is unspendable, never
+            // accidentally unrestricted.
+            ManaSpendRestriction::SpellExiledWithSource => Some(
+                crate::game::players::linked_exile_cards_for_source(state, source_id)
+                    .last()
+                    .map(|snapshot| ManaRestriction::OnlyForSpellObject(snapshot.exiled_id))
+                    .unwrap_or(ManaRestriction::Impossible),
+            ),
             // CR 106.6: Disjunction — recursively lower each branch. The
             // chosen-color branch preserves its fail-closed `Impossible`; the
             // legacy chosen-creature-type branch retains its historical drop.

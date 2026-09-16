@@ -1615,6 +1615,13 @@ fn parse_negative_mana_spend_restriction(lower: &str) -> Option<ManaSpendRestric
         };
     }
 
+    // CR 106.6: the bare negative form — "this mana can't be spent to cast
+    // spells" (Thran Turbine). Spells are prohibited outright and nothing
+    // else is named, so the reading is exactly activation-only.
+    if rest.eq_ignore_ascii_case("spells") {
+        return Some(ManaSpendRestriction::ActivateOnly);
+    }
+
     let rest_lower = rest.to_lowercase();
     let (_, rest) = nom_on_lower(rest, &rest_lower, |i| {
         let (i, _) = opt(nom_primitives::parse_article).parse(i)?;
@@ -1907,6 +1914,18 @@ fn parse_monocolored_spell_of_source_chosen_color(rest: &str) -> bool {
 fn parse_single_cast_clause(rest: &str) -> Option<ManaSpendRestriction> {
     let rest = rest.trim();
     let rest_lower = rest.to_lowercase();
+    // CR 607.2a + CR 608.2k (Ice Cauldron): "the last card exiled with ~" —
+    // the whole clause is one source-linked identity restriction. Matched
+    // before the type-phrase fallback, which cannot classify a possessive
+    // exile referent. The `~` form is what the pipeline produces after
+    // self-reference normalization; the spelled-out forms are accepted for
+    // robustness against un-normalized callers.
+    if matches!(
+        rest_lower.as_str(),
+        "the last card exiled with ~" | "the last card exiled with this artifact" | "the last card exiled with it"
+    ) {
+        return Some(ManaSpendRestriction::SpellExiledWithSource);
+    }
     if nom_on_lower(rest, &rest_lower, |i| {
         value((), all_consuming(tag("spells"))).parse(i)
     })
@@ -4571,6 +4590,23 @@ mod tests {
             Some(vec![ManaSpendRestriction::SpellType(
                 "Instant and Sorcery".to_string()
             )])
+        );
+    }
+
+    // CR 106.6 (Thran Turbine): the bare negative form — spells prohibited
+    // outright, nothing else named — reads as exactly activation-only, the
+    // same semantic the positive "only to activate abilities" arm produces.
+    #[test]
+    fn mana_spend_restriction_cannot_cast_spells_is_activation_only() {
+        let result = parse_mana_spend_restriction("this mana can't be spent to cast spells");
+        assert_eq!(
+            result.map(|(r, _)| r),
+            Some(vec![ManaSpendRestriction::ActivateOnly])
+        );
+        let curly = parse_mana_spend_restriction("this mana can\u{2019}t be spent to cast spells");
+        assert_eq!(
+            curly.map(|(r, _)| r),
+            Some(vec![ManaSpendRestriction::ActivateOnly])
         );
     }
 

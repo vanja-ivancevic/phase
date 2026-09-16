@@ -415,6 +415,10 @@ pub enum InteractionManaRestriction {
     },
     Impossible,
     ConvokePayment,
+    /// CR 607.2a + CR 608.2k (Ice Cauldron): "Spend this mana only to cast the
+    /// last card exiled with ~". Payload-free on the wire — the bound ObjectId
+    /// is engine-internal; the client renders the generic rider text.
+    OnlyForSpellObject,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
