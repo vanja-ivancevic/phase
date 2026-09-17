@@ -2953,6 +2953,7 @@ fn lift_mana_production_quantities_to_triggering_source(produced: &mut ManaProdu
         | ManaProduction::ChoiceAmongExiledColors { .. }
         | ManaProduction::ChoiceAmongCombinations { .. }
         | ManaProduction::DistinctColorsAmongPermanents { .. }
+        | ManaProduction::NotedTypeAndAmount
         | ManaProduction::TriggerEventManaType => {}
     }
 }
@@ -5357,6 +5358,7 @@ pub(crate) fn static_condition_to_trigger_condition(
         }),
         StaticCondition::DayNightIs { .. } => None,
         StaticCondition::SharesColorWithMostCommonColorAmongPermanents => None,
+        StaticCondition::ColorIsMostCommonAmongPermanents { .. } => None,
 
         // CR 608.2c: Quantity comparisons map 1:1 (same fields). The only
         // asymmetry is the `Another` → `OtherThanTriggerObject` substitution

@@ -5,6 +5,10 @@
 //! mana). Before the fix, both clauses fell through to `Effect::Unimplemented`
 //! and the second ability produced no mana at all regardless of what was
 //! noted.
+//!
+//! Ice Cauldron's type-AND-amount sibling wording reuses the same building
+//! blocks: its note stores the exact per-unit payment and its mana ability
+//! replays every noted unit (see the Ice Cauldron tests at the bottom).
 
 use engine::game::effects::{bounce, copy_spell};
 use engine::game::scenario::{GameScenario, P0};
@@ -23,6 +27,30 @@ Note the type of mana spent to pay this activation cost. Activate only if there 
 charge counters on this artifact.\n\
 {T}, Remove a charge counter from this artifact: Add one mana of this artifact's last \
 noted type.";
+
+/// Ice Cauldron's type-AND-amount sibling wording: the noting activation's full
+/// per-unit payment must be stored, and the mana ability must replay every
+/// noted unit (`ManaProduction::NotedTypeAndAmount`), including duplicates and
+/// colorless (CR 106.1b + CR 608.2k; ruling: "if you spent {C}{C}{R}{R} on X,
+/// you get {C}{C}{R}{R} later even if X was 6").
+const ICE_CAULDRON_ORACLE: &str = "{R}{G}, {T}: Put a charge counter on this artifact and \
+note the type and amount of mana spent to pay this activation cost.\n\
+{T}, Remove a charge counter from this artifact: Add this artifact's last noted type and \
+amount of mana.";
+
+/// Colorless-capable variant: a {2} activation paid with two colorless units
+/// must note two units and replay two colorless mana.
+const ICE_CAULDRON_COLORLESS_ORACLE: &str = "{2}, {T}: Put a charge counter on this \
+artifact and note the type and amount of mana spent to pay this activation cost.\n\
+{T}, Remove a charge counter from this artifact: Add this artifact's last noted type and \
+amount of mana.";
+
+/// Ice Cauldron's mana ability WITH its printed spend rider: the produced mana
+/// is bound to "the last card exiled with this artifact".
+const ICE_CAULDRON_RIDER_ORACLE: &str = "{2}, {T}: Put a charge counter on this artifact \
+and note the type and amount of mana spent to pay this activation cost.\n\
+{T}, Remove a charge counter from this artifact: Add this artifact's last noted type and \
+amount of mana. Spend this mana only to cast the last card exiled with this artifact.";
 
 const CHARGE: fn() -> CounterType = || CounterType::Generic("charge".to_string());
 
@@ -610,4 +638,344 @@ fn jeweled_amulet_copied_activation_does_not_note_original_payment() {
         Some([ManaType::Red].as_slice()),
         "the original activation must still note its own (red) payment"
     );
+}
+
+/// Ice Cauldron's "note the type and amount / add the last noted type and
+/// amount" pair: the noting activation's whole per-unit payment must be stored
+/// and replayed in full. {R}{G} paid with one red and one green unit must note
+/// two entries and the mana ability must produce exactly two mana, one of each
+/// noted type — a singular-type read (or a hardcoded amount of one) would
+/// produce only one mana.
+#[test]
+fn ice_cauldron_replays_every_noted_unit_type_and_amount() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cauldron = scenario
+        .add_creature_from_oracle(P0, "Ice Cauldron", 0, 0, ICE_CAULDRON_ORACLE)
+        .as_artifact()
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]),
+            ManaUnit::new(ManaType::Green, ObjectId(0), false, vec![]),
+        ],
+    );
+    let mut runner = scenario.build();
+
+    // Charge: pay {R}{G}; both units are noted, one entry per unit.
+    runner.activate(cauldron, 0).resolve();
+    assert_eq!(
+        charge_counters(&runner, cauldron),
+        1,
+        "the charge ability must place exactly one charge counter"
+    );
+    assert_eq!(
+        pool_total(&runner, P0),
+        0,
+        "reach-guard: the charge must consume both paid units"
+    );
+    let noted = runner.state().objects[&cauldron]
+        .noted_mana_spent()
+        .expect("the charge activation must note its payment")
+        .to_vec();
+    assert_eq!(
+        noted.len(),
+        2,
+        "both paid units must be noted, one per unit (got {noted:?})"
+    );
+    assert!(
+        noted.contains(&ManaType::Red) && noted.contains(&ManaType::Green),
+        "the note must preserve both paid types (got {noted:?})"
+    );
+
+    // Ability 0's own {T} cost tapped the cauldron; untap so the mana
+    // ability's {T} cost is payable (they are unrelated costs on the same
+    // permanent).
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&cauldron)
+        .expect("cauldron must exist")
+        .tapped = false;
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: cauldron,
+            ability_index: 1,
+        })
+        .expect("activate the noted-amount mana ability");
+
+    assert_eq!(
+        pool_color(&runner, P0, ManaType::Red),
+        1,
+        "the noted red unit must be replayed"
+    );
+    assert_eq!(
+        pool_color(&runner, P0, ManaType::Green),
+        1,
+        "the noted green unit must be replayed"
+    );
+    assert_eq!(
+        pool_total(&runner, P0),
+        2,
+        "the noted AMOUNT (two units) must be produced, not a hardcoded one"
+    );
+    assert_eq!(
+        charge_counters(&runner, cauldron),
+        0,
+        "the mana ability must remove the charge counter it noted from"
+    );
+}
+
+/// CR 106.1b: colorless is a mana type, and Ice Cauldron's noted payment must
+/// replay colorless units too ({2} paid with two colorless mana produces two
+/// colorless mana — the ruling's "{C}{C}{R}{R} stays {C}{C}{R}{R}" case).
+#[test]
+fn ice_cauldron_replays_colorless_units() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cauldron = scenario
+        .add_creature_from_oracle(P0, "Ice Cauldron", 0, 0, ICE_CAULDRON_COLORLESS_ORACLE)
+        .as_artifact()
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+            ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+        ],
+    );
+    let mut runner = scenario.build();
+
+    runner.activate(cauldron, 0).resolve();
+    assert_eq!(charge_counters(&runner, cauldron), 1);
+    assert_eq!(
+        runner.state().objects[&cauldron].noted_mana_spent(),
+        Some([ManaType::Colorless, ManaType::Colorless].as_slice()),
+        "a {{2}} cost paid with two colorless units must note both colorless units"
+    );
+
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&cauldron)
+        .expect("cauldron must exist")
+        .tapped = false;
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: cauldron,
+            ability_index: 1,
+        })
+        .expect("activate the noted-amount mana ability");
+
+    assert_eq!(
+        pool_color(&runner, P0, ManaType::Colorless),
+        2,
+        "both noted colorless units must be replayed"
+    );
+}
+
+/// CR 106.5: with nothing noted (no charge activation ever resolved), the
+/// noted-amount production must add zero mana — never a default type or
+/// amount. A charge counter is placed directly so the mana ability's cost is
+/// payable without running the noting ability.
+#[test]
+fn ice_cauldron_produces_no_mana_with_nothing_noted() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cauldron = scenario
+        .add_creature_from_oracle(P0, "Ice Cauldron", 0, 0, ICE_CAULDRON_ORACLE)
+        .as_artifact()
+        .id();
+    scenario.with_counter(cauldron, CHARGE(), 1);
+    let mut runner = scenario.build();
+
+    assert_eq!(
+        pool_total(&runner, P0),
+        0,
+        "reach-guard: pool must start empty"
+    );
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: cauldron,
+            ability_index: 1,
+        })
+        .expect("activate the noted-amount mana ability");
+
+    assert_eq!(
+        pool_total(&runner, P0),
+        0,
+        "CR 106.5: no noted payment must produce no mana"
+    );
+    assert_eq!(
+        charge_counters(&runner, cauldron),
+        0,
+        "the charge counter is still removed even though no mana was produced"
+    );
+}
+
+/// CR 607.2a + CR 608.2k: the "Spend this mana only to cast the last card
+/// exiled with ~" rider binds each produced unit to the concrete card of the
+/// source's most recent linked exile. Production reads the push-ordered exile
+/// links, so the LAST link is the bound card, and the payment gate compares it
+/// against the paying spell's object id: the bound card's own cast qualifies;
+/// any other card, an unknown object, and ability activations all reject.
+#[test]
+fn ice_cauldron_rider_binds_mana_to_the_last_exiled_card() {
+    use engine::types::game_state::{ExileLink, ExileLinkKind};
+    use engine::types::mana::{ManaColor, ManaRestriction, PaymentContext, SpellMeta};
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cauldron = scenario
+        .add_artifact_from_oracle(P0, "Ice Cauldron", ICE_CAULDRON_RIDER_ORACLE)
+        .id();
+    let exiled = scenario.add_spell_to_exile(P0, "Lightning Bolt", true).id();
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]),
+            ManaUnit::new(ManaType::Red, ObjectId(0), false, vec![]),
+        ],
+    );
+    let mut runner = scenario.build();
+
+    // What the charge ability's exile records: the linked-exile entry the
+    // restriction reads at production time (push-ordered, last = most recent).
+    runner.state_mut().exile_links.push(ExileLink {
+        exiled_id: exiled,
+        source_id: cauldron,
+        kind: ExileLinkKind::TrackedBySource,
+    });
+
+    // Charge {2} with the two red units; the note stores [Red, Red].
+    runner.activate(cauldron, 0).resolve();
+    assert_eq!(charge_counters(&runner, cauldron), 1);
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&cauldron)
+        .expect("cauldron must exist")
+        .tapped = false;
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: cauldron,
+            ability_index: 1,
+        })
+        .expect("activate the noted-amount mana ability");
+
+    let units = &runner.state().players[P0.0 as usize].mana_pool.mana;
+    assert_eq!(
+        units.len(),
+        2,
+        "the full noted payment (two units) must be produced"
+    );
+    for unit in units {
+        assert_eq!(unit.color, ManaType::Red);
+        assert_eq!(
+            unit.restrictions,
+            vec![ManaRestriction::OnlyForSpellObject(exiled)],
+            "each produced unit must be bound to the last exiled card"
+        );
+    }
+
+    // Payment gate: only the bound card's own cast qualifies.
+    let bound = ManaRestriction::OnlyForSpellObject(exiled);
+    let meta_for = |object: Option<ObjectId>| SpellMeta {
+        types: vec!["Instant".to_string()],
+        subtypes: vec![],
+        keyword_kinds: vec![],
+        cast_from_zone: Some(Zone::Exile),
+        mana_value: Some(1),
+        color_count: Some(1),
+        colors: vec![ManaColor::Red],
+        has_x_in_cost: false,
+        is_face_down: false,
+        cant_spend_mana: false,
+        object,
+    };
+    assert!(bound.allows(&PaymentContext::Spell(&meta_for(Some(exiled)))));
+    assert!(!bound.allows(&PaymentContext::Spell(&meta_for(Some(ObjectId(
+        exiled.0 + 1
+    ))))));
+    assert!(!bound.allows(&PaymentContext::Spell(&meta_for(None))));
+    assert!(!bound.allows(&PaymentContext::Activation {
+        source_types: &[],
+        source_subtypes: &[],
+        ability_tag: None,
+        mana_color_constraint: engine::types::mana::ActivationManaColorConstraint::Unrestricted,
+    }));
+}
+
+/// Fail-closed production: with NO linked exile (the charge ability's exile
+/// never ran, or its card left exile), the restriction lowers to `Impossible`
+/// — the mana is produced but unspendable, never accidentally unrestricted.
+#[test]
+fn ice_cauldron_rider_without_linked_exile_produces_unspendable_mana() {
+    use engine::types::mana::{ManaColor, ManaRestriction, PaymentContext, SpellMeta};
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    let cauldron = scenario
+        .add_artifact_from_oracle(P0, "Ice Cauldron", ICE_CAULDRON_RIDER_ORACLE)
+        .id();
+    scenario.with_mana_pool(
+        P0,
+        vec![
+            ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+            ManaUnit::new(ManaType::Colorless, ObjectId(0), false, vec![]),
+        ],
+    );
+    let mut runner = scenario.build();
+
+    // Charge {2}; nothing is ever exiled, so no exile link exists.
+    runner.activate(cauldron, 0).resolve();
+    assert_eq!(charge_counters(&runner, cauldron), 1);
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&cauldron)
+        .expect("cauldron must exist")
+        .tapped = false;
+
+    runner
+        .act(GameAction::ActivateAbility {
+            source_id: cauldron,
+            ability_index: 1,
+        })
+        .expect("activate the noted-amount mana ability");
+
+    let units = &runner.state().players[P0.0 as usize].mana_pool.mana;
+    assert_eq!(units.len(), 2);
+    for unit in units {
+        assert_eq!(
+            unit.restrictions,
+            vec![ManaRestriction::Impossible],
+            "no linked exile must lower the rider to Impossible, not drop it"
+        );
+        let meta = SpellMeta {
+            types: vec!["Instant".to_string()],
+            subtypes: vec![],
+            keyword_kinds: vec![],
+            cast_from_zone: Some(Zone::Exile),
+            mana_value: Some(1),
+            color_count: Some(1),
+            colors: vec![ManaColor::Red],
+            has_x_in_cost: false,
+            is_face_down: false,
+            cant_spend_mana: false,
+            object: Some(ObjectId(9_999_999)),
+        };
+        assert!(
+            !unit
+                .restrictions
+                .iter()
+                .any(|r| r.allows(&PaymentContext::Spell(&meta))),
+            "Impossible-restricted mana must not be spendable on any spell"
+        );
+    }
 }

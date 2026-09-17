@@ -607,6 +607,7 @@
     "onlyForSpecialAction": "Spend only on a specific special action",
     "impossible": "This mana can't be spent",
     "convokePayment": "Convoke payment",
+    "onlyForSpellObject": "Spend only to cast the last card exiled with this permanent",
     "grantsProperty": "Grants a property to the spell",
     "grantCantBeCountered": "Spend on this spell to make it uncounterable"
   },

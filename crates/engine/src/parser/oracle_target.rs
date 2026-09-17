@@ -306,6 +306,25 @@ pub fn parse_event_context_ref(text: &str) -> Option<(TargetFilter, &str)> {
             value(TargetFilter::ParentTargetOwner, tag("its owner")),
             value(TargetFilter::ParentTargetOwner, tag("their owner")),
             value(TargetFilter::TriggeringPlayer, tag("that player")),
+            // CR 608.2c: "the player" in trigger context is synonymous with
+            // "that player" — an anaphoric reference to the triggering event's
+            // player (Angel's Trumpet: "deals damage to the player equal to
+            // the number of creatures tapped this way" on a per-player end-step
+            // trigger; the ctx rebinding resolves it to the end-step player).
+            // Composite-guarded: "the player or planeswalker" (Fathom Fleet
+            // Swordjack) is a disjunctive recipient, not a bare anaphor — the
+            // negative lookahead keeps the composite tail out of this arm so
+            // its long-standing diagnostic path is unchanged.
+            value(
+                TargetFilter::TriggeringPlayer,
+                terminated(
+                    tag("the player"),
+                    not(preceded(
+                        tag(" "),
+                        alt((tag("or player"), tag("or planeswalker"))),
+                    )),
+                ),
+            ),
             value(TargetFilter::TriggeringSource, tag("that source")),
             // CR 509.3d: on a per-blocker filtered block event, the blocker is
             // the event source.  This is the definite-article spelling used by
@@ -7739,6 +7758,16 @@ fn parse_keyword_match(text: &str) -> Option<KeywordMatch> {
             _ => unreachable!(),
         };
         return Some(KeywordMatch::Kind(kind));
+    }
+
+    // CR 708.2a (Backslide / Master of the Veil / Weaver of Lies): "with a
+    // morph ability" / "with morph abilities" — the noun-phrase form of a
+    // keyword-kind presence filter. Morph carries a payload cost, so the
+    // filter must match by discriminant (`HasKeywordKind(Morph)`), the same
+    // reasoning as the foretell/miracle meta-references above. The singular
+    // form takes the article ("a morph ability"), the plural drops it.
+    if matches!(text, "a morph ability" | "morph abilities") {
+        return Some(KeywordMatch::Kind(KeywordKind::Morph));
     }
 
     let keyword = Keyword::from_str(text).ok()?;

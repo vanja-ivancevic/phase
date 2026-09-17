@@ -554,6 +554,7 @@
     "onlyForSpecialAction": "Gastar solo en una acción especial específica",
     "impossible": "Este maná no se puede gastar",
     "convokePayment": "Pago de convocar",
+    "onlyForSpellObject": "Gastar solo para lanzar la última carta exiliada con este permanente",
     "grantsProperty": "Otorga una propiedad al hechizo",
     "grantCantBeCountered": "Gástalo en este hechizo para que no se pueda contrarrestar"
   },

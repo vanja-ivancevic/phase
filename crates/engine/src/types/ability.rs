@@ -2764,6 +2764,12 @@ pub enum ManaProduction {
         #[serde(default = "default_quantity_one")]
         count: QuantityExpr,
     },
+    /// CR 106.1b + CR 608.2k (Ice Cauldron): produce the FULL last-noted
+    /// mana payment — every noted unit, in order, including duplicates and
+    /// colorless. Differs from `NotedType` (which repeats its first noted
+    /// type `count` times): the noted AMOUNT here is `types.len()`, the
+    /// number of units the noting activation actually spent.
+    NotedTypeAndAmount,
     /// CR 106.7: Produce mana of any color that a land an opponent controls could produce.
     /// Colors are computed dynamically at resolution time by inspecting opponent lands.
     OpponentLandColors {
@@ -2903,6 +2909,7 @@ impl ManaProduction {
             | ManaProduction::ChoiceAmongExiledColors { .. }
             | ManaProduction::ChoiceAmongCombinations { .. }
             | ManaProduction::DistinctColorsAmongPermanents { .. }
+            | ManaProduction::NotedTypeAndAmount
             | ManaProduction::TriggerEventManaType => {}
         }
     }
@@ -2977,6 +2984,7 @@ impl<'de> serde::Deserialize<'de> for ManaProduction {
                         #[serde(default = "default_quantity_one")]
                         count: QuantityExpr,
                     },
+                    NotedTypeAndAmount,
                     OpponentLandColors {
                         #[serde(default = "default_quantity_one")]
                         count: QuantityExpr,
@@ -3062,6 +3070,7 @@ impl<'de> serde::Deserialize<'de> for ManaProduction {
                     ManaProductionHelper::NotedType { count } => {
                         ManaProduction::NotedType { count }
                     }
+                    ManaProductionHelper::NotedTypeAndAmount => ManaProduction::NotedTypeAndAmount,
                     ManaProductionHelper::OpponentLandColors { count } => {
                         ManaProduction::OpponentLandColors { count }
                     }
@@ -3422,6 +3431,12 @@ pub enum ManaSpendRestriction {
     /// and correctly rejected for any other context — see
     /// [`SpecialAction::TurnFaceUp`](super::mana::SpecialAction::TurnFaceUp).
     TurnPermanentFaceUp,
+    /// CR 607.2a + CR 608.2k (Ice Cauldron): "Spend this mana only to cast the
+    /// last card exiled with ~" — source-linked identity restriction. Lowered
+    /// at production to `ManaRestriction::OnlyForSpellObject` bound to the
+    /// concrete card of the source's most recent linked exile; no linked exile
+    /// lowers to `Impossible` (fail-closed), never to unbound mana.
+    SpellExiledWithSource,
     /// CR 106.6: Disjunction of spend restrictions ("cast X or Y or activate Z").
     /// Lowered to `ManaRestriction::OnlyForAny`.
     Any(Vec<ManaSpendRestriction>),
@@ -3481,7 +3496,11 @@ impl ManaSpendRestriction {
             | ManaSpendRestriction::SpellOfSourceChosenColor
             | ManaSpendRestriction::SpellFromZone(_)
             | ManaSpendRestriction::CannotCastSpellFromZone(_)
-            | ManaSpendRestriction::UnlockDoor => true,
+            | ManaSpendRestriction::UnlockDoor
+            // CR 607.2a + CR 608.2k: lowered to `OnlyForSpellObject`, whose
+            // gate reads `SpellMeta.object` (set by `build_spell_meta`) and
+            // compares against the production-time bound card.
+            | ManaSpendRestriction::SpellExiledWithSource => true,
             // CR 106.6: coverage for a disjunction requires every named branch to
             // be production-live (`.all()`). Partial absorption would drop
             // unsupported branches from coverage accounting. With `FaceDownSpell`
@@ -10178,6 +10197,15 @@ pub enum StaticCondition {
     /// unless it shares a color with the most common color among all permanents
     /// or a color tied for most common" (the static gate wraps this in `Not`).
     SharesColorWithMostCommonColorAmongPermanents,
+    /// CR 105.2: True when the given color is the most common color among all
+    /// permanents on the battlefield, including any color tied for most common
+    /// (the runtime predicate treats every color at the maximum histogram count
+    /// as most-common). Used by the Prophecy djinns: "This creature gets -2/-2
+    /// as long as [color] is the most common color among all permanents or is
+    /// tied for most common" (Goham/Halam/Ruham/Sulam/Zanam Djinn).
+    ColorIsMostCommonAmongPermanents {
+        color: ManaColor,
+    },
     /// CR 400.7: True when the source permanent entered the battlefield this turn.
     /// Used for "as long as this [permanent] entered this turn" conditional statics.
     SourceEnteredThisTurn,
@@ -10404,6 +10432,7 @@ impl StaticCondition {
             | StaticCondition::DuringYourTurn
             | StaticCondition::DuringOpponentsTurn
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
+            | StaticCondition::ColorIsMostCommonAmongPermanents { .. }
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage
             | StaticCondition::WasCast { .. }
@@ -10522,6 +10551,7 @@ impl StaticCondition {
             | StaticCondition::DuringYourTurn
             | StaticCondition::DuringOpponentsTurn
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
+            | StaticCondition::ColorIsMostCommonAmongPermanents { .. }
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage
             | StaticCondition::WasCast { .. }
@@ -10713,6 +10743,7 @@ impl StaticCondition {
             | StaticCondition::DuringYourTurn
             | StaticCondition::DuringOpponentsTurn
             | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
+            | StaticCondition::ColorIsMostCommonAmongPermanents { .. }
             | StaticCondition::SourceEnteredThisTurn
             | StaticCondition::SourceHasDealtDamage
             | StaticCondition::WasCast { .. }

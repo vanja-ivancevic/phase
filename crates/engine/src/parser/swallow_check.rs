@@ -707,6 +707,18 @@ fn detect_optional_you_may(
     if parsed_has_conditional_modal_max(parsed) {
         return;
     }
+    // CR 701.20e: "As many times as you choose, you may pay 1 life, ..." — the
+    // optionality lives INSIDE the typed repeat-loop effect
+    // (`RepeatPaidLibraryLook`): its payment prompt accepts declining, which is
+    // zero paid iterations (Lim-Dûl's Vault). When the ability lowered to that
+    // effect, the "you may" is modeled, not swallowed. Requiring BOTH the
+    // phrase and the typed effect keeps the exemption tight — an unmodeled
+    // "you may pay" clause still reports.
+    if cleaned.contains("as many times as you choose, you may pay")
+        && parsed_has_repeat_paid_library_look(parsed)
+    {
+        return;
+    }
     // CR 702.160a: Prototype keyword explanation "(You may cast this spell with
     // different mana cost, color, and size. It keeps its abilities and types.)"
     // is keyword reminder text, not an optional effect.
@@ -2086,6 +2098,31 @@ fn any_ability_is_optional(parsed: &ParsedAbilities) -> bool {
         // for the corresponding Oracle clause (Force of Will, Misdirection,
         // Borderpost cycle, Mastery cycle, Pact cycle, Expertise cycle, etc.)
         || !parsed.casting_options.is_empty()
+}
+
+/// CR 701.20e: True when any ability or trigger-execute tree lowered to the
+/// typed repeated paid private-library-look effect (Lim-Dûl's Vault family),
+/// whose payment/reorder prompts model the "you may" repetition optionality.
+fn parsed_has_repeat_paid_library_look(parsed: &ParsedAbilities) -> bool {
+    parsed
+        .abilities
+        .iter()
+        .any(def_tree_has_repeat_paid_library_look)
+        || parsed.triggers.iter().any(|trigger| {
+            trigger
+                .execute
+                .as_deref()
+                .is_some_and(def_tree_has_repeat_paid_library_look)
+        })
+}
+
+fn def_tree_has_repeat_paid_library_look(def: &AbilityDefinition) -> bool {
+    if matches!(&*def.effect, Effect::RepeatPaidLibraryLook) {
+        return true;
+    }
+    def.sub_ability
+        .as_deref()
+        .is_some_and(def_tree_has_repeat_paid_library_look)
 }
 
 fn parsed_has_conditional_modal_max(parsed: &ParsedAbilities) -> bool {
@@ -6178,6 +6215,31 @@ mod tests {
             &["Instant"],
         );
 
+        assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
+    }
+
+    #[test]
+    fn optional_you_may_accepts_repeat_paid_library_look() {
+        // CR 701.20e: Lim-Dûl's Vault — the "you may pay 1 life" optionality is
+        // modeled inside the typed `RepeatPaidLibraryLook` effect (its payment
+        // prompt accepts declining = zero paid iterations), so the ability must
+        // NOT be demoted by the Optional_YouMay detector.
+        let parsed = parse_named(
+            "Look at the top five cards of your library. As many times as you \
+             choose, you may pay 1 life, put those cards on the bottom of your \
+             library in any order, then look at the top five cards of your \
+             library. Then shuffle and put the last cards you looked at this way \
+             on top in any order.",
+            "Lim-D\u{fb}l\u{27}s Vault",
+            &["Instant"],
+        );
+        assert!(
+            parsed.abilities.iter().any(|def| {
+                matches!(&*def.effect, crate::types::ability::Effect::RepeatPaidLibraryLook)
+            }),
+            "expected the typed RepeatPaidLibraryLook effect, got: {:#?}",
+            parsed.abilities
+        );
         assert!(!has_swallowed_detector(&parsed, "Optional_YouMay"));
     }
 

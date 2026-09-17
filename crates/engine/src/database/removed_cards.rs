@@ -4,22 +4,24 @@
 //! card database and the precon deck listings — so they never surface in
 //! search, deckbuilding, coverage, or gameplay.
 //!
+//! `Crusade` was deliberately removed from this list: it is a white-weenie
+//! staple in the premodern old-border deck pool, and every card in that pool
+//! must be playable. The remaining names stay excluded.
+//!
 //! This is data-pipeline tooling, not game-rules logic, so no Comprehensive
 //! Rules annotations apply.
 
 /// Officially-removed card names, lowercased for case-insensitive EXACT
-/// matching. Exact match is mandatory: a substring match on "crusade",
-/// "imprison", or "cleanse" would wrongly drop legitimate cards such as
-/// "Cathars' Crusade", the ~27 "...Crusader" cards, "Imprisoned in the Moon",
-/// and "Suncleanser".
-pub const REMOVED_OFFENSIVE_CARDS: [&str; 7] = [
+/// matching. Exact match is mandatory: a substring match on "imprison" or
+/// "cleanse" would wrongly drop legitimate cards such as "Imprisoned in the
+/// Moon" and "Suncleanser".
+pub const REMOVED_OFFENSIVE_CARDS: [&str; 6] = [
     "invoke prejudice",
     "cleanse",
     "stone-throwing devils",
     "pradesh gypsies",
     "jihad",
     "imprison",
-    "crusade",
 ];
 
 /// True if `name` is an officially-removed card that must be excluded from all
@@ -34,9 +36,11 @@ mod tests {
 
     #[test]
     fn matches_exact_names_case_insensitively() {
-        assert!(is_removed_offensive_card("Crusade"));
-        assert!(is_removed_offensive_card("crusade"));
-        assert!(is_removed_offensive_card("CRUSADE"));
+        // Crusade is deliberately NOT excluded: it is required by the premodern
+        // old-border deck pool (see the module docs).
+        assert!(!is_removed_offensive_card("Crusade"));
+        assert!(!is_removed_offensive_card("crusade"));
+        assert!(!is_removed_offensive_card("CRUSADE"));
         assert!(is_removed_offensive_card("Stone-Throwing Devils"));
         assert!(is_removed_offensive_card("Invoke Prejudice"));
         assert!(is_removed_offensive_card("Pradesh Gypsies"));

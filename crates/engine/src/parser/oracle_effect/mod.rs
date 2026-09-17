@@ -30824,6 +30824,7 @@ fn mana_production_with_count(
             filter: filter.clone(),
             contribution: *contribution,
         }),
+        ManaProduction::NotedTypeAndAmount => Some(ManaProduction::NotedTypeAndAmount),
         ManaProduction::Fixed { .. }
         | ManaProduction::Mixed { .. }
         | ManaProduction::ChoiceAmongExiledColors { .. }
@@ -36044,6 +36045,12 @@ pub(crate) fn parse_effect_chain_ir(
         }
         if chain_has_prior_player_target_referent(builder.clauses())
             && has_player_anaphoric_reference(&text_lower)
+            // CR 102.1 + CR 603.2c: a per-player phase head owns the anaphor —
+            // "the player" is the iterated phase player (ScopedPlayer, stamped
+            // by the phase-trigger machinery), not a prior chosen-player
+            // target. Parent-targeting it would bind the damage to the trigger
+            // source instead (Angel's Trumpet).
+            && ctx.relative_player_scope.as_ref() != Some(&ControllerRef::ScopedPlayer)
         {
             replace_player_anaphor_with_parent_target(&mut clause.effect);
         }

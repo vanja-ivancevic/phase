@@ -3089,6 +3089,25 @@ fn finish_sacrifice_for_cost(
         &events[current_start..],
         chosen,
     );
+    // CR 608.2k + CR 400.7: record the first sacrificed object as this
+    // activation's cost-paid referent ("the sacrificed land", Squandered
+    // Resources) so resolution-time effects read its identity and LKI
+    // characteristics after it has moved to the graveyard. `lki_cache` is
+    // the canonical pre-change snapshot; leave any existing binding (an
+    // earlier cost leaf that already recorded one) untouched.
+    if let Some(pending) = pending.as_mut() {
+        if pending.ability.cost_paid_object.is_none() {
+            if let Some(&first) = chosen.first() {
+                if let Some(lki) = state.lki_cache.get(&first) {
+                    pending.ability.cost_paid_object =
+                        Some(crate::types::ability::CostPaidObjectSnapshot {
+                            object_id: first,
+                            lki: lki.clone(),
+                        });
+                }
+            }
+        }
+    }
     let departed = crate::game::zones::departed_subset(state, chosen);
     crate::game::zones::mark_simultaneous_departures(&mut deferred_cost_events, &departed);
     crate::game::zones::mark_simultaneous_departures(&mut events[current_start..], &departed);
@@ -12282,7 +12301,9 @@ pub(crate) fn production_override_for_option(
         // the produced type is fixed by engine-set state read at production
         // time (`noted_mana_type_for`), not chosen per auto-tap option — no
         // override needed, and CR 106.5 governs the no-noted-type case.
+        // `NotedTypeAndAmount` reads the same engine-set state (full payment).
         | crate::types::ability::ManaProduction::NotedType { .. }
+        | crate::types::ability::ManaProduction::NotedTypeAndAmount
         | crate::types::ability::ManaProduction::TriggerEventManaType => None,
     }
 }

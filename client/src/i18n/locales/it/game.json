@@ -554,6 +554,7 @@
     "onlyForSpecialAction": "Spendi solo per un'azione speciale specifica",
     "impossible": "Questo mana non può essere speso",
     "convokePayment": "Pagamento di Convocare",
+    "onlyForSpellObject": "Spendi solo per lanciare l'ultima carta esiliata con questo permanente",
     "grantsProperty": "Concede una proprietà alla magia",
     "grantCantBeCountered": "Spendi per questa magia per renderla impossibile da neutralizzare"
   },

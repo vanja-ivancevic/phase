@@ -875,7 +875,10 @@ export type ManaRestriction =
   // A source-dependent restriction could not resolve its required choice.
   | "Impossible"
   // Internal convoke-tap marker — never surfaced to the player.
-  | "ConvokePayment";
+  | "ConvokePayment"
+  // "Spend this mana only to cast the last card exiled with ~" (Ice Cauldron).
+  // The bound card is engine-internal; the client renders the rider text.
+  | "OnlyForSpellObject";
 
 // Mirrors `crate::types::mana::ManaSpellGrant` (CR 106.6) — properties this
 // mana grants to the spell it is spent on. Externally-tagged serde.

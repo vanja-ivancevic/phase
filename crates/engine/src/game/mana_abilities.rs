@@ -1144,6 +1144,7 @@ pub(crate) fn mana_choice_prompt(
                 land_filter,
                 owner,
                 source_id,
+                None,
             );
             // CR 106.5: An ability that would produce mana of an undefined type
             // produces no mana, so it needs no color choice.
@@ -7428,6 +7429,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let goblin_ctx = PaymentContext::Spell(&goblin_spell);
         let mut pool_clone = pool.clone();
@@ -7449,6 +7451,7 @@ mod tests {
             has_x_in_cost: false,
             is_face_down: false,
             cant_spend_mana: false,
+            object: None,
         };
         let elemental_ctx = PaymentContext::Spell(&elemental_spell);
         assert!(

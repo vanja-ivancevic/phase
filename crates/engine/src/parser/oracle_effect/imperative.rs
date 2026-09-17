@@ -10315,10 +10315,13 @@ fn parse_behold_effect_ast(text: &str, lower: &str) -> Option<ImperativeFamilyAs
     Some(ImperativeFamilyAst::Behold(filter))
 }
 
-/// "Note [the] type of mana spent to pay this [activation] cost", composed
-/// from the instruction, subject, and cost-referent grammar axes. The
-/// type-and-amount wording remains unsupported because it needs a distinct
-/// durable value model.
+/// "Note [the] type [and amount] of mana spent to pay this [activation] cost",
+/// composed from the instruction, subject, and cost-referent grammar axes.
+/// Both the singular-type wording (Jeweled Amulet) and the type-and-amount
+/// wording (Ice Cauldron) lower to `Effect::NoteManaSpent`: the effect records
+/// the exact per-unit payment, so the reader decides whether to use one type
+/// (`ManaProduction::NotedType`) or every noted unit
+/// (`ManaProduction::NotedTypeAndAmount`).
 fn parse_note_mana_spent_clause(input: &str) -> OracleResult<'_, ()> {
     value(
         (),
@@ -10334,7 +10337,13 @@ fn parse_note_mana_spent_clause(input: &str) -> OracleResult<'_, ()> {
 fn parse_note_instruction_prefix(input: &str) -> OracleResult<'_, ()> {
     value(
         (),
-        preceded(tag("note "), preceded(opt(tag("the ")), tag("type"))),
+        preceded(
+            tag("note "),
+            preceded(
+                opt(tag("the ")),
+                terminated(tag("type"), opt(tag(" and amount"))),
+            ),
+        ),
     )
     .parse(input)
 }
@@ -19070,16 +19079,18 @@ mod tests {
         );
     }
 
-    /// CR 608.2b: "turn target creature with a morph ability face down" (Backslide)
-    /// carries a target restriction ("with a morph ability") the parser cannot
-    /// model. Rather than silently drop it — which would illegally widen the
-    /// legal-target set to any creature — the verb arm must reject the clause
-    /// (returning `None`) so it falls through to `Unimplemented`. The unrestricted
-    /// "turn target creature face down" still parses, pinning the guard's other
-    /// end.
+    /// CR 608.2b: a turn-face-down subject carrying a target restriction the
+    /// parser cannot model must be REJECTED (returning `None`) so the clause
+    /// falls through to `Unimplemented`, rather than silently dropping the
+    /// restriction — which would illegally widen the legal-target set to any
+    /// creature. "with a morph ability" IS modeled now (Backslide parses to
+    /// `TurnFaceDown` with a `HasKeywordKind(Morph)` filter — see
+    /// `turn_face_down_with_morph_ability_subject_parses`), so the guard uses a
+    /// genuinely unmodeled restriction. The unrestricted "turn target creature
+    /// face down" still parses, pinning the guard's other end.
     #[test]
     fn turn_face_down_with_unmodeled_restriction_falls_through() {
-        let text = "turn target creature with a morph ability face down";
+        let text = "turn target creature with a mythic ability face down";
         let lower = text.to_lowercase();
         let ast = parse_imperative_family_ast(text, &lower, &mut ParseContext::default());
         assert!(

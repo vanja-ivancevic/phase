@@ -2679,6 +2679,7 @@ pub fn matches_target_filter_on_zone_change_record(
         ctx.source_controller,
         ctx.ability,
         ctx.trigger_source,
+        ctx.scoped_iteration_player,
     )
 }
 
@@ -3791,6 +3792,7 @@ fn build_battlefield_entry_token_object(
     obj
 }
 
+#[allow(clippy::too_many_arguments)]
 fn zone_change_filter_inner(
     state: &GameState,
     record: &ZoneChangeRecord,
@@ -3799,6 +3801,7 @@ fn zone_change_filter_inner(
     source_controller: Option<PlayerId>,
     ability: Option<&ResolvedAbility>,
     trigger_source: Option<&TriggerSourceContext>,
+    scoped_iteration_player: Option<PlayerId>,
 ) -> bool {
     match filter {
         TargetFilter::None => false,
@@ -3870,7 +3873,12 @@ fn zone_change_filter_inner(
                         return false;
                     }
                     ControllerRef::ScopedPlayer => {
-                        match scoped_player_or_controller(state, ability, source_controller, None) {
+                        match scoped_player_or_controller(
+                            state,
+                            ability,
+                            source_controller,
+                            scoped_iteration_player,
+                        ) {
                             Some(pid) if pid == record.controller => {}
                             _ => return false,
                         }
@@ -3927,6 +3935,7 @@ fn zone_change_filter_inner(
                 source_controller,
                 ability,
                 trigger_source,
+                scoped_iteration_player,
             )
         }
         TargetFilter::Or { filters } => filters.iter().any(|inner| {
@@ -3938,6 +3947,7 @@ fn zone_change_filter_inner(
                 source_controller,
                 ability,
                 trigger_source,
+                scoped_iteration_player,
             )
         }),
         TargetFilter::And { filters } => filters.iter().all(|inner| {
@@ -3949,6 +3959,7 @@ fn zone_change_filter_inner(
                 source_controller,
                 ability,
                 trigger_source,
+                scoped_iteration_player,
             )
         }),
         TargetFilter::SpecificObject { id } => record.object_id == *id,
@@ -6188,7 +6199,12 @@ fn matches_filter_prop(
                 }
                 _ => None,
             })
-            .is_some_and(|chosen| obj.card_types.subtypes.iter().any(|subtype| subtype.eq_ignore_ascii_case(chosen))),
+            .is_some_and(|chosen| {
+                obj.card_types
+                    .subtypes
+                    .iter()
+                    .any(|subtype| subtype.eq_ignore_ascii_case(chosen))
+            }),
         // CR 205.3m: Object's creature type ties for highest count
         // among creature cards in the named player's named zone. Scope picks
         // the player whose zone is inspected; `Opponent` falls back to the
@@ -8077,6 +8093,7 @@ mod tests {
             Some(PlayerId(0)),
             Some(&child),
             None,
+            None,
         ));
         assert!(zone_change_filter_inner(
             &state,
@@ -8086,18 +8103,18 @@ mod tests {
             Some(PlayerId(0)),
             Some(&child),
             None,
+            None,
         ));
 
-        let source_ctx =
-            source_context_from_filter(
-                &state,
-                source,
-                Some(PlayerId(0)),
-                Some(&child),
-                None,
-                None,
-                None,
-            );
+        let source_ctx = source_context_from_filter(
+            &state,
+            source,
+            Some(PlayerId(0)),
+            Some(&child),
+            None,
+            None,
+            None,
+        );
         assert!(attachment_controller_matches(
             Some(&ControllerRef::TargetOpponent),
             PlayerId(1),
@@ -9026,9 +9043,10 @@ mod tests {
         let fresh = add_creature(&mut state, PlayerId(0), "Fresh");
         state.objects.get_mut(&fresh).unwrap().summoning_sick = true;
 
-        let filter = TargetFilter::Typed(TypedFilter::default().properties(vec![
-            FilterProp::ControlledContinuouslySinceTurnBegan,
-        ]));
+        let filter = TargetFilter::Typed(
+            TypedFilter::default()
+                .properties(vec![FilterProp::ControlledContinuouslySinceTurnBegan]),
+        );
         assert!(matches_target_filter(&state, established, &filter, source));
         assert!(!matches_target_filter(&state, fresh, &filter, source));
     }
@@ -13446,16 +13464,15 @@ mod tests {
         use crate::types::game_state::ZoneChangeRecord;
 
         let state = GameState::default();
-        let source_ctx =
-            source_context_from_filter(
-                &state,
-                ObjectId(1),
-                Some(PlayerId(0)),
-                None,
-                None,
-                None,
-                None,
-            );
+        let source_ctx = source_context_from_filter(
+            &state,
+            ObjectId(1),
+            Some(PlayerId(0)),
+            None,
+            None,
+            None,
+            None,
+        );
 
         // Leg 1: legendary creature (Arbaaz Mir, In Garruk's Wake-style ETB).
         let legendary_record = ZoneChangeRecord {
@@ -13525,16 +13542,15 @@ mod tests {
         use crate::types::game_state::{LKISnapshot, ZoneChangeRecord};
 
         let mut state = GameState::default();
-        let source_ctx =
-            source_context_from_filter(
-                &state,
-                ObjectId(1),
-                Some(PlayerId(0)),
-                None,
-                None,
-                None,
-                None,
-            );
+        let source_ctx = source_context_from_filter(
+            &state,
+            ObjectId(1),
+            Some(PlayerId(0)),
+            None,
+            None,
+            None,
+            None,
+        );
 
         let lki = |tapped: bool| LKISnapshot {
             name: "Tap Probe".to_string(),
@@ -13628,16 +13644,15 @@ mod tests {
         use crate::types::game_state::ZoneChangeRecord;
 
         let state = GameState::default();
-        let source_ctx =
-            source_context_from_filter(
-                &state,
-                ObjectId(1),
-                Some(PlayerId(0)),
-                None,
-                None,
-                None,
-                None,
-            );
+        let source_ctx = source_context_from_filter(
+            &state,
+            ObjectId(1),
+            Some(PlayerId(0)),
+            None,
+            None,
+            None,
+            None,
+        );
 
         // base 1/1, current 2/2 (had a +1/+1 counter when it left the battlefield).
         let record = ZoneChangeRecord {
@@ -13768,15 +13783,7 @@ mod tests {
         assert_eq!(record.toughness, Some(2));
 
         let source_ctx =
-            source_context_from_filter(
-                &state,
-                id,
-                Some(PlayerId(0)),
-                None,
-                None,
-                None,
-                None,
-            );
+            source_context_from_filter(&state, id, Some(PlayerId(0)), None, None, None, None);
         let pt_filter = |scope| FilterProp::PtComparison {
             stat: PtStat::Power,
             scope,
@@ -13910,16 +13917,15 @@ mod tests {
     #[test]
     fn zone_change_record_token_property_matches_snapshot() {
         let state = GameState::default();
-        let source_ctx =
-            source_context_from_filter(
-                &state,
-                ObjectId(1),
-                Some(PlayerId(0)),
-                None,
-                None,
-                None,
-                None,
-            );
+        let source_ctx = source_context_from_filter(
+            &state,
+            ObjectId(1),
+            Some(PlayerId(0)),
+            None,
+            None,
+            None,
+            None,
+        );
 
         let token_record = ZoneChangeRecord {
             core_types: vec![CoreType::Creature],
@@ -13994,16 +14000,15 @@ mod tests {
         use crate::types::game_state::{ZoneChangeCombatStatus, ZoneChangeRecord};
 
         let state = GameState::default();
-        let source_ctx =
-            source_context_from_filter(
-                &state,
-                ObjectId(1),
-                Some(PlayerId(0)),
-                None,
-                None,
-                None,
-                None,
-            );
+        let source_ctx = source_context_from_filter(
+            &state,
+            ObjectId(1),
+            Some(PlayerId(0)),
+            None,
+            None,
+            None,
+            None,
+        );
         let attacking_record = ZoneChangeRecord {
             combat_status: ZoneChangeCombatStatus {
                 attacking: true,
@@ -14132,15 +14137,7 @@ mod tests {
             .push(ChosenAttribute::Player(PlayerId(1)));
 
         let source_ctx =
-            source_context_from_filter(
-                &state,
-                src,
-                Some(PlayerId(0)),
-                None,
-                None,
-                None,
-                None,
-            );
+            source_context_from_filter(&state, src, Some(PlayerId(0)), None, None, None, None);
 
         assert!(
             attacking_defender_matches(

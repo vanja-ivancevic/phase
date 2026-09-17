@@ -195,6 +195,9 @@ fn guard_mana_restrictions_payload(
             | ManaRestriction::OnlyForFaceDownSpell
             | ManaRestriction::OnlyForSpecialAction(_)
             | ManaRestriction::Impossible
+            // CR 607.2a + CR 608.2k: payload-free on the wire — the bound
+            // ObjectId is engine-internal and never enters the payload.
+            | ManaRestriction::OnlyForSpellObject(_)
             | ManaRestriction::ConvokePayment => {}
         }
     }

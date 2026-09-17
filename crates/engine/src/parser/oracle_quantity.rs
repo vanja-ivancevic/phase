@@ -637,6 +637,13 @@ pub(crate) fn parse_quantity_ref_with_context(
         if let Some(qty) = parse_filtered_landing_zone_this_way(&rest.to_ascii_lowercase()) {
             return Some(qty);
         }
+        // CR 120.1: "the number of <type> tapped this way" (Angel's Trumpet) —
+        // the mass-tap executor publishes its affected set as the latest
+        // tracked set; count it through the same filtered-tracked-set channel
+        // (cause None: the latest set IS the tap set of this resolution).
+        if let Some(qty) = parse_tapped_this_way_count(&rest.to_ascii_lowercase()) {
+            return Some(qty);
+        }
         // CR 301.5a + CR 303.4: "the number of <type> attached to <source>" counts
         // objects whose `attached_to` is the source ("him"/"her"/"~" all denote the
         // source — Whiplash's "where X is the number of Equipment attached to him";
@@ -652,6 +659,40 @@ pub(crate) fn parse_quantity_ref_with_context(
                 return Some(canonicalize_quantity_ref(qty));
             }
         }
+        // CR 120.3: "the number of <type> of that [chosen] color that player
+        // controls" (Searing Rays) — the per-player DamageEachPlayer count.
+        // The count filter gains the chosen-color property
+        // (FilterProp::IsChosenColor — the Choose-a-color sibling clause) and
+        // the DamageEachPlayer recipient as controller: ControllerRef::ScopedPlayer,
+        // which resolve_quantity_scoped_with_targets rebinds to each iterated
+        // player. Tried before the bare type-phrase fall-through, which cannot
+        // consume "of that color" and would leave a non-empty remainder.
+        {
+            let lower_rest = rest.to_ascii_lowercase();
+            let suffixes = [
+                "of that color that player controls",
+                "of the chosen color that player controls",
+            ];
+            for suffix in suffixes {
+                if let Some(mid_len) = lower_rest.strip_suffix(suffix).map(|m| m.len()) {
+                    let type_phrase = rest[..mid_len].trim_end();
+                    if type_phrase.is_empty() {
+                        continue;
+                    }
+                    let (filter, remainder) = parse_type_phrase_with_ctx(type_phrase, ctx);
+                    if remainder.trim().is_empty() {
+                        if let TargetFilter::Typed(mut tf) = filter {
+                            tf.properties.push(FilterProp::IsChosenColor);
+                            tf.controller = Some(ControllerRef::ScopedPlayer);
+                            return Some(QuantityRef::ObjectCount {
+                                filter: TargetFilter::Typed(tf),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
         let (filter, remainder) = parse_type_phrase_with_ctx(rest, ctx);
         // CR 109.1: `parse_type_phrase_with_ctx` always returns `TargetFilter::Typed`,
         // including the empty-shaped form (no `type_filters`, no `controller`, no
@@ -2408,6 +2449,57 @@ fn parse_destroyed_or_sacrificed_this_way_filter(
     None
 }
 
+fn parse_filtered_landing_zone_this_way(lower: &str) -> Option<QuantityRef> {
+    // Composed landing-zone tail grammar (one nom production, not a string-table
+    // loop): `<type phrase> [that was|that were]? (returned | put into a
+    // graveyard) this way`. `parse_type_phrase` consumes the noun phrase; the
+    // tail is a shared optional relative clause (`opt(alt(..))`) plus an `alt()`
+    // over the landing-zone verb phrases, terminated by "this way".
+    let (filter, remainder) = crate::parser::oracle_target::parse_type_phrase(lower);
+
+    // Require a specific type filter. A typeless or generic "card" filter is
+    // the unfiltered count and stays unsupported. A controller-bearing filter
+    // is accepted ONLY when the controller is the per-recipient anaphor
+    // (ControllerRef::ScopedPlayer — "artifacts they controlled", Builder's
+    // Bane): parse_type_phrase maps the pronoun to ScopedPlayer, and
+    // resolve_quantity_scoped_with_targets threads each DamageEachPlayer
+    // recipient through the tracked-set count. Any other controller stays
+    // fail-closed.
+    match &filter {
+        TargetFilter::Typed(typed)
+            if !typed.type_filters.is_empty()
+                && !typed
+                    .type_filters
+                    .iter()
+                    .all(|t| matches!(t, TypeFilter::Card))
+                && matches!(typed.controller, None | Some(ControllerRef::ScopedPlayer)) => {}
+        _ => return None,
+    }
+
+    // Parse the composed landing-zone tail off the type phrase's remainder.
+    let rest = remainder.trim_start();
+    let (rest, _) = opt(alt((
+        tag::<_, _, OracleError<'_>>("that was "),
+        tag::<_, _, OracleError<'_>>("that were "),
+    )))
+    .parse(rest)
+    .ok()?;
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("returned"),
+        tag::<_, _, OracleError<'_>>("put into a graveyard"),
+    ))
+    .parse(rest)
+    .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(" this way").parse(rest).ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+    Some(QuantityRef::FilteredTrackedSetSize {
+        filter: Box::new(filter),
+        caused_by: None,
+    })
+}
+
 /// CR 608.2c + CR 400.7j + CR 701.8a: "the number of <type> {returned | put into
 /// a graveyard} this way" — count from the tracked set populated by the preceding
 /// bounce/destroy in the sub_ability chain. Mirrors
@@ -2431,43 +2523,27 @@ fn parse_destroyed_or_sacrificed_this_way_filter(
 /// - a controller-bearing prefix ("artifacts they controlled") expresses a
 ///   per-recipient scope that a fixed tracked-set filter cannot represent, so it
 ///   is rejected — Builder's Bane stays `Unimplemented` rather than mis-resolving.
-fn parse_filtered_landing_zone_this_way(lower: &str) -> Option<QuantityRef> {
-    // Composed landing-zone tail grammar (one nom production, not a string-table
-    // loop): `<type phrase> [that was|that were]? (returned | put into a
-    // graveyard) this way`. `parse_type_phrase` consumes the noun phrase; the
-    // tail is a shared optional relative clause (`opt(alt(..))`) plus an `alt()`
-    // over the landing-zone verb phrases, terminated by "this way".
+///
+/// CR 120.1 + CR 701.26a: "the number of <type> tapped this way" (Angel's
+/// Trumpet) — count the mass-tap tracked set, filtered by the type phrase.
+/// Requires a concrete type filter (a bare "cards" tail is the unfiltered
+/// count shape and stays unsupported).
+fn parse_tapped_this_way_count(lower: &str) -> Option<QuantityRef> {
     let (filter, remainder) = crate::parser::oracle_target::parse_type_phrase(lower);
-
-    // Require a specific, controller-agnostic type filter. A typeless or generic
-    // "card" filter is the unfiltered count; a controller-bearing filter is
-    // per-recipient (Builder's Bane) — both stay unsupported.
     match &filter {
         TargetFilter::Typed(typed)
-            if typed.controller.is_none()
-                && !typed.type_filters.is_empty()
+            if !typed.type_filters.is_empty()
                 && !typed
                     .type_filters
                     .iter()
                     .all(|t| matches!(t, TypeFilter::Card)) => {}
         _ => return None,
     }
-
-    // Parse the composed landing-zone tail off the type phrase's remainder.
     let rest = remainder.trim_start();
-    let (rest, _) = opt(alt((
-        tag::<_, _, OracleError<'_>>("that was "),
-        tag::<_, _, OracleError<'_>>("that were "),
-    )))
-    .parse(rest)
-    .ok()?;
-    let (rest, _) = alt((
-        tag::<_, _, OracleError<'_>>("returned"),
-        tag::<_, _, OracleError<'_>>("put into a graveyard"),
-    ))
-    .parse(rest)
-    .ok()?;
-    let (rest, _) = tag::<_, _, OracleError<'_>>(" this way").parse(rest).ok()?;
+    let rest = tag::<_, _, OracleError<'_>>("tapped this way")
+        .parse(rest)
+        .ok()?
+        .0;
     if !rest.trim().is_empty() {
         return None;
     }
@@ -6407,7 +6483,10 @@ mod tests {
             parse_event_context_quantity("that artifactoid's mana value"),
             None
         );
-        assert_eq!(parse_event_context_quantity("the artifactoid's power"), None);
+        assert_eq!(
+            parse_event_context_quantity("the artifactoid's power"),
+            None
+        );
     }
 
     /// Negative guard for the participle word-boundary fix: a prefix like
@@ -8166,13 +8245,35 @@ mod tests {
         );
     }
 
-    /// NEGATIVE (Builder's Bane guard): a controller-bearing prefix that leaves
-    /// a `parse_type_phrase` remainder must fail cleanly, not produce a
-    /// FilteredTrackedSetSize.
+    /// POSITIVE (Builder's Bane): the per-recipient controller anaphor
+    /// ("they controlled" → ScopedPlayer) now lowers to a real
+    /// FilteredTrackedSetSize — `resolve_quantity_scoped_with_targets` threads
+    /// each DamageEachPlayer recipient through the count.
     #[test]
-    fn artifacts_they_controlled_put_into_graveyard_this_way_is_none() {
+    fn artifacts_they_controlled_put_into_graveyard_this_way_lowers() {
         let result = parse_event_context_quantity(
             "the number of artifacts they controlled that were put into a graveyard this way",
+        );
+        let Some(QuantityExpr::Ref {
+            qty: QuantityRef::FilteredTrackedSetSize { filter, .. },
+        }) = result
+        else {
+            panic!("expected FilteredTrackedSetSize, got {result:?}");
+        };
+        let TargetFilter::Typed(tf) = filter.as_ref() else {
+            panic!("expected Typed filter, got {filter:?}");
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::ScopedPlayer));
+        assert_eq!(tf.type_filters, vec![TypeFilter::Artifact]);
+    }
+
+    /// NEGATIVE: a controller-bearing prefix that does NOT map to the
+    /// per-recipient anaphor (here `you controlled`) stays fail-closed — it
+    /// must not produce a FilteredTrackedSetSize.
+    #[test]
+    fn artifacts_you_controlled_put_into_graveyard_this_way_is_none() {
+        let result = parse_event_context_quantity(
+            "the number of artifacts you controlled that were put into a graveyard this way",
         );
         assert!(
             !matches!(
@@ -8181,7 +8282,7 @@ mod tests {
                     qty: QuantityRef::FilteredTrackedSetSize { .. },
                 })
             ),
-            "controller-bearing prefix must not become a clean FilteredTrackedSetSize, got {result:?}"
+            "non-anaphoric controller prefix must stay unsupported, got {result:?}"
         );
     }
 
@@ -8804,10 +8905,7 @@ mod tests {
         // Minion of the Wastes uses the pronoun form; Phyrexian Processor's
         // normalized Oracle line uses `~`. Both are the same entry-history
         // quantity, not an ordinary resolution-local "that much" value.
-        for phrase in [
-            "the life paid as it entered",
-            "the life paid as ~ entered",
-        ] {
+        for phrase in ["the life paid as it entered", "the life paid as ~ entered"] {
             assert_eq!(
                 parse_cda_quantity(phrase),
                 Some(QuantityExpr::Ref {
@@ -8998,5 +9096,80 @@ mod tests {
                 "unexpected Effect::Unimplemented in trigger: {effect:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod searing_rays_tests {
+    use super::*;
+
+    /// CR 120.3: Searing Rays' per-player count — "the number of creatures of
+    /// that color that player controls" must lower to an ObjectCount whose
+    /// filter carries the chosen-color property and the DamageEachPlayer
+    /// recipient (ScopedPlayer) as controller.
+    #[test]
+    fn searing_rays_chosen_color_per_player_count_lowers() {
+        use crate::parser::oracle_ir::context::ParseContext;
+        use crate::types::ability::{ControllerRef, FilterProp};
+        let mut scoped = ParseContext {
+            relative_player_scope: Some(ControllerRef::ScopedPlayer),
+            ..Default::default()
+        };
+        let qty = parse_cda_quantity_with_context(
+            "the number of creatures of that color that player controls",
+            &mut scoped,
+        )
+        .expect("Searing Rays count must parse");
+        let QuantityExpr::Ref { qty } = qty else {
+            panic!("expected Ref quantity, got {qty:?}");
+        };
+        let QuantityRef::ObjectCount {
+            filter: TargetFilter::Typed(tf),
+        } = qty
+        else {
+            panic!("expected ObjectCount with Typed filter, got {qty:?}");
+        };
+        assert_eq!(tf.type_filters, vec![TypeFilter::Creature]);
+        assert!(
+            tf.properties.contains(&FilterProp::IsChosenColor),
+            "the chosen-color property must be present, got {:?}",
+            tf.properties
+        );
+        assert_eq!(tf.controller, Some(ControllerRef::ScopedPlayer));
+    }
+}
+
+#[cfg(test)]
+mod builders_bane_tests {
+    use super::*;
+    use crate::parser::oracle_ir::context::ParseContext;
+    use crate::types::ability::ControllerRef;
+
+    /// CR 120.3: Builder's Bane — "the number of artifacts they controlled
+    /// that were put into a graveyard this way" lowers to
+    /// FilteredTrackedSetSize over artifacts controlled by the DamageEachPlayer
+    /// recipient (ScopedPlayer).
+    #[test]
+    fn builders_bane_per_recipient_landing_zone_count_lowers() {
+        let mut scoped = ParseContext {
+            relative_player_scope: Some(ControllerRef::ScopedPlayer),
+            ..Default::default()
+        };
+        let qty = parse_cda_quantity_with_context(
+            "the number of artifacts they controlled that were put into a graveyard this way",
+            &mut scoped,
+        )
+        .expect("Builder's Bane count must parse");
+        let QuantityExpr::Ref { qty } = qty else {
+            panic!("expected Ref quantity, got {qty:?}");
+        };
+        let QuantityRef::FilteredTrackedSetSize { filter, .. } = qty else {
+            panic!("expected FilteredTrackedSetSize, got {qty:?}");
+        };
+        let TargetFilter::Typed(tf) = filter.as_ref() else {
+            panic!("expected Typed filter, got {filter:?}");
+        };
+        assert_eq!(tf.type_filters, vec![TypeFilter::Artifact]);
+        assert_eq!(tf.controller, Some(ControllerRef::ScopedPlayer));
     }
 }

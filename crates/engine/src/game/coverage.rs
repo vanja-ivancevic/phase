@@ -2113,6 +2113,7 @@ fn fmt_mana_production(mp: &ManaProduction) -> String {
         ManaProduction::NotedType { count } => {
             format!("{} of noted type", fmt_quantity(count))
         }
+        ManaProduction::NotedTypeAndAmount => "last noted type and amount".into(),
         ManaProduction::OpponentLandColors { count } => {
             format!("{} of opponent land colors", fmt_quantity(count))
         }
@@ -4716,6 +4717,9 @@ fn fmt_static_condition(cond: &StaticCondition) -> String {
         SC::DuringOpponentsTurn => "during an opponent's turn".into(),
         SC::SharesColorWithMostCommonColorAmongPermanents => {
             "shares a color with the most common color among all permanents".into()
+        }
+        SC::ColorIsMostCommonAmongPermanents { .. } => {
+            "color is the most common color among all permanents".into()
         }
         SC::SourceEnteredThisTurn => "source entered this turn".into(),
         SC::SourceHasDealtDamage => "source has dealt damage".into(),
@@ -8811,6 +8815,9 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::DayNightIs { .. } => ("DayNightIs", Handled),
         StaticCondition::SharesColorWithMostCommonColorAmongPermanents => {
             ("SharesColorWithMostCommonColorAmongPermanents", Handled)
+        }
+        StaticCondition::ColorIsMostCommonAmongPermanents { .. } => {
+            ("ColorIsMostCommonAmongPermanents", Handled)
         }
         StaticCondition::SourceEnteredThisTurn => ("SourceEnteredThisTurn", Handled),
         StaticCondition::SourceHasDealtDamage => ("SourceHasDealtDamage", Handled),

@@ -407,6 +407,45 @@ pub(super) fn try_parse_add_mana_effect_with_context(
             });
         }
 
+        // CR 608.2k + CR 106.7: anaphoric referents — "mana of any type
+        // [that] land could produce" (Benthic Explorers' untap-as-cost land)
+        // and "mana of any type the sacrificed land could produce"
+        // (Squandered Resources). Both refer to the object this ability paid
+        // its own cost
+        // with; the payment paths record that identity on
+        // `ResolvedAbility::cost_paid_object`, and production resolves the
+        // type set from the snapshot's LKI so the sacrificed (dead) land
+        // still produces (CR 400.7 LKI).
+        if nom_on_lower(rest, &rest_lower, |i| {
+            value(
+                (),
+                preceded(
+                    tag("mana of any type "),
+                    preceded(
+                        opt(tag("that ")),
+                        terminated(
+                            alt((tag("the sacrificed land"), tag("land"))),
+                            tag(" could produce"),
+                        ),
+                    ),
+                ),
+            )
+            .parse(i)
+        })
+        .is_some()
+        {
+            return Some(Effect::Mana {
+                produced: ManaProduction::AnyTypeProduceableBy {
+                    count,
+                    land_filter: TargetFilter::CostPaidObject,
+                },
+                restrictions: vec![],
+                grants: vec![],
+                expiry: None,
+                target: where_x_target,
+            });
+        }
+
         if let Some((_, after_color)) = nom_on_lower(rest, &rest_lower, |i| {
             alt((
                 value((), tag("mana of any one color")),
@@ -1452,6 +1491,20 @@ fn scan_mana_production_type(
                 },
                 alt((tag("mana of the chosen color"), tag("mana of that color"))),
             ),
+            // CR 106.1b + CR 608.2k (Ice Cauldron): "Add this artifact's last
+            // noted type and amount of mana" (`~` normalized from "this
+            // artifact" upstream). The noted payment stores one entry per unit
+            // actually spent, so production replays every noted unit in order
+            // and the amount is that list's length rather than a separate
+            // field. Tried before the bare `NotedType` arm below.
+            value(
+                ManaProduction::NotedTypeAndAmount,
+                alt((
+                    tag("~'s last noted type and amount of mana"),
+                    tag("~’s last noted type and amount of mana"),
+                    tag("this artifact's last noted type and amount of mana"),
+                )),
+            ),
             // CR 106.1b: "mana of ~'s last noted type" (Jeweled Amulet: "Add
             // one mana of this artifact's last noted type" — `~` normalized
             // from "this artifact" upstream). Engine-set (`Effect::
@@ -1560,6 +1613,13 @@ fn parse_negative_mana_spend_restriction(lower: &str) -> Option<ManaSpendRestric
             ZoneSpendPolarity::From => Some(ManaSpendRestriction::CannotCastSpellFromZone(zone)),
             ZoneSpendPolarity::NotFrom => None,
         };
+    }
+
+    // CR 106.6: the bare negative form — "this mana can't be spent to cast
+    // spells" (Thran Turbine). Spells are prohibited outright and nothing
+    // else is named, so the reading is exactly activation-only.
+    if rest.eq_ignore_ascii_case("spells") {
+        return Some(ManaSpendRestriction::ActivateOnly);
     }
 
     let rest_lower = rest.to_lowercase();
@@ -1854,6 +1914,18 @@ fn parse_monocolored_spell_of_source_chosen_color(rest: &str) -> bool {
 fn parse_single_cast_clause(rest: &str) -> Option<ManaSpendRestriction> {
     let rest = rest.trim();
     let rest_lower = rest.to_lowercase();
+    // CR 607.2a + CR 608.2k (Ice Cauldron): "the last card exiled with ~" —
+    // the whole clause is one source-linked identity restriction. Matched
+    // before the type-phrase fallback, which cannot classify a possessive
+    // exile referent. The `~` form is what the pipeline produces after
+    // self-reference normalization; the spelled-out forms are accepted for
+    // robustness against un-normalized callers.
+    if matches!(
+        rest_lower.as_str(),
+        "the last card exiled with ~" | "the last card exiled with this artifact" | "the last card exiled with it"
+    ) {
+        return Some(ManaSpendRestriction::SpellExiledWithSource);
+    }
     if nom_on_lower(rest, &rest_lower, |i| {
         value((), all_consuming(tag("spells"))).parse(i)
     })
@@ -3280,6 +3352,43 @@ mod tests {
         assert_eq!(typed.controller, Some(ControllerRef::You));
     }
 
+    /// CR 608.2k + CR 106.7: Squandered Resources — the anaphoric "the
+    /// sacrificed land could produce" referent lowers to AnyTypeProduceableBy
+    /// with `TargetFilter::CostPaidObject`, which the payment paths stamp onto
+    /// `ResolvedAbility::cost_paid_object` at sacrifice completion.
+    #[test]
+    fn sacrificed_land_could_produce_parses_to_cost_paid_object() {
+        use crate::types::ability::TargetFilter;
+        let effect =
+            try_parse_add_mana_effect("Add one mana of any type the sacrificed land could produce")
+                .expect("Squandered Resources clause must parse");
+        let Effect::Mana { produced, .. } = effect else {
+            panic!("expected Effect::Mana, got something else");
+        };
+        let ManaProduction::AnyTypeProduceableBy { count, land_filter } = produced else {
+            panic!("expected AnyTypeProduceableBy, got {produced:?}");
+        };
+        assert_eq!(count, QuantityExpr::Fixed { value: 1 });
+        assert_eq!(land_filter, TargetFilter::CostPaidObject);
+    }
+
+    /// CR 608.2k: Benthic Explorers — "that land could produce" (the land
+    /// untapped as part of the activation cost) uses the same cost-paid
+    /// referent.
+    #[test]
+    fn that_land_could_produce_parses_to_cost_paid_object() {
+        use crate::types::ability::TargetFilter;
+        let effect = try_parse_add_mana_effect("Add one mana of any type that land could produce")
+            .expect("Benthic Explorers clause must parse");
+        let Effect::Mana { produced, .. } = effect else {
+            panic!("expected Effect::Mana, got something else");
+        };
+        let ManaProduction::AnyTypeProduceableBy { land_filter, .. } = produced else {
+            panic!("expected AnyTypeProduceableBy, got {produced:?}");
+        };
+        assert_eq!(land_filter, TargetFilter::CostPaidObject);
+    }
+
     /// CR 106.7: Future opponent-scoped "type" printings must dispatch via
     /// the same primitive — this guards the parser's class generality even
     /// though no current card prints this exact phrase.
@@ -4481,6 +4590,23 @@ mod tests {
             Some(vec![ManaSpendRestriction::SpellType(
                 "Instant and Sorcery".to_string()
             )])
+        );
+    }
+
+    // CR 106.6 (Thran Turbine): the bare negative form — spells prohibited
+    // outright, nothing else named — reads as exactly activation-only, the
+    // same semantic the positive "only to activate abilities" arm produces.
+    #[test]
+    fn mana_spend_restriction_cannot_cast_spells_is_activation_only() {
+        let result = parse_mana_spend_restriction("this mana can't be spent to cast spells");
+        assert_eq!(
+            result.map(|(r, _)| r),
+            Some(vec![ManaSpendRestriction::ActivateOnly])
+        );
+        let curly = parse_mana_spend_restriction("this mana can\u{2019}t be spent to cast spells");
+        assert_eq!(
+            curly.map(|(r, _)| r),
+            Some(vec![ManaSpendRestriction::ActivateOnly])
         );
     }
 

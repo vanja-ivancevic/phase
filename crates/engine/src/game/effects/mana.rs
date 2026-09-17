@@ -601,6 +601,19 @@ pub(crate) fn resolve_restrictions(
                     crate::types::mana::SpecialAction::TurnFaceUp,
                 ))
             }
+            // CR 607.2a + CR 608.2k (Ice Cauldron): bind the spend to the
+            // concrete card of this source's most recent linked exile. The
+            // ruling ties "the last card exiled" to the most recent charge,
+            // and the exile links are push-ordered, so the LAST snapshot is
+            // the bound card. A source with no linked exile (or none still in
+            // exile) lowers to `Impossible` — the mana is unspendable, never
+            // accidentally unrestricted.
+            ManaSpendRestriction::SpellExiledWithSource => Some(
+                crate::game::players::linked_exile_cards_for_source(state, source_id)
+                    .last()
+                    .map(|snapshot| ManaRestriction::OnlyForSpellObject(snapshot.exiled_id))
+                    .unwrap_or(ManaRestriction::Impossible),
+            ),
             // CR 106.6: Disjunction — recursively lower each branch. The
             // chosen-color branch preserves its fail-closed `Impossible`; the
             // legacy chosen-creature-type branch retains its historical drop.
@@ -751,6 +764,15 @@ fn resolve_mana_types_impl(
                 None => Vec::new(),
             }
         }
+        // CR 106.1b + CR 608.2k (Ice Cauldron): replay the FULL noted payment —
+        // every noted unit in order, duplicates and colorless included. The
+        // amount was noted alongside the types (NotedManaPayment.types holds
+        // one entry per spent unit), so the list length IS the amount.
+        ManaProduction::NotedTypeAndAmount => state
+            .objects
+            .get(&source_id)
+            .and_then(|obj| obj.noted_mana_spent().map(|units| units.to_vec()))
+            .unwrap_or_default(),
         // CR 106.7: Produce mana of any color that a land an opponent controls could produce.
         // Delegates to mana_sources::opponent_land_color_options for the shared computation.
         ManaProduction::OpponentLandColors { count } => {
@@ -796,6 +818,7 @@ fn resolve_mana_types_impl(
                 land_filter,
                 controller,
                 source_id,
+                ability.as_ref().and_then(|a| a.cost_paid_object.as_ref()),
             );
             let Some(first) = type_options.first().copied() else {
                 return Vec::new();
@@ -2816,6 +2839,7 @@ mod tests {
             &TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You)),
             PlayerId(0),
             ObjectId(100),
+            None,
         );
         assert!(options.contains(&ManaType::White), "union must include W");
         assert!(options.contains(&ManaType::Black), "union must include B");
@@ -2949,6 +2973,7 @@ mod tests {
             &land_filter,
             PlayerId(0),
             ObjectId(9999),
+            None,
         );
         assert!(
             options.contains(&ManaType::Colorless),
@@ -3046,6 +3071,7 @@ mod tests {
             &TargetFilter::Typed(TypedFilter::land().controller(ControllerRef::You)),
             PlayerId(1),
             pool,
+            None,
         );
         assert!(
             pool_opts.is_empty(),

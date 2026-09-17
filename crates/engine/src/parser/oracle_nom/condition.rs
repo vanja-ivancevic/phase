@@ -1672,6 +1672,30 @@ fn merge_attached_predicate_filter(
 /// downstream merged output is preserved byte-for-byte.
 fn parse_bare_predicate_tail(input: &str) -> OracleResult<'_, TargetFilter> {
     let (rest, _) = opt(parse_article).parse(input)?;
+    // CR 110.5b + CR 611.3a: the tap-state adjectives are bare predicates of
+    // the subject they follow. The attached-subject copula ("enchanted creature
+    // is untapped" — Veteran's Voice, Krovikan Plague) and the recipient
+    // anaphor ("it is untapped") share this tail; before this branch the
+    // attached form failed here and the shared grammar misread the phrase as
+    // the SOURCE being untapped (`Not(SourceIsTapped)`), a different subject.
+    // The terminal guard mirrors the legendary/basic branches so a longer
+    // combinator can still own a trailing phrase.
+    if let Ok((rest, prop)) = alt((
+        value(
+            FilterProp::Untapped,
+            tag::<_, _, OracleError<'_>>("untapped"),
+        ),
+        value(FilterProp::Tapped, tag("tapped")),
+    ))
+    .parse(rest)
+    {
+        if rest.is_empty() {
+            return Ok((
+                rest,
+                TargetFilter::Typed(TypedFilter::default().properties(vec![prop])),
+            ));
+        }
+    }
     if let Ok((rest, color)) = parse_color(rest) {
         return Ok((
             rest,

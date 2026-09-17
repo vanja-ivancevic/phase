@@ -426,7 +426,20 @@ fn resolve_all(
         .copied()
         .collect();
 
+    // CR 701.21a + CR 608.2k: mass tap publishes its affected set as the
+    // latest tracked set so a following sentence in the same resolution ("...
+    // deals damage to the player equal to the number of creatures tapped this
+    // way" — Angel's Trumpet) can count it. Only objects that actually
+    // changed state count: an already-tapped permanent does not become tapped
+    // (CR 701.21a), so it is not "tapped this way".
+    let mut tapped_this_way: Vec<ObjectId> = Vec::new();
+
     for obj_id in matching {
+        if matches!(change, TapStateChange::Tap)
+            && state.objects.get(&obj_id).is_some_and(|obj| !obj.tapped)
+        {
+            tapped_this_way.push(obj_id);
+        }
         let outcome = match change {
             TapStateChange::Tap => process_one_tap(state, obj_id, ability.source_id, events)?,
             TapStateChange::Untap => process_one_untap(state, obj_id, events)?,
@@ -435,6 +448,10 @@ fn resolve_all(
             state.waiting_for = replacement::replacement_choice_waiting_for(player, state);
             return Ok(());
         }
+    }
+
+    if matches!(change, TapStateChange::Tap) && !tapped_this_way.is_empty() {
+        super::publish_tracked_set(state, tapped_this_way);
     }
 
     events.push(GameEvent::EffectResolved {

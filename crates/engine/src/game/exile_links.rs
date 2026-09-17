@@ -22,6 +22,11 @@ const LINKED_EXILE_CONSUMER_TAGS: &[&str] = &[
     // is on a static rather than on a target filter — no special-casing of the
     // static-definition shape required.
     "ExileCastPermission",
+    // CR 607.2a + CR 608.2k (Ice Cauldron): the mana ability's
+    // `ManaSpendRestriction::SpellExiledWithSource` consumes the source's
+    // linked-exile pool, so the exiling ability on the same permanent must
+    // record `TrackedBySource` links for the restriction to bind against.
+    "SpellExiledWithSource",
 ];
 
 /// CR 607.1 / CR 607.2a + CR 406.6: A source only needs ordinary
