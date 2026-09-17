@@ -13,7 +13,7 @@ use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_target::parse_type_phrase;
 use crate::types::ability::{
     Comparator, ControllerRef, FilterProp, ParsedCondition, QuantityExpr, QuantityRef,
-    StaticCondition, TargetFilter, TypedFilter,
+    StaticCondition, TargetFilter, TypeFilter, TypedFilter,
 };
 use crate::types::card_type::CoreType;
 use crate::types::counter::CounterMatch;
@@ -129,7 +129,7 @@ pub fn parse_restriction_condition(text: &str) -> Option<ParsedCondition> {
 /// grammar and full consumption; an unrelated or partially recognized phrase
 /// remains an honest gap.
 fn parse_attached_subject_restriction(text: &str) -> Option<ParsedCondition> {
-    let (rest, filter) = nom_condition::parse_attached_subject_is_filter(text).ok()?;
+let (rest, filter) = nom_condition::parse_attached_subject_is_filter(text).ok()?;
     let (rest, state_prop) = opt(preceded(
         tag::<_, _, OracleError<'_>>(" and "),
         alt((
@@ -148,6 +148,16 @@ fn parse_attached_subject_restriction(text: &str) -> Option<ParsedCondition> {
     };
     if let Some(property) = state_prop {
         typed.properties.push(property);
+    }
+
+    // CR 301.5 + CR 602.5b: the attached-subject tap-state predicate with NO
+    // other characteristic ("enchanted creature is untapped") has a dedicated,
+    // exact restriction leaf — one attachment, so the host-presence and
+    // attached-host readings coincide. The same helper backs the shared
+    // grammar's conversion arm, so the leaf is one truth source across both
+    // pipelines.
+    if let Some(required_type) = attached_untapped_host_type(&typed) {
+        return Some(ParsedCondition::SourceUntappedAttachedTo { required_type });
     }
 
     Some(ParsedCondition::QuantityComparison {
@@ -312,6 +322,46 @@ fn parse_restriction_only_condition(text: &str) -> Option<ParsedCondition> {
 /// failed candidate parse, so the source clause stays visible as `Effect::Unimplemented`
 /// rather than becoming a restriction that silently evaluates to "always true" or, worse,
 /// to a weaker approximation of the printed text.
+/// CR 301.5 + CR 602.5b: Recognize the exact attached-host untapped filter the
+/// attached-subject copula builds for "enchanted/equipped <type> is untapped"
+/// — a single core-type filter with only the self-referential attachment
+/// property plus `Untapped`. Anything else (extra properties, a non-core type,
+/// a controller axis) returns `None` and keeps the generic conversion.
+fn attached_untapped_host_type(typed: &TypedFilter) -> Option<CoreType> {
+    let [type_filter] = typed.type_filters.as_slice() else {
+        return None;
+    };
+    let required_type = match type_filter {
+        TypeFilter::Creature => CoreType::Creature,
+        TypeFilter::Artifact => CoreType::Artifact,
+        TypeFilter::Land => CoreType::Land,
+        _ => return None,
+    };
+    if typed.controller.is_some() {
+        return None;
+    }
+    let mut saw_attachment = false;
+    let mut saw_untapped = false;
+    for prop in &typed.properties {
+        match prop {
+            FilterProp::EnchantedBy | FilterProp::EquippedBy => {
+                if saw_attachment {
+                    return None;
+                }
+                saw_attachment = true;
+            }
+            FilterProp::Untapped => {
+                if saw_untapped {
+                    return None;
+                }
+                saw_untapped = true;
+            }
+            _ => return None,
+        }
+    }
+    (saw_attachment && saw_untapped).then_some(required_type)
+}
+
 fn static_condition_to_restriction_condition(
     condition: StaticCondition,
 ) -> Option<ParsedCondition> {
@@ -367,13 +417,26 @@ fn static_condition_to_restriction_condition(
         // Confront the Assault) reuse the full presence-condition vocabulary.
         StaticCondition::IsPresent {
             filter: Some(filter),
-        } => Some(ParsedCondition::QuantityComparison {
-            lhs: QuantityExpr::Ref {
-                qty: QuantityRef::ObjectCount { filter },
-            },
-            comparator: Comparator::GE,
-            rhs: QuantityExpr::Fixed { value: 1 },
-        }),
+        } => {
+            // CR 301.5 + CR 602.5b: "enchanted/equipped <type> is untapped" has
+            // a dedicated restriction leaf, and it is exact: an Aura/Equipment
+            // attaches to at most one object, so "an untapped <type> enchanted
+            // by this source exists" and "this source's attached host is an
+            // untapped <type>" coincide. Prefer the specific representation
+            // over the generic object-count reading (same words, sharper leaf).
+            if let TargetFilter::Typed(typed) = &filter {
+                if let Some(required_type) = attached_untapped_host_type(typed) {
+                    return Some(ParsedCondition::SourceUntappedAttachedTo { required_type });
+                }
+            }
+            Some(ParsedCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { filter },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            })
+        }
         // CR 102.1: "it's your turn" — the active player is the scoped player.
         // The `Not` recursion arm above yields `Not(IsYourTurn)` for
         // "it's not your turn".
@@ -1718,6 +1781,24 @@ mod tests {
             parse_restriction_condition("enchanted land is untapped"),
             Some(ParsedCondition::SourceUntappedAttachedTo {
                 required_type: CoreType::Land
+            })
+        );
+        // CR 602.5b: the creature and equipped forms must reach the same exact
+        // host predicate (Veteran's Voice / Krovikan Plague: "Activate only if
+        // enchanted creature is untapped"). Before the attached-subject copula
+        // accepted the tap-state adjective, the shared grammar misread the
+        // phrase as the SOURCE being untapped (`Not(SourceIsTapped)`) and the
+        // rejection demoted the card.
+        assert_eq!(
+            parse_restriction_condition("enchanted creature is untapped"),
+            Some(ParsedCondition::SourceUntappedAttachedTo {
+                required_type: CoreType::Creature
+            })
+        );
+        assert_eq!(
+            parse_restriction_condition("equipped creature is untapped"),
+            Some(ParsedCondition::SourceUntappedAttachedTo {
+                required_type: CoreType::Creature
             })
         );
         // Hostile: an unknown source predicate stays unsupported.

@@ -35385,6 +35385,56 @@ fn natures_chosen_retains_attached_creature_activation_gate() {
     );
 }
 
+/// CR 602.5b (Veteran's Voice, Krovikan Plague): the BARE tap-state form —
+/// "Activate only if enchanted creature is untapped", with no characteristic
+/// head — must lower through the attached-subject restriction grammar to the
+/// same host-presence `RequiresCondition` as Nature's Chosen's "white and
+/// untapped" variant, and be absorbed from the ability text rather than left
+/// as an unimplemented sibling clause.
+#[test]
+fn veterans_voice_bare_untapped_activation_gate_is_absorbed() {
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        "Enchant creature you control\n\
+         Tap enchanted creature: Target creature other than the creature tapped this way gets +2/+1 until end of turn. Activate only if enchanted creature is untapped.",
+        "Veteran's Voice",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+
+    assert!(
+        parsed.abilities.iter().any(|ability| {
+            ability.activation_restrictions.iter().any(|restriction| {
+                matches!(
+                    restriction,
+                    ActivationRestriction::RequiresCondition {
+                        condition: Some(ParsedCondition::SourceUntappedAttachedTo {
+                            required_type: CoreType::Creature,
+                        }),
+                    }
+                )
+            })
+        }),
+        "the bare 'enchanted creature is untapped' gate must lower to a typed \
+         RequiresCondition; got {:#?}",
+        parsed.abilities
+    );
+
+    // Coverage honesty: no clause of either ability may remain Unimplemented.
+    fn chain_clean(def: &crate::types::ability::AbilityDefinition) -> bool {
+        !matches!(&*def.effect, crate::types::ability::Effect::Unimplemented { .. })
+            && def
+                .sub_ability
+                .as_deref()
+                .is_none_or(chain_clean)
+    }
+    assert!(
+        parsed.abilities.iter().all(chain_clean),
+        "no Unimplemented may remain; got {:#?}",
+        parsed.abilities
+    );
+}
+
 /// CR 120.1 + CR 120.9: Discordant Spirit's full Oracle-text pipeline must
 /// retain the damage-total quantity inside its first triggered PutCounter
 /// effect. A parser-only quantity test is insufficient here because the
@@ -35442,5 +35492,20 @@ fn discordant_spirit_retains_damage_total_counter_quantity() {
             )
         }),
         "Discordant Spirit must retain a summed damage-to-you quantity, got {quantities:?}"
+    );
+}
+
+/// Isolation guard for `veterans_voice_bare_untapped_activation_gate_is_absorbed`:
+/// the bare attached-subject tap-state restriction must parse at the
+/// restriction-condition grammar directly, independent of the ability-text
+/// absorption seam.
+#[test]
+fn bare_attached_tap_state_restriction_parses() {
+    assert!(
+        crate::parser::oracle_condition::parse_restriction_condition(
+            "enchanted creature is untapped"
+        )
+        .is_some(),
+        "'enchanted creature is untapped' must parse as a restriction condition"
     );
 }
