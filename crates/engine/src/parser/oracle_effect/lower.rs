@@ -35,7 +35,8 @@ use crate::types::ability::{
     AttackSubject, CastPermissionConstraint, CastingPermission, Comparator, ConjureSource,
     ContinuousModification, ControllerRef, DamageChannel, DamageSource, DelayedTriggerCondition,
     Duration, Effect, EffectScope, ExiledSpellRider, FilterProp, GameRestriction, LibraryPosition,
-    ManaSpendPermission, MultiTargetSpec, ObjectScope, PermissionGrantee, PlayerFilter,
+    ManaProduction, ManaSpendPermission, MultiTargetSpec, ObjectScope, PermissionGrantee,
+    PlayerFilter,
     PreventionAmount, PreventionScope, PtValue, QuantityExpr, QuantityRef, RestrictionPlayerScope,
     RoundingMode, SpellStackToGraveyardReplacement, StaticCondition, StaticDefinition,
     SubAbilityLink, TargetChoiceTiming, TargetFilter, TypeFilter, TypedFilter,
@@ -10317,6 +10318,35 @@ pub(super) fn apply_where_x_effect_expression(
         // the sub-ability's "draw X cards"; without this arm the cost amount
         // stayed as the bare `Variable("X")` and decoupled from the resolved
         // expression.
+        // CR 107.3c: mana-production counts ("Add X mana of any one color,
+        // where X is …" — Carpet of Flowers, Food Chain, the mana-dork cycle).
+        // The mana-clause parser binds the tail when it still sees it, but the
+        // ability/trigger assembly harvests "where X is …" first for some
+        // shapes; without this arm the production kept a bare `Variable("X")`
+        // and the totality guard reported every such card as a where-X gap
+        // (`Effect:where_x_binding`), which is the 34-card mana regression.
+        Effect::Mana { produced, .. } => {
+            let existing_count = match produced {
+                ManaProduction::Colorless { count }
+                | ManaProduction::AnyOneColor { count, .. }
+                | ManaProduction::AnyCombination { count, .. }
+                | ManaProduction::ChosenColor { count, .. }
+                | ManaProduction::NotedType { count }
+                | ManaProduction::OpponentLandColors { count }
+                | ManaProduction::AnyCombinationOfObjectColors { count, .. }
+                | ManaProduction::AnyTypeProduceableBy { count, .. }
+                | ManaProduction::AnyInCommandersColorIdentity { count, .. }
+                | ManaProduction::AnyOneColorAmongPermanents { count, .. } => Some(count.clone()),
+                // Quantity-free or state-derived productions carry no X slot.
+                _ => None,
+            };
+            if let Some(mut count) = existing_count {
+                bind_where_x_quantity(&mut count, where_x_expression, &mut unbound_where_x);
+                if let Some(rebound) = super::mana_production_with_count(produced, count) {
+                    *produced = rebound;
+                }
+            }
+        }
         Effect::PayCost { cost, scale, .. } => {
             // CR 118.1 + CR 118.5: per-object scaled mana (`scale`) tracks the
             // surrounding where-X binding before the cost amount itself.

@@ -30763,7 +30763,7 @@ fn parse_that_type_mana_count(text: &str) -> Option<QuantityExpr> {
     .map(|(count, _)| count)
 }
 
-fn mana_production_with_count(
+pub(super) fn mana_production_with_count(
     produced: &ManaProduction,
     count: QuantityExpr,
 ) -> Option<ManaProduction> {
