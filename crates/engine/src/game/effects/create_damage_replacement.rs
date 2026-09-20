@@ -3,7 +3,7 @@ use crate::game::effects::prevent_damage::resolve_source_filter;
 use crate::game::game_object::AttachTarget;
 use crate::types::ability::{
     DamageRedirectTarget, Effect, EffectError, EffectKind, PreventionAmount, RedirectionLifetime,
-    ReplacementDefinition, ResolvedAbility, TargetFilter, TargetRef,
+    ReplacementDefinition, ReplacementMode, ResolvedAbility, TargetFilter, TargetRef,
 };
 use crate::types::card_type::CoreType;
 use crate::types::events::GameEvent;
@@ -34,6 +34,7 @@ pub fn resolve(
 ) -> Result<(), EffectError> {
     #[allow(clippy::type_complexity)]
     let (
+        optional,
         source_filter,
         combat_scope,
         target_filter,
@@ -44,6 +45,7 @@ pub fn resolve(
         redirect_lifetime,
     ) = match &ability.effect {
         Effect::CreateDamageReplacement {
+            optional,
             source_filter,
             combat_scope,
             target_filter,
@@ -57,6 +59,7 @@ pub fn resolve(
             recipient_object_filter,
             redirect_lifetime,
         } => (
+            *optional,
             source_filter.clone(),
             combat_scope.clone(),
             target_filter.clone(),
@@ -181,12 +184,20 @@ pub fn resolve(
     //     set below) so the shield fires only on damage to it; it surfaces NO
     //     target slot, so a `ChosenObjectTarget` redirect reads the FIRST object
     //     target.
+    //   * `Some(AttachedTo)` ("...dealt to enchanted/equipped creature" — Ward
+    //     of Piety): the recipient is the source's live attachment host. Host on
+    //     the Aura/Equipment and use `valid_card: AttachedTo`; it consumes no
+    //     target slot, so the redirect reads the FIRST object target.
     //   * `Some(other)` ("...dealt to target creature" — Jade Monolith): the
     //     recipient is a chosen target object, consuming the first slot; the
     //     redirect reads the SECOND.
     let recipient_is_self = matches!(recipient_object_filter, Some(TargetFilter::SelfRef));
-    let recipient_consumes_slot = recipient_object_filter.is_some() && !recipient_is_self;
+    let recipient_is_attached = matches!(recipient_object_filter, Some(TargetFilter::AttachedTo));
+    let recipient_consumes_slot =
+        recipient_object_filter.is_some() && !recipient_is_self && !recipient_is_attached;
     let recipient_host = if recipient_is_self {
+        Some(ability.source_id)
+    } else if recipient_is_attached {
         Some(ability.source_id)
     } else if recipient_object_filter.is_some() {
         chosen_target_object(ability, /*skip*/ 0)
@@ -252,6 +263,15 @@ pub fn resolve(
         }
     }
 
+    // CR 614.12: an optional damage redirection is still a real replacement
+    // shield, but the affected event must offer its controller an accept/
+    // decline choice before the shield applies. The mode is attached after
+    // the redirection payload is built so mandatory and optional shields share
+    // one recipient/lifetime implementation.
+    if optional {
+        shield = shield.mode(ReplacementMode::Optional { decline: None });
+    }
+
     // CR 614.1a + CR 514.2: The shield is a replacement effect with a "this
     // turn" lifetime (ends at cleanup, CR 514.2). Placement below is engine
     // plumbing — store it where `find_applicable_replacements` can reach it
@@ -264,7 +284,11 @@ pub fn resolve(
     //     the game-level pending registry so the shield outlives stack resolution.
     if let Some(host_id) = recipient_host {
         if shield.valid_card.is_none() {
-            shield.valid_card = Some(TargetFilter::SelfRef);
+            shield.valid_card = Some(if recipient_is_attached {
+                TargetFilter::AttachedTo
+            } else {
+                TargetFilter::SelfRef
+            });
         }
         if let Some(obj) = state.objects.get_mut(&host_id) {
             obj.replacement_definitions.push(shield);
@@ -340,6 +364,7 @@ pub(crate) fn resolve_redirect_recipient(
     state: &GameState,
     recipient: DamageRedirectTarget,
     replacement_source_id: ObjectId,
+    replacement_index: usize,
     damage_source_id: ObjectId,
     chosen_target: Option<TargetRef>,
 ) -> Option<TargetRef> {
@@ -347,7 +372,24 @@ pub(crate) fn resolve_redirect_recipient(
         DamageRedirectTarget::Controller => state
             .objects
             .get(&replacement_source_id)
-            .map(|obj| TargetRef::Player(obj.controller)),
+            .map(|obj| TargetRef::Player(obj.controller))
+            .or_else(|| {
+                // CR 109.4 + CR 614.9: a resolving instant/sorcery is hosted
+                // in the pending registry under sentinel ObjectId(0), so its
+                // controller is carried by the stamped source_controller field
+                // rather than recoverable from state.objects. This is the
+                // recipient side of the same ownership fact used by the
+                // optional replacement-choice prompt.
+                (replacement_source_id == ObjectId(0))
+                    .then(|| {
+                        state
+                            .pending_damage_replacements
+                            .get(replacement_index)
+                            .and_then(|replacement| replacement.source_controller)
+                    })
+                    .flatten()
+                    .map(TargetRef::Player)
+            }),
         DamageRedirectTarget::SourceController => state
             .objects
             .get(&damage_source_id)
@@ -437,6 +479,7 @@ mod tests {
                 &state,
                 DamageRedirectTarget::SourceController,
                 replacement_source,
+                0,
                 damage_source,
                 None,
             ),
@@ -447,6 +490,7 @@ mod tests {
                 &state,
                 DamageRedirectTarget::Controller,
                 replacement_source,
+                0,
                 damage_source,
                 None,
             ),
@@ -465,6 +509,7 @@ mod tests {
                 &state,
                 DamageRedirectTarget::SourceOwner,
                 replacement_source,
+                0,
                 damage_source,
                 None,
             ),
@@ -479,6 +524,7 @@ mod tests {
         let damage_source = create_creature(&mut state, PlayerId(1), "Damage Source");
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::OneOpportunity,
                 source_filter: None,
                 combat_scope: None,
@@ -508,6 +554,50 @@ mod tests {
 
         assert_eq!(state.players[0].life, 20, "the original recipient is untouched");
         assert_eq!(state.players[1].life, 17, "the damage source's controller is hit");
+    }
+
+    #[test]
+    fn optional_continuous_redirect_preserves_choice_mode_and_pending_controller() {
+        // CR 614.12: an effect-created optional replacement must retain both
+        // the accept/decline mode and the resolving spell's controller after
+        // the spell leaves the stack. The latter is also the recipient for
+        // Blood of the Martyr's `to you` redirection.
+        let mut state = GameState::new_two_player(42);
+        let spell = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Blood of the Martyr".to_string(),
+            Zone::Stack,
+        );
+        let ability = ResolvedAbility::new(
+            Effect::CreateDamageReplacement {
+                optional: true,
+                source_filter: None,
+                combat_scope: None,
+                target_filter: Some(crate::types::ability::DamageTargetFilter::CreatureOnly),
+                modification: None,
+                redirect_to: Some(DamageRedirectTarget::Controller),
+                redirect_amount: None,
+                redirect_object_filter: None,
+                recipient_object_filter: None,
+                redirect_lifetime: RedirectionLifetime::Continuous,
+            },
+            vec![],
+            spell,
+            PlayerId(1),
+        );
+
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+        let shield = state
+            .pending_damage_replacements
+            .first()
+            .expect("stack spell must install a pending damage replacement");
+        assert_eq!(shield.source_controller, Some(PlayerId(1)));
+        assert!(matches!(
+            &shield.mode,
+            crate::types::ability::ReplacementMode::Optional { decline: None }
+        ));
     }
 
     #[test]
@@ -547,6 +637,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::Continuous,
                 source_filter: Some(TargetFilter::And {
                     filters: vec![
@@ -629,6 +720,7 @@ mod tests {
     fn amount_oneshot_ability(source: ObjectId, controller: PlayerId) -> ResolvedAbility {
         ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::OneOpportunity,
                 // SelfRef source filter: the shield fires on damage dealt *by*
                 // the shield host (Desperate Gambit's chosen source ≡ host here).
@@ -728,6 +820,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::OneOpportunity,
                 source_filter: Some(TargetFilter::SelfRef),
                 combat_scope: None,
@@ -795,6 +888,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::OneOpportunity,
                 source_filter: None,
                 combat_scope: None,
@@ -919,6 +1013,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::Continuous,
                 source_filter: None,
                 combat_scope: None,
@@ -1067,6 +1162,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::Continuous,
                 source_filter: None,
                 combat_scope: None,
@@ -1119,6 +1215,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::OneOpportunity,
                 source_filter: Some(TargetFilter::SelfRef),
                 combat_scope: None,
@@ -1166,6 +1263,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::OneOpportunity,
                 source_filter: Some(TargetFilter::SelfRef),
                 combat_scope: None,
@@ -1227,6 +1325,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::OneOpportunity,
                 source_filter: None,
                 combat_scope: None,
@@ -1315,6 +1414,7 @@ mod tests {
     fn chosen_source_redirect_ability(host: ObjectId, controller: PlayerId) -> ResolvedAbility {
         ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::OneOpportunity,
                 // "a source of your choice" → ChosenDamageSource.
                 source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
@@ -1345,6 +1445,7 @@ mod tests {
         });
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::OneOpportunity,
                 source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
                 combat_scope: None,
@@ -1498,6 +1599,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::OneOpportunity,
                 source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
                 combat_scope: None,
@@ -1577,6 +1679,7 @@ mod tests {
 
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::OneOpportunity,
                 source_filter: Some(TargetFilter::SelfRef),
                 combat_scope: Some(crate::types::ability::CombatDamageScope::CombatOnly),
@@ -1691,6 +1794,82 @@ mod tests {
         );
     }
 
+    #[test]
+    fn attached_recipient_one_shot_redirects_only_damage_to_enchanted_creature() {
+        // CR 614.9 + CR 301.5 + CR 702.6: Ward of Piety hosts its shield on
+        // the Aura, but the valid-card filter follows the Aura's live host.
+        let mut state = GameState::new_two_player(42);
+        let aura = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Ward of Piety".to_string(),
+            Zone::Battlefield,
+        );
+        let enchanted = create_creature(&mut state, PlayerId(0), "Enchanted Creature");
+        let attacker = create_creature(&mut state, PlayerId(1), "Attacker");
+        {
+            let obj = state.objects.get_mut(&aura).expect("Aura exists");
+            obj.card_types.core_types = vec![CoreType::Enchantment];
+            obj.card_types.subtypes.push("Aura".to_string());
+            obj.attached_to = Some(enchanted.into());
+        }
+        state
+            .objects
+            .get_mut(&enchanted)
+            .expect("enchanted creature exists")
+            .attachments
+            .push(aura);
+
+        let ability = ResolvedAbility::new(
+            Effect::CreateDamageReplacement {
+                optional: false,
+                redirect_lifetime: RedirectionLifetime::OneOpportunity,
+                source_filter: None,
+                combat_scope: None,
+                target_filter: None,
+                modification: None,
+                redirect_to: Some(DamageRedirectTarget::ChosenTarget),
+                redirect_amount: Some(PreventionAmount::Next(1)),
+                redirect_object_filter: Some(TargetFilter::Any),
+                recipient_object_filter: Some(TargetFilter::AttachedTo),
+            },
+            vec![TargetRef::Player(PlayerId(1))],
+            aura,
+            PlayerId(0),
+        );
+        resolve(&mut state, &ability, &mut Vec::new()).unwrap();
+
+        let shield = &state.objects[&aura].replacement_definitions[0];
+        assert_eq!(shield.valid_card, Some(TargetFilter::AttachedTo));
+        assert_eq!(
+            shield.redirect_target,
+            Some(TargetFilter::SpecificPlayer { id: PlayerId(1) })
+        );
+
+        let ctx = deal_damage::DamageContext::from_source(&state, attacker).unwrap();
+        deal_damage::apply_damage_to_target(
+            &mut state,
+            &ctx,
+            TargetRef::Object(enchanted),
+            3,
+            false,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            state.objects[&enchanted].damage_marked,
+            2,
+            "only the next 1 damage to the enchanted creature is redirected"
+        );
+        assert_eq!(
+            state.players[1].life,
+            19,
+            "the chosen player receives the redirected damage"
+        );
+        assert!(state.objects[&aura].replacement_definitions[0].is_consumed);
+    }
+
     /// CR 609.7a (Defect 2, END-TO-END through `apply`): the inline source-choice
     /// round-trip works through the REAL engine — the resolver prompts, the
     /// player's `GameAction::ChooseDamageSource` drains the stashed continuation,
@@ -1779,6 +1958,7 @@ mod tests {
         });
         let ability = ResolvedAbility::new(
             Effect::CreateDamageReplacement {
+                optional: false,
                 redirect_lifetime: RedirectionLifetime::OneOpportunity,
                 source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
                 combat_scope: None,

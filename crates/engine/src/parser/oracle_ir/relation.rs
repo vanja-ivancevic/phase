@@ -143,6 +143,11 @@ pub(crate) enum LinkedChoiceKind {
     /// exists, so a resolution-scoped choice with no durable reader stays
     /// non-persisted.
     PersistedPlayer { choosers: Vec<OracleItemId> },
+    /// CR 607.2d + CR 613.1: A color choice on one printed ability/trigger is
+    /// linked to a separate mana ability that reads the source's chosen color
+    /// (Gem Bazaar's "color last chosen" wording). Same-chain color choices are
+    /// intentionally not promoted: those are resolution-scoped reads.
+    PersistedColor { choosers: Vec<OracleItemId> },
     /// CR 607.2d + CR 707.2c + CR 614.12a: An as-enters permanent-object choice
     /// gap (`chooser` — an Unimplemented ability whose Oracle text is
     /// "As … enters, choose <permanent>") linked to a

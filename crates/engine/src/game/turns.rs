@@ -18,6 +18,7 @@ use crate::types::phase::Phase;
 use crate::types::player::PlayerId;
 use crate::types::proposed_event::ProposedEvent;
 use crate::types::statics::{HandSizeModification, StaticMode, StaticModeKind};
+use crate::types::zones::Zone;
 
 use super::combat;
 use super::combat_damage;
@@ -997,6 +998,10 @@ fn expire_departed_last_turn_attack_records(
         let candidate = seat_order[idx];
         if !super::players::is_alive(state, candidate) {
             state.attacked_defenders_last_turn.remove(&candidate);
+            state.creatures_attacked_last_turn.remove(&candidate);
+            state
+                .players_who_cast_or_put_nontoken_permanent_last_turn
+                .remove(&candidate);
         }
         if candidate == next_active {
             break;
@@ -2313,6 +2318,36 @@ pub fn execute_cleanup(state: &mut GameState, events: &mut Vec<GameEvent>) -> Op
         .cloned()
         .unwrap_or_default();
     state.attacked_defenders_last_turn.insert(ending, this_turn);
+    // CR 508.1a + CR 514.2: Preserve the object-level attack history for the
+    // ending player's most recently completed turn. Unlike the player-only
+    // defender snapshot above, this is keyed by the ending player because a
+    // creature's "last turn" is its current controller's last turn.
+    state
+        .creatures_attacked_last_turn
+        .insert(ending, state.creatures_attacked_this_turn.clone());
+    // CR 514.2 + CR 601.2a + CR 701.6: record the ending player's own
+    // qualifying activity, not every player's activity that happened while
+    // that player had priority.  Battlefield-entry records carry the
+    // authoritative event-time putter; controller is deliberately not a
+    // fallback because replacement effects can change control on entry.
+    let cast_or_put = state
+        .spells_cast_this_turn_by_player
+        .get(&ending)
+        .is_some_and(|casts| !casts.is_empty())
+        || state.zone_changes_this_turn.iter().any(|record| {
+            record.to_zone == Zone::Battlefield
+                && !record.is_token
+                && record.zone_change_putter() == Some(ending)
+        });
+    if cast_or_put {
+        state
+            .players_who_cast_or_put_nontoken_permanent_last_turn
+            .insert(ending);
+    } else {
+        state
+            .players_who_cast_or_put_nontoken_permanent_last_turn
+            .remove(&ending);
+    }
 
     // CR 514.2: "all “until end of turn” and “this turn” effects end." The typed
     // `expiry` is the SINGLE authority for that window — the same authority the
@@ -7295,15 +7330,38 @@ mod tests {
         // P1's turn: P1 declared attackers against P0.
         let mut state = setup();
         state.active_player = PlayerId(1);
+        let p1_attacker = create_object(
+            &mut state,
+            CardId(901),
+            PlayerId(1),
+            "P1 Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        state.creatures_attacked_this_turn.insert(p1_attacker);
         state
             .attacked_defenders_this_turn
             .insert(PlayerId(1), [PlayerId(0)].into_iter().collect());
+        state.spells_cast_this_turn_by_player.insert(
+            PlayerId(1),
+            crate::im::Vector::from(vec![
+                crate::types::game_state::SpellCastRecord::default(),
+            ]),
+        );
         let mut events = Vec::new();
         execute_cleanup(&mut state, &mut events);
 
         assert!(
             state.player_attacked_player_last_turn(PlayerId(1), PlayerId(0)),
             "P1 attacked P0 during P1's (now-completed) turn"
+        );
+        assert_eq!(
+            state.creatures_attacked_last_turn[&PlayerId(1)],
+            [p1_attacker].into_iter().collect(),
+            "cleanup must snapshot the ending player's object-level attackers"
+        );
+        assert!(
+            state.player_cast_or_put_nontoken_permanent_last_turn(PlayerId(1)),
+            "cleanup must snapshot the ending player's qualifying spell activity"
         );
         // The record is one-directional: P0 did not attack P1.
         assert!(
@@ -7315,6 +7373,7 @@ mod tests {
         // to empty, while P1's genuine last-turn record is untouched.
         state.active_player = PlayerId(0);
         state.attacked_defenders_this_turn.clear();
+        state.creatures_attacked_this_turn.clear();
         let mut events = Vec::new();
         execute_cleanup(&mut state, &mut events);
         assert!(
@@ -7325,16 +7384,74 @@ mod tests {
             state.player_attacked_player_last_turn(PlayerId(1), PlayerId(0)),
             "P1's last-turn record persists across another player's turn"
         );
+        assert_eq!(
+            state.creatures_attacked_last_turn[&PlayerId(1)],
+            [p1_attacker].into_iter().collect(),
+            "another player's no-attack turn must not erase P1's object snapshot"
+        );
+        assert!(
+            state.player_cast_or_put_nontoken_permanent_last_turn(PlayerId(1)),
+            "another player's turn must not erase P1's activity snapshot"
+        );
 
         // A later real P1 turn with no attack overwrites P1's record to empty.
         state.active_player = PlayerId(1);
         state.attacked_defenders_this_turn.clear();
+        state.creatures_attacked_this_turn.clear();
+        state.spells_cast_this_turn_by_player.clear();
         let mut events = Vec::new();
         execute_cleanup(&mut state, &mut events);
         assert!(
             !state.player_attacked_player_last_turn(PlayerId(1), PlayerId(0)),
             "P1's subsequent no-attack turn clears its record to empty"
         );
+        assert!(
+            state.creatures_attacked_last_turn[&PlayerId(1)].is_empty(),
+            "a later no-attack turn must clear P1's object snapshot"
+        );
+        assert!(
+            !state.player_cast_or_put_nontoken_permanent_last_turn(PlayerId(1)),
+            "a later no-activity turn must clear P1's activity snapshot"
+        );
+    }
+
+    /// CR 110.2a + CR 514.2: a nontoken battlefield entry counts when its
+    /// event-time putter is the ending player, even if the resulting
+    /// controller differs. Token entries and records without authoritative
+    /// putter provenance do not satisfy Arboria's rider.
+    #[test]
+    fn execute_cleanup_snapshots_nontoken_battlefield_putter() {
+        let mut state = setup();
+        state.active_player = PlayerId(1);
+        let object = create_object(
+            &mut state,
+            CardId(902),
+            PlayerId(1),
+            "Put Permanent Test".to_string(),
+            Zone::Hand,
+        );
+        let mut record = state.objects[&object].snapshot_for_zone_change(
+            object,
+            Some(Zone::Hand),
+            Zone::Battlefield,
+        );
+        record.stamp_zone_change_putter(Some(PlayerId(1)));
+        state.zone_changes_this_turn.push_back(record);
+        execute_cleanup(&mut state, &mut Vec::new());
+        assert!(state.player_cast_or_put_nontoken_permanent_last_turn(PlayerId(1)));
+
+        state.active_player = PlayerId(1);
+        state.zone_changes_this_turn.clear();
+        let mut token_record = state.objects[&object].snapshot_for_zone_change(
+            object,
+            Some(Zone::Hand),
+            Zone::Battlefield,
+        );
+        token_record.is_token = true;
+        token_record.stamp_zone_change_putter(Some(PlayerId(1)));
+        state.zone_changes_this_turn.push_back(token_record);
+        execute_cleanup(&mut state, &mut Vec::new());
+        assert!(!state.player_cast_or_put_nontoken_permanent_last_turn(PlayerId(1)));
     }
 
     #[test]

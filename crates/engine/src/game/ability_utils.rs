@@ -3486,6 +3486,7 @@ fn filter_prop_contains_quantity_scope(prop: &FilterProp, scope: ObjectScope) ->
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -3539,6 +3540,7 @@ fn filter_prop_contains_quantity_scope(prop: &FilterProp, scope: ObjectScope) ->
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
         | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::AttackedLastTurn
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
@@ -3559,6 +3561,7 @@ fn filter_prop_contains_quantity_scope(prop: &FilterProp, scope: ObjectScope) ->
         | FilterProp::NameMatchesAnyPermanent { .. }
         | FilterProp::IsCommander
         | FilterProp::SharesCreatureTypeWithCommander
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
     }
 }
@@ -3633,6 +3636,7 @@ fn filter_prop_binds_prior_target(prop: &FilterProp) -> bool {
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -3685,6 +3689,7 @@ fn filter_prop_binds_prior_target(prop: &FilterProp) -> bool {
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
         | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::AttackedLastTurn
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
@@ -3705,6 +3710,7 @@ fn filter_prop_binds_prior_target(prop: &FilterProp) -> bool {
         | FilterProp::NameMatchesAnyPermanent { .. }
         | FilterProp::IsCommander
         | FilterProp::SharesCreatureTypeWithCommander
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
     }
 }
@@ -3928,6 +3934,7 @@ fn filter_needs_trigger_source(filter: &TargetFilter) -> bool {
             | FilterProp::AttackedThisTurn {
                 defender: Some(ControllerRef::DefendingPlayer),
             } => true,
+            FilterProp::AttackedLastTurn => false,
             FilterProp::AnyOf { props } => props.iter().any(prop_needs),
             FilterProp::Not { prop } => prop_needs(prop),
             _ => false,
@@ -16775,6 +16782,7 @@ mod tests {
                 redirect_amount: None,
                 redirect_object_filter: Some(creature_filter()),
                 recipient_object_filter: None,
+                optional: false,
             },
             vec![],
             host,
@@ -16834,6 +16842,7 @@ mod tests {
                 redirect_amount: None,
                 redirect_object_filter: None,
                 recipient_object_filter: Some(creature_filter()),
+                optional: false,
             },
             vec![],
             host,
@@ -16887,6 +16896,7 @@ mod tests {
                 redirect_amount: None,
                 redirect_object_filter: Some(creature_filter()),
                 recipient_object_filter: Some(creature_filter()),
+                optional: false,
             },
             vec![],
             host,
@@ -17519,6 +17529,7 @@ mod tests {
                 redirect_amount: None,
                 redirect_object_filter: None,
                 recipient_object_filter: None,
+                optional: false,
             },
             vec![],
             host,

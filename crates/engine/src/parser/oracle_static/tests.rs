@@ -15,6 +15,16 @@ use crate::types::keywords::Keyword;
 use crate::types::mana::ManaCost;
 use crate::types::statics::{AdditionalCostTaxAction, CrewAction, CrewContributionKind};
 
+/// CR 701.38d: Brago's wording is equivalent to Tivit's "vote an additional
+/// time" wording and must lower to the same vote-session static.
+#[test]
+fn while_voting_get_an_additional_vote_is_extra_vote_static() {
+    let def = parse_static_line("While voting, you get an additional vote.")
+        .expect("Brago's Representative wording must parse");
+    assert_eq!(def.mode, StaticMode::GrantsExtraVote);
+    assert_eq!(def.affected, Some(TargetFilter::Player));
+}
+
 /// CR 611.3a + CR 613.1f: each conjunct in Tek's compact Oracle sentence has
 /// its own condition. The parser must emit one conditional static per conjunct,
 /// rather than attaching the tail of the sentence to the first condition.
@@ -52,6 +62,24 @@ fn repeated_conditional_statics_split_shared_subject() {
                 .contains(&ContinuousModification::AddKeyword { keyword }));
         }
     }
+}
+
+/// CR 611.3a + CR 702. Regeneration: Oracle may elide the repeated `has`
+/// verb in a shared conditional list, including before a quoted activated
+/// ability. Each ability must retain its own independent gate.
+#[test]
+fn repeated_conditional_statics_accept_elided_verbs_and_quoted_ability() {
+    let defs = parse_static_line_multi(
+        "This creature has trample as long as you control a Beast, haste as long as you control a Goblin, first strike as long as you control a Soldier, flying as long as you control a Wizard, and \"{B}: Regenerate this creature\" as long as you control a Zombie.",
+    );
+    assert_eq!(defs.len(), 5, "expected all Tribal Golem clauses: {defs:?}");
+    assert!(defs.iter().all(|def| {
+        def.condition.is_some()
+            && !matches!(def.condition, Some(StaticCondition::Unrecognized { .. }))
+    }));
+    assert!(defs.iter().any(|def| def.modifications.iter().any(|modification| {
+        matches!(modification, ContinuousModification::GrantAbility { .. })
+    })));
 }
 
 /// CR 613.1f (Layer 6) + CR 105.2: Scion of Draco — "Each creature you control has
@@ -2263,6 +2291,27 @@ fn extra_blockers_static_gated_on_trailing_as_long_as_condition() {
     );
 }
 
+/// CR 508.1b + CR 725.1: combat-restriction statics may name the proposed
+/// defending player directly. The parser must preserve that subject so the
+/// attack declaration path can bind it before CombatState contains an attacker.
+#[test]
+fn cant_attack_unless_defending_player_is_the_monarch_is_typed() {
+    let def = parse_static_line(
+        "This creature can't attack unless defending player is the monarch.",
+    )
+    .expect("Crown-Hunter Hireling's combat restriction must parse");
+    assert_eq!(def.mode, StaticMode::CantAttack);
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::IsMonarch {
+                player: PlayerScope::DefendingPlayer,
+            }),
+        })
+    );
+}
+
 #[test]
 fn extra_blockers_count_phrase_handles_hyphenated_and_any() {
     assert_eq!(
@@ -2463,6 +2512,32 @@ fn quest_for_renewal_inverted_conditional_seedborn_untap() {
             maximum: None,
         })
     );
+}
+
+/// CR 122.1 + CR 611.3a: Homarid and Tidal Influence use the singular
+/// existential spelling "there is exactly one tide counter on this ...".
+/// Both cards must retain the exact-one gate instead of falling back to an
+/// unconditional static.
+#[test]
+fn singular_exactly_one_tide_counter_static_is_typed() {
+    for line in [
+        "As long as there is exactly one tide counter on this creature, it gets -1/-1.",
+        "As long as there is exactly one tide counter on this enchantment, all blue creatures get -2/-0.",
+    ] {
+        let defs = parse_static_line_multi(line);
+        assert_eq!(defs.len(), 1, "expected one static for {line:?}: {defs:?}");
+        assert_eq!(
+            defs[0].condition,
+            Some(StaticCondition::HasCounters {
+                counters: crate::types::counter::CounterMatch::OfType(CounterType::Generic(
+                    "tide".to_string(),
+                )),
+                minimum: 1,
+                maximum: Some(1),
+            }),
+            "exact-one tide-counter gate must remain typed for {line:?}"
+        );
+    }
 }
 
 /// CR 509.1b: Copper Carapace — "Equipped creature gets +2/+2 and can't block."
@@ -10847,6 +10922,39 @@ fn static_as_long_as_enchanted_creature_is_attacking_gate_binds_to_host() {
     );
 }
 
+/// CR 611.3a: Arcades Sabboth's legacy contraction "it's not attacking" is
+/// still a condition on each affected creature, not a source-level predicate.
+#[test]
+fn static_its_not_attacking_binds_to_each_affected_creature() {
+    let defs = parse_static_line_multi(
+        "Each untapped creature you control gets +0/+2 as long as it's not attacking.",
+    );
+    assert_eq!(defs.len(), 1, "expected one Arcades Sabboth static: {defs:?}");
+    assert_eq!(
+        defs[0].affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature()
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::Untapped]),
+        )),
+    );
+    assert_eq!(
+        defs[0].modifications,
+        vec![ContinuousModification::AddToughness { value: 2 }],
+    );
+    assert_eq!(
+        defs[0].condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::RecipientMatchesFilter {
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature()
+                        .properties(vec![FilterProp::Attacking { defender: None }]),
+                ),
+            }),
+        }),
+    );
+}
+
 /// CR 506.5 + CR 509.1b + CR 611.3a: Security Bypass's evasion applies to the
 /// enchanted host only while that recipient is the sole attacker. The Aura is
 /// not the affected object and its combat state is irrelevant.
@@ -18644,6 +18752,28 @@ fn nonbasic_lands_are_mountains_blood_moon() {
     }
 }
 
+/// CR 205.3i + CR 305.7: Wastes is a land subtype, not a basic land type, so
+/// Event Horizon must replace existing land subtypes and then add Wastes.
+#[test]
+fn nonbasic_lands_are_wastes_event_horizon() {
+    let def = parse_static_line("Nonbasic lands are Wastes.").unwrap();
+    assert!(matches!(
+        def.modifications.as_slice(),
+        [
+            ContinuousModification::RemoveAllSubtypes {
+                set: SubtypeSet::Land
+            },
+            ContinuousModification::AddSubtype { subtype }
+        ] if subtype == "Wastes"
+    ));
+    match &def.affected {
+        Some(TargetFilter::Typed(tf)) => assert!(tf.properties.contains(&FilterProp::NotSupertype {
+            value: Supertype::Basic,
+        })),
+        _ => panic!("Expected Typed nonbasic land filter"),
+    }
+}
+
 #[test]
 fn nonbasic_lands_are_islands_harbinger() {
     let def = parse_static_line("Nonbasic lands are Islands.").unwrap();
@@ -21758,6 +21888,31 @@ fn cant_cast_opponents_same_name() {
             who: ProhibitionScope::Opponents,
         }
     );
+}
+
+/// CR 101.2 + CR 305.1 + CR 201.2a: Cornered Market has two independent
+/// dynamic name-based prohibitions. Both must remain typed statics; the land
+/// half must not fall through as an unknown effect or become a blanket land
+/// lock.
+#[test]
+fn cornered_market_parses_both_name_based_prohibitions() {
+    let defs = parse_static_line_multi(
+        "Players can't cast spells with the same name as a nontoken permanent.\n\
+         Players can't play nonbasic lands with the same name as a nontoken permanent.",
+    );
+    assert_eq!(defs.len(), 2, "both Cornered Market sentences must parse");
+    assert!(defs.iter().any(|def| {
+        matches!(
+            &def.mode,
+            StaticMode::Other(name) if name == "CantCastSameNameAsNontokenPermanent"
+        ) && def.affected == Some(TargetFilter::Player)
+    }));
+    assert!(defs.iter().any(|def| {
+        matches!(
+            &def.mode,
+            StaticMode::Other(name) if name == "CantPlayNonbasicLandSameNameAsNontokenPermanent"
+        ) && def.affected == Some(TargetFilter::Player)
+    }));
 }
 
 #[test]
@@ -27896,42 +28051,40 @@ fn cant_be_blocked_fallback_arm_defers_unenforceable_payment_gate() {
     );
 }
 
-/// Chained Throatseeker's defending-player poison gate is preserved as an
-/// undecomposed unless rider until attack legality can evaluate the candidate
-/// defending player before attackers are committed.
+/// CR 701.27 + CR 508.1b: Chained Throatseeker's defending-player poison gate
+/// is typed and retained through the combat-relative static path.
 #[test]
-fn chained_throatseeker_defending_player_poisoned_preserved_not_decomposed() {
+fn chained_throatseeker_defending_player_poisoned_is_typed() {
     let def = parse_static_line("This creature can't attack unless defending player is poisoned.")
         .expect("Chained Throatseeker should parse");
     assert_eq!(def.mode, StaticMode::CantAttack);
-    let Some(StaticCondition::Not { condition }) = def.condition.as_ref() else {
-        panic!("expected Not(Unrecognized), got {:?}", def.condition);
-    };
-    let StaticCondition::Unrecognized { text } = condition.as_ref() else {
-        panic!("expected preserved unrecognized rider, got {condition:?}");
-    };
-    assert_eq!(text, "unless defending player is poisoned");
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::OpponentPoisonAtLeast {
+                count: 1,
+                player: Some(PlayerScope::DefendingPlayer),
+            }),
+        })
+    );
 }
 
-/// Arboria's turn-history rider is preserved in the AST, but not yet decomposed
-/// into runtime semantics.
+/// CR 508.1b + CR 514.2: Arboria's turn-history rider is typed against the
+/// proposed defending player, so the `unless` polarity remains executable.
 #[test]
-fn arboria_cant_attack_player_unless_rider_preserved_not_decomposed() {
+fn arboria_cant_attack_player_unless_rider_is_typed() {
     let def = parse_static_line(
         "Creatures can't attack a player unless that player cast a spell or put a nontoken permanent onto the battlefield during their last turn.",
     )
     .expect("Arboria should parse");
     assert_eq!(def.mode, StaticMode::CantAttack);
     let Some(StaticCondition::Not { condition }) = def.condition.as_ref() else {
-        panic!("expected Not(Unrecognized), got {:?}", def.condition);
+        panic!("expected Not(typed defender history), got {:?}", def.condition);
     };
-    let StaticCondition::Unrecognized { text } = condition.as_ref() else {
-        panic!("expected preserved unrecognized rider, got {condition:?}");
-    };
-    assert_eq!(
-        text,
-        "unless that player cast a spell or put a nontoken permanent onto the battlefield during their last turn"
-    );
+    assert!(matches!(
+        condition.as_ref(),
+        StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
+    ));
 }
 
 /// CR 113.6 + CR 113.6b: Anger (Onslaught / Incarnation cycle). The static
@@ -30345,25 +30498,22 @@ fn self_static_resolves_it_pronoun_combat_state_to_source() {
 }
 
 #[test]
-fn aura_static_does_not_bind_it_pronoun_combat_state_to_source() {
-    // GUARD (anaphor trap): Tahngarth's Rage shape — the Aura's "it" refers to the
-    // ENCHANTED creature, not the Aura source, so it must NOT collapse to
-    // SourceIsAttacking. The ~745 SelfRef guard keeps it an honest Unrecognized gap.
+fn aura_static_binds_it_pronoun_combat_state_to_recipient() {
+    // CR 508.1k + CR 611.3a: Tahngarth's Rage's "it" refers to the enchanted
+    // creature, not the Aura source. The gate must therefore be a live
+    // recipient filter rather than SourceIsAttacking or an unconditional gap.
     let defs = parse_static_line_multi("Enchanted creature gets +3/+0 as long as it's attacking.");
     assert!(!defs.is_empty(), "expected at least one static def");
     for d in &defs {
-        assert_ne!(
-            d.condition,
-            Some(StaticCondition::SourceIsAttacking),
-            "Aura 'it' must not resolve to the source, got {:?}",
-            d.condition
-        );
         assert_eq!(
             d.condition,
-            Some(StaticCondition::Unrecognized {
-                text: "it's attacking".to_string(),
+            Some(StaticCondition::RecipientMatchesFilter {
+                filter: TargetFilter::Typed(
+                    TypedFilter::creature()
+                        .properties(vec![FilterProp::Attacking { defender: None }]),
+                ),
             }),
-            "Aura combat-state gate must stay an honest Unrecognized gap, got {:?}",
+            "Aura combat-state gate must bind to its recipient, got {:?}",
             d.condition
         );
     }

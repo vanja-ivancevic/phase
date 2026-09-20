@@ -374,6 +374,10 @@ mod zone_owner_migration_tests {
 pub enum IterationCategory {
     /// CR 105.1: The five colors, iterated in WUBRG order.
     Color,
+    /// CR 305.6: The five basic land types, iterated in Plains/Island/Swamp/
+    /// Mountain/Forest order. Used by effects such as Sundering Titan's
+    /// "choose a land of each basic land type".
+    BasicLandType,
     /// CR 205.2a: The card types that can appear on a card in a library —
     /// artifact, battle, creature, enchantment, instant, kindred, land,
     /// planeswalker, and sorcery — iterated in CR 205.2a order.
@@ -397,6 +401,14 @@ impl IterationCategory {
                         controller: None,
                         properties: vec![FilterProp::HasColor { color }],
                     })
+                })
+                .collect(),
+            IterationCategory::BasicLandType => BasicLandType::all()
+                .iter()
+                .map(|land_type| {
+                    TargetFilter::Typed(
+                        TypedFilter::land().subtype(land_type.as_subtype_str().to_string()),
+                    )
                 })
                 .collect(),
             // The members are the CR 205.2a card types that can appear in a
@@ -464,6 +476,14 @@ pub enum ForEachCategoryAction {
         /// CR 122.1: Number of counters placed per member iteration.
         count: QuantityExpr,
     },
+    /// CR 608.2c + CR 305.6: Choose one permanent matching the base filter
+    /// and the current category member, accumulating every pick into the
+    /// chain's tracked set for a later instruction such as "destroy those
+    /// lands" (Sundering Titan).
+    ChooseOne {
+        /// Base permanent filter before the per-member category restriction.
+        target: TargetFilter,
+    },
 }
 
 /// CR 101.4: Who selects permanents in a multi-player category choice effect
@@ -508,6 +528,13 @@ pub enum ChooseFromZoneConstraint {
     /// The chosen cards must admit an injective assignment to distinct card types
     /// from the listed categories.
     DistinctCardTypes { categories: Vec<CoreType> },
+    /// CR 401.1 + CR 608.2d: restrict the candidate pool to the top `count`
+    /// objects of the ordered source zone.  The zone-choice resolver applies
+    /// this only to a direct zone scan; a tracked set is already the exact
+    /// population named by the preceding effect.  The old-border
+    /// Phyrexian Grimoire wording is the motivating case ("one of the top two
+    /// cards of your graveyard").
+    TopCards { count: u32 },
 }
 
 /// Selection constraint applied to multi-card library searches at the
@@ -1611,12 +1638,13 @@ impl ShieldKind {
     }
 }
 
-/// CR 615.1a + CR 609.7a + CR 609.7b: EXACT source-filter shape of the
-/// one-shot target-source prevention ("the next time target creature would
-/// deal damage this turn, prevent that damage" — Awe Strike): an `And` of
-/// exactly two legs — a `ParentTargetSlot { 0 }` capture (the chosen target
-/// creature, CR 609.7a) and a `Typed` leaf whose type list is exactly
-/// `[Creature]` with no zone/color properties (the CR 609.7b recheck).
+/// CR 615.1a + CR 609.7a + CR 609.7b: source-filter shapes of one-shot
+/// prevention ("the next time target creature would deal damage this turn,
+/// prevent that damage" — Awe Strike, or "a source/creature of your choice" —
+/// the Protection and Forcefield families).  A declared target uses an `And`
+/// of exactly two legs — a `ParentTargetSlot { 0 }` capture and a typed CR
+/// 609.7b recheck.  A resolving source choice is already represented by the
+/// durable `ChosenDamageSource` sentinel and needs no second capture leg.
 ///
 /// Single authority shared by the parser-side bare-rider gate
 /// (`oracle_effect::assembly::is_oneshot_target_source_prevent_chain`) and the
@@ -1628,6 +1656,7 @@ impl ShieldKind {
 /// `Prevention { All }` semantics instead of silently becoming one-shot.
 pub fn is_oneshot_target_source_prevent_shape(source_filter: &TargetFilter) -> bool {
     match source_filter {
+        TargetFilter::ChosenDamageSource { .. } => true,
         TargetFilter::And { filters } if filters.len() == 2 => {
             matches!(&filters[0], TargetFilter::ParentTargetSlot { index: 0 })
                 && matches!(
@@ -3392,6 +3421,10 @@ pub enum ManaSpendRestriction {
     /// enforced when a Room's CR 709.5e unlock cost is paid through
     /// [`PaymentContext::SpecialAction`](super::mana::PaymentContext::SpecialAction).
     UnlockDoor,
+    /// CR 106.6 + CR 702.23a: "Spend this mana only to pay cumulative upkeep
+    /// costs." Lowered to [`ManaRestriction::OnlyForCumulativeUpkeep`](super::mana::ManaRestriction::OnlyForCumulativeUpkeep)
+    /// and checked through the dedicated cumulative-upkeep payment context.
+    CumulativeUpkeep,
     /// CR 106.6 + CR 708.4: "Spend this mana only to cast face-down spells"
     /// (Tin Street Gossip). Lowered to
     /// [`ManaRestriction::OnlyForFaceDownSpell`](super::mana::ManaRestriction::OnlyForFaceDownSpell),
@@ -3481,7 +3514,8 @@ impl ManaSpendRestriction {
             | ManaSpendRestriction::SpellOfSourceChosenColor
             | ManaSpendRestriction::SpellFromZone(_)
             | ManaSpendRestriction::CannotCastSpellFromZone(_)
-            | ManaSpendRestriction::UnlockDoor => true,
+            | ManaSpendRestriction::UnlockDoor
+            | ManaSpendRestriction::CumulativeUpkeep => true,
             // CR 106.6: coverage for a disjunction requires every named branch to
             // be production-live (`.all()`). Partial absorption would drop
             // unsupported branches from coverage accounting. With `FaceDownSpell`
@@ -5463,6 +5497,11 @@ pub enum FilterProp {
     WithKeyword {
         value: Keyword,
     },
+    /// CR 608.2d: Matches objects that have the keyword persisted by the
+    /// source's preceding typed choice (Phyrexian Splicer). Unlike
+    /// `WithKeyword`, the value is resolved from the source at target
+    /// selection/evaluation time rather than fixed in the printed filter.
+    HasChosenKeyword,
     HasKeywordKind {
         value: KeywordKind,
     },
@@ -5872,6 +5911,11 @@ pub enum FilterProp {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         defender: Option<ControllerRef>,
     },
+    /// CR 508.1a + CR 514.2: Creature was declared as an attacker during its
+    /// controller's most recently completed turn. The per-controller snapshot
+    /// is retained on `GameState` so this remains correct in multiplayer,
+    /// where each player's last turn can be a different completed turn.
+    AttackedLastTurn,
     /// CR 509.1a: Creature was declared as a blocker this turn.
     /// Checks `creatures_blocked_this_turn` tracking set on GameState.
     BlockedThisTurn,
@@ -5905,6 +5949,13 @@ pub enum FilterProp {
     /// for each transformed permanent you control"). Mirrors `FaceDown`/`Tapped`:
     /// a per-object battlefield state read from `GameObject::transformed`.
     Transformed,
+    /// CR 702.26b: Matches permanents that are currently phased out. This is
+    /// intentionally distinct from the normal filter choke point, which hides
+    /// phased-out permanents from ordinary effects. Effects that explicitly
+    /// mention phased-out objects (notably Time and Tide's phase-in half) use
+    /// `matches_target_filter_including_phased_out` so this property can be
+    /// evaluated against the otherwise invisible battlefield object.
+    PhasedOut,
     /// CR 115.9c: Matches stack entries whose targets ALL satisfy the given filter.
     /// Used for "that targets only ~", "that targets only a single creature you control", etc.
     /// Permissive at the per-object filter level; validated against the stack entry's actual
@@ -6210,15 +6261,24 @@ pub enum DiscardSelfScope {
     FromHand,
     /// Discard the source card itself (Channel's "Discard this card").
     SourceCard,
+    /// Discard the most recently drawn card this turn (Jandor's Ring).
+    ///
+    /// This remains a hand discard for cost discovery, but its eligible set is
+    /// narrowed by the per-turn draw ledger at payment time.
+    LastDrawnThisTurn,
 }
 
 impl DiscardSelfScope {
     pub fn is_from_hand(self) -> bool {
-        matches!(self, Self::FromHand)
+        matches!(self, Self::FromHand | Self::LastDrawnThisTurn)
     }
 
     pub fn is_source_card(self) -> bool {
         matches!(self, Self::SourceCard)
+    }
+
+    pub fn is_last_drawn_this_turn(self) -> bool {
+        matches!(self, Self::LastDrawnThisTurn)
     }
 }
 
@@ -10127,9 +10187,22 @@ pub enum StaticCondition {
     /// Weathered Sentinels as future adopters via
     /// `GameState::player_attacked_player_last_turn`.
     AnyPlayerAttackedYouLastTurn,
-    /// CR 701.27: True when any opponent has at least this many poison counters.
+    /// CR 508.1b + CR 514.2: True during attack declaration when the
+    /// proposed defending player cast a spell or put a nontoken permanent
+    /// onto the battlefield during that player's most recently completed turn.
+    /// Arboria's "can't attack a player unless" rider is the current user.
+    /// The combat entry point supplies the proposed defender; outside that
+    /// context the predicate is unanswerable rather than false-and-inverted.
+    DefendingPlayerCastOrPutNontokenPermanentLastTurn,
+    /// CR 701.27: True when any opponent has at least this many poison counters,
+    /// or when the optional subject has the threshold. `None` preserves the
+    /// original "an opponent" aggregate; `Some(DefendingPlayer)` is used by
+    /// combat restrictions such as Chained Throatseeker and is bound to the
+    /// proposed attack target before attackers are committed.
     OpponentPoisonAtLeast {
         count: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        player: Option<PlayerScope>,
     },
     /// CR 118.12a + CR 508.1d + CR 509.1c: "unless [player] pays [cost]" — an optional cost
     /// condition attached to a combat restriction (attack tax / block tax).
@@ -10398,6 +10471,7 @@ impl StaticCondition {
             | StaticCondition::WasStartingPlayer { .. }
             | StaticCondition::SpellCastWithVariantThisTurn { .. }
             | StaticCondition::AnyPlayerAttackedYouLastTurn
+            | StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
             | StaticCondition::OpponentPoisonAtLeast { .. }
             | StaticCondition::UnlessPay { .. }
             | StaticCondition::Unrecognized { .. }
@@ -10517,6 +10591,7 @@ impl StaticCondition {
             | StaticCondition::WasStartingPlayer { .. }
             | StaticCondition::SpellCastWithVariantThisTurn { .. }
             | StaticCondition::AnyPlayerAttackedYouLastTurn
+            | StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
             | StaticCondition::OpponentPoisonAtLeast { .. }
             | StaticCondition::Unrecognized { .. }
             | StaticCondition::DuringYourTurn
@@ -10642,6 +10717,19 @@ impl StaticCondition {
         texts
     }
 
+    /// True when this condition needs the attack declaration's proposed
+    /// defending player as its semantic anchor. Such a condition must be
+    /// rejected by ordinary layer evaluation so `Not` cannot turn an absent
+    /// combat context into an applied restriction.
+    pub(crate) fn requires_proposed_defending_player(&self) -> bool {
+        self.any_leaf(|leaf| {
+            matches!(
+                leaf,
+                StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
+            )
+        })
+    }
+
     /// THE `StaticCondition` tree traversal. Visits every LEAF of this
     /// condition tree in Oracle order, descending through the Boolean
     /// combinators, and stops early the moment `visit` returns
@@ -10707,6 +10795,7 @@ impl StaticCondition {
             | StaticCondition::WasStartingPlayer { .. }
             | StaticCondition::SpellCastWithVariantThisTurn { .. }
             | StaticCondition::AnyPlayerAttackedYouLastTurn
+            | StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
             | StaticCondition::OpponentPoisonAtLeast { .. }
             | StaticCondition::UnlessPay { .. }
             | StaticCondition::Unrecognized { .. }
@@ -11212,6 +11301,13 @@ impl From<NinjutsuVariant> for CastVariantPaid {
 pub enum RuntimeHandler {
     /// Handled by GameAction::ActivateNinjutsu path.
     NinjutsuFamily,
+    /// CR 701.12a: Morality Shift exchanges the controller's graveyard and
+    /// library as one dedicated zone operation before its chained shuffle.
+    MoralityShift,
+    /// CR 701.20e: privately show the resolved object to the ability controller.
+    /// The target filter remains on the handler so ordinary target declaration,
+    /// legality, and anaphoric target propagation continue to apply.
+    LookAtObject { target: TargetFilter },
 }
 
 /// Which object a Host/Augment combine effect should merge onto a Host.
@@ -12298,6 +12394,10 @@ impl AbilityCost {
                     } | Effect::Mana {
                         produced: ManaProduction::Fixed { .. },
                         target: None,
+                        ..
+                    } | Effect::ChangeZone {
+                        origin: Some(Zone::Graveyard),
+                        destination: Zone::Exile,
                         ..
                     }
                 )
@@ -15966,6 +16066,13 @@ pub enum Effect {
     /// chosen object into the shield. All other redirect forms host on the
     /// controller / source with no declared target.
     CreateDamageReplacement {
+        /// CR 614.9 + CR 614.12: whether the continuous redirection offers its
+        /// controller an accept/decline choice for each matching damage event.
+        /// This is distinct from `redirect_lifetime`: Blood of the Martyr's
+        /// shield is continuous until cleanup, but its controller may decline
+        /// each individual redirection.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        optional: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_filter: Option<TargetFilter>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -16745,6 +16852,13 @@ pub enum Effect {
         scope: RetargetScope,
         #[serde(default)]
         forced_to: Option<TargetFilter>,
+        /// CR 115.7a: An optional constraint on the replacement target, used
+        /// by wording such as "The new target must be a player." This is
+        /// distinct from `forced_to`: the latter names a destination that the
+        /// effect itself chooses, while this field restricts the player's
+        /// retarget choice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        new_target_filter: Option<TargetFilter>,
     },
     /// CR 701.40a: Manifest — put the top card of a player's library onto the
     /// battlefield face down as a 2/2 creature with no text, no name, no
@@ -18641,6 +18755,13 @@ impl Effect {
                 ..
             } => Some(&TargetFilter::Player),
             Effect::ChooseFromZone { .. } => None,
+            // CR 701.20e + CR 115.1: a private object look still declares any
+            // printed target at announcement (Aven Soulgazer). Anaphoric
+            // `ParentTarget` forms (Gustha's Scepter) return a context filter
+            // here and therefore do not create a second slot.
+            Effect::RuntimeHandled {
+                handler: RuntimeHandler::LookAtObject { target },
+            } => Some(target),
             // --- Effects with a `target: TargetFilter` field ---
             Effect::DealDamage { target, .. }
             // CR 115.1 + CR 725.1: "target opponent becomes the monarch". The
@@ -19130,7 +19251,9 @@ impl Effect {
             | Effect::Seek { .. }
             | Effect::SetDayNight { .. }
             | Effect::TimeTravel
-            | Effect::RuntimeHandled { .. }
+            | Effect::RuntimeHandled {
+                handler: RuntimeHandler::NinjutsuFamily | RuntimeHandler::MoralityShift,
+            }
             | Effect::Conjure { .. }
             | Effect::Intensify { .. }
             | Effect::DraftFromSpellbook { .. }
@@ -20352,6 +20475,7 @@ impl Effect {
                 match action {
                     ForEachCategoryAction::ExileFromPool { .. } => {}
                     ForEachCategoryAction::PutCounter { count, .. } => f(count),
+                    ForEachCategoryAction::ChooseOne { .. } => {}
                 }
             }
             Effect::StartYourEngines { .. }
@@ -21286,6 +21410,8 @@ pub fn effect_variant_name(effect: &Effect) -> &str {
         Effect::Double { .. } => "Double",
         Effect::RuntimeHandled { handler } => match handler {
             RuntimeHandler::NinjutsuFamily => "RuntimeHandled:NinjutsuFamily",
+            RuntimeHandler::MoralityShift => "RuntimeHandled:MoralityShift",
+            RuntimeHandler::LookAtObject { .. } => "RuntimeHandled:LookAtObject",
         },
         Effect::Learn => "Learn",
         Effect::Forage => "Forage",
@@ -23488,6 +23614,13 @@ pub enum AbilityCondition {
         comparator: Comparator,
         rhs: QuantityExpr,
     },
+    /// CR 102.2 + CR 603.4 + CR 608.2c: True when at least one opponent of
+    /// the current scoped player was dealt damage this turn. The scoped player
+    /// is the referent established by the surrounding trigger (for example,
+    /// Antagonism's "each player's end step" trigger), rather than the printed
+    /// controller of the resolving ability. The condition fails closed when
+    /// no scoped player is bound.
+    ScopedPlayerOpponentDealtDamageThisTurn,
     /// CR 608.2c + CR 120.10: Compares the numeric result tracked from
     /// the previous instruction in the same resolution against `rhs`. The
     /// `channel` selects which resolution-local tally is read:
@@ -23915,6 +24048,7 @@ impl AbilityCondition {
             | AbilityCondition::DayNightIs { .. }
             | AbilityCondition::NthResolutionThisTurn { .. }
             | AbilityCondition::SourceLacksKeyword { .. }
+            | AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn
             | AbilityCondition::ScopedPlayerMatches { .. } => false,
         }
     }
@@ -27002,6 +27136,11 @@ pub enum ManaModification {
     /// CR 614.1a: Replace with a specific mana type regardless of what was produced.
     /// e.g., Contamination ("produces {B} instead"), Pale Moon ("produces colorless instead").
     ReplaceWith { mana_type: ManaType },
+    /// CR 614.1a: Replace with the color currently chosen on the replacement
+    /// source. Used by Hall of Gemstone's upkeep choice, whose replacement
+    /// definition persists on the Hall and reads that source choice when a
+    /// land is tapped for mana.
+    ReplaceWithChosenColor,
     /// CR 106.12b + CR 614.1a: Multiply the amount of mana produced while
     /// preserving its type and restrictions.
     Multiply { factor: u32 },
@@ -31495,6 +31634,7 @@ mod tests {
         .is_coverage_supported());
         assert!(ManaSpendRestriction::CannotCastSpellFromZone(Zone::Hand).is_coverage_supported());
         assert!(ManaSpendRestriction::UnlockDoor.is_coverage_supported());
+        assert!(ManaSpendRestriction::CumulativeUpkeep.is_coverage_supported());
         // CR 116.2b + CR 702.37e: the paid `GameAction::TurnFaceUp` handler makes
         // the turn-face-up special-action gate satisfiable.
         assert!(ManaSpendRestriction::TurnPermanentFaceUp.is_coverage_supported());
@@ -33106,6 +33246,7 @@ mod tests {
             FilterProp::WithKeyword {
                 value: Keyword::Flying,
             },
+            FilterProp::HasChosenKeyword,
             FilterProp::HasKeywordKind {
                 value: KeywordKind::Flashback,
             },

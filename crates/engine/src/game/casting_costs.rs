@@ -4169,33 +4169,63 @@ pub(crate) fn handle_blight_choice(
     finish_pending_cost_or_cast(state, player, pending, events)
 }
 
-/// CR 601.2b + CR 701.4a: Record the creature type chosen for a pre-choice
-/// behold cost and resume behold payment. The chosen type is written onto the
-/// spell object's `chosen_attributes` (the slot every "choose a creature type"
-/// card uses), so the behold `filter`'s `IsChosenCreatureType` leg scopes "of
-/// that type"; `finish_pending_cost_or_cast` then re-runs the behold cost
-/// stashed in `additional_cost_flow`, which now finds the chosen type set and
-/// proceeds to the behold selection.
+/// CR 601.2b + CR 608.2d: Record a typed value chosen during cost payment and
+/// resume the pending cast/activation. Creature-type choices feed the behold
+/// filter; keyword choices feed the source's chosen-keyword state used by the
+/// following ability effect.
 pub(crate) fn handle_cost_type_choice(
     state: &mut GameState,
     player: PlayerId,
     mut pending: PendingCast,
+    choice_type: &crate::types::ability::ChoiceType,
     options: &[String],
     choice: &str,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     if !options.iter().any(|o| o == choice) {
         return Err(EngineError::InvalidAction(format!(
-            "Chosen creature type '{choice}' is not an offered option"
+            "Chosen cost option '{choice}' is not offered"
         )));
     }
+    let chosen_attribute = crate::types::ability::ChosenAttribute::from_choice(
+        choice_type.clone(),
+        choice,
+    )
+    .ok_or_else(|| {
+        EngineError::InvalidAction(format!(
+            "Chosen cost option '{choice}' does not match {choice_type:?}"
+        ))
+    })?;
     if let Some(obj) = state.objects.get_mut(&pending.object_id) {
-        obj.chosen_attributes
-            .retain(|a| !matches!(a, crate::types::ability::ChosenAttribute::CreatureType(_)));
-        obj.chosen_attributes
-            .push(crate::types::ability::ChosenAttribute::CreatureType(
-                choice.to_string(),
-            ));
+        match chosen_attribute {
+            crate::types::ability::ChosenAttribute::CreatureType(_) => obj
+                .chosen_attributes
+                .retain(|a| !matches!(a, crate::types::ability::ChosenAttribute::CreatureType(_))),
+            crate::types::ability::ChosenAttribute::Keyword(_) => obj
+                .chosen_attributes
+                .retain(|a| !matches!(a, crate::types::ability::ChosenAttribute::Keyword(_))),
+            _ => {}
+        }
+        obj.chosen_attributes.push(chosen_attribute);
+    }
+    if matches!(choice_type, crate::types::ability::ChoiceType::Keyword { .. }) {
+        if let Some(cost) = pending.activation_cost.take() {
+            pending.activation_cost = remove_first_activation_cost_matching(cost, |cost| {
+                matches!(
+                    cost,
+                    AbilityCost::EffectCost {
+                        effect,
+                        ..
+                    } if matches!(
+                        effect.as_ref(),
+                        crate::types::ability::Effect::Choose {
+                            choice_type: crate::types::ability::ChoiceType::Keyword { count: 1, .. },
+                            ..
+                        }
+                    )
+                )
+            });
+        }
     }
     if pending.activation_ability_index.is_some() {
         if let Some(waiting_for) =
@@ -4997,6 +5027,35 @@ pub(crate) fn surface_next_unpaid_interactive_activation_cost(
     };
     let source_id = pending.object_id;
 
+    if let Some(AbilityCost::EffectCost { effect, .. }) =
+        first_activation_cost_component_matching(cost, is_keyword_choice_activation_cost)
+    {
+        let Effect::Choose { choice_type, .. } = effect.as_ref() else {
+            unreachable!("keyword-choice cost predicate accepted a non-choice effect")
+        };
+        let options = match choice_type {
+            crate::types::ability::ChoiceType::Keyword { options, .. } => options
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            _ => unreachable!("keyword-choice cost predicate accepted a non-keyword choice"),
+        };
+        let mut pending = pending.clone();
+        pending.activation_cost = remove_first_activation_cost_matching(
+            pending
+                .activation_cost
+                .take()
+                .expect("checked activation cost is present"),
+            is_keyword_choice_activation_cost,
+        );
+        return Ok(Some(WaitingFor::CostTypeChoice {
+            player,
+            choice_type: choice_type.clone(),
+            options,
+            pending_cast: Box::new(pending),
+        }));
+    }
+
     // CR 601.2h + CR 701.9a: A resolved zero-card FromHand discard leg (Lion's Eye Diamond /
     // Bomat Courier's "Discard your hand" on an empty hand) is paid by doing nothing — the
     // helper returns `Ok(None)` so we FALL THROUGH to the next unpaid leg (the sacrifice arm
@@ -5613,6 +5672,22 @@ fn first_activation_cost_component_matching(
     costs
         .iter()
         .find_map(|cost| first_activation_cost_component_matching(cost, predicate))
+}
+
+/// CR 602.2b + CR 608.2d: Whether a serialized activation-cost component is
+/// the parser's typed keyword-choice cost shape. Kept as a named predicate so
+/// the surfacing and removal paths cannot drift.
+fn is_keyword_choice_activation_cost(cost: &AbilityCost) -> bool {
+    let AbilityCost::EffectCost { effect, .. } = cost else {
+        return false;
+    };
+    matches!(
+        effect.as_ref(),
+        Effect::Choose {
+            choice_type: crate::types::ability::ChoiceType::Keyword { count: 1, .. },
+            ..
+        }
+    )
 }
 
 /// CR 602.2b + CR 701.17a + CR 616.1: Resume an activation after its mill
@@ -7768,15 +7843,21 @@ fn pay_additional_cost_with_source(
                 },
             });
         }
-        AbilityCost::Discard { count, filter, .. } => {
+        AbilityCost::Discard {
+            count,
+            filter,
+            self_scope,
+            ..
+        } => {
             let count = super::quantity::resolve_quantity(state, &count, player, pending.object_id)
                 .max(0) as usize;
             // CR 601.2b: Discard requires interactive card selection — return a WaitingFor.
-            let eligible = super::casting::find_eligible_discard_targets(
+            let eligible = super::casting::find_eligible_discard_targets_for_scope(
                 state,
                 player,
                 pending.object_id,
                 filter.as_ref(),
+                    self_scope,
             );
             // CR 601.2b: Defense-in-depth — empty hand means no legal choice.
             if eligible.len() < count {
@@ -8621,12 +8702,13 @@ pub(crate) fn activation_cost_is_payable_after_x_choice(
         } if !self_scope.is_source_card() => {
             let count = super::quantity::resolve_quantity_with_targets(state, count, ability).max(0)
                 as usize;
-            super::casting::find_eligible_discard_targets_for_ability(
+            super::casting::find_eligible_discard_targets_for_ability_and_scope(
                 state,
                 player,
                 source_id,
                 filter.as_ref(),
                 ability,
+                *self_scope,
             )
             .len()
                 >= count

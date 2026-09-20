@@ -3528,7 +3528,10 @@ fn selection_projection(
             object_ids: cards.clone(),
             constraint: match constraint {
                 None => count_constraint(if *up_to { 0 } else { *count }, *count),
-                Some(ChooseFromZoneConstraint::DistinctCardTypes { .. }) => {
+                Some(
+                    ChooseFromZoneConstraint::DistinctCardTypes { .. }
+                    | ChooseFromZoneConstraint::TopCards { .. },
+                ) => {
                     SelectionConstraint::EngineValidatedCount {
                         min: if *up_to { 0 } else { *count }.min(u32::MAX as usize) as u32,
                         max: (*count).min(u32::MAX as usize) as u32,
@@ -4064,6 +4067,9 @@ fn interaction_keyword_kind_code(keyword: crate::types::keywords::KeywordKind) -
 fn interaction_mana_restriction(restriction: &ManaRestriction) -> InteractionManaRestriction {
     match restriction {
         ManaRestriction::OnlyForSpell => InteractionManaRestriction::OnlyForSpell,
+        ManaRestriction::OnlyForCumulativeUpkeep => {
+            InteractionManaRestriction::OnlyForCumulativeUpkeep
+        }
         ManaRestriction::OnlyForSpellType(spell_type) => {
             InteractionManaRestriction::OnlyForSpellType {
                 spell_type: spell_type.clone(),
@@ -8230,6 +8236,7 @@ fn bound_outbound_mana_restriction(
 ) -> Result<(), InteractionReasonCode> {
     match restriction {
         InteractionManaRestriction::OnlyForSpell
+        | InteractionManaRestriction::OnlyForCumulativeUpkeep
         | InteractionManaRestriction::OnlyForActivation
         | InteractionManaRestriction::OnlyForXCosts
         | InteractionManaRestriction::OnlyForFaceDownSpell

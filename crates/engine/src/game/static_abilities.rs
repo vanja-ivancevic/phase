@@ -8,6 +8,7 @@ use crate::game::functioning_abilities::{
 };
 use crate::game::game_object::GameObject;
 use crate::game::layers::{evaluate_condition, evaluate_condition_with_recipient};
+use crate::types::card_type::{CoreType, Supertype};
 use crate::types::ability::{
     ContinuousModification, ControllerRef, StaticDefinition, TargetFilter, TypedFilter,
 };
@@ -386,6 +387,12 @@ pub fn build_static_registry() -> HashMap<StaticMode, StaticAbilityHandler> {
         "CantTransform",
         "CantRegenerate",
         "CantPlayLand",
+        // CR 101.2 + CR 305.1: Cornered Market's name-based prohibitions are
+        // parameterized by the live battlefield, so their runtime checks are
+        // object-aware helpers rather than the blanket `CantBeCast`/`CantPlayLand`
+        // paths.
+        "CantCastSameNameAsNontokenPermanent",
+        "CantPlayNonbasicLandSameNameAsNontokenPermanent",
         "CantShuffle",
         "CantDealDamage",
         "CantBeDealtDamage",
@@ -1765,6 +1772,106 @@ fn check_static_other_by_name(state: &GameState, name: &str, context: &StaticChe
     transient_grants_other_static_to_context(state, name, context)
 }
 
+/// CR 101.2 + CR 201.2a: Test whether an active name-based prohibition applies
+/// to `player` and whether `candidate_name` is shared by a nontoken permanent
+/// on the battlefield.
+///
+/// These statics cannot be represented by the ordinary `affected` filter alone:
+/// the reference set is the live set of all nontoken permanents, not the static
+/// source object. Keep the dynamic name lookup here, beside the existing
+/// `StaticMode::Other` query authority, so cast and land-play legality share the
+/// same source-functioning, player-scope, and condition gates.
+fn active_name_prohibition_applies(
+    state: &GameState,
+    player: PlayerId,
+    candidate_name: &str,
+    mode_name: &str,
+) -> bool {
+    if !static_kind_present(state, StaticModeKind::Other) {
+        return false;
+    }
+    let context = StaticCheckContext {
+        player_id: Some(player),
+        ..Default::default()
+    };
+    let shares_name_with_nontoken_permanent = state.battlefield.iter().any(|object_id| {
+        state.objects.get(object_id).is_some_and(|object| {
+            !object.is_token && object.name.eq_ignore_ascii_case(candidate_name)
+        })
+    });
+    if !shares_name_with_nontoken_permanent {
+        return false;
+    }
+
+    game_functioning_statics(state).any(|(source_obj, def)| {
+        let StaticMode::Other(name) = &def.mode else {
+            return false;
+        };
+        if name != mode_name {
+            return false;
+        }
+        if let Some(affected) = &def.affected {
+            if !static_filter_matches(state, &context, affected, source_obj.id) {
+                return false;
+            }
+        }
+        if !static_condition_matches_context(
+            state,
+            source_obj.id,
+            source_obj.controller,
+            def,
+            &context,
+        ) {
+            return false;
+        }
+        if let Some(condition) = &def.per_player_condition {
+            if !crate::game::restrictions::evaluate_condition(
+                state,
+                player,
+                source_obj.id,
+                condition,
+            ) {
+                return false;
+            }
+        }
+        true
+    })
+}
+
+/// CR 101.2 + CR 601.2a: Cornered Market's cast-side prohibition.
+pub(crate) fn is_blocked_by_same_name_as_nontoken_permanent(
+    state: &GameState,
+    caster: PlayerId,
+    spell: &GameObject,
+) -> bool {
+    active_name_prohibition_applies(
+        state,
+        caster,
+        &spell.name,
+        "CantCastSameNameAsNontokenPermanent",
+    )
+}
+
+/// CR 305.1: Cornered Market's land-side prohibition. The candidate must be a
+/// land without the Basic supertype; the name comparison itself is dynamic.
+pub(crate) fn is_blocked_by_nonbasic_land_same_name_as_nontoken_permanent(
+    state: &GameState,
+    player: PlayerId,
+    land: &GameObject,
+) -> bool {
+    if !land.card_types.core_types.contains(&CoreType::Land)
+        || land.card_types.supertypes.contains(&Supertype::Basic)
+    {
+        return false;
+    }
+    active_name_prohibition_applies(
+        state,
+        player,
+        &land.name,
+        "CantPlayNonbasicLandSameNameAsNontokenPermanent",
+    )
+}
+
 /// CR 611.1 + CR 611.2c: Scan `state.transient_continuous_effects` for an effect
 /// whose `affected` filter pins the context's player or object and whose
 /// modifications grant `StaticMode::Other(name)` via `AddStaticMode`.
@@ -1844,7 +1951,18 @@ fn static_condition_matches_context(
             bind_proposed_defending_player(condition, defending)
         });
         let condition = bound_condition.as_ref().unwrap_or(condition);
-        if let Some(recipient_id) = context.target_id {
+        if let Some(target) = context.attack_target {
+            let defending =
+                crate::game::combat::defending_player_for_target_or(state, target, controller);
+            crate::game::layers::evaluate_condition_for_proposed_defender(
+                state,
+                condition,
+                controller,
+                source_id,
+                context.target_id,
+                defending,
+            )
+        } else if let Some(recipient_id) = context.target_id {
             evaluate_condition_with_recipient(state, condition, controller, source_id, recipient_id)
         } else {
             evaluate_condition(state, condition, controller, source_id)
@@ -2220,7 +2338,7 @@ mod tests {
     use super::*;
     use crate::game::zones::create_object;
     use crate::parser::oracle_static::parse_static_line;
-    use crate::types::ability::StaticCondition;
+    use crate::types::ability::{PlayerScope, StaticCondition};
     use crate::types::ability::{
         ControllerRef, StaticDefinition, TargetFilter, TypeFilter, TypedFilter,
     };
@@ -2449,6 +2567,86 @@ mod tests {
         assert!(
             static_condition_matches_context(&state, attacker, PlayerId(0), &def, &context),
             "the restriction must apply when the proposed defender controls an artifact"
+        );
+    }
+
+    /// CR 508.1b + CR 725.1: "can't attack unless defending player is the
+    /// monarch" must evaluate against the proposed attack target, not the
+    /// attacker's controller and not a pre-existing CombatState attacker.
+    #[test]
+    fn defending_player_monarch_binds_the_proposed_defender() {
+        use crate::game::combat::AttackTarget;
+
+        let mut state = setup();
+        let attacker = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Crown-Hunter Hireling".to_string(),
+            Zone::Battlefield,
+        );
+        let def = StaticDefinition::new(StaticMode::CantAttack).condition(StaticCondition::Not {
+            condition: Box::new(StaticCondition::IsMonarch {
+                player: PlayerScope::DefendingPlayer,
+            }),
+        });
+        let context = StaticCheckContext {
+            target_id: Some(attacker),
+            attack_target: Some(AttackTarget::Player(PlayerId(1))),
+            ..Default::default()
+        };
+
+        state.monarch = Some(PlayerId(0));
+        assert!(
+            static_condition_matches_context(&state, attacker, PlayerId(0), &def, &context),
+            "a non-monarch defending player must leave the unless restriction active"
+        );
+
+        state.monarch = Some(PlayerId(1));
+        assert!(
+            !static_condition_matches_context(&state, attacker, PlayerId(0), &def, &context),
+            "the proposed defending player must be allowed to attack while monarch"
+        );
+    }
+
+    /// CR 701.27 + CR 508.1b: the poison subject of Chained Throatseeker's
+    /// restriction is the proposed defender, not an aggregate over every
+    /// opponent of the attacking creature's controller.
+    #[test]
+    fn defending_player_poison_binds_the_proposed_defender() {
+        use crate::game::combat::AttackTarget;
+
+        let mut state = setup();
+        let attacker = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Chained Throatseeker".to_string(),
+            Zone::Battlefield,
+        );
+        let def = StaticDefinition::new(StaticMode::CantAttack).condition(
+            StaticCondition::Not {
+                condition: Box::new(StaticCondition::OpponentPoisonAtLeast {
+                    count: 1,
+                    player: Some(PlayerScope::DefendingPlayer),
+                }),
+            },
+        );
+        let context = StaticCheckContext {
+            target_id: Some(attacker),
+            attack_target: Some(AttackTarget::Player(PlayerId(1))),
+            ..Default::default()
+        };
+
+        assert!(
+            static_condition_matches_context(&state, attacker, PlayerId(0), &def, &context),
+            "an unpoisoned proposed defender must leave the unless restriction active"
+        );
+
+        state.players[1].poison_counters = 1;
+        assert!(
+            !static_condition_matches_context(&state, attacker, PlayerId(0), &def, &context),
+            "a poisoned proposed defender must satisfy the unless restriction"
         );
     }
 
@@ -3203,6 +3401,105 @@ mod tests {
         assert!(object_has_static_other(&state, source, "CantBeSacrificed"));
         // Sanity: unrelated prohibition name must NOT fire.
         assert!(!object_has_static_other(&state, source, "CantTransform"));
+    }
+
+    /// CR 101.2 + CR 305.1 + CR 201.2a: Cornered Market compares the proposed
+    /// nonbasic land against the live nontoken permanent set. A token with the
+    /// same name is not enough; once the matching permanent becomes nontoken,
+    /// the restriction applies.
+    #[test]
+    fn cornered_market_name_based_land_gate_excludes_tokens() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Cornered Market".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::new(StaticMode::Other(
+                    "CantPlayNonbasicLandSameNameAsNontokenPermanent".to_string(),
+                ))
+                .affected(TargetFilter::Player),
+            );
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .static_definitions
+            .push(
+                StaticDefinition::new(StaticMode::Other(
+                    "CantCastSameNameAsNontokenPermanent".to_string(),
+                ))
+                .affected(TargetFilter::Player),
+            );
+
+        let matching_token = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Mishra's Factory".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&matching_token).unwrap().is_token = true;
+
+        let land = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Mishra's Factory".to_string(),
+            Zone::Hand,
+        );
+        state
+            .objects
+            .get_mut(&land)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Land);
+
+        assert!(!is_blocked_by_same_name_as_nontoken_permanent(
+            &state,
+            PlayerId(0),
+            &state.objects[&land],
+        ));
+
+        assert!(!is_blocked_by_nonbasic_land_same_name_as_nontoken_permanent(
+            &state,
+            PlayerId(0),
+            &state.objects[&land],
+        ));
+
+        state.objects.get_mut(&matching_token).unwrap().is_token = false;
+        assert!(is_blocked_by_same_name_as_nontoken_permanent(
+            &state,
+            PlayerId(0),
+            &state.objects[&land],
+        ));
+        assert!(is_blocked_by_nonbasic_land_same_name_as_nontoken_permanent(
+            &state,
+            PlayerId(0),
+            &state.objects[&land],
+        ));
+
+        state
+            .objects
+            .get_mut(&land)
+            .unwrap()
+            .card_types
+            .supertypes
+            .push(Supertype::Basic);
+        assert!(!is_blocked_by_nonbasic_land_same_name_as_nontoken_permanent(
+            &state,
+            PlayerId(0),
+            &state.objects[&land],
+        ));
     }
 
     /// CR 702.16j: When a transient continuous effect grants a specific player

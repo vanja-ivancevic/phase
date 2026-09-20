@@ -8058,6 +8058,14 @@ pub(crate) fn run_batch_completion(
 ) -> crate::game::zone_pipeline::BatchMoveResult {
     use crate::types::game_state::BatchCompletion;
     match completion {
+        BatchCompletion::EmitEffectResolved { kind, source_id } => {
+            events.push(GameEvent::EffectResolved {
+                kind,
+                source_id,
+                subject: None,
+            });
+            crate::game::zone_pipeline::BatchMoveResult::Done
+        }
         BatchCompletion::MilledDeliveryComplete { player_id, cards } => {
             effects::mill::complete_mill_delivery(state, player_id, cards, events)
         }

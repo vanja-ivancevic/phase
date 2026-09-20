@@ -67,6 +67,7 @@ pub fn resolve(
         &additional_zones,
         zone_owner,
         filter.as_ref(),
+        constraint.as_ref(),
     )?;
 
     // CR 608.2d: If there are no objects to choose from, skip the choice
@@ -176,6 +177,7 @@ pub(crate) fn resolve_with_choosing_player(
         &additional_zones,
         zone_owner,
         filter.as_ref(),
+        constraint.as_ref(),
     )?;
     // CR 608.2d: The pool can only have shrunk to empty if state changed while
     // paused (it cannot — see above), but fail closed identically to `resolve`.
@@ -278,10 +280,14 @@ pub fn resolve_for_each_category(
         ForEachCategoryAction::PutCounter { target, .. } => {
             resolve_put_counter_pool(state, ability, target)
         }
+        ForEachCategoryAction::ChooseOne { .. } => {
+            crate::game::targeting::zone_object_ids(state, Zone::Battlefield)
+        }
     };
     super::publish_fresh_tracked_set(state, Vec::new());
     let member_filters = match action {
-        ForEachCategoryAction::PutCounter { target, .. } => category
+        ForEachCategoryAction::PutCounter { target, .. }
+        | ForEachCategoryAction::ChooseOne { target } => category
             .member_filters()
             .into_iter()
             .map(|member| TargetFilter::And {
@@ -337,6 +343,11 @@ fn prompt_next_category_member(
             false,
             Some((counter_type.clone(), count.clone())),
         ),
+        Effect::ForEachCategory {
+            chooser,
+            action: ForEachCategoryAction::ChooseOne { .. },
+            ..
+        } => (Zone::Battlefield, *chooser, false, None),
         _ => {
             return Err(EffectError::MissingParam(
                 "ForEachCategoryIteration".to_string(),
@@ -521,6 +532,20 @@ pub(crate) fn drain_active_per_category_zone_choice(
         }
     }
 
+    // CR 608.2c: the category-choice action has no terminal per-member work;
+    // its selected permanent is accumulated into the same tracked set that the
+    // later continuation (for example, "destroy those lands") consumes.
+    if matches!(
+        &ability.effect,
+        Effect::ForEachCategory {
+            action: ForEachCategoryAction::ChooseOne { .. },
+            ..
+        }
+    ) && !chosen.is_empty()
+    {
+        publish_tracked_set_unique(state, chosen);
+    }
+
     let _ = prompt_next_category_member(state, &ability, &pool, remaining_member_filters, events);
     crate::game::zone_pipeline::BatchMoveResult::Done
 }
@@ -638,7 +663,7 @@ pub(crate) fn resolve_random_in_chain(
     ability: &mut ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> bool {
-    let (count, zone, additional_zones, zone_owner, filter) = match &ability.effect {
+    let (count, zone, additional_zones, zone_owner, filter, constraint) = match &ability.effect {
         Effect::ChooseFromZone {
             count,
             zone,
@@ -646,6 +671,7 @@ pub(crate) fn resolve_random_in_chain(
             zone_owner,
             filter,
             selection,
+            constraint,
             ..
         } if selection.is_random() => (
             *count as usize,
@@ -653,6 +679,7 @@ pub(crate) fn resolve_random_in_chain(
             additional_zones.clone(),
             *zone_owner,
             filter.clone(),
+            constraint.clone(),
         ),
         _ => return false,
     };
@@ -670,6 +697,7 @@ pub(crate) fn resolve_random_in_chain(
         &additional_zones,
         zone_owner,
         filter.as_ref(),
+        constraint.as_ref(),
     ) {
         Ok(cards) => cards,
         Err(_) => {
@@ -927,6 +955,7 @@ fn resolve_candidate_cards(
     additional_zones: &[Zone],
     zone_owner: ZoneOwner,
     filter: Option<&TargetFilter>,
+    constraint: Option<&ChooseFromZoneConstraint>,
 ) -> Result<Vec<ObjectId>, EffectError> {
     if matches!(zone_owner, ZoneOwner::Each(_)) {
         return Err(EffectError::MissingParam(
@@ -952,7 +981,8 @@ fn resolve_candidate_cards(
         });
 
     let cards = if cards.is_empty() {
-        collect_direct_zone_cards(state, ability, zone, additional_zones, zone_owner, filter)?
+        let cards = collect_direct_zone_cards(state, ability, zone, additional_zones, zone_owner, filter)?;
+        apply_candidate_constraint(cards, zone, constraint)
     } else {
         retain_matching_candidates(state, ability, cards, filter)
     };
@@ -981,6 +1011,31 @@ fn retain_matching_candidates(
         .into_iter()
         .filter(|id| matches_target_filter(state, *id, filter, &filter_ctx))
         .collect()
+}
+
+/// CR 401.1 + CR 608.2d: Apply constraints that narrow a direct zone-backed
+/// candidate pool.  A tracked set is already exact and therefore bypasses this
+/// helper; this function deliberately stays outside `selection_satisfies_constraint`,
+/// whose job is to validate the chosen subset after the prompt is answered.
+fn apply_candidate_constraint(
+    cards: Vec<ObjectId>,
+    zone: Zone,
+    constraint: Option<&ChooseFromZoneConstraint>,
+) -> Vec<ObjectId> {
+    match constraint {
+        Some(ChooseFromZoneConstraint::TopCards { count }) => match zone {
+            // Libraries are stored with index 0 at the top.
+            Zone::Library => cards.into_iter().take(*count as usize).collect(),
+            // Graveyards are ordered oldest-to-newest; the most recent card is
+            // the top, so walk from the back of the ordered zone.
+            Zone::Graveyard => cards.into_iter().rev().take(*count as usize).collect(),
+            // The parser currently emits TopCards only for ordered library-like
+            // zones.  Keep the runtime fail-closed for any future malformed IR:
+            // it must not silently reinterpret "top" as an arbitrary order.
+            _ => Vec::new(),
+        },
+        _ => cards,
+    }
 }
 
 fn chain_tracked_set_cards(state: &GameState) -> Option<Vec<ObjectId>> {
@@ -1230,6 +1285,7 @@ pub fn selection_satisfies_constraint(
         Some(ChooseFromZoneConstraint::DistinctCardTypes { categories }) => {
             selected_cards_cover_distinct_card_types(state, chosen, categories)
         }
+        Some(ChooseFromZoneConstraint::TopCards { .. }) => true,
     }
 }
 
@@ -2077,6 +2133,27 @@ mod tests {
         let err = resolve(&mut state, &ability, &mut events).unwrap_err();
         assert!(
             matches!(err, EffectError::MissingParam(message) if message == "ChooseFromZone targeted player")
+        );
+    }
+
+    #[test]
+    fn top_cards_constraint_preserves_library_and_graveyard_order() {
+        let constraint = ChooseFromZoneConstraint::TopCards { count: 2 };
+        assert_eq!(
+            apply_candidate_constraint(
+                vec![ObjectId(1), ObjectId(2), ObjectId(3)],
+                Zone::Library,
+                Some(&constraint),
+            ),
+            vec![ObjectId(1), ObjectId(2)]
+        );
+        assert_eq!(
+            apply_candidate_constraint(
+                vec![ObjectId(1), ObjectId(2), ObjectId(3)],
+                Zone::Graveyard,
+                Some(&constraint),
+            ),
+            vec![ObjectId(3), ObjectId(2)]
         );
     }
 

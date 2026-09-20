@@ -12,13 +12,17 @@ use crate::types::ObjectId;
 /// Resolves in two modes:
 /// - `forced_to` is `Some`: directly update the stack entry's targets to the resolved target.
 /// - `forced_to` is `None`: set `WaitingFor::RetargetChoice` so the player selects the new target.
+/// - `new_target_filter` optionally narrows the replacement choices without selecting one.
 pub fn resolve(
     state: &mut GameState,
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
     let Effect::ChangeTargets {
-        scope, forced_to, ..
+        scope,
+        forced_to,
+        new_target_filter,
+        ..
     } = &ability.effect
     else {
         return Err(EffectError::MissingParam(
@@ -71,7 +75,11 @@ pub fn resolve(
     if let Some(filter) = forced_to {
         // CR 115.7a/b: Forced retarget — resolve the new target from the filter,
         // but only apply it if the targeted stack entry could legally target it.
-        let legal_new_targets = legal_new_targets_for_stack_entry(state, stack_entry_index);
+        let legal_new_targets = legal_new_targets_for_stack_entry_with_filter(
+            state,
+            stack_entry_index,
+            new_target_filter.as_ref(),
+        );
         let new_targets = find_legal_targets(state, filter, ability.controller, ability.source_id);
         if let Some(new_target) = new_targets
             .into_iter()
@@ -129,7 +137,11 @@ pub fn resolve(
     // be targeted.)" Every other entry — including a triggered or activated
     // ability whose source happens to be a resident Aura — falls back to its own
     // effect's declared target filter.
-    let legal_new_targets = legal_new_targets_for_stack_entry(state, stack_entry_index);
+    let legal_new_targets = legal_new_targets_for_stack_entry_with_filter(
+        state,
+        stack_entry_index,
+        new_target_filter.as_ref(),
+    );
 
     // CR 115.7a: "If a target can't be changed to another legal target, the
     // original target is unchanged, even if the original target is itself
@@ -236,11 +248,41 @@ pub fn legal_new_targets_for_stack_entry(
     state: &GameState,
     stack_entry_index: usize,
 ) -> Vec<TargetRef> {
-    state
+    legal_new_targets_for_stack_entry_with_filter(state, stack_entry_index, None)
+}
+
+/// CR 115.7a: Enumerate legal replacement targets and optionally apply an
+/// additional destination constraint from the retargeting effect itself (for
+/// example, Rebound's "The new target must be a player").
+pub fn legal_new_targets_for_stack_entry_with_filter(
+    state: &GameState,
+    stack_entry_index: usize,
+    new_target_filter: Option<&TargetFilter>,
+) -> Vec<TargetRef> {
+    let targets = state
         .stack
         .get(stack_entry_index)
         .map(|entry| legal_new_targets_for_entry(state, entry))
-        .unwrap_or_default()
+        .unwrap_or_default();
+    let Some(filter) = new_target_filter else {
+        return targets;
+    };
+    let Some(entry) = state.stack.get(stack_entry_index) else {
+        return Vec::new();
+    };
+    let Some(stack_ability) = entry.ability() else {
+        return Vec::new();
+    };
+    let allowed = find_legal_targets(
+        state,
+        filter,
+        stack_ability.controller,
+        stack_ability.source_id,
+    );
+    targets
+        .into_iter()
+        .filter(|target| allowed.contains(target))
+        .collect()
 }
 
 fn legal_new_targets_for_entry(state: &GameState, entry: &StackEntry) -> Vec<TargetRef> {
@@ -446,6 +488,7 @@ mod tests {
                 target: TargetFilter::Any,
                 scope: RetargetScope::Single,
                 forced_to: None,
+                new_target_filter: None,
             },
             vec![TargetRef::Object(aura_id)],
             ObjectId(900),
@@ -584,6 +627,7 @@ mod tests {
                 target: bb_filter,
                 scope: RetargetScope::Single,
                 forced_to: None,
+                new_target_filter: None,
             },
             vec![TargetRef::Object(aura_id)],
             bolt_bend,
@@ -709,6 +753,7 @@ mod tests {
                 target: TargetFilter::Any,
                 scope: RetargetScope::All,
                 forced_to: None,
+                new_target_filter: None,
             },
             vec![TargetRef::Object(spell_id)],
             ObjectId(900),
@@ -788,6 +833,7 @@ mod tests {
                 target: TargetFilter::Any,
                 scope: RetargetScope::All,
                 forced_to: None,
+                new_target_filter: None,
             },
             vec![TargetRef::Object(targetless_spell)],
             ObjectId(900),
@@ -882,6 +928,7 @@ mod tests {
                 target: TargetFilter::Any,
                 scope: RetargetScope::Single,
                 forced_to: Some(TargetFilter::SelfRef),
+                new_target_filter: None,
             },
             vec![TargetRef::Object(spell_id)],
             spellskite,

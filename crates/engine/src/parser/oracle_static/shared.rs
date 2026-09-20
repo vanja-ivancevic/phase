@@ -1366,15 +1366,17 @@ fn parse_spells_have_quoted_keyword_list(text: &str) -> Option<Vec<StaticDefinit
 /// form for Tek is the representative shape:
 ///
 /// `~ gets +0/+2 as long as you control a Plains, has flying as long as you
-/// control an Island, gets +2/+0 as long as you control a Swamp, ...`
+/// control an Island, gets +2/+0 as long as you control a Swamp, ...` and the
+/// elided-verb form used by Tribal Golem: `~ has trample as long as you control
+/// a Beast, haste as long as you control a Goblin, ...`.
 ///
 /// The single-line parser sees the first `as long as` and treats the remainder
 /// (including the next conjuncts) as one condition. That produces one partial
 /// static with an `Unrecognized` condition and silently loses the other
-/// modifications. Decompose only when every comma-delimited conjunct starts
-/// with a supported continuous verb and carries its own typed condition; an
-/// ordinary comma list or an untyped condition remains with the existing
-/// fail-closed parser.
+/// modifications. Decompose only when every comma-delimited conjunct carries
+/// its own typed condition. Explicit continuous verbs remain supported, while
+/// a bare conjunct is normalized to the shared `has` form. An ordinary comma
+/// list or an untyped condition remains with the existing fail-closed parser.
 fn parse_repeated_conditional_statics(text: &str) -> Option<Vec<StaticDefinition>> {
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
@@ -1404,10 +1406,23 @@ fn parse_repeated_conditional_statics(text: &str) -> Option<Vec<StaticDefinition
 
     let mut definitions = Vec::with_capacity(conjuncts.len());
     for conjunct in conjuncts {
-        let body = strip_continuous_verb(conjunct)?;
-        body.split_around_outside_quotes(" as long as ")?;
-        let definition =
-            super::anthem::parse_continuous_gets_has(conjunct.original, affected.clone(), text)?;
+        let conjunct_text = if strip_continuous_verb(conjunct).is_some() {
+            conjunct.original.to_string()
+        } else {
+            // CR 701.3: Oracle elides a repeated "has" in a shared predicate
+            // list. Reintroduce it only after the comma splitter has found a
+            // per-clause `as long as` gate; this cannot turn an ordinary keyword
+            // list into an unconditional grant.
+            format!("has {}", conjunct.original.trim())
+        };
+        if !nom_primitives::scan_contains(&conjunct_text.to_lowercase(), "as long as ") {
+            return None;
+        }
+        let definition = super::anthem::parse_continuous_gets_has(
+            &conjunct_text,
+            affected.clone(),
+            text,
+        )?;
         if definition.condition.is_none()
             || matches!(
                 definition.condition,
@@ -1424,7 +1439,9 @@ fn parse_repeated_conditional_statics(text: &str) -> Option<Vec<StaticDefinition
 /// Find the next top-level comma that introduces another continuous predicate.
 /// Conditions can contain `and`, so the comma-plus-verb boundary is the narrow
 /// structural marker used here. The optional `and` is consumed while preserving
-/// the following verb in the returned tail.
+/// the following verb in the returned tail. Oracle may elide that verb after
+/// the first item; a candidate carrying its own `as long as` gate is therefore
+/// also a valid boundary and is normalized by the caller.
 fn split_conditional_conjunct<'a>(tp: &TextPair<'a>) -> Option<(TextPair<'a>, TextPair<'a>)> {
     let mut offset = 0;
     while let Some(relative) = tp.lower[offset..].find(", ") {
@@ -1434,6 +1451,7 @@ fn split_conditional_conjunct<'a>(tp: &TextPair<'a>) -> Option<(TextPair<'a>, Te
         if ["gets ", "get ", "has ", "have ", "gains ", "gain "]
             .iter()
             .any(|verb| candidate.starts_with(verb))
+            || nom_primitives::scan_contains(candidate.lower, "as long as ")
         {
             let head = tp.slice(0, position);
             return Some((head, candidate));

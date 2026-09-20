@@ -151,7 +151,8 @@ pub fn parse_zone_controller(input: &str) -> OracleResult<'_, ControllerRef> {
 /// Parse a property filter from Oracle text.
 ///
 /// Matches object property keywords: "tapped", "untapped", "attacking",
-/// "blocking", "token", "face down", "nontoken", "enchanted", "equipped".
+/// "blocking", "token", "face down", "phased-out", "nontoken",
+/// "enchanted", "equipped".
 pub fn parse_property_filter(input: &str) -> OracleResult<'_, FilterProp> {
     alt((
         value(FilterProp::Tapped, tag("tapped")),
@@ -165,6 +166,8 @@ pub fn parse_property_filter(input: &str) -> OracleResult<'_, FilterProp> {
         value(FilterProp::FaceDown, tag("face down")),
         // CR 701.27g: "transformed permanent"/"transformed creature" selector.
         value(FilterProp::Transformed, tag("transformed")),
+        // CR 702.26b: explicit references to permanents that are phased out.
+        value(FilterProp::PhasedOut, tag("phased-out")),
         value(FilterProp::Unblocked, tag("unblocked")),
         value(FilterProp::Suspected, tag("suspected")),
         value(FilterProp::Renowned, tag("renowned")),
@@ -695,6 +698,14 @@ mod tests {
         let (rest, p) = parse_property_filter("transformed permanent").unwrap();
         assert_eq!(p, FilterProp::Transformed);
         assert_eq!(rest, " permanent");
+    }
+
+    #[test]
+    fn test_parse_property_filter_phased_out() {
+        // CR 702.26b: Time and Tide's explicit phased-out population.
+        let (rest, p) = parse_property_filter("phased-out creatures").unwrap();
+        assert_eq!(p, FilterProp::PhasedOut);
+        assert_eq!(rest, " creatures");
     }
 
     #[test]

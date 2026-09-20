@@ -14322,6 +14322,45 @@ fn trigger_unless_you_exile_card_from_graveyard() {
     );
 }
 
+/// CR 118.12 + CR 701.7: Barrow Ghoul's alternative action is the top
+/// matching graveyard card, not an arbitrary creature-card selection.
+#[test]
+fn trigger_unless_you_exile_top_creature_card_from_graveyard() {
+    let def = parse_trigger_line(
+        "At the beginning of your upkeep, sacrifice this creature unless you exile the top creature card of your graveyard.",
+        "Barrow Ghoul",
+    );
+    let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
+    let AbilityCost::EffectCost { effect, .. } = &unless_pay.cost else {
+        panic!(
+            "top creature card exile should be an effect-cost, got {:?}",
+            unless_pay.cost
+        );
+    };
+    let Effect::ChangeZone {
+        origin,
+        destination,
+        target,
+        ..
+    } = effect.as_ref()
+    else {
+        panic!("expected ChangeZone effect-cost, got {effect:?}");
+    };
+    assert_eq!(*origin, Some(crate::types::zones::Zone::Graveyard));
+    assert_eq!(*destination, crate::types::zones::Zone::Exile);
+    assert!(matches!(target, TargetFilter::Typed(filter)
+        if filter.controller == Some(ControllerRef::You)
+            && filter.type_filters.contains(&TypeFilter::Creature)
+            && filter.properties.contains(&FilterProp::InZone {
+                zone: crate::types::zones::Zone::Graveyard,
+            })));
+    assert_eq!(
+        unless_pay.payer,
+        TargetFilter::Controller,
+        "payer should be Controller"
+    );
+}
+
 #[test]
 fn trigger_unless_you_exile_two_cards_from_graveyard() {
     let def = parse_trigger_line(
@@ -14510,6 +14549,23 @@ fn trigger_unless_they_sacrifice_filter_binds_triggering_player() {
         panic!("sacrifice target should be typed, got {:?}", cost.target);
     };
     assert_eq!(tf.controller, Some(ControllerRef::You));
+}
+
+/// CR 201.5 + CR 118.12: a self-referential sacrifice alternative is not a
+/// type-filter phrase.  It must lower directly to `SelfRef` so the payer can
+/// sacrifice the source permanent (Withercrown) rather than leaving an
+/// unsupported unless rider.
+#[test]
+fn unless_you_sacrifice_self_reference_lowers_to_self_ref() {
+    for text in ["you sacrifice ~", "you sacrifice this creature"] {
+        let cost = parse_unless_alt_cost(text)
+            .unwrap_or_else(|| panic!("self-sacrifice unless cost should lower: {text}"));
+        assert_eq!(
+            cost,
+            AbilityCost::Sacrifice(SacrificeCost::count(TargetFilter::SelfRef, 1)),
+            "self-reference form {text:?}"
+        );
+    }
 }
 
 #[test]
@@ -14785,6 +14841,30 @@ fn trigger_unless_you_pay_its_mana_cost_is_self_mana_cost() {
     );
 }
 
+#[test]
+fn trigger_unless_you_pay_its_mana_cost_reduced_by_two_is_dynamic_self_cost() {
+    // CR 118.12 + CR 601.2f: Flash's alternative is the source's own printed
+    // mana cost with {2} removed from its generic component. The placeholder
+    // must survive parsing so the resolver can materialize it against the
+    // creature put onto the battlefield.
+    let def = parse_trigger_line(
+        "When this creature enters, sacrifice it unless you pay its mana cost reduced by {2}.",
+        "Flash",
+    );
+    let unless = def
+        .unless_pay
+        .as_ref()
+        .expect("reduced self-mana payment must be recognized as an unless-cost");
+    assert_eq!(
+        unless.cost,
+        AbilityCost::Mana {
+            cost: crate::types::mana::ManaCost::SelfManaCostReduced { reduction: 2 },
+        },
+        "reduced self-mana payment must retain its dynamic placeholder, got {:?}",
+        unless.cost
+    );
+}
+
 // NO-REGRESSION: bare "unless you pay {2}" still routes through the
 // existing mana block (the "you" pronoun is excluded from the explicit-
 // pronoun chain), not the new delegation.
@@ -14812,6 +14892,26 @@ fn trigger_unless_they_pay_binds_creature_controller_to_parent_target_controller
 
     let unless_pay = def.unless_pay.as_ref().expect("should have unless_pay");
     assert_eq!(unless_pay.payer, TargetFilter::ParentTargetController);
+}
+
+/// CR 202.3 + CR 608.2c: Wand of Ith's revealed-card branch must retain the
+/// card's mana value as a target-relative dynamic life payment.
+#[test]
+fn unless_they_pay_life_equal_to_target_mana_value() {
+    let (cost, remainder) =
+        parse_unless_they_pay_life("life equal to its mana value")
+            .expect("dynamic mana-value life payment should lower");
+    assert!(remainder.is_empty(), "the dynamic phrase must be fully consumed");
+    assert!(matches!(
+        cost,
+        AbilityCost::PayLife {
+            amount: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectManaValue {
+                    scope: ObjectScope::Target,
+                }
+            }
+        }
+    ));
 }
 
 #[test]
@@ -29464,6 +29564,37 @@ fn parse_sigil_of_sleep_bounce_targets_triggering_player_controlled_creature() {
         },
         other => panic!("Sigil of Sleep effect must be Bounce, got {other:?}"),
     }
+}
+
+/// CR 120.1 + CR 603.2c: passive player-damage conditions bind the damaged
+/// player as `TriggeringPlayer`, so Antagonism's "their opponents" is relative
+/// to the player who was dealt damage rather than to the enchantment's
+/// controller. The negative cases protect the neighboring active-voice and
+/// permanent-damage grammars from being widened accidentally.
+#[test]
+fn relative_player_scope_binds_passive_damage_recipient_to_triggering_player() {
+    for cond in [
+        "a player is dealt damage",
+        "an opponent is dealt combat damage",
+        "whenever a player is dealt damage",
+    ] {
+        assert_eq!(
+            relative_player_scope_for_condition(cond),
+            Some(ControllerRef::TriggeringPlayer),
+            "passive damage condition must bind its recipient: {cond:?}",
+        );
+    }
+
+    assert_eq!(
+        relative_player_scope_for_condition("a creature is dealt damage"),
+        None,
+        "permanent damage must not invent a player scope",
+    );
+    assert_eq!(
+        relative_player_scope_for_condition("a player deals damage to a creature"),
+        None,
+        "active damage to a permanent must not match the passive player grammar",
+    );
 }
 
 /// CR 603.2e + CR 115.1 + CR 608.2c (Black Bolt, Inhuman King — Lethal Voice):

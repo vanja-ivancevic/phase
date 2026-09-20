@@ -10,11 +10,13 @@ use nom::Parser;
 use serde::{Deserialize, Serialize};
 
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag,
+    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityTag, CardSelectionMode,
     ActivationManaPaymentRestriction, ActivationRestriction, AdditionalCost, CastTimingPermission,
     CastingRestriction, ChoiceType, ChosenSubtypeKind, ContinuousModification, ControllerRef,
-    CostReduction, DelayedTriggerCondition, Duration, Effect, EffectScope, FilterProp,
-    ManaProduction, ModalChoice, ParsedCondition, PlayerFilter, QuantityExpr, QuantityRef,
+    CostReduction, DelayedTriggerCondition, DiscardSelfScope, Duration, Effect, EffectScope,
+    FilterProp,
+    ManaModification, ManaProduction, ModalChoice, ParsedCondition, PlayerFilter, QuantityExpr,
+    QuantityRef,
     ReplacementCondition, ReplacementDefinition, SolveCondition, SpellCastingOption,
     StaticCondition, StaticDefinition, TapStateChange, TargetFilter, TriggerCondition,
     TriggerDefinition, TypedFilter,
@@ -35,7 +37,7 @@ use super::oracle_nom::bridge::{nom_on_lower, split_once_on_lower};
 use super::oracle_nom::condition::parse_graveyard_keyword_grant_sentence;
 use super::oracle_nom::primitives::{
     parse_number as nom_parse_number, parse_object_recipient_pronoun, parse_period_sentences,
-    scan_at_word_boundaries, scan_contains, scan_preceded,
+    scan_at_word_boundaries, scan_contains, scan_preceded, split_once_on,
 };
 
 use super::oracle_attraction::parse_attraction_visit_triggers;
@@ -62,8 +64,9 @@ use super::oracle_dispatch::{dispatch_line_nom, NomDispatchIr};
 use super::oracle_effect::sequence::try_parse_same_is_true_continuation;
 use super::oracle_effect::{
     lower_ability_ir, parse_ability_ir_standalone, parse_ability_ir_with_context,
-    parse_additional_cost_instead_condition_fragment, parse_effect_chain,
-    parse_effect_chain_with_context, rewrite_condition_keyword,
+    parse_additional_cost_instead_condition_fragment, parse_effect_chain, parse_effect_chain_ir,
+    parse_effect_chain_with_context, parse_where_x_quantity_expression,
+    rewrite_condition_keyword,
     try_parse_temporal_delayed_trigger_ability,
 };
 use super::oracle_ir::ast::parsed_clause;
@@ -83,7 +86,7 @@ use super::oracle_ir::feature::ItemIdTracks;
 use super::oracle_ir::relation::{DocumentRelationIr, LinkedChoiceKind, LinkedReturnOutcome};
 use super::oracle_ir::replacement::ReplacementIr;
 use super::oracle_ir::static_ir::StaticIr;
-use super::oracle_ir::trigger::{TriggerIr, TriggerNodeIr};
+use super::oracle_ir::trigger::{TriggerBody, TriggerIr, TriggerNodeIr};
 pub use super::oracle_keyword::keyword_display_name;
 use super::oracle_keyword::{
     is_keyword_cost_line, is_kicker_family_line, parse_kicker_additional_cost_line,
@@ -1358,6 +1361,7 @@ fn detect_document_relations(items: &[OracleItemIr], types: &[String]) -> Vec<Do
     detect_linked_choice_etb_counter(items, &mut relations);
     detect_linked_choice_type_statics(items, types, &mut relations);
     detect_linked_choice_persisted_player(items, &mut relations);
+    detect_linked_choice_persisted_color(items, &mut relations);
     detect_linked_choice_copy_chosen_host(items, &mut relations);
     detect_etb_exile_ltb_return(items, &mut relations);
     detect_active_player_punisher(items, &mut relations);
@@ -1933,6 +1937,142 @@ fn apply_linked_choice_persisted_player(
                 }
             }
         }
+    }
+}
+
+/// CR 607.2d + CR 613.1: A color choice that is read by a separate mana
+/// ability must survive the resolving trigger on the source permanent. The
+/// ordinary in-chain "choose a color, then add mana of that color" form stays
+/// resolution-scoped; only a reader on a different printed item creates this
+/// relation. Gem Bazaar is the old-border witness: its ETB trigger chooses a
+/// random color and its activated ability later adds mana of the color last
+/// chosen.
+fn detect_linked_choice_persisted_color(
+    items: &[OracleItemIr],
+    relations: &mut Vec<DocumentRelationIr>,
+) {
+    let choosers: Vec<OracleItemId> = items
+        .iter()
+        .filter(|item| {
+            item_ability(item).is_some_and(|def| ability_chain_has_color_choice(&def))
+                || item_trigger(item).is_some_and(|trigger| {
+                    trigger
+                        .execute
+                        .as_deref()
+                        .is_some_and(ability_chain_has_color_choice)
+                })
+        })
+        .map(|item| item.id)
+        .collect();
+    if choosers.is_empty() {
+        return;
+    }
+
+    let has_external_reader = items.iter().any(|item| {
+        let reads = item_ability(item).is_some_and(|def| {
+            ability_chain_reads_source_chosen_color(&def)
+        }) || item_trigger(item).is_some_and(|trigger| {
+            trigger
+                .execute
+                .as_deref()
+                .is_some_and(ability_chain_reads_source_chosen_color)
+        }) || item_replacement(item).is_some_and(|replacement| {
+            matches!(
+                replacement.mana_modification,
+                Some(ManaModification::ReplaceWithChosenColor)
+            )
+        });
+        reads && !choosers.contains(&item.id)
+    });
+    if has_external_reader {
+        relations.push(DocumentRelationIr::LinkedChoice(
+            LinkedChoiceKind::PersistedColor { choosers },
+        ));
+    }
+}
+
+fn ability_chain_has_color_choice(def: &AbilityDefinition) -> bool {
+    matches!(
+        def.effect.as_ref(),
+        Effect::Choose {
+            choice_type: ChoiceType::Color { .. },
+            ..
+        }
+    ) || def
+        .sub_ability
+        .as_deref()
+        .is_some_and(ability_chain_has_color_choice)
+        || def
+            .else_ability
+            .as_deref()
+            .is_some_and(ability_chain_has_color_choice)
+}
+
+fn ability_chain_reads_source_chosen_color(def: &AbilityDefinition) -> bool {
+    matches!(
+        def.effect.as_ref(),
+        Effect::Mana {
+            produced: ManaProduction::ChosenColor { .. },
+            ..
+        }
+    ) || matches!(
+        def.effect.as_ref(),
+        Effect::AddTargetReplacement { replacement, .. }
+            if matches!(
+                replacement.mana_modification,
+                Some(ManaModification::ReplaceWithChosenColor)
+            )
+    ) || def
+        .sub_ability
+        .as_deref()
+        .is_some_and(ability_chain_reads_source_chosen_color)
+        || def
+            .else_ability
+            .as_deref()
+            .is_some_and(ability_chain_reads_source_chosen_color)
+}
+
+/// Flip `persist: true` on every color choice made by a linked chooser item,
+/// resolved by document item id. This shares the persisted-choice seam with
+/// player choices while keeping the choice axis explicit.
+fn apply_linked_choice_persisted_color(
+    result: &mut ParsedAbilities,
+    relations: &[DocumentRelationIr],
+    ability_ids: &[OracleItemId],
+    trigger_ids: &[OracleItemId],
+) {
+    for relation in relations {
+        let DocumentRelationIr::LinkedChoice(LinkedChoiceKind::PersistedColor { choosers }) =
+            relation
+        else {
+            continue;
+        };
+        for id in choosers {
+            if let Some(pos) = position_of(ability_ids, *id) {
+                persist_color_choice_in_ability(&mut result.abilities[pos]);
+            } else if let Some(pos) = position_of(trigger_ids, *id) {
+                if let Some(execute) = result.triggers[pos].execute.as_mut() {
+                    persist_color_choice_in_ability(execute);
+                }
+            }
+        }
+    }
+}
+
+fn persist_color_choice_in_ability(def: &mut AbilityDefinition) {
+    if let Effect::Choose {
+        choice_type: ChoiceType::Color { .. },
+        persist,
+        ..
+    } = def.effect.as_mut()
+    {
+        *persist = true;
+    }
+    if let Some(sub) = def.sub_ability.as_mut() {
+        persist_color_choice_in_ability(sub);
+    }
+    if let Some(els) = def.else_ability.as_mut() {
+        persist_color_choice_in_ability(els);
     }
 }
 
@@ -3315,6 +3455,7 @@ pub(crate) fn lower_oracle_ir(ir: &mut OracleDocIr) -> ParsedAbilities {
     );
     reconcile_host_bound_phase_outs(&mut result);
     apply_linked_choice_persisted_player(&mut result, &ir.relations, &ability_ids, &trigger_ids);
+    apply_linked_choice_persisted_color(&mut result, &ir.relations, &ability_ids, &trigger_ids);
 
     // Architectural rule: the parser must never silently discard Oracle text. Run
     // the swallow audit against the parsed result so any unrepresented clause
@@ -4569,6 +4710,17 @@ pub(crate) fn parse_oracle_ir(
 
         let lower = line.to_lowercase();
 
+        // CR 701.9a + CR 116.1a: Old-border cards such as Circling Vultures
+        // use the pre-modern shorthand "You may discard this card any time you
+        // could cast an instant." This is a hand-zone activated ability whose
+        // sole cost is discarding its source. Route it before any generic line
+        // classifier can treat the sentence as an ordinary effect.
+        if let Some(def) = parse_self_discard_instant_permission(&line) {
+            emitter.ability_at(item_line, def);
+            i += 1;
+            continue;
+        }
+
         // Priority 8b (early): "As an additional cost to cast this spell" — must
         // precede static-pattern classifiers (Priority 7) that match embedded
         // "This spell costs {N} less..." tails on combined lines (Rottenmouth
@@ -5382,6 +5534,75 @@ pub(crate) fn parse_oracle_ir(
         // CR 603.2: Compound triggers ("When X and when Y, effect") produce
         // multiple TriggerDefinitions sharing the same execute effect.
         if has_trigger_prefix(&lower) {
+            // CR 603.2 + CR 614.1a: Hall of Gemstone prints its upkeep choice
+            // and the separate end-of-turn mana replacement in one paragraph.
+            // Split the two printed items before the generic trigger parser so
+            // the replacement becomes a source-bound sub-ability installed by
+            // the trigger; document relation discovery can then persist the
+            // trigger's color choice for that replacement to read later.
+            if let Some((trigger_text, replacement_text)) =
+                split_once_on_lower(&line, &lower, ". until end of turn, ")
+            {
+                let trigger_text = format!("{}.", trigger_text.trim());
+                let replacement_text = format!(
+                    "Until end of turn, {}.",
+                    replacement_text.trim().trim_end_matches('.')
+                );
+                let mut hall_triggers = parse_trigger_lines_at_index_ir(
+                    &trigger_text,
+                    card_name,
+                    Some(PrintedTriggerIndex::placeholder()),
+                    &mut ctx,
+                );
+                if hall_triggers.len() == 1
+                    && scan_contains(
+                        &replacement_text.to_ascii_lowercase(),
+                        "lands tapped for mana produce mana of the chosen color",
+                    )
+                {
+                    let replacement_chain =
+                        parse_effect_chain_ir(&replacement_text, AbilityKind::Spell, &mut ctx);
+                    let replacement_is_typed = replacement_chain.clauses.len() == 1
+                        && !matches!(
+                            &replacement_chain.clauses[0].parsed.effect,
+                            Effect::Unimplemented { .. }
+                        );
+                    if replacement_is_typed {
+                        if let Some(TriggerBody::EffectChain(trigger_chain)) =
+                            hall_triggers[0].body.as_mut()
+                        {
+                            trigger_chain
+                                .clauses
+                                .extend(replacement_chain.clauses);
+                            // CR 607.2d: although both instructions share one
+                            // printed trigger, the replacement resolves after
+                            // the choice and reads it through Hall's source
+                            // object. Make the source persistence explicit;
+                            // the cross-item relation pass cannot do this for a
+                            // reader nested in the same trigger item.
+                            if let Some(first_clause) = trigger_chain.clauses.first_mut() {
+                                if let Effect::Choose {
+                                    choice_type: ChoiceType::Color { .. },
+                                    persist,
+                                    ..
+                                } = &mut first_clause.parsed.effect
+                                {
+                                    *persist = true;
+                                }
+                            }
+                            for __item in hall_triggers.drain(..) {
+                                emitter.trigger_ir_at(
+                                    item_line,
+                                    TriggerNodeIr::Parsed(Box::new(__item)),
+                                );
+                            }
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+
             // CR 707.9a: Pass the running trigger count as the base index so
             // any "and it has this ability" except clause in this trigger's
             // body resolves to the correct printed-trigger slot.
@@ -7119,6 +7340,45 @@ fn activation_zone_from_self_effect(def: &AbilityDefinition) -> Option<Zone> {
     activation_zone
 }
 
+/// CR 701.9a + CR 116.1a: Parse the old-border shorthand permission used by
+/// Circling Vultures and its functional siblings:
+/// "You may discard this card any time you could cast an instant."
+///
+/// The printed sentence has no colon, but it is still an activated hand-zone
+/// action. The source-card discard is the entire cost and the successful
+/// activation has no additional effect, so the typed representation uses a
+/// `NoOp` body. Keeping this as a strict whole-line recognizer is important:
+/// malformed or extended sentences must remain visible to the ordinary parser
+/// rather than silently losing a clause.
+fn parse_self_discard_instant_permission(line: &str) -> Option<AbilityDefinition> {
+    let lower = line.trim().to_ascii_lowercase();
+    all_consuming(terminated(
+        (
+            tag::<_, _, OracleError<'_>>("you may discard "),
+            tag::<_, _, OracleError<'_>>("this card"),
+            tag::<_, _, OracleError<'_>>(" any time you could cast "),
+            tag::<_, _, OracleError<'_>>("an instant"),
+        ),
+        opt(tag::<_, _, OracleError<'_>>(".")),
+    ))
+    .parse(lower.as_str())
+    .ok()?;
+
+    let mut definition = AbilityDefinition::new(AbilityKind::Activated, Effect::NoOp)
+        .cost(AbilityCost::Discard {
+            count: QuantityExpr::Fixed { value: 1 },
+            filter: None,
+            selection: CardSelectionMode::Chosen,
+            self_scope: DiscardSelfScope::SourceCard,
+        })
+        .description(line.to_string());
+    // CR 113.6m: a source-card discard cost functions only from its owner's
+    // hand. This is explicit here because this recognizer constructs the
+    // definition directly rather than going through the colon-ability shell.
+    definition.activation_zone = Some(Zone::Hand);
+    Some(definition)
+}
+
 /// CR 608.2k: Source zone of a non-self `AbilityCost::Exile` component
 /// ("Exile a nonland card from your hand"), if present. Effect-side companion
 /// to `activation_zone_from_self_cost`: returns `None` for a self-ref exile
@@ -7158,6 +7418,13 @@ fn parse_activated_ability_ir(
     let cost_text = strip_activated_cost_label(cost_text).unwrap_or(cost_text);
     let normalized_cost_text = normalize_self_refs_for_static(cost_text, card_name);
     let cost = parse_oracle_cost(&normalized_cost_text);
+    // CR 107.3c + CR 602.2b: pre-modern Oracle sometimes prints a defined-X
+    // clause as a separate sentence ("Draw a card. X is the number of cards
+    // in an opponent's hand.") rather than the modern trailing
+    // ", where X is ..." form. Fold only the exact terminal standalone form
+    // into the ordinary where-X grammar, and carry the definition onto the
+    // activation shell when the cost contains {X}.
+    let (effect_text, standalone_x) = fold_standalone_x_definition(&effect_text);
 
     // CR 608.2k: expose this ability's exile-cost source zone so the effect
     // parser can disambiguate "the exiled card" as a cost-paid-object
@@ -7173,6 +7440,12 @@ fn parse_activated_ability_ir(
     // Retry with `~` normalization if the first pass left an Unimplemented node
     // or emitted a target-fallback warning.
     let mut ir = parse_activated_ability_ir_with_self_ref_fallback(&effect_text, card_name, ctx);
+
+    if let Some(quantity) = standalone_x {
+        if ability_cost_contains_x_mana(&cost) {
+            ir.shell.announced_x = Some(quantity);
+        }
+    }
 
     ctx.current_ability_exile_cost_zone = prev_exile_zone;
     ctx.current_ability_index = prev_ability_index;
@@ -7233,6 +7506,52 @@ fn parse_activated_ability_ir(
         ShellStage::ExtractManaSpendTrigger,
     ];
     (ir, effect_text)
+}
+
+/// CR 107.3c: Fold the legacy standalone terminal sentence `X is ...` into
+/// the modern `..., where X is ...` form. The returned quantity is also used
+/// by the activated shell when the cost contains `{X}`.
+fn fold_standalone_x_definition(text: &str) -> (String, Option<QuantityExpr>) {
+    let lower = text.to_ascii_lowercase();
+    // Keep the historical last-boundary behavior, but discover each sentence
+    // boundary through the shared nom splitter rather than string dispatch.
+    let mut offset = 0;
+    let mut remaining = lower.as_str();
+    let mut separator = None;
+    while let Ok((_, (before, after))) = split_once_on(remaining, ". x is ") {
+        separator = Some(offset + before.len());
+        offset += before.len() + ". x is ".len();
+        remaining = after;
+    }
+    let Some(separator) = separator else {
+        return (text.to_string(), None);
+    };
+    let base = text[..separator].trim_end();
+    let expression = text[separator + ". x is ".len()..]
+        .trim()
+        .trim_end_matches('.')
+        .trim();
+    if base.is_empty() || expression.is_empty() {
+        return (text.to_string(), None);
+    }
+    let Some(quantity) = parse_where_x_quantity_expression(expression) else {
+        return (text.to_string(), None);
+    };
+    (
+        format!("{base}, where X is {expression}"),
+        Some(quantity),
+    )
+}
+
+fn ability_cost_contains_x_mana(cost: &AbilityCost) -> bool {
+    match cost {
+        AbilityCost::Mana { cost } => cost.has_x(),
+        AbilityCost::Composite { costs } | AbilityCost::OneOf { costs } => {
+            costs.iter().any(ability_cost_contains_x_mana)
+        }
+        AbilityCost::PerCounter { base, .. } => ability_cost_contains_x_mana(base),
+        _ => false,
+    }
 }
 
 /// CR 106.6: Strip the exact terminal rider "Spend only mana of the chosen

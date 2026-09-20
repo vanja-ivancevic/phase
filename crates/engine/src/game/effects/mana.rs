@@ -504,6 +504,9 @@ pub(crate) fn resolve_restrictions(
         .iter()
         .filter_map(|template| match template {
             ManaSpendRestriction::SpellOnly => Some(ManaRestriction::OnlyForSpell),
+            ManaSpendRestriction::CumulativeUpkeep => {
+                Some(ManaRestriction::OnlyForCumulativeUpkeep)
+            }
             ManaSpendRestriction::SpellType(t) => {
                 Some(ManaRestriction::OnlyForSpellType(t.clone()))
             }

@@ -946,6 +946,7 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
         | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::AttackedLastTurn
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
@@ -960,6 +961,7 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         | FilterProp::AttachedToRecipient
         | FilterProp::HasAttachment { .. }
         | FilterProp::HasAnyAttachmentOf { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeywordKind { .. }
         | FilterProp::Targets { .. }
@@ -1000,6 +1002,7 @@ fn filterprop_reads_only_candidate_fp(p: &FilterProp) -> bool {
         // own fingerprint — POISON for memoization.
         | FilterProp::InTrackedSet { .. }
         | FilterProp::CouldBeTargetedByTriggeringSpell
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
     }
 }

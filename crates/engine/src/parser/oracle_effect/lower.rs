@@ -33,7 +33,8 @@ use crate::parser::oracle_ir::effect_chain::{ClauseIr, EffectChainIr};
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AggregateFunction, AttackScope,
     AttackSubject, CastPermissionConstraint, CastingPermission, Comparator, ConjureSource,
-    ContinuousModification, ControllerRef, DamageChannel, DamageSource, DelayedTriggerCondition,
+    ContinuousModification, ControllerRef, DamageChannel, DamageKindFilter, DamageSource,
+    DelayedTriggerCondition,
     Duration, Effect, EffectScope, ExiledSpellRider, FilterProp, GameRestriction, LibraryPosition,
     ManaSpendPermission, MultiTargetSpec, ObjectScope, PermissionGrantee, PlayerFilter,
     PreventionAmount, PreventionScope, PtValue, QuantityExpr, QuantityRef, RestrictionPlayerScope,
@@ -8216,7 +8217,8 @@ pub(super) fn try_parse_damage_with_remainder<'a>(
             &after[consumed..],
         )
     } else if let Ok((rem, _)) = alt((
-        tag::<_, _, OracleError<'_>>("that much damage"),
+        tag::<_, _, OracleError<'_>>("that damage"),
+        tag("that much damage"),
         // CR 120.1: "that amount of damage" is the synonym used when the
         // antecedent reads "N damage" rather than "this much damage" (Fear of
         // Burning Alive: "deals that amount of damage to target creature that
@@ -9306,6 +9308,15 @@ pub(super) fn strip_leading_sequence_connector(text: &str) -> &str {
         tag("Also "),
         tag("also, "),
         tag("also "),
+        // CR 608.2f: "simultaneously" is a manner adverb, not part of the
+        // first imperative. Strip it at the same boundary as sequence
+        // connectors so compound instructions such as Breaking Wave's
+        // "Simultaneously untap ... and tap ..." reach the ordinary action
+        // parsers without losing either operation.
+        tag("Simultaneously, "),
+        tag("Simultaneously "),
+        tag("simultaneously, "),
+        tag("simultaneously "),
     ))
     .parse(trimmed)
     {
@@ -9504,6 +9515,30 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
             .unwrap_or(expression)
     };
     let expression_lower = expression.to_ascii_lowercase();
+    // CR 107.3c + CR 400.1 + CR 608.2k: old-border Shrine cards define X
+    // from a spell's name rather than from a printed card name:
+    // "the number of cards in all graveyards with the same name as that
+    // spell" (Aven Shrine, Cabal Shrine, Dwarven Shrine) and the trigger
+    // anaphor "the spell" (Cephalid Shrine). The spell is the enclosing
+    // ability's parent object, so retain the dynamic name relation instead of
+    // freezing a literal name or falling back to a zero-valued variable.
+    // Dwarven Shrine's "twice" is a compositional multiplier over the same
+    // quantity, not a separate card-specific quantity kind.
+    if let Some(expr) = parse_where_x_artifact_damage_to_you(expression_lower.as_str()) {
+        return Some(expr);
+    }
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("twice ").parse(expression_lower.as_str()) {
+        let consumed = expression_lower.len() - rest.len();
+        if let Some(inner) = parse_where_x_quantity_expression(&expression[consumed..]) {
+            return Some(QuantityExpr::Multiply {
+                factor: 2,
+                inner: Box::new(inner),
+            });
+        }
+    }
+    if let Some(expr) = parse_where_x_cards_with_same_name_as_spell(expression) {
+        return Some(expr);
+    }
     // CR 702.51c + CR 603.3: Knight-Errant of Eos reads the number of
     // creatures that convoked the spell which became this permanent. The
     // casting pipeline preserves that count through the zone change, so the
@@ -9689,6 +9724,39 @@ pub(crate) fn parse_where_x_quantity_expression(where_x_expression: &str) -> Opt
     crate::parser::oracle_quantity::parse_event_context_quantity(where_x_expression)
 }
 
+/// CR 120.1 + CR 120.9 + CR 107.3c: Reverse Polarity's historical X binding —
+/// "twice the damage dealt to you so far this turn by artifacts" — is a
+/// source-typed damage-history read, not an untyped event-context amount.
+/// Keep the grammar compositional so the same damage-history quantity can be
+/// extended with another recipient or source qualifier without adding a card
+/// name dispatch arm.
+fn parse_where_x_artifact_damage_to_you(input: &str) -> Option<QuantityExpr> {
+    all_consuming(terminated(
+        tag::<_, _, OracleError<'_>>(
+            "twice the damage dealt to you so far this turn by ",
+        ),
+        tag("artifacts"),
+    ))
+    .parse(input)
+    .ok()?;
+
+    Some(QuantityExpr::Multiply {
+        factor: 2,
+        inner: Box::new(QuantityExpr::Ref {
+            qty: QuantityRef::DamageDealtThisTurn {
+                source: Box::new(TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact))),
+                target: Box::new(TargetFilter::Typed(
+                    TypedFilter::default().controller(ControllerRef::You),
+                )),
+                aggregate: AggregateFunction::Sum,
+                group_by: None,
+                damage_kind: DamageKindFilter::Any,
+                channel: DamageChannel::Total,
+            },
+        }),
+    })
+}
+
 /// CR 107.3c + CR 608.2h: "where X is the power of the exiled card" DEFINES X as
 /// the power of the card exiled by this ability's source — Bishop of Binding
 /// ("Whenever this creature attacks, target Vampire gets +X/+X until end of
@@ -9815,6 +9883,39 @@ fn parse_where_x_cards_named_in_all_graveyards(where_x_expression: &str) -> Opti
                     FilterProp::InZone {
                         zone: Zone::Graveyard,
                     },
+                ],
+            }),
+        },
+    })
+}
+
+/// CR 107.3c + CR 608.2k: Parse the Shrine family’s dynamic-name wording:
+/// "the number of cards in all graveyards with the same name as that/the
+/// spell". The `SameNameAsParentTarget` property resolves the spell named by
+/// the enclosing counter/trigger effect at resolution time, including when
+/// the spell has already moved to its owner’s graveyard.
+fn parse_where_x_cards_with_same_name_as_spell(
+    where_x_expression: &str,
+) -> Option<QuantityExpr> {
+    let lower = where_x_expression.to_ascii_lowercase();
+    let prefix = "the number of cards in all graveyards with the same name as ";
+    let (_, referent) = tag::<_, _, OracleError<'_>>(prefix)
+        .parse(lower.as_str())
+        .ok()?;
+    if !matches!(referent, "that spell" | "the spell") {
+        return None;
+    }
+
+    Some(QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount {
+            filter: TargetFilter::Typed(TypedFilter {
+                type_filters: vec![TypeFilter::Card],
+                controller: None,
+                properties: vec![
+                    FilterProp::InZone {
+                        zone: Zone::Graveyard,
+                    },
+                    FilterProp::SameNameAsParentTarget,
                 ],
             }),
         },

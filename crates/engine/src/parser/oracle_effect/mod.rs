@@ -3421,6 +3421,31 @@ fn try_parse_global_life_floor_replacement(text: &str, lower: &str) -> Option<Ef
     })
 }
 
+/// CR 106.3 + CR 614.1a + CR 611.2a: lift a resolving ability's mana-type
+/// replacement into the same floating replacement authority used by static
+/// mana replacements. Deep Water is the old-border witness: "if you tap a
+/// land you control for mana, it produces {U} instead ...". The replacement
+/// parser already owns the source scope and typed mana payload; this adapter
+/// only supplies the effect-level lifetime and global installation target.
+fn try_parse_global_mana_replacement(
+    text: &str,
+    lower: &str,
+    ctx: &ParseContext,
+) -> Option<Effect> {
+    if !nom_primitives::scan_contains(lower, "for mana, it produces ") {
+        return None;
+    }
+    let card_name = ctx.card_name.as_deref().unwrap_or("");
+    let replacement = super::oracle_replacement::parse_replacement_line(text, card_name)?;
+    if !matches!(replacement.event, ReplacementEvent::ProduceMana) {
+        return None;
+    }
+    Some(Effect::AddTargetReplacement {
+        replacement: Box::new(replacement),
+        target: TargetFilter::None,
+    })
+}
+
 /// CR 614.1a + CR 614.1d + CR 601: Recognize a floating zone-change redirect
 /// replacement of the shape
 /// "if one or more <creatures/permanents> would enter [from <zone>]
@@ -3787,6 +3812,54 @@ fn try_parse_next_time_source_damage_replacement(lower: &str) -> Option<Effect> 
     Some(Effect::AddTargetReplacement {
         replacement: Box::new(replacement),
         target: TargetFilter::TriggeringSource,
+    })
+}
+
+/// CR 601.2b + CR 615.1a: the exact follow-up sentence that narrows
+/// Undergrowth's preceding combat-prevention shield after its optional
+/// additional cost was paid. It is deliberately exact: the phrase is a
+/// modifier on a prior effect, not a standalone prevention instruction, so a
+/// broad "doesn't affect" recognizer would create a false independent shield.
+fn is_additional_cost_prevent_damage_exception(text: &str) -> bool {
+    text.trim()
+        .trim_end_matches('.')
+        .eq_ignore_ascii_case(
+            "If this spell's additional cost was paid, this effect doesn't affect combat damage that would be dealt by red creatures",
+        )
+}
+
+/// Parse Pyramids' one-shot destruction replacement:
+/// "The next time target land would be destroyed this turn, remove all damage
+/// marked on it instead."
+///
+/// This is a destruction replacement rather than a post-destruction rider. The
+/// replacement applier clears marked damage and prevents the destruction, so the
+/// land remains on the battlefield. `consume_on_apply` and the end-of-turn
+/// expiry encode the one-opportunity / "this turn" window.
+fn try_parse_next_destroy_remove_damage_replacement(lower: &str) -> Option<Effect> {
+    let (rest, _) = tag::<_, _, OracleError<'_>>("the next time target land would be destroyed ")
+        .parse(lower)
+        .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>("this turn, remove all damage marked on it instead")
+        .parse(rest)
+        .ok()?;
+    parse_optional_period_and_end(rest)?;
+
+    let execute = AbilityDefinition::new(
+        AbilityKind::Spell,
+        Effect::RemoveAllDamage {
+            target: TargetFilter::SelfRef,
+        },
+    );
+    let mut replacement = ReplacementDefinition::new(ReplacementEvent::Destroy)
+        .valid_card(TargetFilter::SelfRef)
+        .execute(execute);
+    replacement.consume_on_apply = true;
+    replacement.expiry = Some(RestrictionExpiry::EndOfTurn);
+
+    Some(Effect::AddTargetReplacement {
+        replacement: Box::new(replacement),
+        target: TargetFilter::Typed(TypedFilter::land()),
     })
 }
 
@@ -7734,6 +7807,10 @@ fn try_parse_for_each_category_exile(tp: TextPair<'_>) -> Option<ParsedEffectCla
     let (rest, _) = match category {
         IterationCategory::Color => tag::<_, _, E>("color").parse(rest).ok()?,
         IterationCategory::CardType => tag::<_, _, E>("type").parse(rest).ok()?,
+        // Basic-land-type choices have their own exact imperative parser
+        // (Sundering Titan); they are not part of the revealed-pool exile
+        // grammar below.
+        IterationCategory::BasicLandType => return None,
     };
     let (rest, _) = tag::<_, _, E>(" from among ").parse(rest).ok()?;
     // CR 608.2c: the pool reference — "them" (anaphor for the revealed cards) or
@@ -7765,6 +7842,115 @@ fn try_parse_for_each_category_exile(tp: TextPair<'_>) -> Option<ParsedEffectCla
         condition: None,
         // CR 608.2: "you may exile" — the iteration itself is optional per
         // member; `up_to` carries the per-member optionality.
+        optional: false,
+        unless_pay: None,
+    })
+}
+
+/// CR 608.2c + CR 105.1 + CR 400.1: Parse All Suns' Dawn's category return:
+/// "for each color, return up to one target card of that color from your
+/// graveyard to your hand". These are five independent target slots, not
+/// resolution-time choices: each slot gets the current color's typed filter
+/// and an optional one-target bound, then the ordinary ChangeZone resolver
+/// owns target legality and replacement-aware delivery.
+fn try_parse_for_each_category_move(tp: TextPair<'_>) -> Option<ParsedEffectClause> {
+    type E<'a> = OracleError<'a>;
+    use crate::types::ability::{
+        AbilityDefinition, AbilityKind, ControllerRef, Effect, FilterProp, MultiTargetSpec,
+        QuantityExpr, TargetFilter, TypedFilter,
+    };
+    use crate::types::mana::ManaColor;
+
+    let (rest, _) = tag::<_, _, E>("for each ").parse(tp.lower).ok()?;
+    let (rest, _) = tag::<_, _, E>("color").parse(rest).ok()?;
+    let (rest, _) = tag::<_, _, E>(
+        ", return up to one target card of that color from your graveyard to your hand",
+    )
+    .parse(rest)
+    .ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    fn build_color_return(index: usize, colors: &[ManaColor]) -> AbilityDefinition {
+        let color = colors[index];
+        let target = TargetFilter::Typed(
+            TypedFilter::card().properties(vec![
+                FilterProp::InZone {
+                    zone: Zone::Graveyard,
+                },
+                FilterProp::Owned {
+                    controller: ControllerRef::You,
+                },
+                FilterProp::HasColor { color },
+            ]),
+        );
+        let mut definition = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Hand,
+                target,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: true,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            },
+        )
+        .multi_target(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 1 }));
+        if index + 1 < colors.len() {
+            definition.sub_ability = Some(Box::new(build_color_return(index + 1, colors)));
+        }
+        definition
+    }
+
+    let first = build_color_return(0, &ManaColor::ALL);
+    let AbilityDefinition {
+        effect,
+        sub_ability,
+        ..
+    } = first;
+    Some(ParsedEffectClause {
+        effect: *effect,
+        duration: None,
+        sub_ability,
+        distribute: None,
+        multi_target: Some(MultiTargetSpec::up_to(QuantityExpr::Fixed { value: 1 })),
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    })
+}
+
+/// CR 509.3d + CR 702.26b: Lower the combat-trigger body used by Dream Fighter,
+/// "~ and that creature phase out". The two objects are not a parent target
+/// pair: the trigger source is one combat participant and `EventTarget` is the
+/// other participant carried by the filtered block event.
+fn try_parse_self_and_event_target_phase_out(text: &str) -> Option<ParsedEffectClause> {
+    if !text.trim().eq_ignore_ascii_case("~ and that creature phase out") {
+        return None;
+    }
+
+    Some(ParsedEffectClause {
+        effect: Effect::PhaseOut {
+            target: TargetFilter::SelfRef,
+        },
+        duration: None,
+        sub_ability: Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::PhaseOut {
+                target: TargetFilter::EventTarget,
+            },
+        ))),
+        distribute: None,
+        multi_target: None,
+        condition: None,
         optional: false,
         unless_pay: None,
     })
@@ -7811,6 +7997,9 @@ fn try_parse_for_each_category_put_counter(tp: TextPair<'_>) -> Option<ParsedEff
     let member_suffix = match category {
         IterationCategory::Color => "of that color",
         IterationCategory::CardType => "of that type",
+        // Keep this combinator scoped to its two existing category grammars;
+        // the basic-land-type choice is handled by the dedicated parser.
+        IterationCategory::BasicLandType => return None,
     };
     let rest = rest.trim();
     if !rest.starts_with(member_suffix) {
@@ -7861,6 +8050,82 @@ mod for_each_category_put_counter_tests {
                     ..
                 },
                 ..
+            }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod for_each_category_move_tests {
+    use super::{try_parse_for_each_category_move, TextPair};
+    use crate::types::ability::{Effect, FilterProp, TargetFilter};
+    use crate::types::mana::ManaColor;
+    use crate::types::zones::Zone;
+
+    /// CR 608.2c + CR 105.1: All Suns' Dawn must retain a real five-color
+    /// iterator and an optional graveyard-to-hand move, not a swallowed
+    /// "for" prefix or a generic one-shot return.
+    #[test]
+    fn parses_all_suns_dawn_color_return() {
+        let text = "for each color, return up to one target card of that color from your graveyard to your hand";
+        let lower = text.to_ascii_lowercase();
+        let clause = try_parse_for_each_category_move(TextPair::new(text, &lower))
+            .expect("All Suns' Dawn category return must match");
+        assert!(clause.multi_target.is_some());
+        let Effect::ChangeZone {
+            origin,
+            destination,
+            target,
+            up_to,
+            ..
+        } = clause.effect
+        else {
+            panic!("expected first color return to be ChangeZone");
+        };
+        assert_eq!(origin, Some(Zone::Graveyard));
+        assert_eq!(destination, Zone::Hand);
+        assert!(up_to);
+        assert!(matches!(
+            target,
+            TargetFilter::Typed(ref typed)
+                if typed.properties.contains(&FilterProp::HasColor {
+                    color: ManaColor::White
+                })
+        ));
+        let mut count = 1;
+        let mut next = clause.sub_ability.as_deref();
+        while let Some(definition) = next {
+            count += 1;
+            assert!(matches!(
+                definition.effect.as_ref(),
+                Effect::ChangeZone { .. }
+            ));
+            next = definition.sub_ability.as_deref();
+        }
+        assert_eq!(count, 5, "one target slot per WUBRG color");
+    }
+}
+
+#[cfg(test)]
+mod phase_out_compound_tests {
+    use super::try_parse_self_and_event_target_phase_out;
+    use crate::types::ability::{Effect, TargetFilter};
+
+    #[test]
+    fn parses_dream_fighter_two_combat_participants() {
+        let clause = try_parse_self_and_event_target_phase_out("~ and that creature phase out")
+            .expect("Dream Fighter body must match");
+        assert!(matches!(
+            clause.effect,
+            Effect::PhaseOut {
+                target: TargetFilter::SelfRef
+            }
+        ));
+        let tail = clause.sub_ability.expect("the other combat participant must be chained");
+        assert!(matches!(
+            tail.effect.as_ref(),
+            Effect::PhaseOut {
+                target: TargetFilter::EventTarget
             }
         ));
     }
@@ -7967,6 +8232,23 @@ fn attach_unless_slots(
 
 #[tracing::instrument(level = "debug")]
 pub(crate) fn parse_effect_clause(text: &str, ctx: &mut ParseContext) -> ParsedEffectClause {
+    // CR 614.9 + CR 614.12: Blood of the Martyr's leading duration and
+    // conditional redirection must be claimed before the clause shell peels
+    // the untyped `if ...` head and the `you may` choice. The replacement
+    // parser owns the exact event grammar; this boundary only preserves the
+    // printed end-of-turn duration on the clause.
+    {
+        let text_lower = text.to_lowercase();
+        if let Some(effect) =
+            crate::parser::oracle_replacement::parse_optional_continuous_damage_redirect(
+                &text_lower,
+            )
+        {
+            let mut clause = parsed_clause(effect);
+            clause.duration = strip_leading_duration(text).map(|(duration, _)| duration);
+            return clause;
+        }
+    }
     // CR 611.2a + CR 611.2c + CR 701.26a + CR 508.1f: "Until your next turn, those
     // creatures can't become tapped unless they're being declared as attackers."
     // Must run BEFORE the unless-suffix stripper below, which would otherwise
@@ -9520,6 +9802,27 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     {
         return parsed_clause(Effect::NoOp);
     }
+    if let Some(clause) = try_parse_self_and_event_target_phase_out(text) {
+        return clause;
+    }
+    // CR 701.12a + CR 608.2c: Cultural Exchange declares the two player
+    // targets and the two creature targets in the preceding text, then the
+    // remaining clause is the anaphoric instruction "Those players exchange
+    // control of those creatures."  The object target slots are already on
+    // the ability; ExchangeControl consumes the two object refs in order.
+    // Keep this whole-clause and exact so an unrelated sentence cannot lose a
+    // target-bearing continuation through a prefix match.
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "those players exchange control of those creatures",
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        return parsed_clause(Effect::ExchangeControl {
+            target_a: TargetFilter::ParentTarget,
+            target_b: TargetFilter::ParentTarget,
+        });
+    }
     // CR 106.4: This is an instruction-driven mana-loss event, not a mana
     // payment and not the automatic emptying that occurs as steps and phases
     // end. Keep the player target on the effect so the ordinary target-binding
@@ -9772,6 +10075,9 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     if let Some(effect) = try_parse_next_time_source_damage_replacement(&lower) {
         return parsed_clause(effect);
     }
+    if let Some(effect) = try_parse_next_destroy_remove_damage_replacement(&lower) {
+        return parsed_clause(effect);
+    }
     if let Some(effect) = try_parse_leave_battlefield_exile_replacement(&lower) {
         return parsed_clause(effect);
     }
@@ -9993,6 +10299,10 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     // for-each path; the `DistinctCounterKindsAmong` iteration source has already
     // been lifted onto the parent's `repeat_for` by `strip_for_each_prefix`.
     if let Some(clause) = try_parse_for_each_counter_kind_choice(tp) {
+        return clause;
+    }
+
+    if let Some(clause) = try_parse_for_each_category_move(tp) {
         return clause;
     }
 
@@ -10346,6 +10656,39 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
         return with_clause_duration(parse_effect_clause(rest, ctx), duration);
     }
 
+    // CR 106.3 + CR 614.1a + CR 611.2a: Hall of Gemstone's
+    // "Until end of turn, lands tapped for mana ..." clause is a
+    // resolution-created replacement, not a printed replacement that is
+    // continuously active on the enchantment.  The leading-duration branch
+    // above has already peeled the lifetime and will reattach it to this
+    // clause, allowing the AddTargetReplacement resolver to expire the
+    // source-attached definition at cleanup.  Keep the exact chosen-color
+    // shape narrow so ordinary mana prose still follows its existing routes.
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "lands tapped for mana produce mana of the chosen color instead of any other color",
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        let card_name = ctx.card_name.as_deref().unwrap_or("");
+        if let Some(replacement) =
+            crate::parser::oracle_replacement::parse_replacement_line(text, card_name)
+        {
+            if matches!(
+                replacement.mana_modification,
+                Some(crate::types::ability::ManaModification::ReplaceWithChosenColor)
+            ) {
+                return parsed_clause(Effect::AddTargetReplacement {
+                    replacement: Box::new(replacement),
+                    // CR 201.5: attach the floating replacement to Hall itself
+                    // so its source-bound chosen color remains available while
+                    // the replacement is active.
+                    target: TargetFilter::SelfRef,
+                });
+            }
+        }
+    }
+
     // CR 614.1a + CR 514.2: floating turn-bound zone-change redirect ("if one or
     // more creatures would enter from exile ... shuffle them into their libraries
     // instead" — Don't Blink). Dispatched AFTER `strip_leading_duration` above so
@@ -10368,6 +10711,11 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
     // reaches it, and `AbilityDefinition.duration == UntilEndOfTurn` reaches
     // `expiry_from_duration` in the install resolver.
     if let Some(effect) = try_parse_global_life_floor_replacement(text, &lower) {
+        return parsed_clause(effect);
+    }
+
+    // CR 106.3 + CR 614.1a: effect-level mana replacement (Deep Water).
+    if let Some(effect) = try_parse_global_mana_replacement(text, &lower, ctx) {
         return parsed_clause(effect);
     }
 
@@ -19725,7 +20073,8 @@ fn parse_bare_damage_continuation<'a>(
                 consumed,
             )
         } else if let Ok((rest, _)) = alt((
-            tag::<_, _, OracleError<'_>>("that much damage"),
+            tag::<_, _, OracleError<'_>>("that damage"),
+            tag("that much damage"),
             // CR 120.1: "that amount of damage" is the synonym used when the
             // antecedent is "N damage" (Fear of Burning Alive's "deals that
             // amount of damage to target creature that player controls"). Both
@@ -22605,6 +22954,48 @@ fn lower_subject_predicate_ast(
                 {
                     *chooser = crate::types::ability::Chooser::Opponent;
                     return clause;
+                }
+            }
+            // CR 608.2c + CR 401.4: a targeted player chooses from their own
+            // zone (Stunted Growth and the same older wording family). The
+            // imperative parser intentionally defaults the chooser to the
+            // source controller; rebind it to `OwningPlayer` only when the
+            // zone itself is the targeted player's zone. That resolver maps
+            // `ZoneOwner::TargetedPlayer` through the declared player target,
+            // while avoiding the incorrect result for text such as "target
+            // player chooses a card from your graveyard".
+            if let Some(player_target) = subject
+                .target
+                .as_ref()
+                .filter(|filter| target_filter_can_target_player(filter))
+            {
+                if matches!(
+                    &clause.effect,
+                    Effect::ChooseFromZone {
+                        zone_owner: ZoneOwner::TargetedPlayer,
+                        ..
+                    }
+                ) && target_filter_can_target_player(&affected)
+                {
+                    if let Effect::ChooseFromZone { chooser, .. } = &mut clause.effect {
+                        *chooser = crate::types::ability::Chooser::OwningPlayer;
+                    }
+                    let mut sub_ability =
+                        AbilityDefinition::new(AbilityKind::Spell, clause.effect.clone());
+                    sub_ability.sub_ability = clause.sub_ability;
+                    sub_ability.multi_target = clause.multi_target;
+                    return ParsedEffectClause {
+                        effect: Effect::TargetOnly {
+                            target: player_target.clone(),
+                        },
+                        duration: clause.duration,
+                        sub_ability: Some(Box::new(sub_ability)),
+                        distribute: None,
+                        multi_target: subject.multi_target,
+                        condition: None,
+                        optional: subject.is_optional,
+                        unless_pay: None,
+                    };
                 }
             }
             if matches!(
@@ -27037,6 +27428,41 @@ fn parse_imperative_effect(text: &str, ctx: &mut ParseContext) -> ParsedEffectCl
     parse_imperative_effect_inner(tp, ctx)
 }
 
+/// CR 701.19a-b + CR 608.2c: Legacy Oracle uses "bury" for destruction that
+/// cannot be regenerated.  Keep this compatibility spelling at the parser
+/// boundary and lower it to the existing authoritative destruction effects;
+/// adding a second runtime destruction kind would only duplicate the
+/// `cant_regenerate` rule already enforced by `Effect::Destroy`.
+fn try_parse_legacy_bury(tp: TextPair<'_>, ctx: &mut ParseContext) -> Option<Effect> {
+    let (all, rest) = if let Some((_, rest)) = nom_on_lower(tp.original, tp.lower, |input| {
+        value((), alt((tag("bury all "), tag("bury each ")))).parse(input)
+    }) {
+        (true, rest)
+    } else {
+        let (_, rest) = nom_on_lower(tp.original, tp.lower, |input| {
+            value((), tag("bury ")).parse(input)
+        })?;
+        (false, rest)
+    };
+
+    let (target, remainder) = parse_target_with_ctx(rest, ctx);
+    if !remainder.trim().is_empty() {
+        return None;
+    }
+
+    Some(if all {
+        Effect::DestroyAll {
+            target,
+            cant_regenerate: true,
+        }
+    } else {
+        Effect::Destroy {
+            target,
+            cant_regenerate: true,
+        }
+    })
+}
+
 /// CR 610.3 + CR 610.3b: This duration marks a zone-change effect that returns
 /// its object immediately after an opponent becomes the monarch. The
 /// `Duration::UntilOpponentBecomesMonarch` link also prevents the initial move
@@ -27092,6 +27518,10 @@ fn try_parse_exile_until_opponent_becomes_monarch_clause(
 fn parse_imperative_effect_inner(tp: TextPair, ctx: &mut ParseContext) -> ParsedEffectClause {
     if let Some(clause) = try_parse_exile_until_opponent_becomes_monarch_clause(tp, ctx) {
         return clause;
+    }
+
+    if let Some(effect) = try_parse_legacy_bury(tp, ctx) {
+        return parsed_clause(effect);
     }
 
     if let Some(ast) = parse_imperative_family_ast(tp.original, tp.lower, ctx) {
@@ -27587,7 +28017,10 @@ pub(crate) fn parse_named_choice_object_with_provenance(
     .parse(rest)
     {
         Some(ChoiceType::color_excluding(vec![excluded]))
-    } else if tag::<_, _, E>("a color").parse(rest).is_ok() {
+    } else if alt((tag::<_, _, E>("a random color"), tag("a color")))
+        .parse(rest)
+        .is_ok()
+    {
         Some(ChoiceType::color())
     } else if tag::<_, _, E>("odd or even").parse(rest).is_ok() {
         Some(ChoiceType::OddOrEven)
@@ -27681,7 +28114,17 @@ pub(crate) fn parse_named_choice_object_with_provenance(
         .is_ok()
     {
         Some(ChoiceType::LandType)
-    } else if let Ok((after_opponent, _)) = tag::<_, _, E>("an opponent").parse(rest) {
+    } else if let Ok((after_opponent, _)) = alt((
+        tag::<_, _, E>("an opponent"),
+        // CR 800.4a: older wording such as Goblin Festival's "choose one of
+        // your opponents" names the same single opponent choice as the modern
+        // "choose an opponent" form. Keep the phrase in this typed choice arm;
+        // it is not a generic labeled choice and must retain multiplayer
+        // opponent eligibility at runtime.
+        tag("one of your opponents"),
+    ))
+    .parse(rest)
+    {
         // CR 608.2c + CR 608.2d: "choose an opponent WITH THE HIGHEST NUMBER"
         // (Itazura, Lingering Wick). The restriction is part of the instruction
         // and cannot be discarded — dropping it lets the controller pick an
@@ -28054,6 +28497,14 @@ fn choose_filter_parts(text: &str) -> (&str, &str) {
     }
     if let Ok((_, (before, suffix))) = nom_primitives::split_once_on(text, " card from it") {
         return (before.trim(), suffix.trim());
+    }
+    // CR 608.2c: some older wording places the restriction before the
+    // anaphoric hand reference (Venarian Glimmer: "a nonland card with mana
+    // value X or less from it"). In that form the filter is complete before
+    // "from it"; do not hand the reference or the following sentence to the
+    // shared search-filter suffix parser.
+    if let Ok((_, (before, _))) = nom_primitives::split_once_on(text, " from it") {
+        return (before.trim(), "");
     }
     (text.trim(), "")
 }
@@ -31803,6 +32254,12 @@ fn apply_ability_shell_envelope(def: &mut AbilityDefinition, shell: &AbilityShel
     }
     // CR 601.2b: `max`, so the `0` default can never lower an established floor.
     def.min_x_value = def.min_x_value.max(shell.min_x_value);
+    // CR 107.3c + CR 602.2b: the activated-ability shell is the seam that can
+    // stamp a standalone-X definition after both the effect chain and cost
+    // have been assembled. Preserve the typed announcement-time quantity.
+    if let Some(announced_x) = &shell.announced_x {
+        def.announced_x = Some(announced_x.clone());
+    }
     // CR 707.10: monotone OR, so a `false` default can never clear the flag.
     def.cant_be_copied |= shell.cant_be_copied;
     // CR 608.2d: the controller's "you may" choice. Monotone OR for the same
@@ -32846,15 +33303,23 @@ fn unimplemented_clause(
 /// resolver does not accidentally turn an amount into repeated instructions.
 /// `SetTapState::Single` is the choice-per-iteration shape used by Tangle Wire
 /// (and the corresponding untap wording); each iteration asks for one eligible
-/// permanent and then applies the tap state to that choice.
+/// permanent and then applies the tap state to that choice.  A non-battlefield
+/// `ChangeZone` is the other choice-per-iteration shape: cards such as
+/// Rofellos's Gift say "return an enchantment card ... for each card revealed
+/// this way", so the resolver must ask for one card once per tracked member,
+/// not turn the dynamic count into one stack-time multi-target declaration.
 fn trailing_for_each_repeat_is_supported(effect: &Effect) -> bool {
-    matches!(
-        effect,
+    match effect {
         Effect::SetTapState {
             scope: EffectScope::Single,
             ..
-        }
-    )
+        } => true,
+        Effect::ChangeZone {
+            origin: Some(zone),
+            ..
+        } => *zone != Zone::Battlefield,
+        _ => false,
+    }
 }
 
 /// CR 701.20e + CR 118.3: Recognize the complete repeated paid-library-look
@@ -34218,6 +34683,30 @@ pub(crate) fn parse_effect_chain_ir(
                     ClauseDisposition::Emit {
                         followup: None,
                         intrinsic: None,
+                    },
+                )
+                .push();
+            continue;
+        }
+
+        // CR 601.2b + CR 615.1a: Undergrowth's second sentence modifies the
+        // immediately preceding combat-prevention shield rather than creating
+        // an independent effect: "If this spell's additional cost was paid,
+        // this effect doesn't affect combat damage ... by red creatures." Keep
+        // the clause as a typed prior-modifier so assembly can build the paid
+        // and unpaid branches without running both shields.
+        if is_additional_cost_prevent_damage_exception(normalized_text)
+            && builder.clauses().last().is_some_and(|clause| {
+                matches!(clause.parsed.effect, Effect::PreventDamage { .. })
+            })
+        {
+            builder
+                .clause(
+                    normalized_text,
+                    placeholder_parsed_clause("additional_cost_prevent_damage_exception"),
+                    chunk.boundary_after,
+                    ClauseDisposition::ModifyPrior {
+                        modifier: PriorModifier::AdditionalCostPreventDamageException,
                     },
                 )
                 .push();
@@ -35612,17 +36101,29 @@ pub(crate) fn parse_effect_chain_ir(
             } else if suffix_repeat_for.is_some()
                 && trailing_for_each_repeat_is_supported(&stripped_clause.effect)
             {
-                // CR 608.2c + CR 115.1d: keyword-action bodies such as Tangle
-                // Wire's Tap are complete once the suffix is removed. Preserve
-                // the count as an exact multi-target selection, matching the
-                // dedicated for-each parser and the resolution-time tap picker;
-                // storing it as `repeat_for` would run the count through a
-                // second, independent repetition mechanism.
-                let mut stripped_clause = stripped_clause;
-                stripped_clause.multi_target = suffix_repeat_for
-                    .as_ref()
-                    .map(|quantity| MultiTargetSpec::exact(quantity.clone()));
-                (stripped_clause, repeat_for)
+                if matches!(&stripped_clause.effect, Effect::ChangeZone { .. }) {
+                    // CR 608.2c: a non-battlefield zone move is a separate
+                    // resolution-time choice for each member of the counted
+                    // set. Keep the dynamic quantity on the ability's
+                    // `repeat_for` slot so the resolver can pause and resume
+                    // one graveyard/hand/exile choice at a time. Encoding it
+                    // as one exact multi-target choice would incorrectly
+                    // require all cards to be available simultaneously.
+                    (stripped_clause, repeat_for.or(suffix_repeat_for))
+                } else {
+                    // CR 608.2c + CR 115.1d: keyword-action bodies such as
+                    // Tangle Wire's Tap are complete once the suffix is
+                    // removed. Preserve the count as an exact multi-target
+                    // selection, matching the dedicated for-each parser and
+                    // the resolution-time tap picker; storing it as
+                    // `repeat_for` would run the count through a second,
+                    // independent repetition mechanism.
+                    let mut stripped_clause = stripped_clause;
+                    stripped_clause.multi_target = suffix_repeat_for
+                        .as_ref()
+                        .map(|quantity| MultiTargetSpec::exact(quantity.clone()));
+                    (stripped_clause, repeat_for)
+                }
             } else if let Some((fanout_clause, fanout_spec, fanout_ctx)) =
                 parse_for_each_opponent_target_fanout_clause(
                     &text_no_qty,
@@ -37746,6 +38247,14 @@ fn parse_unless_have_deal_damage_cost(after_unless: &str) -> Option<(AbilityCost
             TargetFilter::ParentTargetController,
             tag("that spell's controller has "),
         ),
+        // CR 115.1 + CR 118.12a: "target opponent" is a declared payer
+        // target, not an anaphoric player. Preserve the opponent-only legality
+        // constraint in the empty typed player filter so target-slot creation
+        // and unless-payer resolution both retain the declared target.
+        value(
+            TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent)),
+            tag("target opponent has "),
+        ),
         value(TargetFilter::Player, tag("that player has ")),
         value(TargetFilter::Player, tag("that opponent has ")),
     ))
@@ -38304,6 +38813,13 @@ pub(super) fn parse_where_x_is(text: &str) -> Option<QuantityExpr> {
         .parse(trimmed)
         .ok()?;
     let qty_text = rest.trim_end_matches('.').trim();
+    // CR 107.3c: keep the unless-payment path on the same where-X grammar as
+    // ordinary effects. The generic nom quantity parser intentionally does
+    // not know dynamic parent-name relations such as Shrine's
+    // "cards ... with the same name as the spell" wording.
+    if let Some(quantity) = lower::parse_where_x_quantity_expression(qty_text) {
+        return Some(quantity);
+    }
     let (_, qty) = nom_quantity::parse_quantity_ref_complete(qty_text).ok()?;
     Some(QuantityExpr::Ref { qty })
 }
@@ -38706,6 +39222,7 @@ fn try_parse_change_targets(lower: &str) -> Option<Effect> {
                 target: TargetFilter::StackSpell,
                 scope: RetargetScope::Single,
                 forced_to: Some(forced_to),
+                new_target_filter: None,
             });
         }
     }
@@ -38788,6 +39305,7 @@ fn try_parse_change_targets(lower: &str) -> Option<Effect> {
         target,
         scope,
         forced_to,
+        new_target_filter: None,
     })
 }
 
@@ -39565,6 +40083,7 @@ mod change_targets_stack_object_tests {
             target,
             scope,
             forced_to: Some(forced_to),
+            ..
         } = effect
         else {
             panic!("expected forced ChangeTargets effect, got {effect:?}");

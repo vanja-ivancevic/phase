@@ -1828,9 +1828,11 @@ fn maybe_replace_card_types(
 
 /// CR 205.2 + CR 613.1d + CR 613.4b + CR 611.3a: "Each noncreature <T> [you control]
 /// is a[n] [<T>] creature with power and toughness each equal to its mana value
-/// [as long as <condition>]." — March of the Machines class. The affirmative type
+/// [as long as <condition>]" — and the old-border equivalent "loses all abilities
+/// and becomes" form — are the March of the Machines class. The affirmative type
 /// `<T>` must be artifact or enchantment. The second type token (if present) must
-/// agree with `<T>`. Corpus members: March of the Machines, Karn, Silver Golem.
+/// agree with `<T>`. Corpus members include March of the Machines, Karn, Silver
+/// Golem, and Titania's Song.
 ///
 /// This is the noncreature-subject sibling of `parse_pronoun_becomes_type_static`
 /// (which handles self-referential `it's a/an <types>` animations). Opalescence
@@ -1875,9 +1877,43 @@ pub(crate) fn parse_each_noncreature_subject_is_creature_with_pt_mv(
             None => (after_subject_lower, None),
         };
 
-    // STEP C.4 — copula (leading-space-anchored). Try " is an " first (longer match).
-    let after_copula = nom_tag_lower(rest_after_controller, rest_after_controller, " is an ")
-        .or_else(|| nom_tag_lower(rest_after_controller, rest_after_controller, " is a "))?;
+    // STEP C.4 — copula (leading-space-anchored). The old-border Titania's Song
+    // wording uses the semantically equivalent "loses all abilities and becomes"
+    // form rather than March of the Machines' plain "is" copula. Preserve the
+    // ability-loss layer before the shared type/P-T lowering.
+    let (after_copula, mut modifications) = if let Some(rest) =
+        nom_tag_lower(rest_after_controller, rest_after_controller, " is an ")
+            .or_else(|| nom_tag_lower(rest_after_controller, rest_after_controller, " is a "))
+    {
+        (
+            rest,
+            vec![ContinuousModification::AddType {
+                core_type: CoreType::Creature,
+            }],
+        )
+    } else {
+        let rest = nom_tag_lower(
+            rest_after_controller,
+            rest_after_controller,
+            " loses all abilities and becomes an ",
+        )
+        .or_else(|| {
+            nom_tag_lower(
+                rest_after_controller,
+                rest_after_controller,
+                " loses all abilities and becomes a ",
+            )
+        })?;
+        (
+            rest,
+            vec![
+                ContinuousModification::RemoveAllAbilities,
+                ContinuousModification::AddType {
+                    core_type: CoreType::Creature,
+                },
+            ],
+        )
+    };
 
     // STEP D — optional adjective matching affirmative_type, then required "creature".
     // March of the Machines: "is an artifact creature ..." — adjective present.
@@ -1897,9 +1933,6 @@ pub(crate) fn parse_each_noncreature_subject_is_creature_with_pt_mv(
     // STEP E — emit modifications.
     // CR 205.2 + CR 613.1d: Layer 4 add of the Creature core type.
     // CR 613.4b: Layer 7b set of base power/toughness (delegated).
-    let mut modifications = vec![ContinuousModification::AddType {
-        core_type: CoreType::Creature,
-    }];
     if !push_base_pt_mana_value_dynamic_modifications(&mut modifications, after_creature) {
         return None;
     }
@@ -2607,6 +2640,24 @@ fn parse_land_type_change_modifications(rest: &str) -> Option<Vec<ContinuousModi
         return Some(vec![ContinuousModification::AddSubtype {
             subtype: basic_type.as_subtype_str().to_string(),
         }]);
+    }
+
+    // CR 205.3i + CR 305.7: Wastes is a land subtype, but not a basic land
+    // type. A replacement such as Event Horizon's "Nonbasic lands are Wastes"
+    // therefore clears the existing land subtypes before adding Wastes; it
+    // must not be forced through SetBasicLandType.
+    let land_type_text = rest.trim();
+    if let Some((subtype, consumed)) = parse_subtype(land_type_text) {
+        if consumed == land_type_text.len()
+            && matches!(noncreature_subtype_set(&subtype), Some(SubtypeSet::Land))
+        {
+            return Some(vec![
+                ContinuousModification::RemoveAllSubtypes {
+                    set: SubtypeSet::Land,
+                },
+                ContinuousModification::AddSubtype { subtype },
+            ]);
+        }
     }
 
     // CR 305.7: Replacement semantics — "[Type]" or "[Types]" → SetBasicLandType

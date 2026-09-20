@@ -121,6 +121,8 @@ pub mod exchange_control;
 pub mod cloak;
 pub mod exchange_life;
 pub mod exchange_life_totals;
+pub mod exchange_zones;
+pub mod look_at_object;
 pub mod exile_face_down_pile;
 pub mod exile_from_top_until;
 pub mod exile_top;
@@ -3923,6 +3925,7 @@ fn condition_reads_filter_population(
         | AbilityCondition::DayNightIsNeither
         | AbilityCondition::DayNightIs { .. }
         | AbilityCondition::NthResolutionThisTurn { .. }
+        | AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn
         | AbilityCondition::SourceLacksKeyword { .. } => false,
     }
 }
@@ -4351,6 +4354,7 @@ fn should_resolve_subability_on_optional_decline(ability: &ResolvedAbility) -> b
             | AbilityCondition::DayNightIsNeither
             | AbilityCondition::DayNightIs { .. }
             | AbilityCondition::NthResolutionThisTurn { .. }
+            | AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn
             | AbilityCondition::SourceLacksKeyword { .. }
             | AbilityCondition::ScopedPlayerMatches { .. }
             | AbilityCondition::EffectOutcome {
@@ -5605,7 +5609,15 @@ pub fn resolve_effect(
         Effect::SkipNextStep { .. } => skip_next_step::resolve(state, ability, events),
         Effect::SkipNextTurn { .. } => skip_next_turn::resolve(state, ability, events),
         Effect::Double { .. } => double::resolve(state, ability, events),
-        Effect::RuntimeHandled { .. } => Ok(()), // Handled by dedicated engine path
+        Effect::RuntimeHandled { handler } => match handler {
+            crate::types::ability::RuntimeHandler::NinjutsuFamily => Ok(()),
+            crate::types::ability::RuntimeHandler::MoralityShift => {
+                exchange_zones::resolve(state, ability, events)
+            }
+            crate::types::ability::RuntimeHandler::LookAtObject { .. } => {
+                look_at_object::resolve(state, ability, events)
+            }
+        },
         Effect::Learn => learn::resolve(state, ability, events),
         Effect::BlightEffect { .. } => blight::resolve(state, ability, events),
         Effect::Endure { .. } => endure::resolve(state, ability, events),
@@ -12183,6 +12195,22 @@ fn resolve_chain_body(
                         .unwrap_or(ManaCost::NoCost);
                     AbilityCost::Mana { cost }
                 }
+                // CR 118.12 + CR 601.2f: "unless you pay its mana cost
+                // reduced by {N}" — materialize the ability source's printed
+                // cost and reduce only its generic component. Keep this next
+                // to the un-reduced self-cost arm so neither placeholder can
+                // reach the payment path unresolved (which treats placeholders
+                // as zero).
+                AbilityCost::Mana {
+                    cost: ManaCost::SelfManaCostReduced { reduction },
+                } => {
+                    let cost = state
+                        .objects
+                        .get(&ability.source_id)
+                        .map(|obj| obj.mana_cost.reduced_by_generic(*reduction))
+                        .unwrap_or(ManaCost::NoCost);
+                    AbilityCost::Mana { cost }
+                }
                 other => other.clone(),
             };
             // CR 118.5 + CR 118.12a: Zero-mana unless cost short-circuit.
@@ -15445,6 +15473,29 @@ pub(crate) fn evaluate_condition(
             .objects
             .get(&ability.source_id)
             .is_some_and(|obj| !obj.has_keyword(keyword)),
+        // CR 102.2 + CR 603.4 + CR 608.2c: Antagonism's "one of their
+        // opponents was dealt damage this turn" is relative to the player
+        // introduced by the surrounding trigger, not the printed controller.
+        // Require the scoped-player binding; an unbound anaphor must never fall
+        // back to the controller and accidentally suppress the damage.
+        AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn => {
+            let Some(scoped_player) = ability.scoped_player else {
+                return false;
+            };
+            state.players.iter().any(|player| {
+                !player.is_eliminated
+                    && crate::game::players::is_opponent(state, scoped_player, player.id)
+                    && crate::game::quantity::opponent_dealt_damage_matches(
+                        state,
+                        player.id,
+                        scoped_player,
+                        crate::types::ability::DamageKindFilter::Any,
+                        &None,
+                        1,
+                        ability.source_id,
+                    )
+            })
+        }
         // CR 101.3 + CR 109.5 + CR 608.2c: per-iteration scoped-player filter.
         // The decline-tail body for a cross-scope decline clause (parent
         // iterates a wider set than the decline-clause `PlayerFilter`) fires
@@ -18907,6 +18958,61 @@ mod tests {
         match &state.waiting_for {
             WaitingFor::UnlessPayment { player, cost, .. } => {
                 assert_eq!(*player, PlayerId(1));
+                assert_eq!(
+                    *cost,
+                    AbilityCost::Mana {
+                        cost: ManaCost::generic(3),
+                    }
+                );
+            }
+            other => panic!("expected WaitingFor::UnlessPayment, got {other:?}"),
+        }
+    }
+
+    /// CR 118.12 + CR 601.2f: a reduced self-mana unless-cost must be
+    /// materialized against the source object before the payment prompt. A
+    /// `{5}` source reduced by `{2}` must surface as `{3}`, not as the
+    /// unresolved placeholder (which the payment path would treat as free).
+    #[test]
+    fn unless_pay_reduced_self_mana_cost_materializes_before_prompt() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Flash Creature".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&source)
+            .expect("source object exists")
+            .mana_cost = ManaCost::generic(5);
+
+        let mut ability = ResolvedAbility::new(
+            Effect::SetTapState {
+                target: TargetFilter::SelfRef,
+                scope: EffectScope::Single,
+                state: TapStateChange::Tap,
+            },
+            vec![],
+            source,
+            PlayerId(0),
+        );
+        ability.unless_pay = Some(crate::types::ability::UnlessPayModifier {
+            cost: AbilityCost::Mana {
+                cost: ManaCost::SelfManaCostReduced { reduction: 2 },
+            },
+            payer: TargetFilter::Controller,
+        });
+
+        let mut events = Vec::new();
+        resolve_ability_chain(&mut state, &ability, &mut events, 0)
+            .expect("reduced self-mana unless-cost should arm a payment prompt");
+
+        match &state.waiting_for {
+            WaitingFor::UnlessPayment { player, cost, .. } => {
+                assert_eq!(*player, PlayerId(0));
                 assert_eq!(
                     *cost,
                     AbilityCost::Mana {

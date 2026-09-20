@@ -1131,6 +1131,9 @@ pub(crate) fn land_play_is_permitted_by_restrictions(
     land_obj: &GameObject,
 ) -> bool {
     !is_blocked_by_cant_play_lands(state, player, land_obj)
+        && !super::static_abilities::is_blocked_by_nonbasic_land_same_name_as_nontoken_permanent(
+            state, player, land_obj,
+        )
         && !is_blocked_by_prohibit_play_from_zone(state, land_obj, player)
 }
 
@@ -16962,18 +16965,52 @@ pub(super) fn can_pay_effect_mana_cost_after_auto_tap(
     source_id: ObjectId,
     cost: &crate::types::mana::ManaCost,
 ) -> bool {
+    can_pay_non_cast_mana_cost_after_auto_tap(
+        state,
+        player,
+        source_id,
+        cost,
+        PaymentContext::Effect,
+    )
+}
+
+/// CR 702.23a: Returns true if the player can pay a cumulative-upkeep mana
+/// cost after auto-tapping mana sources. This is deliberately separate from
+/// generic effect payment because restricted mana must see the exact
+/// cumulative-upkeep context.
+pub(super) fn can_pay_cumulative_upkeep_mana_cost_after_auto_tap(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &crate::types::mana::ManaCost,
+) -> bool {
+    can_pay_non_cast_mana_cost_after_auto_tap(
+        state,
+        player,
+        source_id,
+        cost,
+        PaymentContext::CumulativeUpkeep,
+    )
+}
+
+fn can_pay_non_cast_mana_cost_after_auto_tap(
+    state: &GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &crate::types::mana::ManaCost,
+    payment_context: PaymentContext<'_>,
+) -> bool {
     let mut simulated = state.clone();
     super::layers::flush_layers(&mut simulated);
 
     let mut tap_events: Vec<crate::types::events::GameEvent> = Vec::new();
-    let effect_ctx = PaymentContext::Effect;
     super::casting_costs::auto_tap_mana_sources_with_context(
         &mut simulated,
         player,
         cost,
         &mut tap_events,
         Some(source_id),
-        Some(&effect_ctx),
+        Some(&payment_context),
     );
     // CR 118.12 + CR 605.3b + CR 616.1: A replacement choice during an
     // auto-tapped mana ability is an in-progress payment, not an affordability
@@ -16999,7 +17036,7 @@ pub(super) fn can_pay_effect_mana_cost_after_auto_tap(
             mana_payment::can_pay_for_spell(
                 &player_data.mana_pool,
                 cost,
-                Some(&effect_ctx),
+                Some(&payment_context),
                 permissions,
             )
         })
@@ -17622,13 +17659,55 @@ pub(super) fn pay_effect_mana_cost_with_resume(
     resume: Option<&ManaAbilityResume>,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EngineError> {
+    pay_non_cast_mana_cost_with_resume(
+        state,
+        player,
+        source_id,
+        cost,
+        PaymentContext::Effect,
+        resume,
+        events,
+    )
+}
+
+/// CR 702.23a + CR 605.3b + CR 616.1: Pay a cumulative-upkeep mana cost
+/// through the same auto-tap/resume authority as other resolution costs, but
+/// preserve the cumulative-upkeep payment context for spend restrictions.
+pub(super) fn pay_cumulative_upkeep_mana_cost_with_resume(
+    state: &mut GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &crate::types::mana::ManaCost,
+    resume: Option<&ManaAbilityResume>,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
+    pay_non_cast_mana_cost_with_resume(
+        state,
+        player,
+        source_id,
+        cost,
+        PaymentContext::CumulativeUpkeep,
+        resume,
+        events,
+    )
+}
+
+fn pay_non_cast_mana_cost_with_resume(
+    state: &mut GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    cost: &crate::types::mana::ManaCost,
+    payment_context: PaymentContext<'_>,
+    resume: Option<&ManaAbilityResume>,
+    events: &mut Vec<GameEvent>,
+) -> Result<(), EngineError> {
     let resume_at_resolution_depth = state.resolution_stack.len();
     match pay_non_cast_mana_cost(
         state,
         player,
         Some(source_id),
         cost,
-        PaymentContext::Effect,
+        payment_context,
         resume,
         events,
     )? {
@@ -18459,10 +18538,24 @@ pub(crate) fn find_non_self_discard(
         AbilityCost::Discard {
             count,
             filter,
-            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+            self_scope,
             selection,
-        } => Some((count, filter.as_ref(), *selection)),
+        } if self_scope.is_from_hand() => Some((count, filter.as_ref(), *selection)),
         AbilityCost::Composite { costs } => costs.iter().find_map(find_non_self_discard),
+        _ => None,
+    }
+}
+
+/// Return the hand-discard scope carried by the first non-self discard leg.
+/// The ordinary detector keeps its compact legacy tuple API; this companion
+/// exposes the identity restriction needed by Jandor's Ring to the payment
+/// authority.
+pub(crate) fn find_non_self_discard_scope(
+    cost: &AbilityCost,
+) -> Option<crate::types::ability::DiscardSelfScope> {
+    match cost {
+        AbilityCost::Discard { self_scope, .. } if self_scope.is_from_hand() => Some(*self_scope),
+        AbilityCost::Composite { costs } => costs.iter().find_map(find_non_self_discard_scope),
         _ => None,
     }
 }
@@ -18506,6 +18599,8 @@ pub(crate) fn resolve_non_self_discard_requirement_with_ability(
     let Some((count, filter, _selection)) = find_non_self_discard(cost) else {
         return Ok(None);
     };
+    let discard_scope = find_non_self_discard_scope(cost)
+        .unwrap_or(crate::types::ability::DiscardSelfScope::FromHand);
     let count = super::quantity::resolve_quantity(state, count, player, source_id).max(0) as usize;
     // CR 601.2h + CR 701.9a: A resolved zero-card discard is paid by doing nothing — never
     // surface a dead selection prompt for it.
@@ -18513,9 +18608,16 @@ pub(crate) fn resolve_non_self_discard_requirement_with_ability(
         return Ok(None);
     }
     let eligible = ability.map_or_else(
-        || find_eligible_discard_targets(state, player, source_id, filter),
+        || find_eligible_discard_targets_for_scope(state, player, source_id, filter, discard_scope),
         |ability| {
-            find_eligible_discard_targets_for_ability(state, player, source_id, filter, ability)
+            find_eligible_discard_targets_for_ability_and_scope(
+                state,
+                player,
+                source_id,
+                filter,
+                ability,
+                discard_scope,
+            )
         },
     );
     if eligible.len() < count {
@@ -18842,6 +18944,33 @@ pub(crate) fn find_eligible_discard_targets(
     find_eligible_hand_cost_targets(state, player, source, filter)
 }
 
+/// CR 701.9a: Apply the identity restriction carried by a discard cost after
+/// normal hand/filter eligibility rules have run.
+pub(crate) fn find_eligible_discard_targets_for_scope(
+    state: &GameState,
+    player: PlayerId,
+    source: ObjectId,
+    filter: Option<&TargetFilter>,
+    scope: crate::types::ability::DiscardSelfScope,
+) -> Vec<ObjectId> {
+    let eligible = find_eligible_discard_targets(state, player, source, filter);
+    if !scope.is_last_drawn_this_turn() {
+        return eligible;
+    }
+    let Some(last_drawn) = state
+        .cards_drawn_this_turn
+        .get(&player)
+        .and_then(|drawn| drawn.last())
+        .copied()
+    else {
+        return Vec::new();
+    };
+    eligible
+        .into_iter()
+        .filter(|object_id| *object_id == last_drawn)
+        .collect()
+}
+
 /// CR 118.3 + CR 602.2b: Select the hand cards that can pay an activated
 /// ability's discard cost by excluding the source and applying its optional
 /// filter against the announced ability context.
@@ -18870,6 +18999,35 @@ pub(crate) fn find_eligible_discard_targets_for_ability(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Ability-context variant of [`find_eligible_discard_targets_for_scope`].
+/// Target filters evaluate against the announced ability; the last-drawn
+/// restriction is applied to the resulting hand population.
+pub(crate) fn find_eligible_discard_targets_for_ability_and_scope(
+    state: &GameState,
+    player: PlayerId,
+    source: ObjectId,
+    filter: Option<&TargetFilter>,
+    ability: &ResolvedAbility,
+    scope: crate::types::ability::DiscardSelfScope,
+) -> Vec<ObjectId> {
+    let eligible = find_eligible_discard_targets_for_ability(state, player, source, filter, ability);
+    if !scope.is_last_drawn_this_turn() {
+        return eligible;
+    }
+    let Some(last_drawn) = state
+        .cards_drawn_this_turn
+        .get(&player)
+        .and_then(|drawn| drawn.last())
+        .copied()
+    else {
+        return Vec::new();
+    };
+    eligible
+        .into_iter()
+        .filter(|object_id| *object_id == last_drawn)
+        .collect()
 }
 
 /// CR 701.20a + CR 601.2b: Eligible cards for an `AbilityCost::Reveal` payment
@@ -22104,6 +22262,14 @@ fn is_blocked_by_cant_be_cast_for(
     spell_obj: &super::game_object::GameObject,
     fused: bool,
 ) -> bool {
+    // CR 101.2 + CR 201.2a: Cornered Market's name-based cast prohibition is
+    // dynamic over the live battlefield and therefore is not a CantBeCast
+    // filter. Check it before the parameterized CantBeCast presence gate.
+    if super::static_abilities::is_blocked_by_same_name_as_nontoken_permanent(
+        state, caster, spell_obj,
+    ) {
+        return true;
+    }
     // CR 604.1: O(1) presence gate — no CantBeCast static means no restriction.
     if !static_kind_present(state, StaticModeKind::CantBeCast) {
         return false;

@@ -10893,6 +10893,7 @@ fn gate_binding_diverges_at_fire_time(condition: &AbilityCondition) -> bool {
         | AbilityCondition::CostPaidObjectMatchesFilter { .. }
         // CR 115.10: the per-iteration player of the RESOLVING ability, which the
         // fire-time context derives from the matched event instead.
+        | AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn
         | AbilityCondition::ScopedPlayerMatches { .. }
         // CR 615.5: the post-replacement window, populated only while a
         // prevention replacement is being applied.
@@ -11566,6 +11567,9 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         FilterProp::Attacking { defender } | FilterProp::AttackedThisTurn { defender } => {
             defender.as_ref().is_some_and(controller_ref_binding_diverges)
         }
+        // CR 508.1a + CR 514.2: this is a source-relative history lookup,
+        // not a nested controller binding.
+        FilterProp::AttackedLastTurn => false,
         FilterProp::HasAttachment { controller, .. }
         | FilterProp::HasAnyAttachmentOf { controller, .. }
         | FilterProp::NameMatchesAnyPermanent { controller } => controller
@@ -11685,6 +11689,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         | FilterProp::HasManaAbility
         | FilterProp::HasNoAbilities
         | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -11727,6 +11732,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
         // An unrecognized parser escape hatch matches nothing on either leg.
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
 
         // ---- BINDING-FREE PAYLOADS: why some fields stay discarded. ----

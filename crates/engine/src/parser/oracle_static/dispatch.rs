@@ -1081,12 +1081,12 @@ pub(crate) fn parse_static_line_inner(
     }
 
     // CR 701.38d: "While voting, you may vote an additional time." (Tivit,
-    // Seller of Secrets and the Council's-dilemma extra-vote family.) Built
-    // for the class — covers any phrasing where the controller gets one
-    // additional vote per session. Dispatched via nom so future variants
-    // ("two additional times", "while voting on a Council's dilemma you cast")
-    // can be added as new combinator arms rather than as additional
-    // string-equality checks.
+    // Seller of Secrets), and the equivalent "While voting, you get an
+    // additional vote." (Brago's Representative). Built for the class —
+    // covers phrasing where the controller gets one additional vote per
+    // session. Dispatched via nom so future variants ("two additional
+    // times", "while voting on a Council's dilemma you cast") can be added
+    // as new combinator arms rather than as additional string-equality checks.
     {
         let lower_trim = tp.lower.trim_end_matches('.').trim();
         // The optional comma after "while voting" is a single `opt` axis rather
@@ -1097,7 +1097,10 @@ pub(crate) fn parse_static_line_inner(
             (
                 nom::bytes::complete::tag("while voting"),
                 nom::combinator::opt(nom::bytes::complete::tag(",")),
-                nom::bytes::complete::tag(" you may vote an additional time"),
+                nom::branch::alt((
+                    nom::bytes::complete::tag(" you may vote an additional time"),
+                    nom::bytes::complete::tag(" you get an additional vote"),
+                )),
             ),
         )
         .parse(lower_trim);
@@ -2925,6 +2928,14 @@ pub(crate) fn parse_static_line_inner(
                     .description(text.to_string()),
             );
         }
+    }
+
+    // CR 101.2 + CR 305.1 + CR 201.2a: Cornered Market's land-side
+    // prohibition is a static rule even though it is not a cast prohibition.
+    // Dispatch it before the generic effect fallback so the live name-based
+    // runtime gate can see the printed nonbasic-land scope.
+    if let Some(def) = parse_cornered_market_land_prohibition(tp.lower, &text) {
+        return Some(def);
     }
 
     // --- CR 101.2: Blanket casting prohibition ("can't cast [type] spells") ---

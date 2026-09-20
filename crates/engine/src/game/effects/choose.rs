@@ -502,6 +502,13 @@ fn apply_choice_attributes(
     if matches!(choice_type, ChoiceType::Keyword { .. }) {
         destination.retain(|attribute| !matches!(attribute, ChosenAttribute::Keyword(_)));
     }
+    // CR 607.2d: a singular "choose a color" answer is the source's current
+    // choice, not an accumulating history. This matters for permanents such as
+    // Hall of Gemstone whose later replacement reads the most recent upkeep
+    // choice. `TwoColors` remains a separate attribute kind and is untouched.
+    if matches!(choice_type, ChoiceType::Color { .. }) {
+        destination.retain(|attribute| !matches!(attribute, ChosenAttribute::Color(_)));
+    }
     if matches!(choice_type, ChoiceType::CounterKind { .. }) {
         destination.retain(|attribute| !matches!(attribute, ChosenAttribute::Counter(_)));
     }

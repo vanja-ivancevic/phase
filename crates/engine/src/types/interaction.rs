@@ -362,6 +362,7 @@ pub enum InteractionManaSpellCostCriterion {
 )]
 pub enum InteractionManaRestriction {
     OnlyForSpell,
+    OnlyForCumulativeUpkeep,
     OnlyForSpellType {
         spell_type: String,
     },

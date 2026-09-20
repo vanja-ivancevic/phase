@@ -4,7 +4,7 @@ use nom::bytes::complete::{tag, take_till, take_until};
 use nom::character::complete::multispace0;
 use nom::combinator::{all_consuming, map, opt, peek, rest, value, verify};
 use nom::multi::separated_list1;
-use nom::sequence::{delimited, preceded, terminated};
+use nom::sequence::{delimited, pair, preceded, terminated};
 use nom::Parser;
 
 use super::animation::{
@@ -16,7 +16,7 @@ use super::lower::BOUNDED_TARGET_CARDINALITIES;
 use super::{resolve_it_pronoun, ParseContext};
 use crate::parser::oracle_ir::ast::*;
 use crate::types::ability::{
-    AbilityDefinition, AbilityKind, AggregateFunction, ChoiceType, ChosenSubtypeKind,
+    AbilityDefinition, AbilityKind, AggregateFunction, ChoiceType, ChosenSubtypeKind, Comparator,
     ColorChangeMode, ContinuousModification, ControllerRef, Duration, EachDamageRecipient, Effect,
     EffectScope, FilterProp, MultiTargetSpec, ObjectScope, PlayerFilter, PlayerRelation,
     PlayerScope, PtValue, QuantityExpr, QuantityRef, StaticCondition, StaticDefinition,
@@ -2816,6 +2816,37 @@ pub(super) fn parse_subject_application(
         return subject_filter_application(TargetFilter::ParentTarget, false);
     }
 
+    // CR 608.2c: "the creature" (and the parallel definite-object forms) is
+    // an anaphoric reference to the object chosen earlier in the same effect
+    // sequence. `parse_target` already recognizes these phrases in target
+    // position, but a subject predicate has to bind the same referent through
+    // `inherits_parent` so a requirement such as Arcum's Whistle's
+    // "the creature attacks this turn if able" does not fall through as an
+    // unbound subject. Keep this list to the definite object nouns that the
+    // target grammar treats as ParentTarget; typed population subjects such as
+    // "the active creature" remain fail-closed until their own semantics are
+    // modeled.
+    if all_consuming(alt((
+        tag::<_, _, OracleError<'_>>("the creature"),
+        tag("the permanent"),
+        tag("the land"),
+        tag("the artifact"),
+        tag("the enchantment"),
+        tag("the card"),
+        tag("the spell"),
+    )))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        return Some(SubjectApplication {
+            affected: TargetFilter::ParentTarget,
+            target: None,
+            multi_target: None,
+            inherits_parent: true,
+            is_optional: false,
+        });
+    }
+
     // Bare plural noun phrase subjects ("creatures you control", "other creatures you control")
     // are implicit "all X" forms — strip any "other " prefix and route through parse_target.
     let (had_other, noun_subject) =
@@ -2892,6 +2923,97 @@ pub(super) fn parse_subject_application(
                 exclude: None,
             },
         );
+        return subject_filter_application(
+            TargetFilter::PlayerMatching {
+                player: Box::new(player),
+            },
+            false,
+        );
+    }
+    // CR 402.1 + CR 603.2: Sokenzan Renegade's upkeep handoff names the
+    // player with the largest hand, not the controller or a fixed opponent.
+    // `HandSize { ScopedPlayer }` is the per-candidate scalar read and the
+    // all-player MAX is the resolution-time threshold, exactly as for life.
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "the player who has the most cards in hand",
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        let player = PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::All,
+            attr: Box::new(QuantityRef::HandSize {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: Comparator::GE,
+            value: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::HandSize {
+                    player: PlayerScope::AllPlayers {
+                        aggregate: AggregateFunction::Max,
+                        exclude: None,
+                    },
+                },
+            }),
+        };
+        return subject_filter_application(
+            TargetFilter::PlayerMatching {
+                player: Box::new(player),
+            },
+            false,
+        );
+    }
+    // CR 109.4 + CR 603.2: the "player who controls the most [type]" family
+    // uses the shared controlled-count parser. Its bare object filter is
+    // evaluated once per candidate player, and the `ControlledByEachPlayer`
+    // maximum threshold keeps ties legal (CR 107.1), covering Wild Mammoth,
+    // Thoughtbound Primoc, and future old-border variants without card names.
+    if let Ok((control_clause, _)) =
+        tag::<_, _, OracleError<'_>>("the player ").parse(lower.as_str())
+    {
+        if let Some((comparator, count, filter, remainder)) =
+            super::parse_controls_permanent_object(control_clause, ctx)
+        {
+            if remainder.trim().is_empty() {
+                let player = PlayerFilter::ControlsCount {
+                    relation: PlayerRelation::All,
+                    filter,
+                    comparator,
+                    count: Box::new(count),
+                };
+                return subject_filter_application(
+                    TargetFilter::PlayerMatching {
+                        player: Box::new(player),
+                    },
+                    false,
+                );
+            }
+        }
+    }
+    // CR 119.1 + CR 603.2: the lowest-life handoff is the MIN counterpart to
+    // the most-life form above. The intervening trigger on Loxodon Peacekeeper
+    // establishes whether the minimum is unique; the recipient still has to be
+    // represented dynamically so ties and multiplayer remain rules-correct.
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "the player with the lowest life total",
+    ))
+    .parse(lower.as_str())
+    .is_ok()
+    {
+        let player = PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::All,
+            attr: Box::new(QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: Comparator::LE,
+            value: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::AllPlayers {
+                        aggregate: AggregateFunction::Min,
+                        exclude: None,
+                    },
+                },
+            }),
+        };
         return subject_filter_application(
             TargetFilter::PlayerMatching {
                 player: Box::new(player),
@@ -4317,6 +4439,16 @@ fn build_continuous_clause(
         return Some(clause);
     }
 
+    // CR 608.2c + CR 608.2d + CR 613.1f: Phyrexian Splicer's two-target
+    // anaphoric transfer — the first target has the keyword chosen in the
+    // activation cost, loses that keyword, and another target gains it. This
+    // is distinct from Urborg's "loses X or Y" resolution-time choice: the
+    // choice is already persisted by the cost, and the second target is a
+    // separate declared target in the same effect chain.
+    if let Some(clause) = build_chosen_keyword_transfer_clause(&application, predicate) {
+        return Some(clause);
+    }
+
     // Strip "where X is..." and "for each..." suffixes before extracting duration,
     // so "until end of turn" is found even when followed by these clauses.
     // The full normalized text is still passed to parse_continuous_modifications
@@ -4530,6 +4662,74 @@ fn build_keyword_choice_loss_clause(
         sub_ability: Some(Box::new(AbilityDefinition::new(
             AbilityKind::Spell,
             apply_effect,
+        ))),
+        distribute: None,
+        multi_target: application.multi_target.clone(),
+        condition: None,
+        optional: false,
+        unless_pay: None,
+    })
+}
+
+fn build_chosen_keyword_transfer_clause(
+    application: &SubjectApplication,
+    predicate: &str,
+) -> Option<ParsedEffectClause> {
+    let first_target_has_choice = matches!(
+        application.target.as_ref(),
+        Some(TargetFilter::Typed(TypedFilter { properties, .. }))
+            if properties.contains(&FilterProp::HasChosenKeyword)
+    );
+    if !first_target_has_choice {
+        return None;
+    }
+
+    let lower = predicate.trim().to_lowercase();
+    let (_, second_target_text) = all_consuming(preceded(
+        tag::<_, _, OracleError<'_>>("loses it and "),
+        terminated(
+            take_until::<_, _, OracleError<'_>>(" gains it"),
+            pair(
+                tag::<_, _, OracleError<'_>>(" gains it"),
+                opt(tag::<_, _, OracleError<'_>>(".")),
+            ),
+        ),
+    ))
+    .parse(lower.as_str())
+    .ok()?;
+    if second_target_text.is_empty() {
+        return None;
+    }
+    let (second_target, remainder) = parse_target(second_target_text);
+    if !remainder.trim().is_empty() {
+        return None;
+    }
+
+    let remove_effect = Effect::GenericEffect {
+        static_abilities: vec![StaticDefinition::continuous()
+            .affected(static_affected_for_application(application))
+            .modifications(vec![ContinuousModification::RemoveChosenKeyword])
+            .description(predicate.to_string())],
+        duration: None,
+        target: application.target.clone(),
+        end_cost: None,
+    };
+    let gain_effect = Effect::GenericEffect {
+        static_abilities: vec![StaticDefinition::continuous()
+            .affected(TargetFilter::ParentTarget)
+            .modifications(vec![ContinuousModification::AddChosenKeyword])
+            .description(predicate.to_string())],
+        duration: None,
+        target: Some(second_target),
+        end_cost: None,
+    };
+
+    Some(ParsedEffectClause {
+        effect: remove_effect,
+        duration: None,
+        sub_ability: Some(Box::new(AbilityDefinition::new(
+            AbilityKind::Spell,
+            gain_effect,
         ))),
         distribute: None,
         multi_target: application.multi_target.clone(),
@@ -7104,6 +7304,10 @@ pub(crate) fn starts_with_subject_prefix(lower: &str) -> bool {
 pub(crate) const PREDICATE_VERBS: &[&str] = &[
     "add",
     "attack",
+    // CR 701.3a: Subject-prefixed attachment instructions (e.g., "that land's
+    // controller may attach ~ to a land of their choice") must split at
+    // "attach" so the dedicated Attach imperative parser can lower them.
+    "attach",
     "become",
     "block",
     "can",
@@ -9718,6 +9922,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_subject_definite_object_binds_the_parent_target() {
+        // CR 608.2c: Arcum's Whistle says "the creature attacks this turn if
+        // able" after a target creature has already been chosen. The definite
+        // article is an anaphor, not a broadcast over every creature.
+        let application = parse_subject_application(
+            "the creature",
+            &mut ParseContext {
+                parent_target_available: true,
+                ..ParseContext::default()
+            },
+        )
+        .expect("the creature must bind the previously chosen object");
+        assert_eq!(application.affected, TargetFilter::ParentTarget);
+        assert!(application.inherits_parent);
+        assert!(application.target.is_none());
+    }
+
+    #[test]
     fn parse_subject_any_number_of_target_players() {
         let mut ctx = ParseContext::default();
         let result = parse_subject_application("any number of target players", &mut ctx);
@@ -10918,6 +11140,31 @@ mod tests {
             description.as_deref(),
             Some(CLAUSE),
             "the gap must quote the WHOLE printed clause, subject included"
+        );
+    }
+
+    /// CR 701.3a + CR 608.2c: a possessive player subject may perform an
+    /// attachment instruction. Registering `attach` as a subject predicate is
+    /// required so the subject layer hands the remainder to the dedicated
+    /// attachment parser instead of reporting `Effect:that`.
+    #[test]
+    fn parent_target_controller_may_attach_lowers_to_attach() {
+        let parsed = super::super::parse_effect_chain(
+            "That land's controller may attach ~ to a land of their choice",
+            AbilityKind::Spell,
+        );
+
+        assert!(parsed.optional, "the controller's may choice must be preserved");
+        assert!(matches!(
+            parsed.effect.as_ref(),
+            Effect::Attach {
+                attachment: TargetFilter::SelfRef,
+                target: TargetFilter::Typed(_),
+            }
+        ), "expected a concrete Attach effect, got {parsed:#?}");
+        assert!(
+            !matches!(parsed.effect.as_ref(), Effect::Unimplemented { .. }),
+            "subject-prefixed attach must not remain unimplemented: {parsed:#?}"
         );
     }
 }

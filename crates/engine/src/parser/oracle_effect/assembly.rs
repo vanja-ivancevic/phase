@@ -1052,6 +1052,9 @@ pub(super) enum EffectClass {
     /// `super::effect_installs_continuous_effect`, the same predicate the
     /// detector uses, so detection and binding cannot select different defs.
     InstalledContinuousEffect,
+    /// `PreventDamage` — the effect shape patched by the Undergrowth
+    /// additional-cost exception.
+    PreventDamage,
 }
 
 /// What a handler does when its antecedent does not resolve.
@@ -1292,6 +1295,9 @@ impl AssemblyEnv {
             // names nothing.
             Some(BindGuard::EffectShape(EffectClass::InstalledContinuousEffect)) => {
                 super::effect_installs_continuous_effect(&defs[index].effect)
+            }
+            Some(BindGuard::EffectShape(EffectClass::PreventDamage)) => {
+                matches!(&*defs[index].effect, Effect::PreventDamage { .. })
             }
             Some(BindGuard::DigLookbackTransparentCost) => {
                 let d = &defs[index];
@@ -1931,6 +1937,54 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
                                 }
                                 env.observe(&defs, Some(clause_ir.id), NodeRole::HandlerProduct);
                             }
+                        }
+                    }
+                    PriorModifier::AdditionalCostPreventDamageException => {
+                        // CR 601.2b + CR 615.1a: Undergrowth's optional
+                        // additional cost changes the source population of an
+                        // already-created combat-prevention shield. Bind only
+                        // the immediately preceding PreventDamage node.
+                        let bound = env.resolve(
+                            &defs,
+                            AntecedentSelector::LastEmitted,
+                            Some(BindGuard::EffectShape(EffectClass::PreventDamage)),
+                            OnMiss::Ignore,
+                        );
+                        if bound.is_some() {
+                            let patched_id = env.arena.id_at(defs.len() - 1);
+                            let mut patched = defs.pop().unwrap();
+                            env.observe(&defs, None, NodeRole::Unknown);
+
+                            let mut paid_branch = patched.clone();
+                            paid_branch.condition = None;
+                            paid_branch.else_ability = None;
+                            if let Effect::PreventDamage {
+                                damage_source_filter,
+                                ..
+                            } = paid_branch.effect.as_mut()
+                            {
+                                let red_creature = TargetFilter::Typed(
+                                    crate::types::ability::TypedFilter::creature().properties(
+                                        vec![crate::types::ability::FilterProp::HasColor {
+                                            color: crate::types::mana::ManaColor::Red,
+                                        }],
+                                    ),
+                                );
+                                *damage_source_filter = Some(TargetFilter::Not {
+                                    filter: Box::new(red_creature),
+                                });
+                                patched.condition = Some(AbilityCondition::Not {
+                                    condition: Box::new(
+                                        AbilityCondition::additional_cost_paid_any(),
+                                    ),
+                                });
+                                patched.else_ability = Some(Box::new(paid_branch));
+                            }
+                            defs.push(patched);
+                            if let Some(id) = patched_id {
+                                env.arena.reinstate(id);
+                            }
+                            env.observe(&defs, Some(clause_ir.id), NodeRole::HandlerProduct);
                         }
                     }
                 }

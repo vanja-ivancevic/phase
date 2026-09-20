@@ -192,8 +192,29 @@ fn is_reveal_chosen_attribute_noop(part: &str) -> bool {
 fn parse_oracle_cost_no_or(text: &str) -> AbilityCost {
     let text = text.trim();
 
+    // CR 602.2b + CR 608.2d: Some old-border activated abilities put a
+    // typed keyword choice in the cost position (Phyrexian Splicer: "Choose
+    // flying, first strike, trample, or shadow"). The commas belong to the
+    // choice list, not to a composite cost, so recognize this whole phrase
+    // before the generic cost splitter. Runtime cost payment intercepts this
+    // Effect::Choose through the existing CostTypeChoice prompt and persists
+    // the selected keyword on the source for the ability's effect.
+    if let Some(choice_type) = super::oracle_effect::try_parse_named_choice(&text.to_lowercase())
+        .filter(|choice| matches!(choice, ChoiceType::Keyword { count: 1, .. }))
+    {
+        return AbilityCost::EffectCost {
+            effect: Box::new(crate::types::ability::Effect::Choose {
+                choice_type,
+                persist: true,
+                selection: crate::types::ability::TargetSelectionMode::Chosen,
+            }),
+            player_scope: None,
+        };
+    }
+
     // Split on ", " for composite costs
-    let parts = fixup_from_among_remove_counter_parts(split_cost_parts(text));
+    let parts = fixup_keyword_choice_parts(split_cost_parts(text));
+    let parts = fixup_from_among_remove_counter_parts(parts);
     // Drop no-op "reveal the <chosen attribute> you chose" components so the
     // remaining cost list is exactly the real costs (e.g. a single Sacrifice),
     // never a Composite carrying a phantom reveal-Sacrifice. Keep the original
@@ -258,12 +279,61 @@ fn split_cost_parts(text: &str) -> Vec<&str> {
     parts
 }
 
+/// CR 602.2b + CR 608.2d: the commas in a typed keyword choice are part of
+/// the option list, not separate cost components. The generic cost splitter
+/// must run first because mana/tap costs can precede the choice; then rejoin
+/// the fragments beginning at `Choose` once the complete phrase is recognized.
+fn fixup_keyword_choice_parts(parts: Vec<&str>) -> Vec<String> {
+    let mut fixed = Vec::new();
+    let mut i = 0;
+
+    while i < parts.len() {
+        let part = parts[i].trim();
+        let lower = part.to_lowercase();
+        if nom_on_lower(part, &lower, |input| value((), tag("choose ")).parse(input))
+            .is_none()
+        {
+            fixed.push(part.to_string());
+            i += 1;
+            continue;
+        }
+
+        let mut candidate = part.to_string();
+        let mut next = i + 1;
+        let mut recognized = None;
+        loop {
+            if super::oracle_effect::try_parse_named_choice(&candidate.to_lowercase())
+                .is_some_and(|choice| matches!(choice, ChoiceType::Keyword { count: 1, .. }))
+            {
+                recognized = Some(next);
+                break;
+            }
+            let Some(fragment) = parts.get(next) else {
+                break;
+            };
+            candidate.push_str(", ");
+            candidate.push_str(fragment.trim());
+            next += 1;
+        }
+
+        if let Some(next) = recognized {
+            fixed.push(candidate);
+            i = next;
+        } else {
+            fixed.push(part.to_string());
+            i += 1;
+        }
+    }
+
+    fixed
+}
+
 /// CR 601.2b / CR 602.2b + CR 122.1: "Remove N counters from among [type],
 /// [type], and [type] you control" is one activation-cost component. The
 /// top-level splitter cannot know whether a comma belongs to a type list or to
 /// the next cost, so merge only contiguous fragments that still parse as a
 /// complete `RemoveCounter` from-among cost.
-fn fixup_from_among_remove_counter_parts(parts: Vec<&str>) -> Vec<String> {
+fn fixup_from_among_remove_counter_parts(parts: Vec<String>) -> Vec<String> {
     let mut fixed = Vec::new();
     let mut i = 0;
 
@@ -872,6 +942,23 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
                 self_scope: crate::types::ability::DiscardSelfScope::SourceCard,
             };
         }
+        // CR 207.2c + CR 701.9a: Jandor's Ring names a particular card in
+        // hand rather than permitting an arbitrary discard. Keep the identity
+        // constraint on the cost so payment can consult the per-turn draw
+        // ledger when it builds the legal choice set.
+        if all_consuming(tag::<_, _, nom::error::Error<&str>>(
+            "the last card you drew this turn",
+        ))
+        .parse(rest_lower.as_str())
+        .is_ok()
+        {
+            return AbilityCost::Discard {
+                count: QuantityExpr::Fixed { value: 1 },
+                filter: None,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                self_scope: crate::types::ability::DiscardSelfScope::LastDrawnThisTurn,
+            };
+        }
         if all_consuming(tag::<_, _, nom::error::Error<&str>>("a card"))
             .parse(rest_lower.as_str())
             .is_ok()
@@ -950,6 +1037,14 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
                 zone: Some(Zone::Library),
                 filter: None,
             };
+        }
+        // CR 118.12 + CR 701.7: A top-of-graveyard exile is a deterministic
+        // effect-cost, not an ordinary selectable graveyard exile. Keep the
+        // distinction in the typed AST so the resolution payer can take the
+        // first matching card from the ordered graveyard rather than opening a
+        // choice over every matching card.
+        if let Some(cost) = parse_exile_top_matching_graveyard_cost(rest) {
+            return cost;
         }
         // CR 107.3a + CR 118.8: "Exile X card(s) from your graveyard" — variable
         // count announced during casting (Harvest Pyre). Ordered before the typed
@@ -1366,6 +1461,74 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
     AbilityCost::Unimplemented {
         description: text.to_string(),
     }
+}
+
+/// CR 118.12 + CR 701.7: Parse "the top [type] card of your graveyard" as a
+/// deterministic effect-cost. Graveyards are ordered oldest-to-newest in the
+/// engine, so the runtime resolves the matching card from the back of the
+/// payer's graveyard.
+///
+/// This is intentionally separate from [`AbilityCost::Exile`]. The latter is
+/// an interactive selection over a zone; a top-of-graveyard instruction has no
+/// choice and must skip nonmatching cards until it reaches the first matching
+/// card. The returned `ChangeZone` effect is consumed only by the shared
+/// resolution-cost payer.
+pub(crate) fn parse_exile_top_matching_graveyard_cost(
+    rest: &str,
+) -> Option<AbilityCost> {
+    type E<'a> = super::oracle_nom::error::OracleError<'a>;
+    let lower = rest.trim().to_ascii_lowercase();
+    let ((), tail) = nom_on_lower(lower.as_str(), lower.as_str(), |input| {
+        value((), tag("the top ")).parse(input)
+    })?;
+    let (mut filter, tail) = parse_type_phrase(tail);
+    let tail = tail.trim_start();
+    let (tail, _) = terminated(
+        alt((
+            tag::<_, _, E<'_>>(" card of your graveyard"),
+            tag::<_, _, E<'_>>("card of your graveyard"),
+            tag::<_, _, E<'_>>(" of your graveyard"),
+            tag::<_, _, E<'_>>("of your graveyard"),
+        )),
+        opt(tag::<_, _, E<'_>>(".")),
+    )
+    .parse(tail)
+    .ok()?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+
+    let TargetFilter::Typed(ref mut typed) = filter else {
+        return None;
+    };
+    typed.controller = Some(ControllerRef::You);
+    if !typed
+        .properties
+        .contains(&FilterProp::InZone { zone: Zone::Graveyard })
+    {
+        typed
+            .properties
+            .push(FilterProp::InZone { zone: Zone::Graveyard });
+    }
+
+    Some(AbilityCost::EffectCost {
+        effect: Box::new(crate::types::ability::Effect::ChangeZone {
+            origin: Some(Zone::Graveyard),
+            destination: Zone::Exile,
+            target: filter,
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: None,
+            enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: vec![],
+            conditional_enter_with_counters: vec![],
+            face_down_profile: None,
+            enters_modified_if: None,
+        }),
+        player_scope: None,
+    })
 }
 
 /// CR 601.2f + CR 602.2b: Recognize the *head* of a self ACTIVATED-ability
@@ -3039,6 +3202,19 @@ mod tests {
     }
 
     #[test]
+    fn cost_discard_last_drawn_card_this_turn() {
+        assert_eq!(
+            parse_oracle_cost("Discard the last card you drew this turn"),
+            AbilityCost::Discard {
+                count: QuantityExpr::Fixed { value: 1 },
+                filter: None,
+                selection: crate::types::ability::CardSelectionMode::Chosen,
+                self_scope: crate::types::ability::DiscardSelfScope::LastDrawnThisTurn,
+            }
+        );
+    }
+
+    #[test]
     fn cost_discard_your_hand() {
         assert_eq!(
             parse_oracle_cost("Discard your hand"),
@@ -3368,6 +3544,35 @@ mod tests {
                 filter: None,
             }
         );
+    }
+
+    /// CR 118.12 + CR 701.7: top-of-graveyard exile is deterministic and must
+    /// not collapse into the ordinary selectable `AbilityCost::Exile` shape.
+    #[test]
+    fn cost_exile_top_matching_card_of_graveyard_is_effect_cost() {
+        let cost = parse_oracle_cost("Exile the top creature card of your graveyard");
+        let AbilityCost::EffectCost { effect, .. } = cost else {
+            panic!("expected deterministic graveyard-top effect cost, got {cost:?}");
+        };
+        let crate::types::ability::Effect::ChangeZone {
+            origin,
+            destination,
+            target,
+            ..
+        } = effect.as_ref()
+        else {
+            panic!("expected ChangeZone effect cost, got {effect:?}");
+        };
+        assert_eq!(*origin, Some(Zone::Graveyard));
+        assert_eq!(*destination, Zone::Exile);
+        let TargetFilter::Typed(filter) = target else {
+            panic!("expected typed graveyard filter, got {target:?}");
+        };
+        assert_eq!(filter.controller, Some(ControllerRef::You));
+        assert!(filter.type_filters.contains(&TypeFilter::Creature));
+        assert!(filter.properties.contains(&FilterProp::InZone {
+            zone: Zone::Graveyard,
+        }));
     }
 
     #[test]
@@ -4151,5 +4356,48 @@ mod tests {
             .is_none(),
             "qualified \"by\" continuation must not truncate to EventContextAmount"
         );
+    }
+
+    #[test]
+    fn phyrexian_splicer_keyword_choice_cost_shape() {
+        let cost = parse_oracle_cost("Choose flying, first strike, trample, or shadow");
+        let AbilityCost::EffectCost { effect, .. } = cost else {
+            panic!("expected a typed keyword choice effect-cost, got {cost:#?}");
+        };
+        assert!(matches!(
+            effect.as_ref(),
+            crate::types::ability::Effect::Choose {
+                choice_type: ChoiceType::Keyword { options, count: 1 },
+                persist: true,
+                ..
+            } if options == &[
+                crate::types::keywords::Keyword::Flying,
+                crate::types::keywords::Keyword::FirstStrike,
+                crate::types::keywords::Keyword::Trample,
+                crate::types::keywords::Keyword::Shadow,
+            ]
+        ));
+    }
+
+    #[test]
+    fn phyrexian_splicer_keyword_choice_cost_composes_after_mana_and_tap() {
+        let cost = parse_oracle_cost(
+            "{2}, {T}, Choose flying, first strike, trample, or shadow",
+        );
+        let AbilityCost::Composite { costs } = cost else {
+            panic!("expected a composite activation cost, got {cost:#?}");
+        };
+        assert!(matches!(costs.as_slice(), [
+            AbilityCost::Mana { .. },
+            AbilityCost::Tap,
+            AbilityCost::EffectCost { effect, .. },
+        ] if matches!(
+            effect.as_ref(),
+            crate::types::ability::Effect::Choose {
+                choice_type: ChoiceType::Keyword { options, count: 1 },
+                persist: true,
+                ..
+            } if options.len() == 4
+        )));
     }
 }

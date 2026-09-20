@@ -1090,13 +1090,24 @@ pub(super) fn handle_unless_payment(
             // — the same final mana path the old `pay_unless_cost` shim used —
             // and maps an unpayable cost to the "unless" branch fall-through.
             AbilityCost::Mana { .. } => {
-                match costs::pay_ability_cost_for_resolution(
-                    state,
-                    player,
-                    &cost,
-                    pending_effect.as_ref(),
-                    events,
-                )? {
+                let outcome = if pending_effect.unless_was_cumulative_upkeep {
+                    costs::pay_ability_cost_for_cumulative_upkeep(
+                        state,
+                        player,
+                        &cost,
+                        pending_effect.as_ref(),
+                        events,
+                    )?
+                } else {
+                    costs::pay_ability_cost_for_resolution(
+                        state,
+                        player,
+                        &cost,
+                        pending_effect.as_ref(),
+                        events,
+                    )?
+                };
+                match outcome {
                     PaymentOutcome::Paid => {}
                     PaymentOutcome::Failed { .. } => payment_failed = true,
                     // CR 118.12 + CR 605.3b + CR 616.1: An auto-tapped mana
@@ -1228,7 +1239,7 @@ pub(super) fn handle_unless_payment(
                 count,
                 filter,
                 selection,
-                self_scope: _,
+                self_scope,
             } => {
                 let resolved = crate::game::quantity::resolve_quantity_with_targets(
                     state,
@@ -1237,11 +1248,12 @@ pub(super) fn handle_unless_payment(
                 );
                 let count = u32::try_from(resolved.max(0)).unwrap_or(0);
 
-                let hand_cards = crate::game::casting::find_eligible_discard_targets(
+                let hand_cards = crate::game::casting::find_eligible_discard_targets_for_scope(
                     state,
                     player,
                     pending_effect.source_id,
                     filter.as_ref(),
+                    self_scope,
                 );
                 // CR 702.24a: partial payments aren't allowed — if the controller
                 // can't produce the full count, the unless cost is unpayable and

@@ -1924,14 +1924,44 @@ pub(crate) fn map_keyword(text: &str) -> Option<Keyword> {
 }
 
 pub(crate) fn parse_landwalk_keyword(text: &str) -> Option<Keyword> {
-    match text.trim().to_ascii_lowercase().as_str() {
-        "plainswalk" => Some(Keyword::Landwalk("Plains".to_string())), // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-        "islandwalk" => Some(Keyword::Landwalk("Island".to_string())), // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-        "swampwalk" => Some(Keyword::Landwalk("Swamp".to_string())), // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-        "mountainwalk" => Some(Keyword::Landwalk("Mountain".to_string())), // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-        "forestwalk" => Some(Keyword::Landwalk("Forest".to_string())), // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-        _ => None,
-    }
+    let lower = text.trim().to_ascii_lowercase();
+    let (_, keyword) = all_consuming(alt((
+        value(
+            Keyword::Landwalk("Plains".to_string()),
+            tag::<_, _, OracleError<'_>>("plainswalk"),
+        ),
+        value(
+            Keyword::Landwalk("Island".to_string()),
+            tag("islandwalk"),
+        ),
+        value(
+            Keyword::Landwalk("Swamp".to_string()),
+            tag("swampwalk"),
+        ),
+        value(
+            Keyword::Landwalk("Mountain".to_string()),
+            tag("mountainwalk"),
+        ),
+        value(
+            Keyword::Landwalk("Forest".to_string()),
+            tag("forestwalk"),
+        ),
+        value(
+            Keyword::Landwalk("Snow".to_string()),
+            tag("snow forestwalk"),
+        ),
+        // CR 702.14a: Ice Age also printed the composite legacy spelling
+        // "Snow swampwalk".  The engine's established compatibility
+        // representation for these pre-modern snow-landwalk keywords is the
+        // existing Snow landwalk qualifier.
+        value(
+            Keyword::Landwalk("Snow".to_string()),
+            tag("snow swampwalk"),
+        ),
+    )))
+    .parse(lower.as_str())
+    .ok()?;
+    Some(keyword)
 }
 
 /// CR 702.14a: Parse one of the five basic-land landwalk keyword tokens

@@ -197,6 +197,31 @@ fn parses_march_of_the_machines_static() {
     );
 }
 
+/// CR 613.1d + CR 613.6 + CR 613.4b: Titania's Song uses the old-border
+/// "loses all abilities and becomes" wording for the same noncreature-artifact
+/// animation class as March of the Machines.
+#[test]
+fn parses_titanias_song_ability_loss_animation_static() {
+    let def = parse_static_line(
+        "Each noncreature artifact loses all abilities and becomes an artifact creature with power and toughness each equal to its mana value.",
+    )
+    .expect("Titania's Song must parse");
+    assert!(def.modifications.contains(&ContinuousModification::RemoveAllAbilities));
+    assert!(def.modifications.contains(&ContinuousModification::AddType {
+        core_type: CoreType::Creature,
+    }));
+    assert!(def.modifications.iter().any(|modification| matches!(
+        modification,
+        ContinuousModification::SetPowerDynamic { value }
+            if matches!(value, QuantityExpr::Ref { qty: QuantityRef::ObjectManaValue { scope: ObjectScope::Recipient } })
+    )));
+    assert!(def.modifications.iter().any(|modification| matches!(
+        modification,
+        ContinuousModification::SetToughnessDynamic { value }
+            if matches!(value, QuantityExpr::Ref { qty: QuantityRef::ObjectManaValue { scope: ObjectScope::Recipient } })
+    )));
+}
+
 /// CR 205.2 + CR 613.1d + CR 613.4b + CR 109.5: Karn-shape, controller-scoped
 /// (`you control`). The `controller` field on the typed filter must be set.
 #[test]

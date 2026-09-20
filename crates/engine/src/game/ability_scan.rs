@@ -1587,6 +1587,11 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             // class — no battlefield target filter to descend ⇒ NONE (behavior unchanged
             // from the former `.. => NONE` residual, now explicit).
             ForEachCategoryAction::ExileFromPool { .. } => Axes::NONE,
+            // CR 608.2c: the per-member battlefield choice carries the same
+            // board-growth dependency as PutCounter's target filter.
+            ForEachCategoryAction::ChooseOne { target } => {
+                scan_target_filter(target, target_ctx, mode)
+            }
         },
         Effect::ChooseObjectsIntoTrackedSet {
             chooser,
@@ -1743,11 +1748,15 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
         Effect::ChangeTargets {
             target,
             forced_to,
+            new_target_filter,
             scope: _,
         } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_target_filter(target, target_ctx, mode));
             if let Some(x) = forced_to {
+                acc = acc.or(scan_target_filter(x, target_ctx, mode));
+            }
+            if let Some(x) = new_target_filter {
                 acc = acc.or(scan_target_filter(x, target_ctx, mode));
             }
             acc
@@ -1847,7 +1856,13 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc = acc.or(scan_target_filter(target, target_ctx, mode));
             acc
         }
-        Effect::RuntimeHandled { handler: _ } => Axes::NONE,
+        Effect::RuntimeHandled { handler } => match handler {
+            crate::types::ability::RuntimeHandler::LookAtObject { target } => {
+                scan_target_filter(target, target_ctx, mode)
+            }
+            crate::types::ability::RuntimeHandler::NinjutsuFamily
+            | crate::types::ability::RuntimeHandler::MoralityShift => Axes::NONE,
+        },
         Effect::Incubate { count } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_quantity_expr(count, mode));
@@ -2795,6 +2810,11 @@ fn scan_quantity_expr(x: &QuantityExpr, mode: ScanMode) -> Axes {
 fn scan_ability_condition(x: &AbilityCondition, mode: ScanMode) -> Axes {
     match x {
         AbilityCondition::TriggerEventTargetDamagedBySourceThisTurn => Axes {
+            event: true,
+            sibling: false,
+            projected: false,
+        },
+        AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn => Axes {
             event: true,
             sibling: false,
             projected: false,
@@ -4187,7 +4207,12 @@ fn scan_static_condition(x: &StaticCondition, mode: ScanMode) -> Axes {
             sibling: false,
             projected: true,
         },
-        StaticCondition::OpponentPoisonAtLeast { count: _ } => Axes {
+        StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn => Axes {
+            event: false,
+            sibling: false,
+            projected: true,
+        },
+        StaticCondition::OpponentPoisonAtLeast { .. } => Axes {
             event: false,
             sibling: false,
             projected: true,
@@ -4318,6 +4343,7 @@ fn scan_filter_prop(x: &FilterProp, mode: ScanMode) -> Axes {
         | FilterProp::ConvokedSource
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -4379,6 +4405,7 @@ fn scan_filter_prop(x: &FilterProp, mode: ScanMode) -> Axes {
         // CR 205.3m + CR 903.3: reads commander designation + the candidate's own
         // creature types — a board/object read, no player resource.
         | FilterProp::SharesCreatureTypeWithCommander
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => Axes::NONE,
 
         // --- QuantityExpr-bearing: recurse so `Ref(LifeTotal)` / `PlayerCounter`
@@ -4432,6 +4459,7 @@ fn scan_filter_prop(x: &FilterProp, mode: ScanMode) -> Axes {
         FilterProp::AttackedThisTurn { defender } => {
             defender.as_ref().map_or(Axes::NONE, scan_controller_ref)
         }
+        FilterProp::AttackedLastTurn => Axes::NONE,
         FilterProp::NameMatchesAnyPermanent { controller } => {
             controller.as_ref().map_or(Axes::NONE, scan_controller_ref)
         }
@@ -8939,7 +8967,10 @@ mod tests {
         ));
         // Static-condition dormant reader (poison).
         assert!(static_condition_reads_projected_resource(
-            &StaticCondition::OpponentPoisonAtLeast { count: 1 }
+            &StaticCondition::OpponentPoisonAtLeast {
+                count: 1,
+                player: None,
+            }
         ));
         // Replacement-condition dormant reader (life).
         assert!(replacement_condition_reads_projected_resource(
@@ -8947,7 +8978,10 @@ mod tests {
         ));
         // Transient ForAsLongAs duration wrapping a life-reading static condition.
         assert!(duration_reads_projected_resource(&Duration::ForAsLongAs {
-            condition: StaticCondition::OpponentPoisonAtLeast { count: 1 }
+            condition: StaticCondition::OpponentPoisonAtLeast {
+                count: 1,
+                player: None,
+            }
         }));
     }
 

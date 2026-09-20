@@ -3379,6 +3379,25 @@ pub fn parse_type_phrase_with_ctx<'a>(
     // `nom_filter::parse_zone_controller`. Composes with a preceding "you own"
     // → `FilterProp::Owned{You}`, yielding the owned-but-opponent-controlled
     // population.
+    // CR 105.4: Old Oracle also places the chosen-color qualifier before this
+    // relative controller clause ("creatures of that color that player
+    // controls"). Consume it before the controller parser gets the
+    // `that player controls` tail. The post-controller sibling below handles
+    // the equally valid "creatures that player controls of that color" order.
+    {
+        let remaining_chosen_color = lower[pos..].trim_start();
+        let chosen_color_offset = lower[pos..].len() - remaining_chosen_color.len();
+        if let Ok((rest, _)) = alt((
+            tag::<_, _, OracleError<'_>>("of that color"),
+            tag("of the chosen color"),
+        ))
+        .parse(remaining_chosen_color)
+        {
+            properties.push(FilterProp::IsChosenColor);
+            pos += chosen_color_offset + remaining_chosen_color.len() - rest.len();
+        }
+    }
+
     if controller.is_none() {
         let remaining_that_ctrl = lower[pos..].trim_start();
         let that_ctrl_offset = lower[pos..].len() - remaining_that_ctrl.len();
@@ -3404,6 +3423,22 @@ pub fn parse_type_phrase_with_ctx<'a>(
                 }
             }
         }
+    }
+
+    // CR 105.4: The chosen-color qualifier may also trail a controller clause
+    // ("creatures that player controls of that color"). Keep both orders in
+    // this shared type-phrase grammar so per-player quantities and ordinary
+    // object filters use the same AST shape.
+    let remaining_chosen_color = lower[pos..].trim_start();
+    let remaining_chosen_color_offset = lower[pos..].len() - remaining_chosen_color.len();
+    if let Ok((rest, _)) = alt((
+        tag::<_, _, OracleError<'_>>("of that color"),
+        tag("of the chosen color"),
+    ))
+    .parse(remaining_chosen_color)
+    {
+        properties.push(FilterProp::IsChosenColor);
+        pos += remaining_chosen_color_offset + remaining_chosen_color.len() - rest.len();
     }
 
     if let Some((prop, consumed)) = parse_attacking_defender_suffix(&lower[pos..]) {
@@ -3703,6 +3738,21 @@ pub fn parse_type_phrase_with_ctx<'a>(
     {
         has_chosen_name = true;
         pos += chosen_offset + (remaining_chosen.len() - rest.len());
+    }
+
+    // CR 608.2d: "with the chosen ability" binds the object to the keyword
+    // selected earlier in the same resolving instruction (Phyrexian Splicer).
+    // Keep this as a typed property rather than a fixed `WithKeyword`: the
+    // selected value is persisted on the source only at activation/payment
+    // time and must be read when the target filter is evaluated.
+    let mut has_chosen_keyword = false;
+    let remaining_keyword = lower[pos..].trim_start();
+    let keyword_offset = lower[pos..].len() - remaining_keyword.len();
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("with the chosen ability")
+        .parse(remaining_keyword)
+    {
+        has_chosen_keyword = true;
+        pos += keyword_offset + (remaining_keyword.len() - rest.len());
     }
 
     // CR 608.2d: "of their choice" / "of his or her choice" — informational qualifier
@@ -4010,6 +4060,26 @@ pub fn parse_type_phrase_with_ctx<'a>(
     let filter = if has_chosen_name {
         TargetFilter::And {
             filters: vec![filter, TargetFilter::HasChosenName],
+        }
+    } else {
+        filter
+    };
+
+    let filter = if has_chosen_keyword {
+        match filter {
+            TargetFilter::Typed(mut typed) => {
+                typed.properties.push(FilterProp::HasChosenKeyword);
+                TargetFilter::Typed(typed)
+            }
+            filter => TargetFilter::And {
+                filters: vec![
+                    filter,
+                    TargetFilter::Typed(
+                        TypedFilter::default()
+                            .properties(vec![FilterProp::HasChosenKeyword]),
+                    ),
+                ],
+            },
         }
     } else {
         filter
@@ -4542,6 +4612,9 @@ pub(crate) fn is_adjective_prefix_prop(prop: &FilterProp) -> bool {
             // CR 110.5: "tapped [type]" / "untapped [type]".
             | FilterProp::Tapped
             | FilterProp::Untapped
+            // CR 702.26b: "phased-out [type]" is a leg-local battlefield
+            // designation, just like "transformed [type]".
+            | FilterProp::PhasedOut
             // CR 702.171b: "saddled [type]" adjective prefix.
             | FilterProp::IsSaddled
             | FilterProp::ProtectorMatches { .. }
@@ -4562,6 +4635,7 @@ pub(crate) fn is_adjective_prefix_prop(prop: &FilterProp) -> bool {
             // phrase that parsed them — never retroactively onto earlier Or
             // disjuncts ("artifact, enchantment, or creature with flying").
             | FilterProp::WithKeyword { .. }
+            | FilterProp::HasChosenKeyword
             | FilterProp::WithoutKeyword { .. }
             | FilterProp::WithoutKeywordKind { .. }
             // CR 702.1: "<type> with [keyword kind]" (e.g. "a card with
@@ -4674,6 +4748,7 @@ fn prop_reads_creature_pt(prop: &FilterProp) -> bool {
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -4725,11 +4800,13 @@ fn prop_reads_creature_pt(prop: &FilterProp) -> bool {
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
         | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::AttackedLastTurn
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
         | FilterProp::FaceDown
         | FilterProp::Transformed
+        | FilterProp::PhasedOut
         | FilterProp::TargetsOnly { .. }
         | FilterProp::Targets { .. }
         | FilterProp::CouldBeTargetedByTriggeringSpell
@@ -5740,6 +5817,10 @@ pub(crate) fn parse_combat_status_prefix(text: &str) -> Option<(FilterProp, usiz
                 // as an adjective prefix in type phrases ("transformed permanent",
                 // Mutagen Connoisseur).
                 | FilterProp::Transformed
+                // CR 702.26b: "phased-out" is an explicit phasing designation. It
+                // is evaluated by the phase-in resolver through the phased-out-aware
+                // filter choke point.
+                | FilterProp::PhasedOut
                 // CR 701.60b: "suspected" is a battlefield designation that appears
                 // as an adjective prefix in type phrases ("suspected creatures").
                 | FilterProp::Suspected
@@ -5754,6 +5835,10 @@ pub(crate) fn parse_combat_status_prefix(text: &str) -> Option<(FilterProp, usiz
     // Handle "face-down " (hyphenated variant not in the nom combinator).
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("face-down ").parse(text) {
         return Some((FilterProp::FaceDown, text.len() - rest.len()));
+    }
+
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("phased-out ").parse(text) {
+        return Some((FilterProp::PhasedOut, text.len() - rest.len()));
     }
 
     None
@@ -8030,6 +8115,8 @@ pub(crate) fn attachment_kinds_filter_prop(
 /// - CR 120.6 + CR 120.9: "that was dealt damage this turn" → `WasDealtDamageThisTurn`
 /// - CR 400.7: "that entered (the battlefield) this turn" → `EnteredThisTurn`
 /// - CR 508.1a: "that attacked this turn" → `AttackedThisTurn`
+/// - CR 508.1a + CR 514.2: "that attacked during their controller's last turn"
+///   → `AttackedLastTurn`
 /// - CR 509.1a: "that blocked this turn" → `BlockedThisTurn`
 /// - CR 301.5 + CR 303.4: "that are enchanted or equipped" → attachment predicate
 ///
@@ -8216,7 +8303,7 @@ pub(crate) fn parse_that_clause_suffix<'a>(
     ))
     .parse(after_that)
     {
-        if let Some((prop, consumed)) = parse_counter_spec_after_lead(after_verb, Comparator::GE) {
+    if let Some((prop, consumed)) = parse_counter_spec_after_lead(after_verb, Comparator::GE) {
             let verb_len = after_that.len() - after_verb.len();
             return Some((vec![prop], that_len + verb_len + consumed));
         }
@@ -8242,6 +8329,23 @@ pub(crate) fn parse_that_clause_suffix<'a>(
                 let consumed = that_len + after_that.len() - rest.len();
                 return Some((vec![FilterProp::HasAdventure], consumed));
             }
+        }
+    }
+
+    // CR 508.1a + CR 514.2: Halls of Mist's global restriction uses a
+    // controller-relative look-back, not the current-turn attacker ledger.
+    // Keep this before the present-turn verb table; the phrases are disjoint,
+    // but this makes the temporal distinction explicit at the grammar boundary.
+    for phrase in [
+        "attacked during their controller's last turn",
+        "attacked during its controller's last turn",
+        "attacked during your last turn",
+    ] {
+        if let Ok((_, _)) = tag::<_, _, OracleError<'_>>(phrase).parse(after_that) {
+            return Some((
+                vec![FilterProp::AttackedLastTurn],
+                that_len + phrase.len(),
+            ));
         }
     }
 
@@ -13184,6 +13288,18 @@ mod tests {
     }
 
     #[test]
+    fn creature_with_the_chosen_ability_composes_dynamic_keyword_filter() {
+        let (f, rest) = parse_target("creature with the chosen ability");
+        assert_eq!(rest, "");
+        assert!(matches!(
+            f,
+            TargetFilter::Typed(TypedFilter { type_filters, properties, .. })
+                if type_filters.contains(&TypeFilter::Creature)
+                    && properties == vec![FilterProp::HasChosenKeyword]
+        ));
+    }
+
+    #[test]
     fn creatures_with_flying_does_not_attach_has_chosen_name() {
         // Negative: an unrelated "with <keyword>" suffix must not spuriously
         // attach HasChosenName.
@@ -16604,6 +16720,19 @@ mod tests {
     }
 
     #[test]
+    fn phased_out_is_a_typed_status_prefix() {
+        // CR 702.26b: the hyphenated adjective must survive the shared type
+        // phrase parser as a typed property, not as an opaque subtype.
+        let (filter, remainder) = parse_type_phrase("phased-out creatures");
+        assert!(remainder.trim().is_empty(), "remainder: '{remainder}'");
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter");
+        };
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert!(tf.properties.contains(&FilterProp::PhasedOut));
+    }
+
+    #[test]
     fn parse_type_phrase_unblocked_attacking_creatures_you_control() {
         let (filter, remainder) = parse_type_phrase("unblocked attacking creatures you control");
         assert!(remainder.trim().is_empty(), "remainder: '{remainder}'");
@@ -17506,6 +17635,15 @@ mod tests {
         assert_eq!(props, vec![FilterProp::AttackedThisTurn { defender: None }]);
     }
 
+    #[test]
+    fn that_attacked_during_controller_last_turn_emits_last_turn_history() {
+        let text = " that attacked during their controller's last turn";
+        let (props, consumed) =
+            parse_that_clause_suffix(text, None).expect("last-turn attack clause must parse");
+        assert_eq!(consumed, text.len());
+        assert_eq!(props, vec![FilterProp::AttackedLastTurn]);
+    }
+
     /// Upstream-truncated form: some producers (the "tap all" target extractor)
     /// strip the trailing " this turn" duration before the target text reaches
     /// the type-phrase parser, leaving "that didn't attack" at end-of-string.
@@ -17603,6 +17741,30 @@ mod tests {
             "trailing negated clause must attach after the controller clause, got {:?}",
             tf.properties
         );
+    }
+
+    /// CR 105.4 + CR 109.4: Searing Rays uses the old-border ordering
+    /// "creatures of that color that player controls" inside a per-player
+    /// damage quantity. The chosen-color property must survive before the
+    /// relative controller clause, and the controller must remain the scoped
+    /// player rather than collapsing to the caster.
+    #[test]
+    fn creatures_of_that_color_that_player_controls_full_phrase() {
+        let mut ctx = ParseContext {
+            relative_player_scope: Some(ControllerRef::ScopedPlayer),
+            ..ParseContext::default()
+        };
+        let (filter, rest) = parse_type_phrase_with_ctx(
+            "creatures of that color that player controls",
+            &mut ctx,
+        );
+        assert!(rest.trim().is_empty(), "remainder: '{rest}'");
+        let TargetFilter::Typed(tf) = filter else {
+            panic!("expected Typed filter, got {filter:?}");
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::ScopedPlayer));
+        assert!(tf.type_filters.contains(&TypeFilter::Creature));
+        assert!(tf.properties.contains(&FilterProp::IsChosenColor));
     }
 
     #[test]

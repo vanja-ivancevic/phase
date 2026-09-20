@@ -1340,6 +1340,20 @@ fn replacement_choice_player(
             .map(|obj| obj.owner)
             .unwrap_or_else(|| proposed.affected_player(state));
     }
+    // CR 614.12 + CR 109.4: an effect-created replacement hosted in the
+    // pending damage registry has no object controller to consult. Its
+    // installer stamped `source_controller`, which is the player who said
+    // "you may" (Blood of the Martyr), so that player owns the choice even
+    // when damage is being dealt to another player's creature.
+    if rid.source == ObjectId(0) && matches!(proposed, ProposedEvent::Damage { .. }) {
+        if let Some(player) = state
+            .pending_damage_replacements
+            .get(rid.index)
+            .and_then(|replacement| replacement.source_controller)
+        {
+            return player;
+        }
+    }
     proposed.affected_player(state)
 }
 
@@ -1557,9 +1571,9 @@ fn pay_replacement_may_cost(
         // permanent enters only after the card actually leaves the hand.
         AbilityCost::Discard {
             selection: crate::types::ability::CardSelectionMode::Chosen,
-            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+            self_scope,
             ..
-        } => {
+        } if self_scope.is_from_hand() => {
             // The synthesized ability is the payment context for the resolution
             // authority: `pay_ability_cost_for_resolution` reads only its
             // `source_id` and resolves the (here fixed) discard `count` against
@@ -2073,6 +2087,7 @@ fn redirect_damage_event(
         state,
         recipient,
         rid.source,
+        rid.index,
         source_id,
         chosen,
     )
@@ -2838,6 +2853,42 @@ fn destroy_applier(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
 ) -> ApplyResult {
+    // CR 614.1a + CR 701.7: Pyramids' "remove all damage marked on it
+    // instead" is a one-shot destruction replacement, not regeneration. Clear
+    // damage and prevent the destruction without tapping or removing the land
+    // from combat. Keep this exact to the parser-produced execute shape so a
+    // future destruction replacement with a chained RemoveAllDamage effect does
+    // not accidentally acquire Pyramids' replacement semantics.
+    let clears_damage_instead = replacement_definition_for_id(state, rid)
+        .and_then(|repl| repl.execute.as_deref())
+        .is_some_and(|execute| {
+            execute.sub_ability.is_none()
+                && matches!(
+                    &*execute.effect,
+                    Effect::RemoveAllDamage {
+                        target: TargetFilter::SelfRef,
+                    }
+                )
+        });
+    if clears_damage_instead {
+        let ProposedEvent::Destroy { object_id, .. } = &event else {
+            return ApplyResult::Modified(event);
+        };
+        if rid.source != *object_id {
+            return ApplyResult::Modified(event);
+        }
+        if let Some(obj) = state.objects.get_mut(object_id) {
+            obj.damage_marked = 0;
+            obj.dealt_deathtouch_damage = false;
+        }
+        if let Some(obj) = state.objects.get_mut(&rid.source) {
+            if let Some(repl) = obj.replacement_definitions.get_mut(rid.index) {
+                repl.is_consumed = true;
+            }
+        }
+        return ApplyResult::Prevented;
+    }
+
     // Check if this replacement is a regeneration shield
     let is_regen = state
         .objects
@@ -4536,6 +4587,15 @@ fn produce_mana_applier(
             Some(ManaModification::ReplaceWith {
                 mana_type: replacement,
             }) => (replacement, count),
+            Some(ManaModification::ReplaceWithChosenColor) => {
+                let chosen = state
+                    .objects
+                    .get(&rid.source)
+                    .and_then(|obj| obj.chosen_color())
+                    .map(Into::into)
+                    .unwrap_or(mana_type);
+                (chosen, count)
+            }
             Some(ManaModification::Multiply { factor }) => {
                 (mana_type, count.saturating_mul(factor))
             }
@@ -7901,10 +7961,7 @@ pub(crate) fn proposed_event_prompt_cause(
     }
     let mut causes = ReplacementPromptCauses::NONE;
     for rid in &candidates {
-        let def = state
-            .objects
-            .get(&rid.source)
-            .and_then(|o| o.replacement_definitions.get(rid.index));
+        let def = replacement_definition_for_id(state, *rid);
         let Some(def) = def else {
             // CR 614.1a: no resolvable definition (every virtual candidate) ⇒
             // conservatively interactive.
@@ -8873,6 +8930,7 @@ fn apply_single_replacement(
                         // affected event (issue #5676).
                         | (ProposedEvent::CoinFlip { .. }, Effect::FlipCoins { .. })
                         | (ProposedEvent::Damage { .. }, Effect::RemoveAllDamage { .. })
+                        | (ProposedEvent::Destroy { .. }, Effect::RemoveAllDamage { .. })
                         // CR 614.1a + CR 111.1: Full token substitution
                         // (Divine Visitation) is performed inline by
                         // `create_token_applier`; stashing the same
@@ -9376,7 +9434,8 @@ fn mana_commute_class(modification: &crate::types::ability::ManaModification) ->
     use crate::types::ability::ManaModification;
     match modification {
         ManaModification::Multiply { .. } => CommuteClass::Multiplicative,
-        ManaModification::ReplaceWith { .. } => CommuteClass::NonCommuting,
+        ManaModification::ReplaceWith { .. }
+        | ManaModification::ReplaceWithChosenColor => CommuteClass::NonCommuting,
     }
 }
 
@@ -9750,12 +9809,16 @@ fn replacement_definition_for_id(
     state: &GameState,
     rid: ReplacementId,
 ) -> Option<&ReplacementDefinition> {
-    state
-        .liminal_entries
-        .get(&rid.source)
-        .map(|entry| entry.object.projected())
-        .or_else(|| state.objects.get(&rid.source))
-        .and_then(|obj| obj.replacement_definitions.get(rid.index))
+    if rid.source == ObjectId(0) {
+        state.pending_damage_replacements.get(rid.index)
+    } else {
+        state
+            .liminal_entries
+            .get(&rid.source)
+            .map(|entry| entry.object.projected())
+            .or_else(|| state.objects.get(&rid.source))
+            .and_then(|obj| obj.replacement_definitions.get(rid.index))
+    }
         // CR 121.2: an instruction to draw multiple cards is performed as that many
         // individual draws, and CR 121.2a modifies the instruction's count *before* any
         // individual draw happens. A Draw replacement must therefore declare which of the
@@ -16687,6 +16750,57 @@ mod tests {
         id
     }
 
+    #[test]
+    fn pyramids_destroy_replacement_clears_damage_without_regeneration() {
+        // CR 614.1a + CR 701.7: Pyramids prevents the destruction and removes
+        // marked damage, but it does not tap the land or remove it from combat.
+        let mut state = GameState::new_two_player(42);
+        let land = crate::game::zones::create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Target Land".to_string(),
+            Zone::Battlefield,
+        );
+        let replacement = ReplacementDefinition::new(ReplacementEvent::Destroy)
+            .valid_card(TargetFilter::SelfRef)
+            .execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::RemoveAllDamage {
+                    target: TargetFilter::SelfRef,
+                },
+            ));
+        {
+            let obj = state.objects.get_mut(&land).expect("land exists");
+            obj.card_types
+                .core_types
+                .push(crate::types::card_type::CoreType::Land);
+            obj.damage_marked = 5;
+            obj.dealt_deathtouch_damage = true;
+            obj.tapped = false;
+            let mut replacement = replacement;
+            replacement.consume_on_apply = true;
+            obj.replacement_definitions.push(replacement);
+        }
+
+        let proposed = ProposedEvent::Destroy {
+            object_id: land,
+            source: None,
+            cant_regenerate: false,
+            applied: HashSet::new(),
+        };
+        let mut events = Vec::new();
+        let result = replace_event(&mut state, proposed, &mut events);
+
+        assert_eq!(result, ReplacementResult::Prevented);
+        assert!(state.battlefield.contains(&land));
+        let obj = state.objects.get(&land).expect("land survives");
+        assert_eq!(obj.damage_marked, 0);
+        assert!(!obj.dealt_deathtouch_damage);
+        assert!(!obj.tapped, "Pyramids is not a regeneration effect");
+        assert!(obj.replacement_definitions[0].is_consumed);
+    }
+
     fn create_creature_with_umbra(state: &mut GameState, owner: PlayerId) -> (ObjectId, ObjectId) {
         let creature = crate::game::zones::create_object(
             state,
@@ -17824,6 +17938,55 @@ mod tests {
                 );
             }
             other => panic!("expected Execute(ProduceMana), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn produce_mana_replacement_reads_source_chosen_color() {
+        // CR 106.3 + CR 614.1a: Hall of Gemstone changes a land's produced
+        // color to the color currently chosen on the Hall, while retaining the
+        // production amount and the tapped-for-mana event context.
+        use crate::types::ability::{ChosenAttribute, ManaModification, ManaReplacementScope};
+        use crate::types::mana::{ManaColor, ManaType};
+
+        let land_id = ObjectId(10);
+        let hall_id = ObjectId(20);
+        let repl = ReplacementDefinition::new(ReplacementEvent::ProduceMana)
+            .mana_modification(ManaModification::ReplaceWithChosenColor)
+            .mana_replacement_scope(ManaReplacementScope::TappedForMana)
+            .valid_card(TargetFilter::Typed(TypedFilter::land()));
+        let mut state = test_state_with_object(hall_id, Zone::Battlefield, vec![repl]);
+        state
+            .objects
+            .get_mut(&hall_id)
+            .expect("Hall source exists")
+            .chosen_attributes
+            .push(ChosenAttribute::Color(ManaColor::Red));
+
+        let mut land = GameObject::new(
+            land_id,
+            CardId(2),
+            PlayerId(0),
+            "Forest".to_string(),
+            Zone::Battlefield,
+        );
+        land.card_types.core_types.push(CoreType::Land);
+        state.objects.insert(land_id, land);
+        state.battlefield.push_back(land_id);
+
+        let mut events = Vec::new();
+        let result = replace_event(
+            &mut state,
+            ProposedEvent::produce_mana_with_context(land_id, PlayerId(0), ManaType::Green, true),
+            &mut events,
+        );
+
+        match result {
+            ReplacementResult::Execute(ProposedEvent::ProduceMana { mana_type, count, .. }) => {
+                assert_eq!(mana_type, ManaType::Red);
+                assert_eq!(count, 1);
+            }
+            other => panic!("expected Execute(ProduceMana), got {other:?}"),
         }
     }
 
@@ -21093,6 +21256,68 @@ mod tests {
             "UnlessYourTurn shield should match on opponent's turn"
         );
     }
+
+    #[test]
+    fn pending_optional_damage_redirect_asks_installer_and_redirects_to_installer() {
+        // CR 614.12: Blood of the Martyr's "you may" belongs to the spell's
+        // controller, even when the affected creature (and therefore the
+        // proposed damage event) belongs to the opponent. The pending registry
+        // has no source object, so both the prompt owner and Controller
+        // recipient must use the stamped source_controller.
+        let registry = build_replacement_registry();
+        let mut state = GameState::new_two_player(42);
+        // Keep the Blood shield at a non-zero pending index so recipient
+        // resolution cannot accidentally use the first pending entry's
+        // controller when several floating replacements coexist.
+        state
+            .pending_damage_replacements
+            .push(ReplacementDefinition::new(ReplacementEvent::Moved));
+        let mut shield = ReplacementDefinition::new(ReplacementEvent::DamageDone)
+            .redirection_shield(
+                DamageRedirectTarget::Controller,
+                PreventionAmount::All,
+                RedirectionLifetime::Continuous,
+            )
+            .mode(ReplacementMode::Optional { decline: None });
+        shield.source_controller = Some(PlayerId(1));
+        state.pending_damage_replacements.push(shield);
+
+        let proposed = ProposedEvent::Damage {
+            source_id: ObjectId(50),
+            target: TargetRef::Player(PlayerId(0)),
+            amount: 3,
+            is_combat: false,
+            applied: HashSet::new(),
+        };
+        let mut events = Vec::new();
+        assert_eq!(
+            replace_event(&mut state, proposed, &mut events),
+            ReplacementResult::NeedsChoice(PlayerId(1)),
+            "the installer, not the damaged player, must own the optional choice"
+        );
+
+        let WaitingFor::ReplacementChoice {
+            player,
+            candidate_count,
+            ..
+        } = replacement_choice_waiting_for(PlayerId(1), &state)
+        else {
+            panic!("expected Blood's optional damage replacement prompt");
+        };
+        assert_eq!(player, PlayerId(1));
+        assert_eq!(candidate_count, 2);
+
+        let result = continue_replacement(&mut state, 0, &mut events);
+        assert!(matches!(
+            result,
+            ReplacementResult::Execute(ProposedEvent::Damage {
+                target: TargetRef::Player(PlayerId(1)),
+                amount: 3,
+                ..
+            })
+        ));
+    }
+
     /// #5652 (CR 615.1): a prevention effect is a "shield around whatever it's
     /// affecting" — a self-scoped shield must fire only for damage dealt TO its
     /// own object, never for damage the object DEALS. Swans of Bryn

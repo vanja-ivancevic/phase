@@ -1978,6 +1978,7 @@ fn legacy_ability_condition(x: &AbilityCondition) -> bool {
             legacy_quantity_expr(lhs) || legacy_quantity_expr(rhs)
         }
         AbilityCondition::PreviousEffectAmount { rhs, .. } => legacy_quantity_expr(rhs),
+        AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn => false,
         AbilityCondition::ScopedPlayerMatches { filter } => legacy_player_filter(filter),
         AbilityCondition::DiscardedCardMatchesFilter { filter } => legacy_target_filter(filter),
         AbilityCondition::ConditionInstead { inner }
@@ -2064,6 +2065,7 @@ fn legacy_static_condition(x: &StaticCondition) -> bool {
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
         | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
         | StaticCondition::SourceMatchesFilter { .. }
         | StaticCondition::TopOfLibraryMatches { .. }
         | StaticCondition::UnlessPay { .. }
@@ -2468,6 +2470,7 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::NameMatchesAnyPermanent { controller: c } => {
             c.as_ref().is_some_and(legacy_controller_ref)
         }
+        FilterProp::AttackedLastTurn => false,
         FilterProp::AnyOf { props } => props.iter().any(legacy_filter_prop),
         FilterProp::Not { prop } => legacy_filter_prop(prop),
         // CR 607.2d / CR 607.2m (by analogy): player-anchor labels are live
@@ -2498,6 +2501,7 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::ConvokedSource
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -2562,6 +2566,7 @@ fn legacy_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::Historic
         | FilterProp::NotHistoric
         | FilterProp::CouldBeTargetedByTriggeringSpell
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
     }
 }
@@ -2748,6 +2753,7 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::NameMatchesAnyPermanent { controller: c } => {
             c.as_ref().is_some_and(member_bound_controller_ref)
         }
+        FilterProp::AttackedLastTurn => false,
         FilterProp::AnyOf { props } => props.iter().any(member_bound_filter_prop),
         FilterProp::Not { prop } => member_bound_filter_prop(prop),
         // CR 607.2d / CR 607.2m (by analogy): this reads durable per-player anchor
@@ -2781,6 +2787,7 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::ConvokedSource
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -2843,6 +2850,7 @@ fn member_bound_filter_prop(p: &FilterProp) -> bool {
         | FilterProp::Historic
         | FilterProp::NotHistoric
         | FilterProp::CouldBeTargetedByTriggeringSpell
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
     }
 }
@@ -3371,8 +3379,15 @@ fn legacy_effect(x: &Effect) -> bool {
         } => oqe(amount_dynamic) || legacy_target_filter(target),
         Effect::PayCost { scale, payer, .. } => oqe(scale) || legacy_target_filter(payer),
         Effect::ChangeTargets {
-            target, forced_to, ..
-        } => legacy_target_filter(target) || otf(forced_to),
+            target,
+            forced_to,
+            new_target_filter,
+            ..
+        } => {
+            legacy_target_filter(target)
+                || otf(forced_to)
+                || otf(new_target_filter)
+        }
         Effect::CreateDamageReplacement {
             source_filter,
             redirect_object_filter,
@@ -5583,11 +5598,15 @@ fn rw_effect(
             target,
             scope: _,
             forced_to,
+            new_target_filter,
         } => {
             let mut p = ext_write(StateKind::StackShape);
             flag_legacy_write_target(&mut p, target);
             if let Some(ft) = forced_to {
                 flag_legacy_write_target(&mut p, ft);
+            }
+            if let Some(nt) = new_target_filter {
+                flag_legacy_write_target(&mut p, nt);
             }
             (p, None)
         }
@@ -6562,6 +6581,7 @@ fn rw_ability_condition(x: &AbilityCondition) -> RwProfile {
         }
         AbilityCondition::SourceIsTapped => reads_src_of(StateKind::TapState),
         AbilityCondition::ControllerControlsMatching { filter } => board_membership_read(filter),
+        AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn => reads_event_live(),
         AbilityCondition::ScopedPlayerMatches { filter } => rw_player_filter(filter),
         AbilityCondition::TriggeringSpellTargetsFilter { filter: _ }
         | AbilityCondition::ZoneChangeObjectMatchesFilter { .. }
@@ -6821,7 +6841,7 @@ fn rw_static_condition(x: &StaticCondition) -> RwProfile {
         StaticCondition::HasCounters { .. } => reads_src_of(StateKind::ObjectCounters),
         StaticCondition::IsTapped { scope, .. } => read_object_scope(scope, StateKind::TapState),
         StaticCondition::SourceIsTapped => reads_src_of(StateKind::TapState),
-        StaticCondition::OpponentPoisonAtLeast { count: _ } => {
+        StaticCondition::OpponentPoisonAtLeast { .. } => {
             reads_player_of(StateKind::PlayerLife)
         }
         StaticCondition::SpellCastWithVariantThisTurn { .. } => {
@@ -6833,6 +6853,9 @@ fn rw_static_condition(x: &StaticCondition) -> RwProfile {
         // conservatively depending on it invalidates the cached gate whenever the
         // turn sequence changes.
         StaticCondition::AnyPlayerAttackedYouLastTurn => {
+            reads_player_of(StateKind::TurnStructure)
+        }
+        StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn => {
             reads_player_of(StateKind::TurnStructure)
         }
         StaticCondition::SourceMatchesFilter { filter: _ } => {
@@ -8742,6 +8765,7 @@ mod tests {
             target: TargetFilter::StackSpell,
             scope: crate::types::game_state::RetargetScope::Single,
             forced_to: None,
+            new_target_filter: None,
         }));
         assert!(
             ct.writes_external.stack_shape,
@@ -8757,6 +8781,7 @@ mod tests {
                     target: TargetFilter::StackSpell,
                     scope: crate::types::game_state::RetargetScope::Single,
                     forced_to: None,
+                    new_target_filter: None,
                 }),
                 &batch()
             ),

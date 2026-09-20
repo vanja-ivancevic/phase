@@ -2433,6 +2433,22 @@ fn parse_number_of_type_on_battlefield_with_keyword(input: &str) -> OracleResult
 
 /// Parse "cards in your graveyard" / "creature cards in your graveyard" after "the number of".
 fn parse_number_of_cards_in_zone(input: &str) -> OracleResult<'_, QuantityRef> {
+    // CR 402.1 + CR 107.3c: old-border Oracle uses the singular indefinite
+    // form "cards in an opponent's hand" for a cross-player hand-size
+    // quantity (Bargaining Table). In a quantity position this is the same
+    // opponent aggregate represented by the legacy OpponentHandSize channel:
+    // the largest hand among the controller's opponents.
+    const OPPONENT_HAND_TEXT: &str = "cards in an opponent's hand";
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>(OPPONENT_HAND_TEXT).parse(input) {
+        return Ok((
+            rest,
+            QuantityRef::HandSize {
+                player: PlayerScope::Opponent {
+                    aggregate: AggregateFunction::Max,
+                },
+            },
+        ));
+    }
     parse_zone_card_count(input)
 }
 
@@ -3631,7 +3647,7 @@ fn parse_damage_dealt_this_turn_ref(input: &str) -> OracleResult<'_, QuantityRef
     // ability source.
     if let Ok((rest, _)) = (
         tag::<_, _, OracleError<'_>>("damage already dealt to "),
-        tag("it"),
+        alt((tag("it"), tag("that player"))),
         tag(" this turn"),
     )
         .parse(input)
@@ -4722,17 +4738,27 @@ fn parse_for_each_differently_named(input: &str) -> OracleResult<'_, QuantityRef
     ))
 }
 
-/// Parse "different <quality> among <type-phrase>" patterns (distinct-value
+/// Parse "[different ]<quality> among <type-phrase>" patterns (distinct-value
 /// population count). Used for "for each different power among creatures you
 /// control" (Golden Ratio), "different mana value among nonland permanents you
 /// control" (Lunar Insight), "different mana value among nonland cards in your
 /// graveyard" (Sudden Insight), and the "the number of different powers among
-/// creatures you control" form (Celebrate the Harvest). The quality-generalized
-/// sibling of `parse_for_each_differently_named` (which is the Name case).
+/// creatures you control" form (Celebrate the Harvest). The bare mana-value
+/// form is the wording used by Graveyard Shift: "five or more mana values among
+/// cards in your graveyard." Only mana value permits the omitted "different"
+/// adjective; bare colors/powers/etc. remain on their dedicated grammar paths.
+/// The quality-generalized sibling of `parse_for_each_differently_named` (which
+/// is the Name case).
 /// CR 201.2 + CR 603.4: Distinct-by-quality population count.
 fn parse_distinct_quality_among_objects(input: &str) -> OracleResult<'_, QuantityRef> {
-    let (rest, _) = tag("different ").parse(input)?;
+    let (rest, different) = opt(tag("different ")).parse(input)?;
     let (rest, quality) = parse_shared_quality(rest)?;
+    if different.is_none() && quality != SharedQuality::ManaValue {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
     let (rest, _) = tag(" among ").parse(rest)?;
     let type_text = rest.trim_end_matches('.').trim_end_matches(',');
     let (filter, remainder) = parse_type_phrase(type_text);
@@ -11028,6 +11054,27 @@ mod tests {
         let (rest, q) =
             parse_for_each_clause_ref("different mana value among nonland cards in your graveyard")
                 .unwrap();
+        assert_eq!(rest, "");
+        match q {
+            QuantityRef::ObjectCountDistinct { filter, qualities } => {
+                assert_eq!(qualities, vec![SharedQuality::ManaValue]);
+                assert_eq!(
+                    filter.extract_in_zone(),
+                    Some(crate::types::zones::Zone::Graveyard),
+                    "graveyard zone must survive into the filter: {filter:?}"
+                );
+            }
+            other => panic!("expected ObjectCountDistinct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_bare_mana_values_among_graveyard_cards_as_distinct_values() {
+        // Graveyard Shift: Oracle omits the adjective "different" while still
+        // counting distinct mana values (the same semantic axis as the explicit
+        // "different mana value" forms above).
+        let (rest, q) =
+            parse_quantity_ref("mana values among cards in your graveyard").unwrap();
         assert_eq!(rest, "");
         match q {
             QuantityRef::ObjectCountDistinct { filter, qualities } => {

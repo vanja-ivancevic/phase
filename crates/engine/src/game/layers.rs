@@ -1222,10 +1222,12 @@ pub(crate) fn evaluate_condition(
     controller: PlayerId,
     source_id: ObjectId,
 ) -> bool {
-    if static_condition_has_unresolvable_designation_anchor(condition) {
+    if static_condition_has_unresolvable_designation_anchor(condition)
+        || condition.requires_proposed_defending_player()
+    {
         return false;
     }
-    evaluate_condition_with_context(state, condition, controller, source_id, None)
+    evaluate_condition_with_context(state, condition, controller, source_id, None, None)
 }
 
 pub(crate) fn evaluate_condition_with_recipient(
@@ -1235,10 +1237,45 @@ pub(crate) fn evaluate_condition_with_recipient(
     source_id: ObjectId,
     recipient_id: ObjectId,
 ) -> bool {
-    if static_condition_has_unresolvable_designation_anchor(condition) {
+    if static_condition_has_unresolvable_designation_anchor(condition)
+        || condition.requires_proposed_defending_player()
+    {
         return false;
     }
-    evaluate_condition_with_context(state, condition, controller, source_id, Some(recipient_id))
+    evaluate_condition_with_context(
+        state,
+        condition,
+        controller,
+        source_id,
+        Some(recipient_id),
+        None,
+    )
+}
+
+/// CR 508.1b + CR 725.1: evaluate a static gate during declaration of an
+/// attack against a proposed target. The ordinary layer evaluator has no
+/// combat anchor and must reject non-controller designation subjects; this
+/// narrow entry point supplies the defender that the attack declaration is
+/// currently considering.
+pub(crate) fn evaluate_condition_for_proposed_defender(
+    state: &GameState,
+    condition: &StaticCondition,
+    controller: PlayerId,
+    source_id: ObjectId,
+    recipient_id: Option<ObjectId>,
+    defending_player: PlayerId,
+) -> bool {
+    if static_condition_has_unresolvable_designation_anchor_for_proposed_defender(condition) {
+        return false;
+    }
+    evaluate_condition_with_context(
+        state,
+        condition,
+        controller,
+        source_id,
+        recipient_id,
+        Some(defending_player),
+    )
 }
 
 /// CR 109.4 + CR 725.5 (static analogue of the trigger-side CR 603.4 gate):
@@ -1261,6 +1298,30 @@ pub(crate) fn evaluate_condition_with_recipient(
 /// condition "supported" when it can never bind at runtime.
 fn static_condition_has_unresolvable_designation_anchor(condition: &StaticCondition) -> bool {
     condition.has_unbindable_designation_anchor()
+}
+
+/// Combat is the one static-enforcement context that can answer the
+/// `DefendingPlayer` designation subject. Keep every other non-controller
+/// subject fail-closed, including nested Boolean forms.
+fn static_condition_has_unresolvable_designation_anchor_for_proposed_defender(
+    condition: &StaticCondition,
+) -> bool {
+    match condition {
+        StaticCondition::And { conditions } | StaticCondition::Or { conditions } => conditions
+            .iter()
+            .any(static_condition_has_unresolvable_designation_anchor_for_proposed_defender),
+        StaticCondition::Not { condition } => {
+            static_condition_has_unresolvable_designation_anchor_for_proposed_defender(condition)
+        }
+        _ => condition
+            .designation_player_anchor()
+            .is_some_and(|scope| {
+                !matches!(
+                    scope,
+                    PlayerScope::Controller | PlayerScope::DefendingPlayer
+                )
+            }),
+    }
 }
 
 /// Selects the controller that supplies "you" for an active effect's
@@ -1438,6 +1499,7 @@ fn static_condition_uses_object_population(condition: &StaticCondition) -> bool 
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
         | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
@@ -1596,6 +1658,7 @@ fn static_condition_characteristic_reads_at(
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
         | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
@@ -1721,6 +1784,7 @@ fn entered_object_perturbs_static_condition(
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
         | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::DuringYourTurn
@@ -1799,6 +1863,7 @@ fn evaluate_condition_with_context(
     controller: PlayerId,
     source_id: ObjectId,
     recipient_id: Option<ObjectId>,
+    proposed_defending_player: Option<PlayerId>,
 ) -> bool {
     match condition {
         StaticCondition::DevotionGE { colors, threshold } => {
@@ -1850,13 +1915,34 @@ fn evaluate_condition_with_context(
         StaticCondition::HasMaxSpeed => has_max_speed(state, controller),
         StaticCondition::SpeedGE { threshold } => effective_speed(state, controller) >= *threshold,
         StaticCondition::And { conditions } => conditions.iter().all(|c| {
-            evaluate_condition_with_context(state, c, controller, source_id, recipient_id)
+            evaluate_condition_with_context(
+                state,
+                c,
+                controller,
+                source_id,
+                recipient_id,
+                proposed_defending_player,
+            )
         }),
         StaticCondition::Or { conditions } => conditions.iter().any(|c| {
-            evaluate_condition_with_context(state, c, controller, source_id, recipient_id)
+            evaluate_condition_with_context(
+                state,
+                c,
+                controller,
+                source_id,
+                recipient_id,
+                proposed_defending_player,
+            )
         }),
         StaticCondition::Not { condition } => {
-            !evaluate_condition_with_context(state, condition, controller, source_id, recipient_id)
+            !evaluate_condition_with_context(
+                state,
+                condition,
+                controller,
+                source_id,
+                recipient_id,
+                proposed_defending_player,
+            )
         }
         // CR 731.1: True when the game has the requested day/night designation.
         StaticCondition::DayNightIs {
@@ -1961,6 +2047,15 @@ fn evaluate_condition_with_context(
         StaticCondition::AnyPlayerAttackedYouLastTurn => state.players.iter().any(|p| {
             p.id != controller && state.player_attacked_player_last_turn(p.id, controller)
         }),
+        // CR 508.1b + CR 514.2: Arboria's rider is evaluated against the
+        // player the proposed attack would defend, never against the static's
+        // controller or the attacking creature's controller.
+        StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn => {
+            proposed_defending_player
+                .is_some_and(|defending| {
+                    state.player_cast_or_put_nontoken_permanent_last_turn(defending)
+                })
+        }
         // CR 105.2 + CR 611.3a: the subject is the recipient (the enchanted
         // creature, "it"), not the Aura source; fall back to the source only when
         // evaluated without a recipient (the source gate defers to per-recipient).
@@ -2185,6 +2280,9 @@ fn evaluate_condition_with_context(
         StaticCondition::IsMonarch {
             player: PlayerScope::Controller,
         } => eval_is_monarch(state, controller),
+        StaticCondition::IsMonarch {
+            player: PlayerScope::DefendingPlayer,
+        } => proposed_defending_player.is_some_and(|defending| eval_is_monarch(state, defending)),
         StaticCondition::IsMonarch { .. } => false,
         // CR 726.3: True when the controller has the initiative.
         StaticCondition::IsInitiative => eval_is_initiative(state, controller),
@@ -2194,11 +2292,25 @@ fn evaluate_condition_with_context(
         StaticCondition::HasCityBlessing => eval_has_city_blessing(state, controller),
         // CR 702.195b: True when the controller has the enduring story designation.
         StaticCondition::HasEnduringStory => eval_has_enduring_story(state, controller),
-        StaticCondition::OpponentPoisonAtLeast { count } => state
+        StaticCondition::OpponentPoisonAtLeast {
+            count,
+            player: None,
+        } => state
             .players
             .iter()
             .filter(|player| player.id != controller)
             .any(|player| player.poison_counters >= *count),
+        StaticCondition::OpponentPoisonAtLeast {
+            count,
+            player: Some(PlayerScope::DefendingPlayer),
+        } => proposed_defending_player.is_some_and(|defending| {
+            state
+                .players
+                .iter()
+                .find(|player| player.id == defending)
+                .is_some_and(|player| player.poison_counters >= *count)
+        }),
+        StaticCondition::OpponentPoisonAtLeast { .. } => false,
         // CR 118.12a: "unless pays" conditions evaluate as false (restriction active).
         // This is a conservative but rules-correct default for cards like Ghostly
         // Prison: absent a per-attacker/per-blocker optional cost payment round-trip
@@ -3805,6 +3917,7 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -3851,6 +3964,7 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
         | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::AttackedLastTurn
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
@@ -3872,6 +3986,7 @@ fn filter_prop_reads_life(prop: &FilterProp) -> bool {
         | FilterProp::Modified
         | FilterProp::Historic
         | FilterProp::NotHistoric
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
     }
 }
@@ -4007,6 +4122,7 @@ fn static_condition_reads_life(condition: &StaticCondition) -> bool {
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
         | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
         | StaticCondition::OpponentPoisonAtLeast { .. }
         | StaticCondition::UnlessPay { .. }
         | StaticCondition::Unrecognized { .. }
@@ -7435,6 +7551,7 @@ fn filter_references_ability(filter: &TargetFilter) -> bool {
             matches!(
                 p,
                 crate::types::ability::FilterProp::WithKeyword { .. }
+                    | crate::types::ability::FilterProp::HasChosenKeyword
                     | crate::types::ability::FilterProp::CanEnchant { .. }
                     | crate::types::ability::FilterProp::HasKeywordKind { .. }
                     | crate::types::ability::FilterProp::WithoutKeyword { .. }
@@ -9573,6 +9690,53 @@ mod tests {
 
     fn setup() -> GameState {
         GameState::new_two_player(42)
+    }
+
+    /// CR 508.1b + CR 514.2: Arboria's `unless` rider must bind to the
+    /// proposed defender. Ordinary layer evaluation has no such anchor and
+    /// must fail closed so `Not` cannot accidentally apply the restriction.
+    #[test]
+    fn arboria_last_turn_activity_is_proposed_defender_relative() {
+        let mut state = setup();
+        state
+            .players_who_cast_or_put_nontoken_permanent_last_turn
+            .insert(P1);
+        let inner = StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn;
+        let restriction = StaticCondition::Not {
+            condition: Box::new(inner.clone()),
+        };
+
+        assert!(
+            !evaluate_condition(&state, &restriction, P0, ObjectId(0)),
+            "a defender-relative condition must not invert an absent combat anchor"
+        );
+        assert!(evaluate_condition_for_proposed_defender(
+            &state,
+            &inner,
+            P0,
+            ObjectId(0),
+            None,
+            P1,
+        ));
+        assert!(
+            !evaluate_condition_for_proposed_defender(
+                &state,
+                &restriction,
+                P0,
+                ObjectId(0),
+                None,
+                P1,
+            ),
+            "P1 did qualify, so Arboria's negated restriction must be inactive"
+        );
+        assert!(evaluate_condition_for_proposed_defender(
+            &state,
+            &restriction,
+            P0,
+            ObjectId(0),
+            None,
+            P0,
+        ));
     }
 
     #[test]

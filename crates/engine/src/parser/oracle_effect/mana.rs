@@ -583,6 +583,7 @@ pub(super) fn try_parse_add_mana_effect_with_context(
             alt((
                 value((), tag("mana of the chosen color")),
                 value((), tag("mana of that color")),
+                value((), tag("mana of the color last chosen")),
             ))
             .parse(i)
         }) {
@@ -1450,7 +1451,11 @@ fn scan_mana_production_type(
                     contribution,
                     fixed_alternative: None,
                 },
-                alt((tag("mana of the chosen color"), tag("mana of that color"))),
+                alt((
+                    tag("mana of the chosen color"),
+                    tag("mana of that color"),
+                    tag("mana of the color last chosen"),
+                )),
             ),
             // CR 106.1b: "mana of ~'s last noted type" (Jeweled Amulet: "Add
             // one mana of this artifact's last noted type" — `~` normalized
@@ -1554,6 +1559,15 @@ fn parse_negative_mana_spend_restriction(lower: &str) -> Option<ManaSpendRestric
         value((), tag(" be spent to cast ")).parse(i)
     })?;
     let rest = rest.trim().trim_end_matches(['.', '"']).trim();
+
+    // CR 106.6: "This mana can't be spent to cast spells" is the negative
+    // spelling of an activation-only restriction.  The existing type-spell
+    // parser deliberately expects a qualified spell phrase ("a nonartifact
+    // spell", "spells from your hand", etc.), so the bare plural must be
+    // recognized before that grammar is attempted.
+    if rest == "spells" {
+        return Some(ManaSpendRestriction::ActivateOnly);
+    }
 
     if let Some((zone, polarity)) = parse_spell_from_zone(rest) {
         return match polarity {
@@ -1718,6 +1732,17 @@ pub(crate) fn parse_mana_spend_restriction(
     })?;
     let base = base.trim_end_matches(['.', '"']);
     let base_lower = base.to_lowercase();
+
+    // CR 702.23a: cumulative-upkeep-only mana is a payment-context
+    // restriction, not a spell or activation restriction. Recognize the exact
+    // Oracle wording before the broader activation/cast clauses below.
+    if nom_on_lower(base, &base_lower, |i| {
+        value((), all_consuming(tag("to pay cumulative upkeep costs"))).parse(i)
+    })
+    .is_some()
+    {
+        return Some((vec![ManaSpendRestriction::CumulativeUpkeep], vec![]));
+    }
 
     // CR 106.6: "spend this mana only to activate power-up abilities" -- tag-scoped.
     // Try BEFORE the broader "to activate abilities" arm (more-specific-first) so
@@ -4310,6 +4335,18 @@ mod tests {
     }
 
     #[test]
+    fn negated_bare_spell_spend_maps_to_activation_only() {
+        // CR 106.6: Thran Turbine's older wording is a bare plural rather
+        // than a qualified "non<TYPE>" phrase.  It forbids spell payments but
+        // leaves ability-activation payments legal.
+        let (restriction, grants) =
+            parse_mana_spend_restriction("this mana can't be spent to cast spells")
+                .expect("bare negative spell restriction must parse");
+        assert_eq!(restriction, vec![ManaSpendRestriction::ActivateOnly]);
+        assert!(grants.is_empty());
+    }
+
+    #[test]
     fn negated_spell_from_zone_lowers_to_cast_prohibition_once() {
         let expected = vec![ManaSpendRestriction::CannotCastSpellFromZone(Zone::Hand)];
 
@@ -4466,6 +4503,16 @@ mod tests {
                 ManaSpendRestriction::SpellType("Room".to_string()),
                 ManaSpendRestriction::UnlockDoor,
             ])])
+        );
+    }
+
+    #[test]
+    fn mana_spend_restriction_cumulative_upkeep() {
+        let result =
+            parse_mana_spend_restriction("spend this mana only to pay cumulative upkeep costs");
+        assert_eq!(
+            result,
+            Some((vec![ManaSpendRestriction::CumulativeUpkeep], vec![]))
         );
     }
 

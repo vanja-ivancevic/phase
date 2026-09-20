@@ -1100,6 +1100,35 @@ fn try_nom_condition_as_unless(
     condition_text: &str,
     ctx: &mut ParseContext,
 ) -> Option<AbilityCondition> {
+    // CR 102.2 + CR 603.4 + CR 608.2c: In a player-scoped trigger whose effect
+    // refers to "their opponents", the possessive is anchored to the player
+    // introduced by the trigger (Antagonism), not to the ability controller.
+    // This is a resolution-time condition rather than a static condition, so
+    // keep it on the effect-condition path and require an established relative
+    // player scope instead of guessing an anchor.
+    if ctx.relative_player_scope.is_some()
+        && all_consuming(tag::<_, _, OracleError<'_>>(
+            "one of their opponents was dealt damage this turn",
+        ))
+        .parse(condition_text)
+        .is_ok()
+    {
+        return Some(AbilityCondition::Not {
+            condition: Box::new(AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn),
+        });
+    }
+
+    // CR 508.1a + CR 608.2c: target-anaphoric combat history is also legal in
+    // an `unless` rider.  The static-condition parser handles source-scoped
+    // forms such as "unless it attacked this turn"; "unless that creature
+    // attacked this turn" names the parent/triggering object instead and must
+    // use the same target condition as the trailing-`if` path (Insubordination).
+    if let Some(inner) = parse_target_attacked_this_turn_condition_text(condition_text) {
+        return Some(AbilityCondition::Not {
+            condition: Box::new(inner),
+        });
+    }
+
     use crate::parser::oracle_nom::condition::parse_inner_condition;
 
     let (rest, inner) = parse_inner_condition(condition_text).ok()?;
@@ -4784,9 +4813,15 @@ pub(crate) fn static_condition_to_ability_condition(
             })
         }
         StaticCondition::IsRingBearer => Some(AbilityCondition::IsRingBearer),
-        StaticCondition::OpponentPoisonAtLeast { count } => {
+        StaticCondition::OpponentPoisonAtLeast {
+            count,
+            player: None,
+        } => {
             Some(opponent_poison_at_least_as_quantity_check(*count))
         }
+        // The defending-player subject is bound by combat declaration and has
+        // no equivalent in the generic resolution-time condition vocabulary.
+        StaticCondition::OpponentPoisonAtLeast { .. } => None,
         StaticCondition::DayNightIs { state } => {
             Some(AbilityCondition::DayNightIs { state: *state })
         }
@@ -5076,6 +5111,7 @@ pub(crate) fn static_condition_to_ability_condition(
         // effect-resolution rider; no `AbilityCondition` equivalent — lowering
         // returns `None`.
         | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
         | StaticCondition::None => None,
     }
 }
@@ -5196,6 +5232,7 @@ pub(crate) fn ability_condition_to_static_condition(
         | AbilityCondition::CostPaidObjectMatchesFilter { .. }
         | AbilityCondition::ConditionInstead { .. }
         | AbilityCondition::NthResolutionThisTurn { .. }
+        | AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn
         | AbilityCondition::ScopedPlayerMatches { .. } => None,
         AbilityCondition::DiscardedCardMatchesFilter { .. } => None,
 
@@ -8773,6 +8810,26 @@ mod tests {
         assert!(
             !assert_attacked_this_turn_target_match(&cond),
             "Berserk's 'attacked' form must NOT be Not-wrapped"
+        );
+    }
+
+    /// CR 508.1a + CR 608.2c: an `unless` rider uses the opposite polarity
+    /// from a trailing positive `if` gate.  Insubordination's "unless that
+    /// creature attacked this turn" must therefore become
+    /// `Not(TargetMatchesFilter{ ... AttackedThisTurn })`.
+    #[test]
+    fn target_attacked_this_turn_condition_unless_is_negated() {
+        let (strip, text) = strip_unless_entered_suffix(
+            "~ deals 2 damage to that player unless that creature attacked this turn",
+            &mut ParseContext::default(),
+        );
+        assert_eq!(text, "~ deals 2 damage to that player");
+        let UnlessSuffixStrip::Parsed(cond) = strip else {
+            panic!("Insubordination unless rider must extract a condition: {strip:?}");
+        };
+        assert!(
+            assert_attacked_this_turn_target_match(&cond),
+            "unless-attacked form must be Not-wrapped"
         );
     }
 

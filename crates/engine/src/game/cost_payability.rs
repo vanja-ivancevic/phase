@@ -482,25 +482,23 @@ impl AbilityCost {
                 self_scope,
                 ..
             } => {
-                let Some(p) = state.players.get(player.0 as usize) else {
+                if state.players.get(player.0 as usize).is_none() {
                     return false;
-                };
+                }
                 if self_scope.is_source_card() {
-                    return p.hand.contains(&source);
+                    return state.players[player.0 as usize].hand.contains(&source);
                 }
                 let resolved =
                     super::quantity::resolve_quantity(state, count, player, source).max(0) as usize;
                 let effective_filter = cost_filter_before_x_announcement(filter.as_ref());
-                let ctx = FilterContext::from_source(state, source);
-                p.hand
-                    .iter()
-                    .filter(|&&id| {
-                        id != source
-                            && effective_filter
-                                .as_ref()
-                                .is_none_or(|f| matches_target_filter(state, id, f, &ctx))
-                    })
-                    .count()
+                super::casting::find_eligible_discard_targets_for_scope(
+                    state,
+                    player,
+                    source,
+                    effective_filter.as_ref(),
+                    *self_scope,
+                )
+                .len()
                     >= resolved
             }
             // CR 601.2b: Exile requires a choice of card from the specified zone.

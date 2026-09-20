@@ -2126,6 +2126,7 @@ pub(super) fn matching_block_events(
 ) -> Vec<GameEvent> {
     let source_id = source_event_subject_id(source_context);
     if let GameEvent::BlockersDeclared { assignments } = event {
+        let carries_filtered_combat_pair = combat_filter(trigger).is_some();
         assignments
             .iter()
             .filter_map(|(blocker, attacker)| {
@@ -2148,8 +2149,20 @@ pub(super) fn matching_block_events(
                     }
                     None => true,
                 };
-                attacker_matches.then_some(GameEvent::BlockersDeclared {
-                    assignments: vec![(*blocker, *attacker)],
+                attacker_matches.then_some(if carries_filtered_combat_pair {
+                    // CR 509.3d: preserve both combat roles for a filtered
+                    // "blocks [quality]" trigger. The same event shape is used
+                    // by the becomes-blocked half, so an effect body can bind
+                    // `TriggeringSource` and `EventTarget` consistently whether
+                    // the source is the blocker or the attacker.
+                    GameEvent::AttackerBecameBlockedByFilteredBlocker {
+                        attacker: *attacker,
+                        blocker: *blocker,
+                    }
+                } else {
+                    GameEvent::BlockersDeclared {
+                        assignments: vec![(*blocker, *attacker)],
+                    }
                 })
             })
             .collect()
@@ -10705,6 +10718,48 @@ mod tests {
                     assignments: vec![(blocker, second_attacker)]
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn filtered_blocks_trigger_carries_attacker_and_blocker_roles() {
+        let mut state = setup();
+        let blocker = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Dream Fighter".to_string(),
+            Zone::Battlefield,
+        );
+        let attacker = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Attacker".to_string(),
+            Zone::Battlefield,
+        );
+        state
+            .objects
+            .get_mut(&attacker)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        let trigger = make_trigger(TriggerMode::BlocksOrBecomesBlocked)
+            .valid_card(TargetFilter::SelfRef)
+            .valid_target(TargetFilter::Typed(TypedFilter::creature()));
+        let event = GameEvent::BlockersDeclared {
+            assignments: vec![(blocker, attacker)],
+        };
+
+        assert_eq!(
+            matching_block_events(
+                &event,
+                &trigger,
+                &test_trigger_source_context(&state, blocker),
+                &state,
+            ),
+            vec![GameEvent::AttackerBecameBlockedByFilteredBlocker { attacker, blocker }]
         );
     }
 

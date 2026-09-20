@@ -250,6 +250,7 @@ pub const LAND_SUBTYPES: &[&str] = &[
     "Tower",
     "Town",
     "Urza's",
+    "Wastes",
 ];
 
 pub const ARTIFACT_SUBTYPES: &[&str] = &[

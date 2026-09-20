@@ -4946,6 +4946,7 @@ fn detect_duration_this_turn(
                 | FilterProp::EnteredThisTurn
                 | FilterProp::ZoneChangedThisTurn { .. }
                 | FilterProp::AttackedThisTurn { .. }
+                | FilterProp::AttackedLastTurn
                 | FilterProp::BlockedThisTurn
                 | FilterProp::AttackedOrBlockedThisTurn
                 | FilterProp::CountersPutOnThisTurn { .. }

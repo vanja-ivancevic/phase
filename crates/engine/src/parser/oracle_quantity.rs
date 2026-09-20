@@ -966,6 +966,22 @@ pub(crate) fn parse_cda_quantity_with_context(
         }
     }
 
+    // CR 608.2c + CR 701.19: older wording such as Angel's Trumpet's "the
+    // number of creatures tapped this way" names the resolution-chain set
+    // published by the preceding tap effect. The shared for-each grammar
+    // already resolves the inner population to `TrackedSetSize`; expose it
+    // here under the CDA surface's "the number of" head.
+    if let Ok((rest, qty)) = preceded(
+        tag::<_, _, OracleError<'_>>("the number of "),
+        |input| nom_quantity::parse_for_each_clause_ref_with_context(input, ctx),
+    )
+    .parse(text)
+    {
+        if rest.trim().is_empty() {
+            return Some(QuantityExpr::Ref { qty });
+        }
+    }
+
     if let Some(qty) = parse_milled_this_way_count(text) {
         return Some(QuantityExpr::Ref { qty });
     }

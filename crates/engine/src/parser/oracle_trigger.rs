@@ -45,7 +45,7 @@ use super::oracle_target::{
 use super::oracle_util::{
     canonicalize_subtype_name, is_core_type_name, is_non_subtype_subject_name, merge_or_filters,
     normalize_card_name_refs, parse_number, parse_ordinal, parse_subtype, strip_after,
-    strip_reminder_text, TextPair, SELF_REF_PARSE_ONLY_PHRASES,
+    strip_reminder_text, TextPair, SELF_REF_PARSE_ONLY_PHRASES, SELF_REF_TYPE_PHRASES,
 };
 use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
 use crate::types::ability::ManaProduction;
@@ -616,6 +616,7 @@ fn rewrite_cost_x_in_condition(cond: &mut crate::types::ability::AbilityConditio
         | AbilityCondition::DayNightIs { .. }
         | AbilityCondition::NthResolutionThisTurn { .. }
         | AbilityCondition::SourceLacksKeyword { .. }
+        | AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn
         | AbilityCondition::ScopedPlayerMatches { .. } => {}
     }
 }
@@ -1257,6 +1258,32 @@ fn condition_introduces_target_player(cond_lower: &str) -> bool {
     false
 }
 
+/// CR 120.1 + CR 603.2c: a passive damage-received condition such as
+/// "a player is dealt damage" introduces the player who received the damage
+/// for trailing "that player"/"their" anaphors. The event extractor stamps
+/// that player as `TriggeringPlayer`; this is deliberately limited to the
+/// player-recipient passive forms rather than treating every "is dealt"
+/// condition as a player event.
+fn condition_introduces_passive_damage_player(cond_lower: &str) -> bool {
+    let input = cond_lower.trim_start();
+    let input = match alt((
+        tag::<_, _, OracleError<'_>>("whenever "),
+        tag("when "),
+    ))
+    .parse(input)
+    {
+        Ok((rest, _)) => rest,
+        Err(_) => input,
+    };
+
+    alt((
+        tag::<_, _, OracleError<'_>>("a player is dealt "),
+        tag("an opponent is dealt "),
+    ))
+    .parse(input)
+    .is_ok()
+}
+
 fn condition_introduces_damage_source_controller_player(cond_lower: &str) -> bool {
     let input = cond_lower.trim_start();
     let input = alt((
@@ -1348,6 +1375,8 @@ fn is_damage_done_trigger_pattern(cond_lower: &str) -> bool {
 /// `TriggeringPlayer` while generic target-player triggers need `TargetPlayer`.
 pub(crate) fn relative_player_scope_for_condition(cond_lower: &str) -> Option<ControllerRef> {
     if is_damage_done_trigger_pattern(cond_lower) {
+        Some(ControllerRef::TriggeringPlayer)
+    } else if condition_introduces_passive_damage_player(cond_lower) {
         Some(ControllerRef::TriggeringPlayer)
     } else if condition_introduces_damage_source_controller_player(cond_lower) {
         Some(ControllerRef::ParentTargetController)
@@ -4151,6 +4180,31 @@ pub(crate) fn parse_unless_alt_cost(after_unless: &str) -> Option<AbilityCost> {
     // life" arm below, with which it shares the "you pay " prefix.
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("you pay ").parse(after_unless) {
         let tail = rest.trim_end_matches('.').trim();
+        if let Ok((reduction_text, _)) = alt((
+            tag::<_, _, OracleError<'_>>("its mana cost reduced by "),
+            tag::<_, _, OracleError<'_>>("~'s mana cost reduced by "),
+        ))
+        .parse(tail)
+        {
+            if let Some((reduction, remainder)) =
+                super::oracle_effect::parse_unless_mana_cost_prefix(reduction_text)
+            {
+                if remainder.trim().is_empty() {
+                    if let crate::types::mana::ManaCost::Cost { shards, generic } = reduction {
+                        // CR 601.2f: a printed reduction in this grammar is
+                        // generic mana only. Do not silently reinterpret a
+                        // colored reduction as a legal alternative cost.
+                        if shards.is_empty() {
+                            return Some(AbilityCost::Mana {
+                                cost: crate::types::mana::ManaCost::SelfManaCostReduced {
+                                    reduction: generic,
+                                },
+                            });
+                        }
+                    }
+                }
+            }
+        }
         let is_self_mana_cost = tag::<_, _, OracleError<'_>>("its mana cost")
             .parse(tail)
             .or_else(|_| tag::<_, _, OracleError<'_>>("~'s mana cost").parse(tail))
@@ -4267,6 +4321,12 @@ fn parse_unless_tap_untapped_cost(rest: &str) -> Option<AbilityCost> {
 /// Supports articles and numeric counts before delegating the filter phrase to
 /// the shared target parser.
 fn parse_unless_exile_cost(rest: &str) -> Option<AbilityCost> {
+    // CR 118.12 + CR 701.7: preserve the deterministic "top matching card"
+    // instruction as an effect-cost before the ordinary selectable exile-cost
+    // parser handles "a card from your graveyard" and its counted variants.
+    if let Some(cost) = super::oracle_cost::parse_exile_top_matching_graveyard_cost(rest) {
+        return Some(cost);
+    }
     let (count, filter) = parse_unless_counted_target_filter(rest)?;
     Some(AbilityCost::Exile {
         count,
@@ -4658,6 +4718,25 @@ fn parse_unless_they_pay_life(input: &str) -> Option<(AbilityCost, &str)> {
     // to its toughness", `its` names the object targeted by the surrounding
     // effect, not the source ability. Preserve the target-relative quantity
     // for the shared resolution payment path.
+    // CR 202.3 + CR 608.2c: Wand of Ith's "they pay life equal to its mana
+    // value" uses the same target-relative anaphora, but reads mana value
+    // instead of toughness. Keep this before the fixed-number arm so the
+    // dynamic phrase remains an executable payment rather than an unsupported
+    // unless clause.
+    if let Ok((rest, _)) =
+        tag::<_, _, OracleError<'_>>("life equal to its mana value").parse(input)
+    {
+        return Some((
+            AbilityCost::PayLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectManaValue {
+                        scope: ObjectScope::Target,
+                    },
+                },
+            },
+            rest,
+        ));
+    }
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("life equal to its toughness").parse(input)
     {
         return Some((
@@ -4811,6 +4890,22 @@ fn parse_unless_sacrifice_filter(rest: &str) -> Option<AbilityCost> {
 
     if filter_text.is_empty() {
         return None;
+    }
+
+    // CR 201.5 + CR 118.12: the source marker is a valid sacrifice referent
+    // but is not a type phrase, so wrapping it in `target ...` would make the
+    // shared target parser return an incomplete bare-target match.  Preserve
+    // the self-reference directly (Withercrown: "unless you sacrifice ~").
+    let is_self_reference = filter_text == "~"
+        || SELF_REF_TYPE_PHRASES
+            .iter()
+            .chain(SELF_REF_PARSE_ONLY_PHRASES)
+            .any(|phrase| *phrase == filter_text);
+    if count == 1 && is_self_reference {
+        return Some(AbilityCost::Sacrifice(SacrificeCost::count(
+            TargetFilter::SelfRef,
+            count,
+        )));
     }
 
     // Delegate filter parsing to the shared building block. The `target {...}`
@@ -5690,6 +5785,7 @@ pub(crate) fn static_condition_to_trigger_condition(
         // variant), so there is no `TriggerCondition` equivalent — lowering
         // returns `None`.
         | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
         | StaticCondition::None => None,
 
         // CR 309.7: Dungeon completion bridges directly.
@@ -14593,7 +14689,38 @@ fn try_parse_casts_or_copies_trigger(lower: &str) -> Option<(TriggerMode, Trigge
     Some((TriggerMode::SpellCastOrCopy, def))
 }
 
+/// CR 702.33d + CR 603.2: Legacy Oracle's "a player kicks a spell" is a
+/// SpellCast trigger whose card filter requires at least one kicker payment.
+/// The cast event already records that fact as `FilterProp::WasKicked`; retain
+/// the actor as `TargetFilter::Player` so the trigger is not narrowed to the
+/// source controller.
+fn try_parse_player_kicks_spell_trigger(
+    lower: &str,
+) -> Option<(TriggerMode, TriggerDefinition)> {
+    all_consuming((
+        alt((
+            tag::<_, _, OracleError<'_>>("whenever "),
+            tag("when "),
+        )),
+        tag("a player kicks a spell"),
+    ))
+    .parse(lower)
+    .ok()?;
+
+    let mut def = make_base();
+    def.mode = TriggerMode::SpellCast;
+    def.valid_target = Some(TargetFilter::Player);
+    def.valid_card = Some(TargetFilter::Typed(
+        TypedFilter::card().properties(vec![FilterProp::WasKicked]),
+    ));
+    Some((TriggerMode::SpellCast, def))
+}
+
 fn try_parse_special_trigger_pattern(lower: &str) -> Option<(TriggerMode, TriggerDefinition)> {
+    if let Some(result) = try_parse_player_kicks_spell_trigger(lower) {
+        return Some(result);
+    }
+
     if let Some(result) = try_parse_self_or_another_controlled_subtype_enters(lower) {
         return Some(result);
     }

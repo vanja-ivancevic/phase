@@ -7,13 +7,53 @@ use crate::parser::oracle_ir::doc::{
 use crate::parser::oracle_ir::static_ir::StaticIr;
 use crate::parser::oracle_util::GRANTING_SELF_PLACEHOLDER;
 use crate::types::ability::{
-    AdditionalCostOrigin, AdditionalCostPaymentSource, CountScope, CounterAdjustment,
-    DamageModification, DamageRedirectTarget, DamageTargetFilter, DamageTargetPlayerScope,
-    DoorLockOp, PlayerRelation, RedirectionLifetime, SpellStackToGraveyardReplacement,
+    AdditionalCostOrigin, AdditionalCostPaymentSource, AggregateFunction, CountScope,
+    CounterAdjustment, DamageModification, DamageRedirectTarget, DamageTargetFilter,
+    DamageTargetPlayerScope, DoorLockOp, PlayerRelation, PlayerScope, RedirectionLifetime,
+    LibraryPosition, RoundingMode, SpellStackToGraveyardReplacement,
 };
-use crate::types::card_type::Supertype;
+use crate::types::card_type::{CoreType, Supertype};
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::triggers::AttackTargetFilter;
+
+#[test]
+fn bargaining_table_binds_legacy_standalone_x_definition_at_activation() {
+    let (ir, _) = parse_activated_ability_ir(
+        "{X}, {T}",
+        "Draw a card. X is the number of cards in an opponent's hand.",
+        "{X}, {T}: Draw a card. X is the number of cards in an opponent's hand.",
+        "Bargaining Table",
+        Some(PrintedAbilityIndex::placeholder()),
+        &mut ParseContext::default(),
+    );
+    let definition = lower_ability_ir(&ir);
+
+    assert!(
+        !has_unimplemented(&definition),
+        "legacy standalone X sentence must not remain an effect gap: {definition:#?}"
+    );
+    assert!(
+        definition
+            .cost
+            .as_ref()
+            .is_some_and(ability_cost_contains_x_mana),
+        "the activation cost must retain its X mana component: {definition:#?}"
+    );
+    assert_eq!(
+        definition.announced_x,
+        Some(QuantityExpr::Ref {
+            qty: QuantityRef::HandSize {
+                player: PlayerScope::Opponent {
+                    aggregate: AggregateFunction::Max,
+                },
+            },
+        })
+    );
+    assert!(
+        matches!(definition.effect.as_ref(), Effect::Draw { count: QuantityExpr::Fixed { value: 1 }, .. }),
+        "the actual ability must remain Draw 1: {definition:#?}"
+    );
+}
 
 /// Quicksilver Dragon's condition belongs to the resolving ability, not the
 /// announced target. Keep the chain entry point honest before the full-card
@@ -1117,6 +1157,55 @@ fn grizzled_wolverine_blocker_gate_is_source_relative() {
 }
 
 #[test]
+fn krovikan_plague_untapped_enchanted_creature_gate_is_typed() {
+    let r = parse(
+        "Enchant non-Wall creature you control\n\
+         When this Aura enters, draw a card at the beginning of the next turn's upkeep.\n\
+         Tap enchanted creature: This Aura deals 1 damage to any target. Put a -0/-1 counter on enchanted creature. Activate only if enchanted creature is untapped.",
+        "Krovikan Plague",
+        &[],
+        &["Enchantment"],
+        &["Aura"],
+    );
+    assert_eq!(r.abilities.len(), 1, "got {r:#?}");
+    assert!(
+        r.abilities[0]
+            .activation_restrictions
+            .iter()
+            .any(|restriction| {
+                matches!(
+                    restriction,
+                    ActivationRestriction::RequiresCondition {
+                        condition: Some(ParsedCondition::SourceUntappedAttachedTo {
+                            required_type: CoreType::Creature,
+                        })
+                    }
+                )
+            }),
+        "the attached-creature untapped gate must remain typed: {:?}",
+        r.abilities[0].activation_restrictions
+    );
+    assert!(
+        !parsed_has_unimplemented(&r),
+        "Krovikan Plague must not retain an unimplemented activation rider: {r:#?}"
+    );
+
+    let face = oracle_face_for(
+        "Krovikan Plague",
+        "Enchant non-Wall creature you control\n\
+         When this Aura enters, draw a card at the beginning of the next turn's upkeep.\n\
+         Tap enchanted creature: This Aura deals 1 damage to any target. Put a -0/-1 counter on enchanted creature. Activate only if enchanted creature is untapped.",
+        &["Enchantment"],
+        &["Aura"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Krovikan Plague should not regress into a coverage gap: {gaps:?}"
+    );
+}
+
+#[test]
 fn ashen_ghoul_above_source_gate_is_not_dropped() {
     let r = parse(
         "{B}: Return Ashen Ghoul from your graveyard to the battlefield. Activate only during your upkeep and only if three or more creature cards are above Ashen Ghoul.",
@@ -1681,6 +1770,39 @@ fn parsed_has_unimplemented(r: &ParsedAbilities) -> bool {
             .any(def_chain_has_unimplemented)
 }
 
+/// CR 701.12a + CR 608.2c: Cultural Exchange names its player and creature
+/// targets before the anaphoric control-swap instruction. The full Oracle
+/// synthesis path must preserve that final instruction as ExchangeControl.
+#[test]
+fn cultural_exchange_has_no_unimplemented_anaphoric_swap() {
+    let parsed = parse(
+        "Choose two target players. Those players exchange control of two target creatures they control.",
+        "Cultural Exchange",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Cultural Exchange must parse with zero Unimplemented effects: {parsed:#?}"
+    );
+}
+
+#[test]
+fn morality_shift_has_no_unimplemented_zone_exchange() {
+    let parsed = parse(
+        "Exchange your graveyard and library. Then shuffle your library.",
+        "Morality Shift",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Morality Shift must parse with zero Unimplemented effects: {parsed:#?}"
+    );
+}
+
 #[test]
 fn altair_ibn_la_ahad_for_each_exile_memory_counter_copy_parses() {
     let parsed = parse(
@@ -2079,12 +2201,12 @@ fn compound_target_player_continuations_share_one_target() {
 }
 
 use crate::types::ability::{
-    AbilityCondition, AbilityDefinition, AggregateFunction, BasicLandType, CardPlayMode,
+    AbilityCondition, AbilityDefinition, BasicLandType, CardPlayMode,
     CastingPermission, Comparator, ContinuousModification, ControllerRef, DelayedTriggerCondition,
     Duration, Effect, EffectScope, FilterProp, ManaProduction, ManaSpendRestriction,
     ModalSelectionConstraint, MultiTargetSpec, ObjectProperty, ObjectScope, ParsedCondition,
-    PermissionGrantee, PlayerFilter, PlayerScope, PreventionAmount, PtStat, PtValue, PtValueScope,
-    QuantityExpr, QuantityRef, ReplacementCondition, RestrictionExpiry, RoundingMode,
+    PermissionGrantee, PlayerFilter, PreventionAmount, PtStat, PtValue, PtValueScope,
+    QuantityExpr, QuantityRef, ReplacementCondition, RestrictionExpiry,
     SacrificeCost, SacrificeRequirement, SharedQuality, SharedQualityRelation, ShieldKind,
     StaticCondition, TapStateChange, TargetFilter, TriggerCondition, TypeFilter, TypedFilter,
 };
@@ -3140,6 +3262,17 @@ fn oracle_face_for(
     types: &[&str],
     subtypes: &[&str],
 ) -> crate::types::card::CardFace {
+    oracle_face_for_with_keywords(name, text, types, subtypes, &[])
+}
+
+#[cfg(test)]
+fn oracle_face_for_with_keywords(
+    name: &str,
+    text: &str,
+    types: &[&str],
+    subtypes: &[&str],
+    keywords: &[&str],
+) -> crate::types::card::CardFace {
     use crate::database::mtgjson::{AtomicCard, AtomicIdentifiers};
     let card = AtomicCard {
         name: name.to_string(),
@@ -3156,7 +3289,8 @@ fn oracle_face_for(
         types: types.iter().map(|s| s.to_string()).collect(),
         subtypes: subtypes.iter().map(|s| s.to_string()).collect(),
         supertypes: Vec::new(),
-        keywords: None,
+        keywords: (!keywords.is_empty())
+            .then(|| keywords.iter().map(|keyword| (*keyword).to_string()).collect()),
         side: None,
         face_name: None,
         mana_value: 5.0,
@@ -3173,6 +3307,1681 @@ fn oracle_face_for(
         related_cards: crate::database::mtgjson::SetRelatedCards::default(),
     };
     crate::database::synthesis::build_oracle_face(&card, None)
+}
+
+/// CR 508.1a + CR 514.2: old-border source restrictions that look back to the
+/// source controller's most recently completed turn must lower to the shared
+/// object-history filter rather than a swallowed condition.
+#[test]
+fn last_turn_attack_restrictions_are_fully_supported() {
+    let cases = [
+        (
+            "Giant Turtle",
+            "This creature can't attack if it attacked during your last turn.",
+            &["Creature"][..],
+            &[][..],
+        ),
+        (
+            "Goblin Rock Sled",
+            "Trample\nThis creature doesn't untap during your untap step if it attacked during your last turn.\nThis creature can't attack unless defending player controls a Mountain.",
+            &["Creature"][..],
+            &["Goblin"][..],
+        ),
+        (
+            "Halls of Mist",
+            "Cumulative upkeep {1}\nCreatures that attacked during their controller's last turn can't attack.",
+            &["Enchantment"][..],
+            &[][..],
+        ),
+        (
+            "Tangle Kelp",
+            "This creature doesn't untap during your untap step if it attacked during its controller's last turn.",
+            &["Creature"][..],
+            &["Kelp"][..],
+        ),
+    ];
+
+    for (name, text, types, subtypes) in cases {
+        let face = oracle_face_for(name, text, types, subtypes);
+        let gaps = crate::game::coverage::card_face_gaps(&face);
+        assert!(
+            gaps.is_empty(),
+            "{name} must be fully supported: {gaps:?}"
+        );
+    }
+}
+
+/// CR 508.1b + CR 514.2: Arboria's attack restriction must preserve the
+/// proposed defender's own last-turn activity through full Oracle synthesis.
+#[test]
+fn arboria_defender_last_turn_activity_restriction_is_fully_supported() {
+    let face = oracle_face_for(
+        "Arboria",
+        "Creatures can't attack a player unless that player cast a spell or put a nontoken permanent onto the battlefield during their last turn.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Arboria must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 611.3a: Arcades Sabboth's legacy contraction is a recipient-relative
+/// combat-state gate. Keep the full synthesis path covered in addition to the
+/// lower-level parser test, because this wording historically degraded to an
+/// unconditional static.
+#[test]
+fn arcades_sabboth_recipient_not_attacking_static_is_fully_supported() {
+    let face = oracle_face_for(
+        "Arcades Sabboth",
+        "Each untapped creature you control gets +0/+2 as long as it's not attacking.",
+        &["Creature"],
+        &["Elder", "Dragon"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Arcades Sabboth must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 102.2 + CR 603.4 + CR 608.2c: Antagonism's end-step trigger must keep
+/// "their opponents" relative to the player whose end step is being processed,
+/// rather than the enchantment's controller, and lower its unless rider as an
+/// executable condition through the full synthesis path.
+#[test]
+fn antagonism_scoped_opponent_damage_unless_is_fully_supported() {
+    let face = oracle_face_for(
+        "Antagonism",
+        "At the beginning of each player's end step, this enchantment deals 2 damage to that player unless one of their opponents was dealt damage this turn.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Antagonism must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 115.1 + CR 118.12a: Pia's Revolution's target-opponent damage option
+/// must survive the full card synthesis path as an executable unless payment.
+#[test]
+fn pias_revolution_target_opponent_unless_is_fully_supported() {
+    let face = oracle_face_for(
+        "Pia's Revolution",
+        "Whenever a nontoken artifact is put into your graveyard from the battlefield, return that card to your hand unless target opponent has this enchantment deal 3 damage to them.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Pia's Revolution must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 701.3a + CR 608.2c: Kudzu's second trigger is a subject-prefixed
+/// resolution-time attachment choice. The land's controller, not the Aura's
+/// controller, may move Kudzu to another land. Keep this as a full-card gate
+/// so the subject splitter and Attach lowering stay wired through synthesis.
+#[test]
+fn kudzu_has_no_unimplemented_subject_attach_gap() {
+    let face = oracle_face_for(
+        "Kudzu",
+        "Enchant land\n\
+         Whenever enchanted land becomes tapped, destroy Kudzu.\n\
+         That land's controller may attach Kudzu to a land of their choice.",
+        &["Enchantment"],
+        &["Aura"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Kudzu's subject-prefixed attach must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 106.1 + CR 106.7: Benthic Explorers derives one mana type from a tapped
+/// land controlled by an opponent. Keep the opponent-scoped land filter and
+/// `AnyTypeProduceableBy` production wired through full Oracle synthesis.
+#[test]
+fn benthic_explorers_opponent_land_mana_is_fully_supported() {
+    let face = oracle_face_for(
+        "Benthic Explorers",
+        "{T}, Untap a tapped land an opponent controls: Add one mana of any type that land could produce.",
+        &["Creature"],
+        &["Merfolk", "Wizard"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Benthic Explorers must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 603.5 + CR 608.2c: Bogardan Phoenix's death-counter branch must keep
+/// the existing counter test as the antecedent and route the no-counter case
+/// through the explicit Otherwise branch. Keep this old-border card as a
+/// full-synthesis regression rather than testing the branch parser in
+/// isolation.
+#[test]
+fn bogardan_phoenix_death_counter_otherwise_is_fully_supported() {
+    let face = oracle_face_for(
+        "Bogardan Phoenix",
+        "Flying\nWhen Bogardan Phoenix dies, exile it if it had a death counter on it. Otherwise, return it to the battlefield under your control and put a death counter on it.",
+        &["Creature"],
+        &["Phoenix"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Bogardan Phoenix must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 120.1 + CR 120.9 + CR 107.3c: Reverse Polarity's historical damage
+/// ledger expression must survive full Oracle synthesis, not just the
+/// where-X quantity parser.
+#[test]
+fn reverse_polarity_artifact_damage_x_binding_is_fully_supported() {
+    let face = oracle_face_for(
+        "Reverse Polarity",
+        "You gain X life, where X is twice the damage dealt to you so far this turn by artifacts.",
+        &["Sorcery"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Reverse Polarity must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 106.3 + CR 614.1a: Deep Water's "it produces {U}" replacement must
+/// remain typed through full Oracle synthesis.
+#[test]
+fn deep_water_mana_replacement_is_fully_supported() {
+    let face = oracle_face_for(
+        "Deep Water",
+        "{U}: Until end of turn, if you tap a land you control for mana, it produces {U} instead of any other type.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Deep Water must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 702.26b + CR 608.2f: Time and Tide's old-border phase populations must
+/// both lower through the typed filter/effect path. This is a coverage test;
+/// the runtime resolver already has the phased-out-aware phase-in choke point.
+#[test]
+fn time_and_tide_phased_populations_are_fully_supported() {
+    let face = oracle_face_for(
+        "Time and Tide",
+        "Simultaneously, all phased-out creatures phase in and all creatures with phasing phase out.",
+        &["Sorcery"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Time and Tide must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 602.5b + CR 602.2a + CR 503.1: Infinite Hourglass's pre-modern
+/// "Any player may activate this ability but only during any upkeep step"
+/// rider must preserve both the all-player permission and the unscoped upkeep
+/// restriction. The coverage assertion prevents the timing sentence from
+/// being swallowed as an unsupported activation clause.
+#[test]
+fn infinite_hourglass_any_player_any_upkeep_is_fully_supported() {
+    let face = oracle_face_for(
+        "Infinite Hourglass",
+        "At the beginning of your upkeep, put a time counter on this artifact.\nAll creatures get +1/+0 for each time counter on this artifact.\n{3}: Remove a time counter from this artifact. Any player may activate this ability but only during any upkeep step.",
+        &["Artifact"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Infinite Hourglass must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 508.1a + CR 603.4: Instill Furor's granted upkeep trigger must retain
+/// the enchanted creature's attack history when lowering the negated
+/// "unless it attacked this turn" clause.
+#[test]
+fn instill_furor_attack_history_unless_clause_is_fully_supported() {
+    let face = oracle_face_for(
+        "Instill Furor",
+        "Enchant creature\nEnchanted creature has \"At the beginning of your end step, sacrifice this creature unless it attacked this turn.\"",
+        &["Enchantment"],
+        &["Aura"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Instill Furor must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 508.1a + CR 608.2c: Insubordination's Aura-granted trigger refers to
+/// the enchanted creature with a target anaphor, not the Aura's own source
+/// identity.  The unless rider must still lower to an executable negated
+/// attack-history condition through full synthesis.
+#[test]
+fn insubordination_target_attack_history_unless_is_fully_supported() {
+    let face = oracle_face_for(
+        "Insubordination",
+        "Enchant creature\nAt the beginning of the end step of enchanted creature's controller, this Aura deals 2 damage to that player unless that creature attacked this turn.",
+        &["Enchantment"],
+        &["Aura"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Insubordination must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 201.5 + CR 118.12: Withercrown grants a quoted upkeep ability whose
+/// alternative is sacrificing the enchanted creature itself.  Keep the full
+/// quoted-ability path covered so self-reference normalization and the unless
+/// payment lowering cannot regress independently.
+#[test]
+fn withercrown_self_sacrifice_unless_is_fully_supported() {
+    let face = oracle_face_for(
+        "Withercrown",
+        "Enchant creature\nEnchanted creature has base power 0 and has \"At the beginning of your upkeep, you lose 1 life unless you sacrifice this creature.\"",
+        &["Enchantment"],
+        &["Aura"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Withercrown must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 202.3 + CR 608.2c: Wand of Ith's nonland branch pays life equal to the
+/// revealed card's mana value, not the Wand's. Keep the target-relative
+/// quantity through the full discard/unless synthesis path.
+#[test]
+fn wand_of_ith_dynamic_mana_value_unless_is_fully_supported() {
+    let face = oracle_face_for(
+        "Wand of Ith",
+        "{3}, {T}: Target player reveals a card at random from their hand. If it's a land card, that player discards it unless they pay 1 life. If it isn't a land card, the player discards it unless they pay life equal to its mana value. Activate only during your turn.",
+        &["Artifact"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Wand of Ith must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 118.12 + CR 601.2f: Flash's replacement creature branch must retain the
+/// source's own mana cost as a dynamic cost, reduced by generic {2}, rather
+/// than falling through to an unsupported unless clause.
+#[test]
+fn flash_reduced_self_mana_unless_is_fully_supported() {
+    let face = oracle_face_for(
+        "Flash",
+        "You may put a creature card from your hand onto the battlefield. If you do, sacrifice it unless you pay its mana cost reduced by {2}.",
+        &[],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Flash must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 509.1b + CR 611.3a: Veiled Serpent's quoted combat restriction uses a
+/// defending-player land-type condition. Keep the quoted static and its
+/// combat-context binding covered through full Oracle synthesis.
+#[test]
+fn veiled_serpent_defending_player_island_gate_is_fully_supported() {
+    let face = oracle_face_for(
+        "Veiled Serpent",
+        "When an opponent casts a spell, if this permanent is an enchantment, it becomes a 4/4 Serpent creature with \"This creature can't attack unless defending player controls an Island.\"\nCycling {2} ({2}, Discard this card: Draw a card.)",
+        &[],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Veiled Serpent must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 508.1b + CR 725.1: Crown-Hunter Hireling's attack restriction must keep
+/// its proposed-defender monarch subject through full card synthesis.
+#[test]
+fn crown_hunter_hireling_defending_player_monarch_gate_is_fully_supported() {
+    let face = oracle_face_for(
+        "Crown-Hunter Hireling",
+        "When this creature enters, you become the monarch.\nThis creature can't attack unless defending player is the monarch.",
+        &["Creature"],
+        &["Human", "Rogue"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Crown-Hunter Hireling must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 201.2 + CR 202.3 + CR 604.3: Graveyard Shift's flash condition counts
+/// distinct mana values among cards in the controller's graveyard. Its Oracle
+/// wording omits "different", so keep the bare mana-value population on the
+/// full synthesis path rather than allowing it to become an unrecognized gate.
+#[test]
+fn graveyard_shift_graveyard_mana_value_gate_is_fully_supported() {
+    let face = oracle_face_for(
+        "Graveyard Shift",
+        "This spell has flash as long as there are five or more mana values among cards in your graveyard.\nReturn target creature card from your graveyard to the battlefield.",
+        &["Sorcery"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Graveyard Shift must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 107.3c + CR 603.7a: Aven Shrine's X binding is the number of cards in
+/// all graveyards sharing the triggering spell's name. The parent spell name
+/// must survive trigger lowering instead of becoming an unresolved variable.
+#[test]
+fn aven_shrine_same_name_graveyard_count_is_fully_supported() {
+    let face = oracle_face_for(
+        "Aven Shrine",
+        "Whenever a player casts a spell, that player gains X life, where X is the number of cards in all graveyards with the same name as that spell.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Aven Shrine must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 702.3b + CR 303.4a: Animate Wall combines the subtype-qualified Aura
+/// enchant ability with a defender override on the enchanted Wall. Keep both
+/// lines on the production synthesis path so the legacy `Enchant Wall` form
+/// cannot regress to a silent dropped effect.
+#[test]
+fn animate_wall_enchant_wall_defender_override_is_fully_supported() {
+    let face = oracle_face_for(
+        "Animate Wall",
+        "Enchant Wall\nEnchanted Wall can attack as though it didn't have defender.",
+        &["Enchantment"],
+        &["Aura"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Animate Wall must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 614.9 + CR 614.12: Blood of the Martyr creates a continuous creature
+/// damage redirection whose controller may accept or decline each event.  The
+/// card-level assertion protects the full Oracle router, not only the focused
+/// replacement-clause parser.
+#[test]
+fn blood_of_the_martyr_is_fully_supported_with_optional_redirect() {
+    let face = oracle_face_for(
+        "Blood of the Martyr",
+        "Until end of turn, if damage would be dealt to any creature, you may have that damage dealt to you instead.",
+        &[],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Blood of the Martyr must be fully supported: {gaps:?}"
+    );
+    assert!(face.abilities.iter().any(|ability| {
+        matches!(
+            ability.effect.as_ref(),
+            Effect::CreateDamageReplacement {
+                optional: true,
+                target_filter: Some(DamageTargetFilter::CreatureOnly),
+                redirect_to: Some(DamageRedirectTarget::Controller),
+                redirect_lifetime: RedirectionLifetime::Continuous,
+                ..
+            }
+        )
+    }));
+}
+
+/// CR 614.1a + CR 701.7: Pyramids' modal land replacement must be represented
+/// as a one-shot Destroy replacement that clears marked damage and prevents the
+/// destruction, rather than as a generic unresolved "the" clause.
+#[test]
+fn pyramids_destroy_replacement_clears_marked_damage() {
+    let face = oracle_face_for(
+        "Pyramids",
+        "{2}: Choose one —\n• Destroy target Aura attached to a land.\n• The next time target land would be destroyed this turn, remove all damage marked on it instead.",
+        &["Artifact"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Pyramids must be fully supported: {gaps:?}"
+    );
+
+    let replacement = face.abilities.iter().find_map(|ability| {
+        let Effect::AddTargetReplacement { replacement, target } = ability.effect.as_ref() else {
+            return None;
+        };
+        Some((replacement, target))
+    });
+    let (replacement, target) = replacement.expect("Pyramids must install a land replacement");
+    assert_eq!(
+        *target,
+        TargetFilter::Typed(TypedFilter::land()),
+        "the replacement must target a land selected by the modal ability"
+    );
+    assert_eq!(replacement.event, ReplacementEvent::Destroy);
+    assert_eq!(
+        replacement.valid_card,
+        Some(TargetFilter::SelfRef),
+        "the installed replacement must apply to the selected land"
+    );
+    assert!(replacement.consume_on_apply);
+    assert_eq!(replacement.expiry, Some(RestrictionExpiry::EndOfTurn));
+    assert!(matches!(
+        replacement
+            .execute
+            .as_deref()
+            .map(|ability| ability.effect.as_ref()),
+        Some(Effect::RemoveAllDamage {
+            target: TargetFilter::SelfRef
+        })
+    ));
+}
+
+/// CR 614.9 + CR 301.5 + CR 702.6: Ward of Piety's one-shot redirection
+/// binds the original recipient to its enchanted creature and exposes only the
+/// destination `any target` slot.
+#[test]
+fn ward_of_piety_redirects_damage_from_its_enchanted_creature() {
+    let face = oracle_face_for(
+        "Ward of Piety",
+        "Enchant creature\n{1}{W}: The next 1 damage that would be dealt to enchanted creature this turn is dealt to any target instead.",
+        &["Enchantment"],
+        &["Aura"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Ward of Piety must be fully supported: {gaps:?}"
+    );
+    let effects = collect_all_effects(&face.abilities);
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::CreateDamageReplacement {
+            recipient_object_filter: Some(TargetFilter::AttachedTo),
+            redirect_to: Some(DamageRedirectTarget::ChosenTarget),
+            redirect_amount: Some(PreventionAmount::Next(1)),
+            redirect_object_filter: Some(TargetFilter::Any),
+            ..
+        }
+    )));
+}
+
+/// CR 613.1d + CR 613.6 + CR 613.4b: the full old-border Titania's Song
+/// synthesis must retain ability loss, artifact animation, and mana-value P/T.
+#[test]
+fn titanias_song_is_fully_supported_with_ability_loss_animation() {
+    let face = oracle_face_for(
+        "Titania's Song",
+        "Each noncreature artifact loses all abilities and becomes an artifact creature with power and toughness each equal to its mana value.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Titania's Song must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 701.27 + CR 604.1: Viridian Betrayers uses the boolean wording for the
+/// same opponent-poison threshold already used by numeric poison conditions.
+#[test]
+fn viridian_betrayers_poison_condition_is_fully_supported() {
+    let face = oracle_face_for(
+        "Viridian Betrayers",
+        "As long as an opponent is poisoned, Viridian Betrayers gets +2/+2.",
+        &["Creature"],
+        &["Elf", "Warrior"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Viridian Betrayers must be fully supported: {gaps:?}"
+    );
+    assert!(face.static_abilities.iter().any(|static_def| {
+        static_def.condition
+            == Some(StaticCondition::OpponentPoisonAtLeast {
+                count: 1,
+                player: None,
+            })
+    }));
+}
+
+/// CR 701.27 + CR 508.1b: Chained Throatseeker's evasion gate must retain the
+/// proposed defending player as the poison subject through full synthesis.
+#[test]
+fn chained_throatseeker_defending_player_poison_gate_is_fully_supported() {
+    let face = oracle_face_for(
+        "Chained Throatseeker",
+        "Infect (This creature deals damage to creatures in the form of -1/-1 counters and to players in the form of poison counters.)\nThis creature can't attack unless defending player is poisoned.",
+        &["Creature"],
+        &["Horror"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Chained Throatseeker must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 205.3i + CR 305.7: Event Horizon changes only the land subtype set;
+/// Wastes is not a basic land type and must not be lowered as SetBasicLandType.
+#[test]
+fn event_horizon_wastes_type_change_is_fully_supported() {
+    let face = oracle_face_for(
+        "Event Horizon",
+        "Nonbasic lands are Wastes.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Event Horizon must be fully supported: {gaps:?}"
+    );
+    assert!(face.static_abilities.iter().any(|static_def| {
+        static_def
+            .modifications
+            .contains(&ContinuousModification::AddSubtype {
+                subtype: "Wastes".to_string(),
+            })
+    }));
+}
+
+/// CR 702.112a + CR 611.3a: Goblin Glory Chaser's menace grant is gated by
+/// the source's live renown designation, not by a permanently true placeholder.
+#[test]
+fn goblin_glory_chaser_renown_gate_is_fully_supported() {
+    let face = oracle_face_for(
+        "Goblin Glory Chaser",
+        "Renown 1 (When this creature deals combat damage to a player, if it isn't renowned, put a +1/+1 counter on it and it becomes renowned.)\nAs long as this creature is renowned, it has menace. (It can't be blocked except by two or more creatures.)",
+        &["Creature"],
+        &["Goblin", "Warrior"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Goblin Glory Chaser must be fully supported: {gaps:?}"
+    );
+    assert!(face.static_abilities.iter().any(|static_def| {
+        static_def.condition.as_ref().is_some_and(|condition| {
+            matches!(
+                condition,
+                StaticCondition::SourceMatchesFilter {
+                    filter: TargetFilter::Typed(filter),
+                } if filter.properties.contains(&FilterProp::Renowned)
+            )
+        })
+    }));
+}
+
+/// CR 508.1c + CR 509.1c: Mogg Toady's attack and block restrictions compare
+/// the controller's creature count with the combat player appropriate to each
+/// side. Keep both printed statics and their typed conditions in the card-level
+/// coverage path.
+#[test]
+fn mogg_toady_combat_player_restrictions_are_fully_supported() {
+    let face = oracle_face_for(
+        "Mogg Toady",
+        "This creature can't attack unless you control more creatures than defending player.\nThis creature can't block unless you control more creatures than attacking player.",
+        &["Creature"],
+        &["Goblin"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(gaps.is_empty(), "Mogg Toady must be fully supported: {gaps:?}");
+    assert_eq!(
+        face.static_abilities.len(),
+        2,
+        "both combat restrictions must survive synthesis: {:?}",
+        face.static_abilities
+    );
+    assert!(face.static_abilities.iter().all(|static_def| {
+        matches!(static_def.mode, StaticMode::CantAttack | StaticMode::CantBlock)
+            && static_def.condition.is_some()
+    }));
+}
+
+/// CR 701.38d: Brago's Representative uses the alternate wording for the
+/// same per-vote extra-vote static already used by Tivit, Seller of Secrets.
+#[test]
+fn bragos_representative_extra_vote_is_fully_supported() {
+    let face = oracle_face_for(
+        "Brago's Representative",
+        "While voting, you get an additional vote. (The votes can be for different choices or for the same choice.)",
+        &["Creature"],
+        &["Human", "Advisor"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Brago's Representative must be fully supported: {gaps:?}"
+    );
+    assert!(face
+        .static_abilities
+        .iter()
+        .any(|static_def| static_def.mode == StaticMode::GrantsExtraVote));
+}
+
+/// CR 201.5 + CR 208.1: Lesser Werewolf's inline power threshold must remain
+/// a source-relative condition on the activated ability, not an unsupported
+/// `if` prefix that lets the counter/pump body fall through.
+#[test]
+fn lesser_werewolf_power_gate_is_fully_supported() {
+    let face = oracle_face_for(
+        "Lesser Werewolf",
+        "{B}: If this creature's power is 1 or more, it gets -1/-0 until end of turn and put a -0/-1 counter on target creature blocking or blocked by this creature. Activate only during the declare blockers step.",
+        &["Creature"],
+        &["Werewolf"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Lesser Werewolf must be fully supported: {gaps:?}"
+    );
+    assert!(face.abilities.iter().any(|ability| {
+        matches!(
+            &ability.condition,
+            Some(AbilityCondition::QuantityCheck {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: ObjectScope::Source,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            })
+        )
+    }));
+}
+
+/// CR 401.7 + CR 107.3c: Quarry Colossus defines the depth of its library
+/// insertion with a typed `where X is ...` clause. The definition must replace
+/// the bare X placeholder rather than leave a triggered ability resolving X to
+/// zero, and the complete card must stay out of the coverage gap report.
+#[test]
+fn quarry_colossus_dynamic_beneath_top_is_fully_supported() {
+    let face = oracle_face_for(
+        "Quarry Colossus",
+        "When this creature enters, put target creature into its owner's library just beneath the top X cards of that library, where X is the number of Plains you control.",
+        &["Creature"],
+        &["Giant"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Quarry Colossus must be fully supported: {gaps:?}"
+    );
+    let ability = face
+        .abilities
+        .iter()
+        .find(|ability| matches!(ability.effect.as_ref(), Effect::PutAtLibraryPosition { .. }))
+        .expect("Quarry Colossus must lower to a library-position effect");
+    assert!(matches!(
+        ability.effect.as_ref(),
+        Effect::PutAtLibraryPosition {
+            target: TargetFilter::Typed(_),
+            position: LibraryPosition::BeneathTop {
+                depth: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount { .. }
+                }
+            },
+            ..
+        }
+    ));
+}
+
+/// CR 122.1 + CR 608.2c: Holy Frazzle-Cannon places a counter on the
+/// triggering equipped creature and on the other controller-owned creatures
+/// sharing a creature type with it. The two recipients must survive as one
+/// mass population, not as a truncated first anaphor.
+#[test]
+fn holy_frazzle_cannon_shared_type_counter_population_is_fully_supported() {
+    let face = oracle_face_for(
+        "Holy Frazzle-Cannon",
+        "Whenever equipped creature attacks, put a +1/+1 counter on that creature and each other creature you control that shares a creature type with it.\nEquip {1}",
+        &["Artifact"],
+        &["Equipment"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Holy Frazzle-Cannon must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 700.3 + CR 701.8: Do or Die's target-player pile partition must reach
+/// the existing interactive SeparateIntoPiles primitive through the production
+/// synthesis path, including the no-regeneration destroy rider.
+#[test]
+fn do_or_die_is_fully_supported_through_pile_synthesis() {
+    let face = oracle_face_for(
+        "Do or Die",
+        "Separate all creatures target player controls into two piles. Destroy all creatures in the pile of that player's choice. They can't be regenerated.",
+        &["Sorcery"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(gaps.is_empty(), "Do or Die must be fully supported: {gaps:?}");
+    assert!(collect_all_effects(&face.abilities)
+        .iter()
+        .any(|effect| matches!(effect, Effect::SeparateIntoPiles { .. })));
+}
+
+/// CR 109.4 + CR 119.1 + CR 402.1 + CR 603.2: old-border creatures whose
+/// upkeep trigger hands them to the current extremal player must retain a
+/// dynamic `PlayerMatching` recipient. These are one shared subject grammar,
+/// not four card-specific exceptions.
+#[test]
+fn extremal_player_control_handoffs_are_fully_supported() {
+    let cases = [
+        (
+            "Ghazbán Ogre",
+            "At the beginning of your upkeep, if a player has more life than each other player, the player with the most life gains control of this creature.",
+            &["Creature"][..],
+            &["Ogre"][..],
+        ),
+        (
+            "Sokenzan Renegade",
+            "At the beginning of your upkeep, if a player has more cards in hand than each other player, the player who has the most cards in hand gains control of this creature.",
+            &["Creature"][..],
+            &["Human", "Samurai"][..],
+        ),
+        (
+            "Wild Mammoth",
+            "At the beginning of your upkeep, if a player controls more creatures than each other player, the player who controls the most creatures gains control of this creature.",
+            &["Creature"][..],
+            &["Elephant"][..],
+        ),
+        (
+            "Thoughtbound Primoc",
+            "Flying\nAt the beginning of your upkeep, if a player controls more Wizards than each other player, the player who controls the most Wizards gains control of this creature.",
+            &["Creature"][..],
+            &["Bird", "Wizard"][..],
+        ),
+        (
+            "Loxodon Peacekeeper",
+            "At the beginning of your upkeep, the player with the lowest life total gains control of this creature. If two or more players are tied for lowest life total, you choose one of them, and that player gains control of this creature.",
+            &["Creature"][..],
+            &["Elephant"][..],
+        ),
+    ];
+
+    for (name, text, types, subtypes) in cases {
+        let face = oracle_face_for(name, text, types, subtypes);
+        let gaps = crate::game::coverage::card_face_gaps(&face);
+        assert!(gaps.is_empty(), "{name} must be fully supported: {gaps:?}");
+        assert!(collect_all_effects(&face.abilities).iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::GiveControl {
+                    recipient: TargetFilter::PlayerMatching { .. },
+                    ..
+                }
+            )
+        }), "{name} must preserve a dynamic player recipient");
+    }
+}
+
+/// CR 614.9 + CR 615.1a: Mirrorwood Treefolk's unnumbered passive-voice
+/// replacement redirects the complete next damage event from itself to a
+/// chosen `any target`, rather than being mistaken for an unsupported `the`
+/// clause or a numbered depletion shield.
+#[test]
+fn mirrorwood_treefolk_full_damage_redirection_is_fully_supported() {
+    let face = oracle_face_for(
+        "Mirrorwood Treefolk",
+        "{2}{R}{W}: The next time damage would be dealt to ~ this turn, that damage is dealt to any target instead.",
+        &["Creature"],
+        &["Treefolk"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Mirrorwood Treefolk must be fully supported: {gaps:?}"
+    );
+    assert!(collect_all_effects(&face.abilities).iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::CreateDamageReplacement {
+                recipient_object_filter: Some(TargetFilter::SelfRef),
+                redirect_to: Some(DamageRedirectTarget::ChosenTarget),
+                redirect_amount: None,
+                redirect_object_filter: Some(TargetFilter::Any),
+                redirect_lifetime: RedirectionLifetime::OneOpportunity,
+                ..
+            }
+        )
+    }));
+}
+
+/// CR 614.9 + CR 115.1 + CR 609.7a-b: Shield Dancer's chosen attacking
+/// creature is both the damage source and the redirection recipient. The full
+/// synthesis path must retain that shared target slot and the combat-only
+/// restriction.
+#[test]
+fn shield_dancer_reflects_combat_damage_to_the_chosen_attacker() {
+    let face = oracle_face_for(
+        "Shield Dancer",
+        "{2}{W}: The next time target attacking creature would deal combat damage to ~ this turn, that creature deals that damage to itself instead.",
+        &["Creature"],
+        &["Human"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Shield Dancer must be fully supported: {gaps:?}"
+    );
+    assert!(collect_all_effects(&face.abilities).iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::CreateDamageReplacement {
+                source_filter: Some(TargetFilter::And { .. }),
+                combat_scope: Some(crate::types::ability::CombatDamageScope::CombatOnly),
+                recipient_object_filter: Some(TargetFilter::SelfRef),
+                redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+                redirect_amount: None,
+                redirect_object_filter: None,
+                redirect_lifetime: RedirectionLifetime::OneOpportunity,
+                ..
+            }
+        )
+    }));
+}
+
+/// CR 122.1 + CR 614.1a: Rock Hydra's static per-damage replacement is already
+/// represented by the typed counter-gated runtime path; keep a production
+/// synthesis regression so the static-shaped router does not demote it back to
+/// an unsupported structure.
+#[test]
+fn rock_hydra_counter_gated_damage_replacement_is_fully_supported() {
+    let face = oracle_face_for(
+        "Rock Hydra",
+        "This creature enters with X +1/+1 counters on it.\nFor each 1 damage that would be dealt to this creature, if it has a +1/+1 counter on it, remove a +1/+1 counter from it and prevent that 1 damage.",
+        &["Creature"],
+        &["Hydra"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Rock Hydra must be fully supported: {gaps:?}"
+    );
+    let replacement = face
+        .replacements
+        .iter()
+        .find(|replacement| replacement.damage_counter_removal.is_some())
+        .expect("Rock Hydra must retain its counter-consuming damage replacement");
+    assert_eq!(
+        replacement.damage_counter_removal,
+        Some(crate::types::counter::CounterType::Plus1Plus1)
+    );
+    assert!(matches!(
+        &replacement.condition,
+        Some(crate::types::ability::ReplacementCondition::SourceHasCounterAtLeast {
+            counter_type: crate::types::counter::CounterType::Plus1Plus1,
+            count: 1,
+        })
+    ));
+}
+
+/// CR 614.9 + CR 115.1: Kor Chant's targeted victim carries a controller
+/// qualifier, while its destination is a second chosen creature. Both target
+/// roles must survive continuous-redirection lowering.
+#[test]
+fn kor_chant_preserves_controlled_victim_and_redirect_target() {
+    let face = oracle_face_for(
+        "Kor Chant",
+        "All damage that would be dealt this turn to target creature you control by a source of your choice is dealt to another target creature instead.",
+        &["Instant"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(gaps.is_empty(), "Kor Chant must be fully supported: {gaps:?}");
+    assert!(collect_all_effects(&face.abilities).iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::CreateDamageReplacement {
+                source_filter: Some(TargetFilter::ChosenDamageSource { filter: None }),
+                recipient_object_filter: Some(TargetFilter::Typed(_)),
+                redirect_to: Some(DamageRedirectTarget::ChosenObjectTarget),
+                redirect_object_filter: Some(TargetFilter::Typed(_)),
+                redirect_lifetime: RedirectionLifetime::Continuous,
+                ..
+            }
+        )
+    }));
+}
+
+/// CR 122.1 + CR 611.3a: the tide-counter cycle's singular exact-one static
+/// must survive full Oracle synthesis for both cards that use it. This guards
+/// the production router in addition to the direct static-line regression.
+#[test]
+fn homarid_and_tidal_influence_are_fully_supported() {
+    let cases = [
+        (
+            "Homarid",
+            "This creature enters with a tide counter on it.\nAt the beginning of your upkeep, put a tide counter on this creature.\nAs long as there is exactly one tide counter on this creature, it gets -1/-1.\nAs long as there are exactly three tide counters on this creature, it gets +1/+1.\nWhenever there are four or more tide counters on this creature, remove all tide counters from it.",
+            ["Creature"],
+        ),
+        (
+            "Tidal Influence",
+            "Cast this spell only if no permanents named Tidal Influence are on the battlefield.\nThis enchantment enters with a tide counter on it.\nAt the beginning of your upkeep, put a tide counter on this enchantment.\nAs long as there is exactly one tide counter on this enchantment, all blue creatures get -2/-0.\nAs long as there are exactly three tide counters on this enchantment, all blue creatures get +2/+0.\nWhenever there are four or more tide counters on this enchantment, remove all tide counters from it.",
+            ["Enchantment"],
+        ),
+    ];
+
+    for (name, text, types) in cases {
+        let face = oracle_face_for(name, text, &types, &[]);
+        let gaps = crate::game::coverage::card_face_gaps(&face);
+        assert!(gaps.is_empty(), "{name} must be fully supported: {gaps:?}");
+    }
+}
+
+/// CR 101.2 + CR 305.1 + CR 201.2a: Cornered Market's two name-based
+/// prohibitions must both lower to runtime-recognized statics. The land clause
+/// is the regression that previously surfaced as `Effect:unknown`.
+#[test]
+fn cornered_market_name_based_prohibitions_are_fully_supported() {
+    let face = oracle_face_for(
+        "Cornered Market",
+        "Players can't cast spells with the same name as a nontoken permanent.\nPlayers can't play nonbasic lands with the same name as a nontoken permanent.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Cornered Market must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 106.3 + CR 614.1a + CR 607.2d: Hall of Gemstone's upkeep choice must
+/// persist on the source so its separate mana replacement can read the chosen
+/// color, while the replacement remains limited to lands tapped for mana.
+#[test]
+fn hall_of_gemstone_chosen_color_replacement_is_fully_supported() {
+    let face = oracle_face_for(
+        "Hall of Gemstone",
+        "At the beginning of each player's upkeep, that player chooses a color. Until end of turn, lands tapped for mana produce mana of the chosen color instead of any other color.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Hall of Gemstone must be fully supported: {gaps:?}"
+    );
+    let trigger = face
+        .triggers
+        .iter()
+        .find(|trigger| trigger.execute.is_some())
+        .expect("Hall of Gemstone must retain its upkeep trigger");
+    let execute = trigger.execute.as_deref().expect("trigger execute");
+    assert!(matches!(
+        execute.effect.as_ref(),
+        Effect::Choose {
+            choice_type: crate::types::ability::ChoiceType::Color { .. },
+            persist: true,
+            ..
+        }
+    ));
+    let replacement = execute
+        .sub_ability
+        .as_deref()
+        .and_then(|ability| match ability.effect.as_ref() {
+            Effect::AddTargetReplacement { replacement, .. } => Some(replacement.as_ref()),
+            _ => None,
+        })
+        .expect("Hall of Gemstone must install its mana replacement from the trigger");
+    assert_eq!(
+        replacement.mana_modification,
+        Some(crate::types::ability::ManaModification::ReplaceWithChosenColor)
+    );
+    assert_eq!(
+        replacement.expiry,
+        None,
+        "the trigger duration is supplied at installation, not baked into the printed definition"
+    );
+}
+
+/// CR 601.2b + CR 615.1a: Undergrowth's optional additional cost changes the
+/// source population of its existing combat-prevention shield. The paid branch
+/// must exclude red creatures while the unpaid branch still prevents all combat
+/// damage; the sentence must not be reported as an unrelated unsupported effect.
+#[test]
+fn undergrowth_additional_cost_exception_is_fully_supported() {
+    let face = oracle_face_for(
+        "Undergrowth",
+        "As an additional cost to cast this spell, you may pay {2}{R}.\nPrevent all combat damage that would be dealt this turn. If this spell's additional cost was paid, this effect doesn't affect combat damage that would be dealt by red creatures.",
+        &["Instant"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Undergrowth must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 115.7a: Rebound's separate destination sentence restricts the
+/// replacement target to players while retaining interactive retargeting.
+#[test]
+fn rebound_retarget_constraint_is_fully_supported() {
+    let face = oracle_face_for(
+        "Rebound",
+        "Change the target of target spell that targets only a player. The new target must be a player.",
+        &["Instant"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(gaps.is_empty(), "Rebound must be fully supported: {gaps:?}");
+    let change_targets = collect_all_effects(&face.abilities)
+        .into_iter()
+        .find_map(|effect| match effect {
+            Effect::ChangeTargets {
+                new_target_filter: Some(filter),
+                ..
+            } => Some(filter),
+            _ => None,
+        })
+        .expect("Rebound must retain its ChangeTargets destination constraint");
+    assert_eq!(change_targets, TargetFilter::Player);
+}
+
+/// CR 508.1 + CR 509.1: Okk and Orcish Conscripts express combat
+/// restrictions through live existential/count conditions. The full synthesis
+/// path must retain both attack and block riders rather than merely recognizing
+/// the bare `CantAttack`/`CantBlock` modes.
+#[test]
+fn okk_and_orcish_conscripts_are_fully_supported() {
+    let cases = [
+        (
+            "Okk",
+            "Okk can't attack unless a creature with greater power also attacks.\nOkk can't block unless a creature with greater power also blocks.",
+        ),
+        (
+            "Orcish Conscripts",
+            "Orcish Conscripts can't attack unless at least two other creatures attack.\nOrcish Conscripts can't block unless at least two other creatures block.",
+        ),
+        (
+            "Scarred Puma",
+            "Scarred Puma can't attack unless a black or green creature also attacks.",
+        ),
+    ];
+
+    for (name, text) in cases {
+        let face = oracle_face_for(name, text, &["Creature"], &["Orc"]);
+        let gaps = crate::game::coverage::card_face_gaps(&face);
+        assert!(gaps.is_empty(), "{name} must be fully supported: {gaps:?}");
+    }
+}
+
+/// CR 201.2 + CR 611.3a: the `not named Escape` exclusion is part of
+/// Escaped Shapeshifter's live opponent-presence condition, not an ignorable
+/// qualifier.
+#[test]
+fn escaped_shapeshifter_is_fully_supported() {
+    let face = oracle_face_for(
+        "Escaped Shapeshifter",
+        "As long as an opponent controls a creature with flying not named Escape, Escaped Shapeshifter has flying.",
+        &["Creature"],
+        &["Shapeshifter"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Escaped Shapeshifter must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 105.2 + CR 611.3a: Common Cause's condition is a live shared-color
+/// population check, not an unconditional anthem rider.
+#[test]
+fn common_cause_is_fully_supported() {
+    let face = oracle_face_for(
+        "Common Cause",
+        "Creatures get +2/+2 as long as they all share a color.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(gaps.is_empty(), "Common Cause must be fully supported: {gaps:?}");
+}
+
+/// CR 105.1 + CR 611.3a: the five Djinn statics differ only by the fixed
+/// color named by their most-common-color condition.
+#[test]
+fn djinn_most_common_color_statics_are_fully_supported() {
+    let cases = [
+        (
+            "Goham Djinn",
+            "Black creatures get +1/+1 as long as black is the most common color among all permanents or is tied for most common.",
+        ),
+        (
+            "Halam Djinn",
+            "Red creatures get +1/+1 as long as red is the most common color among all permanents or is tied for most common.",
+        ),
+        (
+            "Ruham Djinn",
+            "White creatures get +1/+1 as long as white is the most common color among all permanents or is tied for most common.",
+        ),
+        (
+            "Sulam Djinn",
+            "Green creatures get +1/+1 as long as green is the most common color among all permanents or is tied for most common.",
+        ),
+        (
+            "Zanam Djinn",
+            "Blue creatures get +1/+1 as long as blue is the most common color among all permanents or is tied for most common.",
+        ),
+    ];
+
+    for (name, text) in cases {
+        let face = oracle_face_for(name, text, &["Creature"], &["Djinn"]);
+        let gaps = crate::game::coverage::card_face_gaps(&face);
+        assert!(gaps.is_empty(), "{name} must be fully supported: {gaps:?}");
+    }
+}
+
+/// CR 508.1k + CR 509.1g + CR 611.3a: attached-Aura combat-state pronouns
+/// must bind to the enchanted creature, and a compound recipient gate must
+/// retain its independent controller condition.
+#[test]
+fn attached_aura_combat_state_statics_are_fully_supported() {
+    let cases = [
+        (
+            "Tahngarth's Rage",
+            "Enchant creature\nEnchanted creature gets +3/+0 as long as it's attacking. Otherwise, it gets -2/-1.",
+        ),
+        (
+            "Snow Devil",
+            "Enchant creature\nEnchanted creature has flying.\nEnchanted creature has first strike as long as it's blocking and you control a snow land.",
+        ),
+    ];
+
+    for (name, text) in cases {
+        let face = oracle_face_for(name, text, &["Enchantment"], &["Aura"]);
+        let gaps = crate::game::coverage::card_face_gaps(&face);
+        assert!(gaps.is_empty(), "{name} must be fully supported: {gaps:?}");
+    }
+}
+
+/// CR 109.4 + CR 611.3a: Favorable Destiny's second static binds
+/// "its controller" to the enchanted creature and counts that creature plus
+/// another creature controlled by the same player.
+#[test]
+fn favorable_destiny_controller_population_static_is_fully_supported() {
+    let face = oracle_face_for(
+        "Favorable Destiny",
+        "Enchant creature\nEnchanted creature gets +1/+2 as long as it's white.\nEnchanted creature has shroud as long as its controller controls another creature.",
+        &["Enchantment"],
+        &["Aura"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Favorable Destiny must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 611.3a + CR 702: Tribal Golem's elided shared `has` list must lower to
+/// five independently gated statics, including its quoted regeneration ability.
+#[test]
+fn tribal_golem_conditional_ability_list_is_fully_supported() {
+    let face = oracle_face_for(
+        "Tribal Golem",
+        "This creature has trample as long as you control a Beast, haste as long as you control a Goblin, first strike as long as you control a Soldier, flying as long as you control a Wizard, and \"{B}: Regenerate this creature\" as long as you control a Zombie.",
+        &["Artifact", "Creature"],
+        &["Golem"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Tribal Golem must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 614.1a + CR 701.20e + CR 401.4: Aladdin's Lamp's old-border draw
+/// replacement must be represented by a dynamic top-library Dig, random rest
+/// placement, and a chained draw, with no residual coverage gap in the full
+/// production synthesis path.
+#[test]
+fn aladdins_lamp_draw_replacement_is_fully_supported() {
+    let face = oracle_face_for(
+        "Aladdin's Lamp",
+        "{X}, {T}: The next time you would draw a card this turn, instead look at the top X cards of your library, put all but one of them on the bottom of your library in a random order, then draw a card. X can't be 0.",
+        &["Artifact"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Aladdin's Lamp must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 701.20e + CR 401.4: the old-border "then put them back" wording is a
+/// Dig continuation, not a second standalone effect. Both target-player and
+/// self-library look/reorder clauses must therefore survive full synthesis.
+#[test]
+fn tahngarths_glare_two_library_reorders_are_fully_supported() {
+    let face = oracle_face_for(
+        "Tahngarth's Glare",
+        "Look at the top three cards of target opponent's library, then put them back in any order. That player looks at the top three cards of your library, then puts them back in any order.",
+        &["Instant"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Tahngarth's Glare must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 702.14a: old Oracle uses the two-word "Snow forestwalk" spelling for
+/// Rime Dryad. It must lower to the existing Snow landwalk keyword rather than
+/// becoming an unknown effect line.
+#[test]
+fn rime_dryad_snow_forestwalk_is_fully_supported() {
+    let face = oracle_face_for(
+        "Rime Dryad",
+        "Snow forestwalk (This creature can't be blocked as long as defending player controls a snow Forest.)",
+        &["Creature"],
+        &["Dryad"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Rime Dryad must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 702.14a: Legions of Lim-Dûl uses the sibling Ice Age spelling
+/// "Snow swampwalk".  It must take the same legacy landwalk compatibility
+/// route as Rime Dryad's "Snow forestwalk" rather than becoming an unknown
+/// keyword line.
+#[test]
+fn legions_of_lim_dul_snow_swampwalk_is_fully_supported() {
+    let face = oracle_face_for(
+        "Legions of Lim-Dûl",
+        "Snow swampwalk (This creature can't be blocked as long as defending player controls a snow Swamp.)",
+        &["Creature"],
+        &["Zombie"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Legions of Lim-Dûl must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 614.1c + CR 608.2d + CR 205.3m: Callous Oppressor's entry replacement
+/// has two distinct decision makers.  The opponent chosen by the controller
+/// names the creature type, which is then consumed by the activated ability's
+/// "isn't of the chosen type" filter.
+#[test]
+fn callous_oppressor_opponent_chooses_creature_type_is_fully_supported() {
+    let face = oracle_face_for(
+        "Callous Oppressor",
+        "You may choose not to untap this creature during your untap step.\nAs this creature enters, an opponent chooses a creature type.\n{T}: Gain control of target creature that isn't of the chosen type for as long as this creature remains tapped.",
+        &["Creature"],
+        &["Cephalid"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Callous Oppressor must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 614.1c + CR 701.21a: Overlaid Terrain's self-entry sacrifice is a
+/// replacement effect and must reuse the ordinary mandatory-all sacrifice
+/// representation rather than being reported as an unsupported as-enters line.
+#[test]
+fn overlaid_terrain_sacrifices_all_lands_as_it_enters() {
+    let face = oracle_face_for(
+        "Overlaid Terrain",
+        "As Overlaid Terrain enters the battlefield, sacrifice all lands you control.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Overlaid Terrain must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 614.1c + CR 701.9a: Heightened Awareness uses the same legacy
+/// self-entry replacement seam, with the ordinary hand-discard effect as its
+/// authoritative body.
+#[test]
+fn heightened_awareness_discards_hand_as_it_enters() {
+    let face = oracle_face_for(
+        "Heightened Awareness",
+        "As Heightened Awareness enters the battlefield, discard your hand.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Heightened Awareness must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 614.1c + CR 119.3: Lich's entry replacement reads the controller's
+/// current life total through the existing life-quantity representation.
+#[test]
+fn lich_loses_its_life_total_as_it_enters() {
+    let face = oracle_face_for(
+        "Lich",
+        "As Lich enters the battlefield, you lose life equal to your life total.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(gaps.is_empty(), "Lich must be fully supported: {gaps:?}");
+}
+
+/// CR 702.33d + CR 603.2: "a player kicks a spell" is an any-player
+/// SpellCast trigger filtered by the existing WasKicked event property.
+#[test]
+fn saproling_infestation_kicked_spell_trigger_is_fully_supported() {
+    let face = oracle_face_for(
+        "Saproling Infestation",
+        "Whenever a player kicks a spell, you create a 1/1 green Saproling creature token.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Saproling Infestation must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 701.20 + CR 708: Aven Soulgazer's activated ability looks at a
+/// face-down creature without revealing it.  Keep this as a full-card
+/// regression so the private-object look handler remains connected to the
+/// production coverage path, not merely to its effect-parser unit test.
+#[test]
+fn aven_soulgazer_private_face_down_look_is_fully_supported() {
+    let face = oracle_face_for(
+        "Aven Soulgazer",
+        "Flying\n{2}{W}: Look at target face-down creature.",
+        &["Creature"],
+        &["Bird"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Aven Soulgazer must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 609.7a + CR 615.1a: Forcefield combines a chosen damage source, an
+/// unblocked-creature recheck, combat-only scope, and an all-but-one shield.
+#[test]
+fn forcefield_chosen_unblocked_combat_prevention_is_fully_supported() {
+    let face = oracle_face_for(
+        "Forcefield",
+        "{1}: The next time an unblocked creature of your choice would deal combat damage to you this turn, prevent all but 1 of that damage.",
+        &["Artifact"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Forcefield must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 302.6 + CR 602.5b: Rocket Launcher's old-border control-continuity
+/// activation rider must survive the full Oracle pipeline as a typed,
+/// runtime-enforced restriction.
+#[test]
+fn rocket_launcher_control_continuity_gate_is_fully_supported() {
+    let face = oracle_face_for(
+        "Rocket Launcher",
+        "{2}: This artifact deals 1 damage to any target. Destroy this artifact at the beginning of the next end step. Activate only if you've controlled this artifact continuously since the beginning of your most recent turn.",
+        &["Artifact"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Rocket Launcher must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 105.4 + CR 109.4 + CR 120.3: Searing Rays counts creatures of the
+/// chosen color separately for each damaged player, using the old-border
+/// "that player controls" relative scope.
+#[test]
+fn searing_rays_chosen_color_per_player_damage_is_fully_supported() {
+    let face = oracle_face_for(
+        "Searing Rays",
+        "Choose a color. Searing Rays deals damage to each player equal to the number of creatures of that color that player controls.",
+        &["Sorcery"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Searing Rays must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 614.1a + CR 701.8a + CR 101.4: Words of Waste's old-border draw
+/// replacement needs an opponent-scoped discard continuation rather than a
+/// controller-scoped generic discard.
+#[test]
+fn words_of_waste_opponent_discard_draw_replacement_is_fully_supported() {
+    let face = oracle_face_for(
+        "Words of Waste",
+        "{1}: The next time you would draw a card this turn, each opponent discards a card instead.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Words of Waste must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 608.2c + CR 508.1d: Arcum's Whistle refers back to its chosen creature
+/// with the definite article in the forced-attack clause. That subject must
+/// inherit the selected target rather than widen to every creature.
+#[test]
+fn arcums_whistle_definite_creature_anaphor_is_fully_supported() {
+    let face = oracle_face_for(
+        "Arcum's Whistle",
+        "{3}, {T}: Choose target non-Wall creature the active player has controlled continuously since the beginning of the turn. That player may pay {X}, where X is that creature's mana value. If they don't pay, the creature attacks this turn if able, and at the beginning of the next end step, destroy it if it didn't attack this turn. Activate only before attackers are declared.",
+        &["Artifact"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Arcum's Whistle must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 120.1 + CR 608.2c: Flaming Gambit's redirection clause reuses the
+/// amount from its first damage event with the wording "that damage". The
+/// full synthesis path must preserve that event-context amount and the chosen
+/// creature target rather than leaving an `Effect:deal` coverage gap.
+#[test]
+fn flaming_gambit_damage_redirection_is_fully_supported() {
+    let face = oracle_face_for(
+        "Flaming Gambit",
+        "Flaming Gambit deals X damage to target player or planeswalker. That player or that planeswalker's controller may choose a creature they control and have Flaming Gambit deal that damage to it instead. Flashback {X}{R}{R} (You may cast this card from your graveyard for its flashback cost. Then exile it.)",
+        &["Instant"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Flaming Gambit must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 608.2c + CR 701.19: Angel's Trumpet counts the creatures tapped by its
+/// preceding tap instruction when it deals damage to the player.
+#[test]
+fn angels_trumpet_tapped_creature_count_is_fully_supported() {
+    let face = oracle_face_for(
+        "Angel's Trumpet",
+        "{3}: Untap all creatures and tap all creatures. At the beginning of each player's end step, Angel's Trumpet deals damage to that player equal to the number of creatures tapped this way.",
+        &["Artifact"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Angel's Trumpet must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 120.9 + CR 608.2c: Final Punishment's "that player" damage-history
+/// anaphor must bind back to its target player instead of opening a new target
+/// or falling through to an unresolved quantity.
+#[test]
+fn final_punishment_damage_history_is_fully_supported() {
+    let face = oracle_face_for(
+        "Final Punishment",
+        "Target player loses life equal to the damage already dealt to that player this turn.",
+        &["Sorcery"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Final Punishment must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 608.2f + CR 701.26a-b: Breaking Wave's leading "Simultaneously" is a
+/// manner adverb over two ordinary tap-state instructions. It must not cause
+/// the first untap or the second tap to become an unsupported residual.
+#[test]
+fn breaking_wave_simultaneous_tap_state_change_is_fully_supported() {
+    let face = oracle_face_for(
+        "Breaking Wave",
+        "You may cast Breaking Wave as though it had flash if you pay {2} more to cast it. (You may cast it any time you could cast an instant.) Simultaneously untap all tapped creatures and tap all untapped creatures.",
+        &["Instant"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Breaking Wave must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 608.2c + CR 701.9a: Forget's draw instruction reads the cards discarded
+/// by the preceding each-player instruction through the tracked resolution set.
+#[test]
+fn forget_draws_the_cards_discarded_this_way() {
+    let face = oracle_face_for(
+        "Forget",
+        "Each player discards all the cards in their hand, then draws as many cards as they discarded this way.",
+        &["Sorcery"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(gaps.is_empty(), "Forget must be fully supported: {gaps:?}");
+}
+
+/// CR 601.2c + CR 608.2c: the targeted form of Forget must carry the
+/// discarded-card tracked set into the target player's dynamic draw, not use
+/// the caster's discard journal or a fixed one-card fallback.
+#[test]
+fn forget_target_player_draws_the_cards_discarded_this_way() {
+    let face = oracle_face_for(
+        "Forget",
+        "Target player discards two cards, then draws as many cards as they discarded this way.",
+        &["Sorcery"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(gaps.is_empty(), "Forget target form must be fully supported: {gaps:?}");
+    let effects = collect_all_effects(&face.abilities);
+    assert!(matches!(
+        effects.first(),
+        Some(Effect::Discard {
+            count: QuantityExpr::Fixed { value: 2 },
+            ..
+        })
+    ));
+    assert!(effects.iter().any(|effect| matches!(
+        effect,
+        Effect::Draw {
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::TrackedSetSize,
+            },
+            ..
+        }
+    )));
+}
+
+/// CR 406.3 + CR 701.24a: Parallel Thoughts shuffles its face-down exile
+/// pile, not a player's library. The tracked-pile sentinel must survive full
+/// Oracle synthesis so the pile order remains the source of later replacement
+/// draws.
+#[test]
+fn parallel_thoughts_shuffles_its_face_down_pile() {
+    let face = oracle_face_for(
+        "Parallel Thoughts",
+        "When this enchantment enters, search your library for seven cards, exile them in a face-down pile, and shuffle that pile. Then shuffle your library. If you would draw a card, you may instead put the top card of the pile you exiled into your hand.",
+        &["Enchantment"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Parallel Thoughts must be fully supported: {gaps:?}"
+    );
 }
 
 /// CR 509.3d: No Quarter's two filtered block triggers name opposite members
@@ -3376,6 +5185,135 @@ fn found_footage_look_at_face_down_static_full_card_supported() {
         }
         other => panic!("expected Typed affected filter, got {other:?}"),
     }
+}
+
+/// CR 701.20e + CR 406.3: Gustha's Scepter's "You may look at it for as long
+/// as it remains exiled" rider is a private object-identity lookup of the
+/// card just exiled face down, not a public reveal or an unresolved verb.
+/// Keep the full old-border card on the coverage path so the chained
+/// `ParentTarget` lookup remains wired to the typed runtime handler.
+#[test]
+fn gusthas_scepter_private_exiled_card_look_is_fully_supported() {
+    let face = oracle_face_for(
+        "Gustha's Scepter",
+        "{T}: Exile a card from your hand face down. You may look at it for as long as it remains exiled.\n{T}: Return a card you own exiled with this artifact to your hand.\nWhen you lose control of this artifact, put all cards exiled with this artifact into their owner's graveyard.",
+        &["Artifact"],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Gustha's Scepter must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 105.1 + CR 608.2c: All Suns' Dawn must preserve its five independent
+/// optional color selections and the final self-exile as a complete card face.
+#[test]
+fn all_suns_dawn_color_returns_are_fully_supported() {
+    let face = oracle_face_for(
+        "All Suns' Dawn",
+        "For each color, return up to one target card of that color from your graveyard to your hand. Exile All Suns' Dawn.",
+        &[],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "All Suns' Dawn must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 509.3d + CR 702.26b: Dream Fighter's combat trigger must preserve both
+/// participants — its own object and the creature it blocked or was blocked by.
+#[test]
+fn dream_fighter_phases_out_both_combat_participants() {
+    let face = oracle_face_for(
+        "Dream Fighter",
+        "Whenever this creature blocks or becomes blocked by a creature, this creature and that creature phase out.",
+        &["Creature"],
+        &["Human", "Wizard"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Dream Fighter must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 608.2c + CR 701.20a: Rofellos's Gift must repeat its resolution-time
+/// graveyard return once per card revealed, rather than leaving the trailing
+/// dynamic `for each` clause unsupported.
+#[test]
+fn rofellos_gift_returns_one_enchantment_per_revealed_card() {
+    let face = oracle_face_for(
+        "Rofellos's Gift",
+        "Reveal any number of green cards in your hand. Return an enchantment card from your graveyard to your hand for each card revealed this way.",
+        &[],
+        &[],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Rofellos's Gift must be fully supported: {gaps:?}"
+    );
+}
+
+/// CR 118.12 + CR 701.7: Barrow Ghoul's upkeep rider must retain the ordered
+/// top-creature graveyard action as a real unless payment, rather than leaving
+/// an "Unsupported unless clause" parser gap.
+#[test]
+fn barrow_ghoul_top_creature_graveyard_unless_is_fully_supported() {
+    let face = oracle_face_for(
+        "Barrow Ghoul",
+        "At the beginning of your upkeep, sacrifice this creature unless you exile the top creature card of your graveyard.",
+        &["Creature"],
+        &["Zombie"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Barrow Ghoul must be fully supported: {gaps:?}"
+    );
+}
+
+/// Circling Vultures shares Barrow Ghoul's exact top-creature graveyard
+/// alternative action; keep both old-border cards on the regression path so
+/// the parser/runtime contract cannot regress to a one-card exception.
+#[test]
+fn circling_vultures_top_creature_graveyard_unless_is_fully_supported() {
+    let face = oracle_face_for_with_keywords(
+        "Circling Vultures",
+        "Flying\nYou may discard this card any time you could cast an instant.\nAt the beginning of your upkeep, sacrifice this creature unless you exile the top creature card of your graveyard.",
+        &["Creature"],
+        &["Bird"],
+        &["Flying"],
+    );
+    let gaps = crate::game::coverage::card_face_gaps(&face);
+    assert!(
+        gaps.is_empty(),
+        "Circling Vultures must be fully supported: {gaps:?}"
+    );
+    let discard_ability = face
+        .abilities
+        .iter()
+        .find(|ability| {
+            ability.kind == AbilityKind::Activated
+                && ability.activation_zone == Some(Zone::Hand)
+                && matches!(
+                    ability.cost,
+                    Some(AbilityCost::Discard {
+                        self_scope: DiscardSelfScope::SourceCard,
+                        ..
+                    })
+                )
+        })
+        .expect("Circling Vultures must expose its hand-zone self-discard action");
+    assert!(
+        matches!(&*discard_ability.effect, Effect::NoOp),
+        "the self-discard action must not invent a second effect: {:?}",
+        discard_ability.effect
+    );
 }
 
 /// CR 708.5: Lumbering Laundry's "{2}: Until end of turn, you may look at
@@ -4488,6 +6426,26 @@ fn parse_urborg_activated_choose_then_remove_chosen_keyword() {
             .iter()
             .any(|effect| matches!(effect, Effect::Unimplemented { .. })),
         "Urborg must have no unimplemented effect, got {effects:?}"
+    );
+}
+
+/// CR 602.2b + CR 608.2d: Phyrexian Splicer's legacy wording puts the typed
+/// keyword choice in the activation cost, then reads that choice in both
+/// target clauses. The cost must not be split at the choice-list commas, and
+/// the effect must retain the chosen-keyword loss/gain semantics.
+#[test]
+fn parse_phyrexian_splicer_keyword_choice_cost_and_effect() {
+    let parsed = parse(
+        "{2}, {T}, Choose flying, first strike, trample, or shadow: Until end of turn, target creature with the chosen ability loses it and another target creature gains it.",
+        "Phyrexian Splicer",
+        &[],
+        &["Artifact", "Creature"],
+        &["Phyrexian"],
+    );
+
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Phyrexian Splicer must have no parser gaps: {parsed:#?}"
     );
 }
 
@@ -10168,6 +12126,43 @@ fn jetfire_front_face_activated_ability() {
         ),
         "sub-ability must be a self-transform, got {:?}",
         sub.effect
+    );
+}
+
+/// CR 106.6: Thran Turbine's legacy mana sentence uses the bare negative
+/// wording "This mana can't be spent to cast spells".  The continuation must
+/// fold into the preceding mana effect as `ActivateOnly`, rather than remain
+/// an `unbound_subject` residual.
+#[test]
+fn thran_turbine_bare_negative_mana_restriction_is_fully_supported() {
+    use crate::types::ability::ManaSpendRestriction;
+
+    let parsed = parse(
+        "At the beginning of your upkeep, you may add {C}{C}. This mana can't be spent to cast spells.",
+        "Thran Turbine",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Thran Turbine must not leave a restriction residual: {parsed:#?}"
+    );
+    let execute = parsed.triggers[0]
+        .execute
+        .as_ref()
+        .expect("upkeep trigger must have an execute body");
+    let Effect::Mana { restrictions, .. } = execute.effect.as_ref() else {
+        panic!("expected upkeep body to remain Effect::Mana: {execute:?}");
+    };
+    assert_eq!(
+        restrictions,
+        &vec![ManaSpendRestriction::ActivateOnly],
+        "bare negative spell wording must forbid spells while allowing abilities"
+    );
+    assert!(
+        execute.sub_ability.is_none(),
+        "the restriction sentence must be absorbed into the mana effect"
     );
 }
 
@@ -24255,6 +26250,459 @@ fn trigger_persisted_type_choice_reconciles_self_chosen_type_static() {
         modification,
         ContinuousModification::AddChosenSubtype {
             kind: crate::types::ability::ChosenSubtypeKind::CreatureType
+        }
+    )));
+}
+
+#[test]
+fn gem_bazaar_persists_random_color_for_later_mana_ability() {
+    // CR 607.2d + CR 613.1: the ETB choice is a durable source choice because
+    // the separate activated ability reads the source's last chosen color.
+    let parsed = parse(
+        "Gem Bazaar enters the battlefield tapped.\n{T}: Add one mana of the color last chosen. Then choose a random color.\nWhen Gem Bazaar comes into play, choose a random color.",
+        "Gem Bazaar",
+        &[],
+        &["Land"],
+        &[],
+    );
+
+    let etb = parsed
+        .triggers
+        .iter()
+        .find(|trigger| trigger.execute.is_some())
+        .and_then(|trigger| trigger.execute.as_deref())
+        .expect("Gem Bazaar must have an ETB choice trigger");
+    assert!(matches!(
+        etb.effect.as_ref(),
+        Effect::Choose {
+            choice_type: crate::types::ability::ChoiceType::Color { .. },
+            persist: true,
+            selection: crate::types::ability::TargetSelectionMode::Random,
+        }
+    ));
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "Gem Bazaar's old-border choice/mana wording must be fully represented: {parsed:#?}"
+    );
+}
+
+#[test]
+fn animal_magnetism_filters_opponent_choice_to_revealed_creatures() {
+    // CR 608.2c: "from among them" refers to the preceding reveal's tracked
+    // set; the creature qualifier must remain on that candidate pool.
+    let parsed = parse(
+        "Reveal the top five cards of your library. An opponent chooses a creature card from among them. Put that card onto the battlefield and the rest into your graveyard.",
+        "Animal Magnetism",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    assert!(!parsed_has_unimplemented(&parsed), "{parsed:#?}");
+    let ability = parsed
+        .abilities
+        .first()
+        .expect("Animal Magnetism spell ability");
+    let choice = ability
+        .sub_ability
+        .as_deref()
+        .expect("reveal should chain to the choice");
+    assert!(matches!(
+        choice.effect.as_ref(),
+        Effect::ChooseFromZone {
+            chooser: crate::types::ability::Chooser::Opponent,
+            filter: Some(TargetFilter::Typed(_)),
+            count: 1,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn stunted_growth_keeps_targeted_count_and_library_ordering() {
+    // CR 608.2c + CR 401.4: the target player chooses three cards from their
+    // hand, and the same chosen set is then ordered on top of their library.
+    let parsed = parse(
+        "Target player chooses three cards from their hand and puts them on top of their library in any order.",
+        "Stunted Growth",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    assert!(!parsed_has_unimplemented(&parsed), "{parsed:#?}");
+    let ability = parsed
+        .abilities
+        .first()
+        .expect("Stunted Growth spell ability");
+    let target = ability
+        .sub_ability
+        .as_deref()
+        .expect("target player wrapper");
+    assert!(matches!(
+        target.effect.as_ref(),
+        Effect::TargetOnly {
+            target: TargetFilter::Player
+        }
+    ));
+    let choose = target
+        .sub_ability
+        .as_deref()
+        .expect("target player choice");
+    assert!(matches!(
+        choose.effect.as_ref(),
+        Effect::ChooseFromZone {
+            count: 3,
+            zone: Zone::Hand,
+            zone_owner: crate::types::ability::ZoneOwner::TargetedPlayer,
+            chooser: crate::types::ability::Chooser::OwningPlayer,
+            ..
+        }
+    ));
+    let put = choose
+        .sub_ability
+        .as_deref()
+        .expect("chosen cards should have a library-placement continuation");
+    assert!(matches!(
+        put.effect.as_ref(),
+        Effect::PutAtLibraryPosition {
+            position: crate::types::ability::LibraryPosition::Top,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn scrounge_routes_typed_graveyard_choice_to_target_opponent() {
+    // CR 608.2c: the targeted opponent chooses from that same opponent's
+    // graveyard, even though the spell controller owns the resulting move.
+    let parsed = parse(
+        "Target opponent chooses an artifact card in their graveyard. Put that card onto the battlefield under your control.",
+        "Scrounge",
+        &[],
+        &[],
+        &[],
+    );
+    assert!(!parsed_has_unimplemented(&parsed), "{parsed:#?}");
+    let ability = parsed.abilities.first().expect("Scrounge spell ability");
+    let target = ability
+        .sub_ability
+        .as_deref()
+        .expect("targeted choice should be wrapped as a spell target");
+    assert!(matches!(
+        target.effect.as_ref(),
+        Effect::TargetOnly {
+            target: TargetFilter::Typed(_)
+        }
+    ));
+    let choose = target
+        .sub_ability
+        .as_deref()
+        .expect("targeted choice should be the spell's continuation");
+    assert!(matches!(
+        choose.effect.as_ref(),
+        Effect::ChooseFromZone {
+            zone: Zone::Graveyard,
+            zone_owner: crate::types::ability::ZoneOwner::TargetedPlayer,
+            chooser: crate::types::ability::Chooser::OwningPlayer,
+            filter: Some(TargetFilter::Typed(_)),
+            count: 1,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn venarian_glimmer_keeps_x_bound_on_revealed_hand_choice() {
+    let parsed = parse(
+        "Target player reveals their hand. You choose a nonland card with mana value X or less from it. That player discards that card.",
+        "Venarian Glimmer",
+        &[],
+        &["Instant"],
+        &[],
+    );
+    assert!(!parsed_has_unimplemented(&parsed), "{parsed:#?}");
+    let reveal = parsed.abilities.first().expect("Venarian Glimmer ability");
+    assert!(matches!(
+        reveal.effect.as_ref(),
+        Effect::RevealHand {
+            card_filter: TargetFilter::Typed(filter),
+            ..
+        } if filter.type_filters.iter().any(|kind| matches!(
+            kind,
+            TypeFilter::Non(inner) if **inner == TypeFilter::Land
+        )) && filter.properties.iter().any(|property| matches!(
+            property,
+            FilterProp::Cmc {
+                comparator: Comparator::LE,
+                value: QuantityExpr::Ref {
+                    qty: QuantityRef::Variable { name }
+                }
+            } if name == "X"
+        ))
+    ), "Venarian Glimmer choice filter was not retained: {reveal:#?}");
+}
+
+#[test]
+fn psychotic_episode_chooses_from_the_revealed_population() {
+    let parsed = parse(
+        "Target player reveals their hand and the top card of their library. You choose a card revealed this way. That player puts the chosen card on the bottom of their library.",
+        "Psychotic Episode",
+        &[],
+        &["Sorcery"],
+        &[],
+    );
+    assert!(!parsed_has_unimplemented(&parsed), "{parsed:#?}");
+
+    fn chain_has(def: &AbilityDefinition, predicate: impl Fn(&Effect) -> bool + Copy) -> bool {
+        predicate(def.effect.as_ref())
+            || def
+                .sub_ability
+                .as_deref()
+                .is_some_and(|child| chain_has(child, predicate))
+    }
+
+    let ability = parsed.abilities.first().expect("Psychotic Episode ability");
+    assert!(
+        chain_has(ability, |effect| matches!(effect, Effect::RevealHand { .. })),
+        "expected the target player's hand reveal: {ability:#?}"
+    );
+    assert!(
+        chain_has(ability, |effect| matches!(effect, Effect::RevealTop { count: 1, .. })),
+        "expected the top-card reveal: {ability:#?}"
+    );
+    assert!(
+        chain_has(ability, |effect| matches!(
+            effect,
+            Effect::ChooseFromZone {
+                count: 1,
+                filter: None,
+                chooser: crate::types::ability::Chooser::Controller,
+                ..
+            }
+        )),
+        "expected a tracked-set choice: {ability:#?}"
+    );
+    assert!(
+        chain_has(ability, |effect| matches!(
+            effect,
+            Effect::PutAtLibraryPosition {
+                position: crate::types::ability::LibraryPosition::Bottom,
+                ..
+            }
+        )),
+        "expected the chosen card to be put on the library bottom: {ability:#?}"
+    );
+}
+
+#[test]
+fn skyship_weatherlight_chooses_random_linked_exile() {
+    let parsed = parse(
+        "When Skyship Weatherlight enters, search your library for any number of artifact and/or creature cards, exile them, then shuffle.\n{4}, {T}: Choose a card at random that was exiled with Skyship Weatherlight. Put that card into its owner's hand.",
+        "Skyship Weatherlight",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    assert!(!parsed_has_unimplemented(&parsed), "{parsed:#?}");
+    let activated = parsed
+        .abilities
+        .first()
+        .expect("Skyship Weatherlight activated ability");
+    assert!(matches!(
+        activated.effect.as_ref(),
+        Effect::ChooseFromZone {
+            zone: Zone::Exile,
+            zone_owner: crate::types::ability::ZoneOwner::AllOwners,
+            filter: Some(TargetFilter::ExiledBySource),
+            selection: crate::types::ability::CardSelectionMode::Random,
+            count: 1,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn phyrexian_grimoire_chooses_only_from_top_two_graveyard_cards() {
+    let parsed = parse(
+        "{4}, {T}: Target opponent chooses one of the top two cards of your graveyard. Exile that card and put the other one into your hand.",
+        "Phyrexian Grimoire",
+        &[],
+        &["Artifact"],
+        &[],
+    );
+    assert!(!parsed_has_unimplemented(&parsed), "{parsed:#?}");
+
+    fn chain_has(def: &AbilityDefinition, predicate: impl Fn(&Effect) -> bool + Copy) -> bool {
+        predicate(def.effect.as_ref())
+            || def
+                .sub_ability
+                .as_deref()
+                .is_some_and(|child| chain_has(child, predicate))
+    }
+
+    let activated = parsed
+        .abilities
+        .first()
+        .expect("Phyrexian Grimoire activated ability");
+    assert!(chain_has(activated, |effect| matches!(
+        effect,
+        Effect::ChooseFromZone {
+            count: 1,
+            zone: Zone::Graveyard,
+            zone_owner: crate::types::ability::ZoneOwner::Controller,
+            chooser: crate::types::ability::Chooser::Opponent,
+            constraint: Some(
+                crate::types::ability::ChooseFromZoneConstraint::TopCards { count: 2 }
+            ),
+            ..
+        }
+    )));
+    assert!(chain_has(activated, |effect| matches!(
+        effect,
+        Effect::ChangeZone {
+            destination: Zone::Exile,
+            // Choice-partition continuations use the selected targets on the
+            // continuation frame.  The resolver replaces this `Any` target
+            // with the chosen card before it executes the first leg.
+            target: TargetFilter::Any,
+            ..
+        }
+    )));
+    assert!(chain_has(activated, |effect| matches!(
+        effect,
+        Effect::ChangeZone {
+            destination: Zone::Hand,
+            // The second leg receives the unchosen remainder as its target
+            // list when the interactive choice is submitted.
+            target: TargetFilter::Any,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn sundering_titan_chooses_each_basic_land_type_before_destroying() {
+    let parsed = parse(
+        "When this creature enters or leaves the battlefield, choose a land of each basic land type, then destroy those lands.",
+        "Sundering Titan",
+        &[],
+        &["Artifact", "Creature"],
+        &[],
+    );
+    assert!(!parsed_has_unimplemented(&parsed), "{parsed:#?}");
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|trigger| trigger.execute.is_some())
+        .and_then(|trigger| trigger.execute.as_deref())
+        .expect("Sundering Titan enters/leaves trigger");
+    assert!(matches!(
+        trigger.effect.as_ref(),
+        Effect::ForEachCategory {
+            category: crate::types::ability::IterationCategory::BasicLandType,
+            action: crate::types::ability::ForEachCategoryAction::ChooseOne {
+                target: TargetFilter::Typed(filter)
+            },
+            ..
+        } if filter.type_filters == vec![TypeFilter::Land]
+    ));
+    let destroy = trigger
+        .sub_ability
+        .as_deref()
+        .expect("the selected lands should feed the destroy continuation");
+    assert!(matches!(
+        destroy.effect.as_ref(),
+        Effect::Destroy {
+            target: TargetFilter::TrackedSet { .. },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn infectious_rage_chooses_random_creature_before_returning_as_aura() {
+    let parsed = parse(
+        "Enchant creature\nWhen enchanted creature dies, choose a creature at random this Aura can enchant. Return this card to the battlefield attached to that creature.",
+        "Infectious Rage",
+        &[],
+        &["Enchantment"],
+        &["Aura"],
+    );
+    assert!(!parsed_has_unimplemented(&parsed), "{parsed:#?}");
+
+    fn chain_has(def: &AbilityDefinition, predicate: impl Fn(&Effect) -> bool + Copy) -> bool {
+        predicate(def.effect.as_ref())
+            || def
+                .sub_ability
+                .as_deref()
+                .is_some_and(|child| chain_has(child, predicate))
+    }
+
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|trigger| trigger.execute.is_some())
+        .and_then(|trigger| trigger.execute.as_deref())
+        .expect("Infectious Rage death trigger");
+    assert!(chain_has(trigger, |effect| matches!(
+        effect,
+        Effect::ChooseFromZone {
+            zone: Zone::Battlefield,
+            filter: Some(TargetFilter::Typed(_)),
+            selection: crate::types::ability::CardSelectionMode::Random,
+            count: 1,
+            ..
+        }
+    )));
+    assert!(chain_has(trigger, |effect| matches!(
+        effect,
+        Effect::Attach {
+            target: TargetFilter::TrackedSet { .. }
+                | TargetFilter::TrackedSetFiltered { .. },
+            ..
+        }
+    )));
+}
+
+#[test]
+fn takkle_maggot_uses_enchanted_creature_controller_for_return_choice() {
+    let parsed = parse(
+        "Enchant creature\nAt the beginning of the upkeep of enchanted creature's controller, put a -0/-1 counter on that creature.\nWhen enchanted creature dies, that creature's controller chooses a creature that this card could enchant. If the player does, return this card to the battlefield under your control attached to that creature. If they don't, return this card to the battlefield under your control as a non-Aura enchantment. It loses \"enchant creature\" and gains \"At the beginning of that player's upkeep, this enchantment deals 1 damage to that player.\"",
+        "Takklemaggot",
+        &[],
+        &["Enchantment"],
+        &["Aura"],
+    );
+    assert!(!parsed_has_unimplemented(&parsed), "{parsed:#?}");
+
+    fn chain_has(def: &AbilityDefinition, predicate: impl Fn(&Effect) -> bool + Copy) -> bool {
+        predicate(def.effect.as_ref())
+            || def
+                .sub_ability
+                .as_deref()
+                .is_some_and(|child| chain_has(child, predicate))
+    }
+
+    let trigger = parsed
+        .triggers
+        .iter()
+        .find(|trigger| trigger.execute.is_some())
+        .and_then(|trigger| trigger.execute.as_deref())
+        .expect("Takklemaggot death trigger");
+    assert!(chain_has(trigger, |effect| matches!(
+        effect,
+        Effect::ChooseObjectsIntoTrackedSet {
+            chooser: TargetFilter::ParentTargetController,
+            min: 1,
+            max: Some(1),
+            ..
+        }
+    )));
+    assert!(chain_has(trigger, |effect| matches!(
+        effect,
+        Effect::Attach {
+            target: TargetFilter::TrackedSet { .. }
+                | TargetFilter::TrackedSetFiltered { .. },
+            ..
         }
     )));
 }

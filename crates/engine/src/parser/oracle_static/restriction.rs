@@ -1341,8 +1341,26 @@ pub(crate) fn parse_cant_cast_type_spells(
     }
 
     // --- "spells with the same name as ..." ---
-    // CR 101.2: "can't cast spells with the same name as [reference]" — approximate as
-    // blanket prohibition; the name-matching filter is too dynamic for static representation.
+    // CR 101.2 + CR 201.2a: Cornered Market's reference set is the live set of
+    // nontoken permanents, so route this exact shape to the object-aware runtime
+    // prohibition instead of the historical blanket approximation.
+    if all_consuming(tag::<_, _, OracleError<'_>>(
+        "spells with the same name as a nontoken permanent",
+    ))
+    .parse(trimmed)
+    .is_ok()
+    {
+        let def = StaticDefinition::new(StaticMode::Other(
+            "CantCastSameNameAsNontokenPermanent".to_string(),
+        ))
+        .affected(TargetFilter::Player)
+        .description(text.to_string());
+        return attach_parsed_static_gate(def, gate_condition_text);
+    }
+
+    // Other same-name references (for example, a card exiled with a source) do
+    // not yet have a static source-link representation, so preserve the legacy
+    // conservative fallback for those shapes.
     if nom_tag_lower(trimmed, trimmed, "spells with the same name as ").is_some() {
         let def =
             StaticDefinition::new(StaticMode::CantBeCast { who }).description(text.to_string());
@@ -1390,6 +1408,32 @@ pub(crate) fn parse_cant_cast_type_spells(
         def = def.affected(filter);
     }
     attach_parsed_static_gate(def, gate_condition_text)
+}
+
+/// CR 101.2 + CR 305.1 + CR 201.2a: Parse Cornered Market's land-side
+/// prohibition. This is deliberately exact: the live reference set is handled
+/// by `static_abilities`, while the parser only records the printed scope and
+/// the nonbasic-land axis.
+pub(crate) fn parse_cornered_market_land_prohibition(
+    tp: &str,
+    text: &str,
+) -> Option<StaticDefinition> {
+    let trimmed = tp.trim_end_matches('.');
+    if !all_consuming(tag::<_, _, OracleError<'_>>(
+        "players can't play nonbasic lands with the same name as a nontoken permanent",
+    ))
+    .parse(trimmed)
+    .is_ok()
+    {
+        return None;
+    }
+    Some(
+        StaticDefinition::new(StaticMode::Other(
+            "CantPlayNonbasicLandSameNameAsNontokenPermanent".to_string(),
+        ))
+        .affected(TargetFilter::Player)
+        .description(text.to_string()),
+    )
 }
 
 /// CR 101.2: Shared passive-voice "`<subject>` can't be cast" SUBJECT filter

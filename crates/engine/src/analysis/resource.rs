@@ -4920,6 +4920,7 @@ fn prop_is_arrival_invariant(prop: &crate::types::ability::FilterProp) -> bool {
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -4962,6 +4963,7 @@ fn prop_is_arrival_invariant(prop: &crate::types::ability::FilterProp) -> bool {
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
         | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::AttackedLastTurn
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
@@ -4978,6 +4980,7 @@ fn prop_is_arrival_invariant(prop: &crate::types::ability::FilterProp) -> bool {
         | FilterProp::SameNameAsExiledBySource
         | FilterProp::IsCommander
         | FilterProp::SharesCreatureTypeWithCommander
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
     }
 }
@@ -10928,7 +10931,10 @@ mod tests {
         for state in [&mut prior, &mut current] {
             let oid = bf_object(state, 802);
             let mut def = StaticDefinition::new(StaticMode::CantLoseTheGame);
-            def.condition = Some(StaticCondition::OpponentPoisonAtLeast { count: 1 });
+            def.condition = Some(StaticCondition::OpponentPoisonAtLeast {
+                count: 1,
+                player: None,
+            });
             state
                 .objects
                 .get_mut(&oid)

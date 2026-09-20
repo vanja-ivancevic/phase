@@ -237,7 +237,7 @@ fn collect_phase_in_targets(
 mod tests {
     use super::*;
     use crate::game::zones::create_object;
-    use crate::types::ability::{ControllerRef, TypedFilter};
+    use crate::types::ability::{ControllerRef, FilterProp, TypedFilter};
     use crate::types::card_type::CoreType;
     use crate::types::identifiers::CardId;
     use crate::types::player::PlayerId;
@@ -295,6 +295,44 @@ mod tests {
             state.objects[&theirs].is_phased_out(),
             "opponent's phased-out creature must remain phased out"
         );
+    }
+
+    /// CR 702.26b: the explicit "phased-out" adjective is a real typed
+    /// property, not merely a bypass flag on the phase-in resolver. It must
+    /// select only phased-out creatures and keep a phased-out noncreature out.
+    #[test]
+    fn phase_in_filter_matches_the_phased_out_property() {
+        let mut state = GameState::new_two_player(42);
+        let source = add_creature(&mut state, PlayerId(0), "Phase Source");
+        let creature = add_creature(&mut state, PlayerId(0), "Creature");
+        let noncreature_card_id = CardId(state.next_object_id);
+        let noncreature = create_object(
+            &mut state,
+            noncreature_card_id,
+            PlayerId(0),
+            "Noncreature".to_string(),
+            Zone::Battlefield,
+        );
+
+        let mut events = Vec::new();
+        phase_out_object(&mut state, creature, PhaseOutCause::Directly, &mut events);
+        phase_out_object(&mut state, noncreature, PhaseOutCause::Directly, &mut events);
+
+        let ability = ResolvedAbility::new(
+            Effect::PhaseIn {
+                target: TargetFilter::Typed(
+                    TypedFilter::creature().properties(vec![FilterProp::PhasedOut]),
+                ),
+            },
+            Vec::new(),
+            source,
+            PlayerId(0),
+        );
+
+        resolve_phase_in(&mut state, &ability, &mut events).unwrap();
+
+        assert!(state.objects[&creature].is_phased_in());
+        assert!(state.objects[&noncreature].is_phased_out());
     }
 
     /// CR 702.26c + CR 101.2 + CR 611.2b: `resolve_phase_in` is the second

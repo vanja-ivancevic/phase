@@ -612,6 +612,7 @@ impl EventObjectSnapshot {
 
             // ---- embedded characteristics ----
             FilterProp::WithKeyword { .. }
+            | FilterProp::HasChosenKeyword
             | FilterProp::HasKeywordKind { .. }
             | FilterProp::WithoutKeyword { .. }
             | FilterProp::WithoutKeywordKind { .. }
@@ -671,6 +672,10 @@ impl EventObjectSnapshot {
             | FilterProp::AttackedOrBlockedThisTurn
             | FilterProp::ZoneChangedThisTurn { .. }
             | FilterProp::CountersPutOnThisTurn { .. } => Supported,
+
+            // The Connive event snapshot is turn-local; it intentionally does
+            // not carry the controller's prior-turn object ledger.
+            FilterProp::AttackedLastTurn => Unsupported,
 
             // ---- embedded tracked-set membership ----
             FilterProp::InTrackedSet { .. } => Supported,
@@ -746,6 +751,7 @@ impl EventObjectSnapshot {
             // (CR 106.6 / CR 603.7a), which are evaluated live at the casting site —
             // never from the event-subject grammar.
             | FilterProp::SharesCreatureTypeWithCommander
+            | FilterProp::PhasedOut
             | FilterProp::Other { .. } => Unsupported,
         }
     }

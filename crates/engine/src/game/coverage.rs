@@ -717,6 +717,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 parts.push("haste or controlled since turn began".into())
             }
             FilterProp::WithKeyword { value } => parts.push(format!("with {value:?}")),
+            FilterProp::HasChosenKeyword => parts.push("with the chosen ability".into()),
             FilterProp::CanEnchant { target } => {
                 parts.push(format!("can enchant {}", fmt_target(target)))
             }
@@ -1003,6 +1004,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 }
                 Some(_) => parts.push("attacked scoped player this turn".into()),
             },
+            FilterProp::AttackedLastTurn => parts.push("attacked during last turn".into()),
             FilterProp::BlockedThisTurn => parts.push("blocked this turn".into()),
             FilterProp::AttackedOrBlockedThisTurn => {
                 parts.push("attacked or blocked this turn".into());
@@ -1033,6 +1035,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::Modal => parts.push("modal spell".into()),
             FilterProp::FaceDown => parts.push("face-down".into()),
             FilterProp::Transformed => parts.push("transformed".into()),
+            FilterProp::PhasedOut => parts.push("phased-out".into()),
             FilterProp::TargetsOnly { filter } => {
                 parts.push(format!("targets only {}", fmt_target(filter)));
             }
@@ -3579,6 +3582,9 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                 "category".into(),
                 match category {
                     crate::types::ability::IterationCategory::Color => "color".to_string(),
+                    crate::types::ability::IterationCategory::BasicLandType => {
+                        "basic land type".to_string()
+                    }
                     crate::types::ability::IterationCategory::CardType => "card type".to_string(),
                 },
             ));
@@ -3593,6 +3599,9 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                 } => {
                     d.push(("target".into(), fmt_target(target)));
                     d.push(("counter_type".into(), counter_type.as_str().to_string()));
+                }
+                ForEachCategoryAction::ChooseOne { target } => {
+                    d.push(("target".into(), fmt_target(target)));
                 }
             }
         }
@@ -4376,6 +4385,9 @@ fn fmt_ability_condition(cond: &AbilityCondition) -> String {
         AbilityCondition::SourceLacksKeyword { keyword } => {
             format!("source lacks {}", keyword_label(keyword))
         }
+        AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn => {
+            "scoped player's opponent was dealt damage this turn".into()
+        }
         AbilityCondition::ScopedPlayerMatches { filter } => {
             format!("scoped player is {}", fmt_player_filter(filter))
         }
@@ -4709,7 +4721,18 @@ fn fmt_static_condition(cond: &StaticCondition) -> String {
             "a spell was cast with this variant this turn".into()
         }
         SC::AnyPlayerAttackedYouLastTurn => "a player attacked you during their last turn".into(),
-        SC::OpponentPoisonAtLeast { count } => format!("an opponent has {count}+ poison"),
+        SC::DefendingPlayerCastOrPutNontokenPermanentLastTurn => {
+            "that player cast a spell or put a nontoken permanent onto the battlefield during their last turn".into()
+        }
+        SC::OpponentPoisonAtLeast {
+            count,
+            player: None,
+        } => format!("an opponent has {count}+ poison"),
+        SC::OpponentPoisonAtLeast {
+            count,
+            player: Some(PlayerScope::DefendingPlayer),
+        } => format!("defending player has {count}+ poison"),
+        SC::OpponentPoisonAtLeast { count, .. } => format!("scoped player has {count}+ poison"),
         SC::UnlessPay { .. } => "unless a cost is paid".into(),
         SC::Unrecognized { .. } => "unrecognized".into(),
         SC::DuringYourTurn => "during your turn".into(),
@@ -8483,6 +8506,9 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
             ("CostPaidObjectMatchesFilter", Handled)
         }
         AbilityCondition::SourceLacksKeyword { .. } => ("SourceLacksKeyword", Handled),
+        AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn => {
+            ("ScopedPlayerOpponentDealtDamageThisTurn", Handled)
+        }
         // CR 101.3 + CR 109.5: per-iteration scoped-player filter check; handled by
         // `evaluate_condition` (effects/mod.rs). Used by cross-scope decline-tail
         // gates (Liliana, Waker of the Dead — parent `All`, decline `Opponent`).
@@ -8848,12 +8874,12 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::SourceIsAttacking => ("SourceIsAttacking", Handled),
         StaticCondition::SourceIsBlocking => ("SourceIsBlocking", Handled),
         StaticCondition::SourceIsBlocked => ("SourceIsBlocked", Handled),
-        // CR 725.1: only the controller subject has a static-side evaluator.
-        // `layers::evaluate_condition{,_with_recipient}` rejects every other
-        // scope at its entry boundary (no trigger event, no combat anchor), so
-        // coverage must report those `Unhandled` rather than claim support.
+        // CR 725.1: controller-scoped statics use the ordinary layer evaluator;
+        // the combat-scoped defending-player form is bound by
+        // `static_abilities::static_condition_matches_context` during attack
+        // declaration. Other scopes still have no static-side binding authority.
         StaticCondition::IsMonarch {
-            player: PlayerScope::Controller,
+            player: PlayerScope::Controller | PlayerScope::DefendingPlayer,
         } => ("IsMonarch", Handled),
         StaticCondition::IsMonarch { .. } => ("IsMonarch", Unhandled),
         StaticCondition::IsInitiative => ("IsInitiative", Handled),
@@ -8871,6 +8897,14 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         // CR 508.6: runtime-handled by `layers::evaluate_condition` over the
         // cleanup-time attack snapshot (drives Avenge's cost reduction).
         StaticCondition::AnyPlayerAttackedYouLastTurn => ("AnyPlayerAttackedYouLastTurn", Handled),
+        StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn => (
+            "DefendingPlayerCastOrPutNontokenPermanentLastTurn",
+            Handled,
+        ),
+        StaticCondition::OpponentPoisonAtLeast {
+            player: Some(PlayerScope::DefendingPlayer),
+            ..
+        } => ("OpponentPoisonAtLeast", Handled),
         StaticCondition::OpponentPoisonAtLeast { .. } => ("OpponentPoisonAtLeast", Unhandled),
         StaticCondition::UnlessPay { .. } => ("UnlessPay", Handled),
         // CR 903.3d: the RUNTIME does evaluate this static

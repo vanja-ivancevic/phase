@@ -7,7 +7,7 @@ use crate::parser::oracle_static::{
     parse_discard_matching_color_alternative_cost, parse_static_line,
 };
 use crate::types::ability::{
-    AbilityCost, AbilityTag, ActivationManaPaymentRestriction, ActivationRestriction,
+    AbilityCost, AbilityTag, ActivationManaPaymentRestriction, ActivationRestriction, ChoiceType,
     AdditionalCost, AggregateFunction, BasicLandType, CastPermissionConstraint, CastVariantPaid,
     CastingPermission, CastingRestriction, ChosenAttribute, ChosenSubtypeKind, Comparator,
     ContinuousModification, ControllerRef, CostCategory, CountScope, EffectScope, FilterProp,
@@ -26763,6 +26763,56 @@ fn cost_type_auto_cast_remains_offered_and_reaches_cost_type_choice() {
     assert!(options.iter().any(|option| option == "Elf"));
 }
 
+#[test]
+fn activated_keyword_choice_cost_reaches_cost_type_choice() {
+    use crate::game::scenario::P0;
+    use crate::parser::oracle_cost::parse_oracle_cost;
+
+    let mut state = setup_game_at_main_phase();
+    let source = create_colorless_tap_activated_source(
+        &mut state,
+        P0,
+        parse_oracle_cost("{2}, {T}, Choose flying, first strike, trample, or shadow"),
+        Effect::Draw {
+            count: QuantityExpr::Fixed { value: 1 },
+            target: TargetFilter::Controller,
+        },
+    );
+    state.players[0]
+        .mana_pool
+        .add(ManaUnit::new(ManaType::Colorless, source, false, vec![]));
+    state.players[0]
+        .mana_pool
+        .add(ManaUnit::new(ManaType::Colorless, source, false, vec![]));
+
+    assert!(can_activate_ability_now(&state, P0, source, 1));
+    let waiting = handle_activate_ability(&mut state, P0, source, 1, &mut Vec::new())
+        .expect("keyword-choice cost must enter the interactive payment flow");
+    let WaitingFor::CostTypeChoice {
+        choice_type,
+        options,
+        pending_cast,
+        ..
+    } = waiting
+    else {
+        panic!("activated keyword-choice cost must surface CostTypeChoice");
+    };
+    assert_eq!(choice_type, ChoiceType::Keyword {
+        options: vec![
+            Keyword::Flying,
+            Keyword::FirstStrike,
+            Keyword::Trample,
+            Keyword::Shadow,
+        ],
+        count: 1,
+    });
+    assert_eq!(
+        options,
+        vec!["Flying", "First Strike", "Trample", "Shadow"]
+    );
+    assert_eq!(pending_cast.object_id, source);
+}
+
 fn resolve_torch_the_tower(
     bargain: bool,
 ) -> (crate::game::scenario::CastOutcome, ObjectId, ObjectId) {
@@ -32829,7 +32879,10 @@ fn self_graveyard_static_flashback_grant_is_castable() {
             .affected(TargetFilter::SelfRef)
             .condition(crate::types::ability::StaticCondition::And {
                 conditions: vec![
-                    crate::types::ability::StaticCondition::OpponentPoisonAtLeast { count: 3 },
+                    crate::types::ability::StaticCondition::OpponentPoisonAtLeast {
+                        count: 3,
+                        player: None,
+                    },
                     crate::types::ability::StaticCondition::SourceInZone {
                         zone: Zone::Graveyard,
                     },
@@ -55180,6 +55233,45 @@ fn from_hand_discard_cost(count: QuantityExpr) -> AbilityCost {
         selection: crate::types::ability::CardSelectionMode::Chosen,
         self_scope: crate::types::ability::DiscardSelfScope::FromHand,
     }
+}
+
+/// CR 701.9a: Jandor's Ring may discard only the last card drawn this turn,
+/// not an arbitrary card from the hand. The draw ledger is authoritative even
+/// when older cards remain eligible for an ordinary discard.
+#[test]
+fn last_drawn_discard_cost_restricts_choices_to_latest_draw() {
+    let mut state = setup_game_at_main_phase();
+    let source = create_object(
+        &mut state,
+        CardId(3_000_001),
+        PlayerId(0),
+        "Jandor's Ring".to_string(),
+        Zone::Battlefield,
+    );
+    let first = create_object(
+        &mut state,
+        CardId(3_000_002),
+        PlayerId(0),
+        "Earlier draw".to_string(),
+        Zone::Hand,
+    );
+    let last = create_object(
+        &mut state,
+        CardId(3_000_003),
+        PlayerId(0),
+        "Latest draw".to_string(),
+        Zone::Hand,
+    );
+    state.cards_drawn_this_turn.insert(PlayerId(0), vec![first, last]);
+
+    let eligible = find_eligible_discard_targets_for_scope(
+        &state,
+        PlayerId(0),
+        source,
+        None,
+        crate::types::ability::DiscardSelfScope::LastDrawnThisTurn,
+    );
+    assert_eq!(eligible, vec![last]);
 }
 
 /// Issue #6494 (negative, class boundary): a fixed `Discard { count: 1 }` on an

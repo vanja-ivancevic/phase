@@ -304,6 +304,19 @@ fn resolve_counter_placement_target<'a>(
             .unwrap_or_else(|| resolve_it_pronoun(ctx));
         return (it_target, parsed_remainder, None);
     }
+    // CR 608.2c + CR 608.2k + CR 122.1: a compound recipient such as Holy
+    // Frazzle-Cannon's "that creature and each other creature you control that
+    // shares a creature type with it" is one untargeted population. The first
+    // leg is the non-self trigger subject; the second leg is already expressible
+    // by the context-aware type-phrase parser, whose "it" reference resolves to
+    // the same triggering source. Keep the union together so the mass counter
+    // lowering applies to both legs and does not leave the `and each` tail as a
+    // swallowed effect.
+    if let Some((target, remainder)) =
+        resolve_triggering_source_and_shared_type(on_rest, text, ctx)
+    {
+        return (target, remainder, None);
+    }
     // CR 608.2k + CR 301.5a: "that creature" in a trigger whose subject is a
     // non-self filter (e.g. Pip-Boy 3000's "Whenever equipped creature
     // attacks ... put a +1/+1 counter on that creature") refers to the
@@ -367,6 +380,39 @@ fn resolve_counter_placement_target<'a>(
     let (target, remainder) = parse_target_with_ctx(target_text, ctx);
     let (target, remainder) = apply_other_than_that_recipient_suffix(target, remainder, ctx);
     (target, remainder, multi)
+}
+
+/// Resolve the compound counter recipient used by templates that name the
+/// triggering object first and then broadcast to related objects. This is
+/// deliberately narrow: only the exact "that creature and <type phrase>"
+/// shape is accepted, and only inside a non-self trigger subject, so ordinary
+/// spell/ability anaphors keep their existing `ParentTarget` semantics.
+fn resolve_triggering_source_and_shared_type<'a>(
+    on_rest: &str,
+    text: &'a str,
+    ctx: &mut ParseContext,
+) -> Option<(TargetFilter, &'a str)> {
+    if !matches!(
+        &ctx.subject,
+        Some(subject) if !matches!(subject, TargetFilter::SelfRef | TargetFilter::Any)
+    ) {
+        return None;
+    }
+    let (shared_text, _) = tag::<_, _, OracleError<'_>>("that creature and ")
+        .parse(on_rest)
+        .ok()?;
+    let (shared, remainder) = parse_type_phrase_with_ctx(shared_text, ctx);
+    if matches!(shared, TargetFilter::Any) || !remainder.trim().is_empty() && remainder.trim() != "."
+    {
+        return None;
+    }
+    let offset = text.len() - remainder.len();
+    Some((
+        TargetFilter::Or {
+            filters: vec![TargetFilter::TriggeringSource, shared],
+        },
+        &text[offset..],
+    ))
 }
 
 /// Consume an object-anaphoric distinctness rider on a counter recipient.
@@ -1671,7 +1717,7 @@ fn parse_mana_color_from_text(text: &str) -> Option<ManaColor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ability::TargetChoiceTiming;
+    use crate::types::ability::{SharedQuality, TargetChoiceTiming};
     use crate::types::{ControllerRef, FilterProp, TypedFilter};
 
     fn default_ctx() -> ParseContext {
@@ -2523,6 +2569,40 @@ mod tests {
             ),
             "that-creature count should bind to the triggering object, got {count:?}"
         );
+    }
+
+    /// CR 608.2c + CR 122.1: Holy Frazzle-Cannon's compound recipient must
+    /// remain one mass counter placement over the triggering creature and the
+    /// other same-type creatures, rather than stopping after "that creature".
+    #[test]
+    fn put_counter_on_triggering_creature_and_shared_type_population() {
+        let mut ctx = default_ctx();
+        ctx.subject = Some(TargetFilter::Typed(TypedFilter::creature()));
+        let text = "put a +1/+1 counter on that creature and each other creature you control that shares a creature type with it";
+        let (effect, remainder, _) =
+            try_parse_put_counter(text, text, &mut ctx).expect("compound recipient must parse");
+        assert_eq!(remainder, "");
+        let Effect::PutCounter { target, .. } = effect else {
+            panic!("expected PutCounter, got {effect:?}");
+        };
+        let TargetFilter::Or { filters } = target else {
+            panic!("expected source-plus-shared-type union, got {target:?}");
+        };
+        assert!(filters.contains(&TargetFilter::TriggeringSource));
+        assert!(filters.iter().any(|filter| {
+            matches!(
+                filter,
+                TargetFilter::Typed(typed)
+                    if typed.properties.iter().any(|property| matches!(
+                        property,
+                        FilterProp::SharesQuality {
+                            quality: SharedQuality::CreatureType,
+                            reference: Some(reference),
+                            ..
+                        } if matches!(reference.as_ref(), TargetFilter::TriggeringSource)
+                    ))
+            )
+        }));
     }
 
     /// CR 202.3 + CR 608.2k: Dusty Parlor — "Whenever you cast an enchantment spell,

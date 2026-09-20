@@ -387,6 +387,11 @@ pub enum PaymentContext<'a> {
     /// restriction variants name spell-casting or ability-activation use, so
     /// restricted mana is not eligible here.
     Effect,
+    /// CR 702.23a: Payment for a cumulative-upkeep cost. This is distinct from
+    /// generic effect resolution because a mana unit may explicitly be
+    /// restricted to cumulative upkeep and must remain ineligible everywhere
+    /// else.
+    CumulativeUpkeep,
     /// CR 116.2: Payment for a special action's mana cost (e.g. a Room's
     /// unlock cost, CR 116.2m / CR 709.5e). Special actions don't use the stack
     /// and are neither spell casts nor ability activations, so they need a
@@ -409,7 +414,7 @@ impl PaymentContext<'_> {
                 mana_color_constraint,
                 ..
             } => mana_color_constraint.permits(mana_type),
-            Self::Spell(_) | Self::Effect | Self::SpecialAction(_) => true,
+            Self::Spell(_) | Self::Effect | Self::CumulativeUpkeep | Self::SpecialAction(_) => true,
         }
     }
 }
@@ -609,6 +614,8 @@ impl SpellCostCriterion {
 pub enum ManaRestriction {
     /// "Spend this mana only to cast spells."
     OnlyForSpell,
+    /// CR 106.6 + CR 702.23a: mana restricted to cumulative-upkeep payments.
+    OnlyForCumulativeUpkeep,
     /// "Spend this mana only to cast creature spells" / "only to cast artifact spells".
     OnlyForSpellType(String),
     /// "Spend this mana only to cast a creature spell of the chosen type."
@@ -923,25 +930,26 @@ fn cmp_mana_restriction(left: &ManaRestriction, right: &ManaRestriction) -> std:
     fn rank(value: &ManaRestriction) -> u8 {
         match value {
             ManaRestriction::OnlyForSpell => 0,
-            ManaRestriction::OnlyForSpellType(_) => 1,
-            ManaRestriction::OnlyForCreatureType(_) => 2,
-            ManaRestriction::OnlyForTypeSpellsOrAbilities { .. } => 3,
-            ManaRestriction::OnlyForActivation => 4,
-            ManaRestriction::OnlyForTaggedActivation(_) => 5,
-            ManaRestriction::OnlyForXCosts => 6,
-            ManaRestriction::OnlyForSpellWithKeywordKind(_) => 7,
-            ManaRestriction::OnlyForSpellWithKeywordKindFromZone(_, _) => 8,
-            ManaRestriction::OnlyForSpellWithManaValue { .. } => 9,
-            ManaRestriction::OnlyForSpellMatchingCostCriteria { .. } => 10,
-            ManaRestriction::OnlyForSpellWithColorCount { .. } => 11,
-            ManaRestriction::OnlyForSpellColor(_) => 12,
-            ManaRestriction::OnlyForSpellFromZone(_) => 13,
-            ManaRestriction::CannotCastSpellFromZone(_) => 14,
-            ManaRestriction::OnlyForFaceDownSpell => 15,
-            ManaRestriction::OnlyForAny(_) => 16,
-            ManaRestriction::OnlyForSpecialAction(_) => 17,
-            ManaRestriction::Impossible => 18,
-            ManaRestriction::ConvokePayment => 19,
+            ManaRestriction::OnlyForCumulativeUpkeep => 1,
+            ManaRestriction::OnlyForSpellType(_) => 2,
+            ManaRestriction::OnlyForCreatureType(_) => 3,
+            ManaRestriction::OnlyForTypeSpellsOrAbilities { .. } => 4,
+            ManaRestriction::OnlyForActivation => 5,
+            ManaRestriction::OnlyForTaggedActivation(_) => 6,
+            ManaRestriction::OnlyForXCosts => 7,
+            ManaRestriction::OnlyForSpellWithKeywordKind(_) => 8,
+            ManaRestriction::OnlyForSpellWithKeywordKindFromZone(_, _) => 9,
+            ManaRestriction::OnlyForSpellWithManaValue { .. } => 10,
+            ManaRestriction::OnlyForSpellMatchingCostCriteria { .. } => 11,
+            ManaRestriction::OnlyForSpellWithColorCount { .. } => 12,
+            ManaRestriction::OnlyForSpellColor(_) => 13,
+            ManaRestriction::OnlyForSpellFromZone(_) => 14,
+            ManaRestriction::CannotCastSpellFromZone(_) => 15,
+            ManaRestriction::OnlyForFaceDownSpell => 16,
+            ManaRestriction::OnlyForAny(_) => 17,
+            ManaRestriction::OnlyForSpecialAction(_) => 18,
+            ManaRestriction::Impossible => 19,
+            ManaRestriction::ConvokePayment => 20,
         }
     }
     rank(left).cmp(&rank(right)).then_with(|| match (left, right) {
@@ -1144,6 +1152,7 @@ impl ManaRestriction {
     pub fn allows_spell(&self, meta: &SpellMeta) -> bool {
         match self {
             ManaRestriction::OnlyForSpell => true,
+            ManaRestriction::OnlyForCumulativeUpkeep => false,
             // CR 106.6: Oracle type phrases in spend restrictions name both core
             // types (Creature, Instant, …) and subtypes (Ninja, Turtle, …). Consult
             // both buckets uniformly, same as `OnlyForTypeSpellsOrAbilities`.
@@ -1278,6 +1287,7 @@ impl ManaRestriction {
         match self {
             // Spell-only restrictions don't permit ability activation.
             ManaRestriction::OnlyForSpell
+            | ManaRestriction::OnlyForCumulativeUpkeep
             | ManaRestriction::OnlyForSpellType(_)
             | ManaRestriction::OnlyForCreatureType(_)
             | ManaRestriction::OnlyForSpellWithKeywordKind(_)
@@ -1342,6 +1352,12 @@ impl ManaRestriction {
                 ManaRestriction::OnlyForAny(subs) => subs.iter().any(|r| r.allows(ctx)),
                 _ => false,
             },
+            PaymentContext::CumulativeUpkeep => match self {
+                ManaRestriction::OnlyForCumulativeUpkeep => true,
+                ManaRestriction::CannotCastSpellFromZone(_) => true,
+                ManaRestriction::OnlyForAny(subs) => subs.iter().any(|r| r.allows(ctx)),
+                _ => false,
+            },
             // CR 116.2: Positive "only for" restrictions must authorize this
             // exact special-action class (directly or through a disjunction).
             // A negative restriction naming only one spell-cast class does not
@@ -1363,6 +1379,7 @@ impl ManaRestriction {
                 subs.iter().any(|r| r.allows_special_action(action))
             }
             ManaRestriction::OnlyForSpell
+            | ManaRestriction::OnlyForCumulativeUpkeep
             | ManaRestriction::OnlyForSpellType(_)
             | ManaRestriction::OnlyForCreatureType(_)
             | ManaRestriction::OnlyForTypeSpellsOrAbilities { .. }
@@ -3684,6 +3701,23 @@ mod tests {
             mana_color_constraint: ActivationManaColorConstraint::Unrestricted,
         }));
         assert!(!restriction.allows(&PaymentContext::Effect));
+    }
+
+    // CR 702.23a: cumulative-upkeep-only mana is eligible only at the
+    // cumulative-upkeep payment seam, not for ordinary effect costs.
+    #[test]
+    fn restriction_cumulative_upkeep_only_uses_dedicated_context() {
+        let restriction = ManaRestriction::OnlyForCumulativeUpkeep;
+        assert!(restriction.allows(&PaymentContext::CumulativeUpkeep));
+        assert!(!restriction.allows(&PaymentContext::Effect));
+        assert!(!restriction.allows(&PaymentContext::Spell(&SpellMeta::default())));
+        assert!(!restriction.allows(&PaymentContext::SpecialAction(SpecialAction::UnlockDoor,)));
+        assert!(!restriction.allows(&PaymentContext::Activation {
+            source_types: &[],
+            source_subtypes: &[],
+            ability_tag: None,
+            mana_color_constraint: ActivationManaColorConstraint::Unrestricted,
+        }));
     }
 
     // CR 106.6: Creeping Peeper's three-way disjunction

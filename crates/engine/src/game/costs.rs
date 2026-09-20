@@ -43,7 +43,8 @@
 use std::collections::HashSet;
 
 use crate::types::ability::{
-    AbilityCost, EffectKind, TargetFilter, TypedFilter, EXILE_COST_ANY_NUMBER,
+    AbilityCost, DiscardSelfScope, Effect, EffectKind, TargetFilter, TypedFilter,
+    EXILE_COST_ANY_NUMBER,
     REMOVE_COUNTER_COST_ALL,
 };
 use crate::types::events::GameEvent;
@@ -57,9 +58,10 @@ use crate::types::statics::StaticMode;
 use crate::types::zones::Zone;
 
 use super::casting::{
-    ability_mana_payment_excluded_sources, can_pay_effect_mana_cost_after_auto_tap,
-    find_eligible_discard_targets, mana_ability_cost_payment_is_paused, pay_ability_mana_cost,
-    pay_ability_mana_cost_excluding, pay_effect_mana_cost_with_resume,
+    ability_mana_payment_excluded_sources, can_pay_cumulative_upkeep_mana_cost_after_auto_tap,
+    can_pay_effect_mana_cost_after_auto_tap, find_eligible_discard_targets_for_scope,
+    mana_ability_cost_payment_is_paused, pay_ability_mana_cost, pay_ability_mana_cost_excluding,
+    pay_cumulative_upkeep_mana_cost_with_resume, pay_effect_mana_cost_with_resume,
 };
 use super::engine::EngineError;
 use super::filter::FilterContext;
@@ -159,6 +161,55 @@ fn find_eligible_exile_targets(
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// CR 118.12 + CR 701.7: Return the typed target filter for the deterministic
+/// "exile the top matching card of your graveyard" effect-cost shape. Ordinary
+/// `AbilityCost::Exile` remains a selectable zone payment; only this exact
+/// parser-emitted `ChangeZone` shape is ordered and deterministic.
+fn top_graveyard_exile_target(effect: &Effect) -> Option<&TargetFilter> {
+    let Effect::ChangeZone {
+        origin: Some(Zone::Graveyard),
+        destination: Zone::Exile,
+        target,
+        ..
+    } = effect
+    else {
+        return None;
+    };
+    let TargetFilter::Typed(filter) = target else {
+        return None;
+    };
+    (filter.controller == Some(crate::types::ability::ControllerRef::You)
+        && filter
+            .properties
+            .contains(&crate::types::ability::FilterProp::InZone {
+                zone: Zone::Graveyard,
+            }))
+    .then_some(target)
+}
+
+/// CR 401.4 + CR 701.7: Graveyards are ordered oldest-to-newest in the state;
+/// the top card is therefore the last matching object in the payer's graveyard.
+fn top_matching_graveyard_card_for_cost(
+    state: &GameState,
+    payer: PlayerId,
+    source_id: ObjectId,
+    target: &TargetFilter,
+) -> Option<ObjectId> {
+    let ctx = FilterContext::from_source_with_controller(source_id, payer);
+    state
+        .players
+        .iter()
+        .find(|player_state| player_state.id == payer)
+        .and_then(|player_state| {
+            player_state
+                .graveyard
+                .iter()
+                .rev()
+                .copied()
+                .find(|id| super::filter::matches_target_filter(state, *id, target, &ctx))
+        })
 }
 
 fn find_eligible_tap_creatures_targets(
@@ -673,6 +724,59 @@ pub(crate) fn pay_ability_cost_for_resolution(
     Ok(outcome)
 }
 
+/// CR 702.23a + CR 118.12: Pay the mana component of a cumulative-upkeep
+/// cost through the resolution-time payment authority, retaining the distinct
+/// cumulative-upkeep context for mana-spend restrictions. Cumulative upkeep
+/// reaches this narrow adapter from the `UnlessPayment` handler; all ordinary
+/// resolution costs continue through [`pay_ability_cost_for_resolution`].
+pub(crate) fn pay_ability_cost_for_cumulative_upkeep(
+    state: &mut GameState,
+    payer: PlayerId,
+    cost: &AbilityCost,
+    ability: &ResolvedAbility,
+    events: &mut Vec<GameEvent>,
+) -> Result<PaymentOutcome, EngineError> {
+    let AbilityCost::Mana { cost } = cost else {
+        return Ok(payment_failed(
+            "cumulative upkeep adapter received a non-mana cost",
+        ));
+    };
+    if !can_pay_cumulative_upkeep_mana_cost_after_auto_tap(state, payer, ability.source_id, cost) {
+        return Ok(payment_failed("insufficient mana"));
+    }
+    let scope = PaymentScope::Resolution {
+        ability,
+        cost_move_root: ResolutionCostMoveRoot::EffectPayCost,
+    };
+    let concrete_cost = AbilityCost::Mana { cost: cost.clone() };
+    let resume = effect_pay_cost_mana_resume(
+        state,
+        payer,
+        &scope,
+        resume_cost_with_concrete_mana(Some(&concrete_cost), cost.clone()),
+    );
+    if pay_cumulative_upkeep_mana_cost_with_resume(
+        state,
+        payer,
+        ability.source_id,
+        cost,
+        resume.as_ref(),
+        events,
+    )
+    .is_err()
+    {
+        if mana_ability_cost_payment_is_paused(state)
+            || state.pending_deferred_life_cost_resume.is_some()
+        {
+            return Ok(PaymentOutcome::Paused {
+                remaining_cost: None,
+            });
+        }
+        return Ok(payment_failed("insufficient mana"));
+    }
+    Ok(PaymentOutcome::Paid)
+}
+
 /// Pays a replacement's MayCost. Its dedicated root owns the outer
 /// replacement state required by [`PendingCostMoveResume::ReplacementMayCost`].
 pub(crate) fn pay_ability_cost_for_replacement_may_cost(
@@ -1066,11 +1170,17 @@ fn pay_ability_cost_inner(
             count,
             filter,
             selection: crate::types::ability::CardSelectionMode::Chosen,
-            self_scope: crate::types::ability::DiscardSelfScope::FromHand,
-        } if matches!(scope, PaymentScope::Resolution { .. }) => {
+            self_scope,
+        } if self_scope.is_from_hand() && matches!(scope, PaymentScope::Resolution { .. }) => {
             let count =
                 resolve_cost_quantity(state, count, player, source_id, scope).max(0) as usize;
-            let eligible = find_eligible_discard_targets(state, player, source_id, filter.as_ref());
+            let eligible = find_eligible_discard_targets_for_scope(
+                state,
+                player,
+                source_id,
+                filter.as_ref(),
+                *self_scope,
+            );
             if eligible.len() < count {
                 return Ok(payment_failed("not enough cards to discard"));
             }
@@ -1354,6 +1464,61 @@ fn pay_ability_cost_inner(
         AbilityCost::EffectCost { effect, .. } => {
             use crate::types::ability::Effect;
             match effect.as_ref() {
+                // CR 602.2b + CR 608.2d: The activation payability dry-run
+                // reaches a typed keyword choice before the live dispatcher
+                // surfaces its CostTypeChoice prompt. A paused result is the
+                // correct dry-run witness; the live path removes this leg at
+                // that prompt and never executes it as a resolution effect.
+                Effect::Choose {
+                    choice_type: crate::types::ability::ChoiceType::Keyword { count: 1, .. },
+                    ..
+                } => {
+                    return Ok(PaymentOutcome::Paused {
+                        remaining_cost: None,
+                    });
+                }
+                // CR 118.12 + CR 701.7: pay a deterministic top-of-graveyard
+                // exile by binding the first matching ordered card to a normal
+                // replacement-aware ChangeZone resolution. The parser's
+                // `top_graveyard_exile_target` predicate keeps this path
+                // separate from selectable graveyard exile costs.
+                Effect::ChangeZone { .. }
+                    if top_graveyard_exile_target(effect.as_ref()).is_some() =>
+                {
+                    let target = top_graveyard_exile_target(effect.as_ref())
+                        .expect("top-graveyard exile shape was checked");
+                    let Some(object_id) = top_matching_graveyard_card_for_cost(
+                        state, player, source_id, target,
+                    ) else {
+                        return Ok(payment_failed(
+                            "no matching top graveyard card for effect-cost exile",
+                        ));
+                    };
+                    let mut move_ability = ResolvedAbility::new(
+                        effect.as_ref().clone(),
+                        vec![],
+                        source_id,
+                        player,
+                    );
+                    let mut move_effect = effect.as_ref().clone();
+                    if let Effect::ChangeZone { target, .. } = &mut move_effect {
+                        *target = TargetFilter::SpecificObject { id: object_id };
+                    }
+                    move_ability.effect = move_effect;
+                    super::effects::change_zone::resolve(state, &move_ability, events)
+                        .map_err(|error| EngineError::InvalidAction(error.to_string()))?;
+                    if state
+                        .objects
+                        .get(&object_id)
+                        .is_some_and(|object| object.zone == Zone::Exile)
+                    {
+                        // The cost event resolved and the object reached exile.
+                    } else {
+                        return Ok(payment_failed(
+                            "top graveyard card exile was prevented or redirected",
+                        ));
+                    }
+                }
                 Effect::PutCounter {
                     counter_type,
                     count,
@@ -2019,7 +2184,7 @@ pub(crate) fn is_resolution_optional_payment_prompt_branch(cost: &AbilityCost) -
 /// absent: the optional-branch selector intercepts it before this executor and
 /// rewrites the completed frame to an empty prepaid composite.
 pub(crate) fn supported_at_resolution(cost: &AbilityCost) -> bool {
-    use crate::types::ability::{CardSelectionMode, DiscardSelfScope};
+    use crate::types::ability::CardSelectionMode;
     match cost {
         AbilityCost::Mana { .. }
         | AbilityCost::ManaDynamic { .. }
@@ -2274,7 +2439,7 @@ fn can_pay_resolution(
     cost: &AbilityCost,
     ability: &ResolvedAbility,
 ) -> bool {
-    use crate::types::ability::{CardSelectionMode, DiscardSelfScope};
+    use crate::types::ability::CardSelectionMode;
     match cost {
         AbilityCost::Mana { cost: mana_cost } => {
             can_pay_effect_mana_cost_after_auto_tap(state, payer, ability.source_id, mana_cost)
@@ -2322,12 +2487,17 @@ fn can_pay_resolution(
             count,
             filter,
             selection: CardSelectionMode::Chosen,
-            self_scope: DiscardSelfScope::FromHand,
-        } => {
+            self_scope,
+        } if self_scope.is_from_hand() => {
             let count = u32::try_from(resolve_quantity_with_targets(state, count, ability).max(0))
                 .unwrap_or(0) as usize;
-            let eligible =
-                find_eligible_discard_targets(state, payer, ability.source_id, filter.as_ref());
+            let eligible = find_eligible_discard_targets_for_scope(
+                state,
+                payer,
+                ability.source_id,
+                filter.as_ref(),
+                *self_scope,
+            );
             eligible.len() >= count
         }
         // CR 406.6: Non-self exile cost at resolution time (e.g., The Mimeoplasm's
@@ -2425,6 +2595,15 @@ fn can_pay_resolution(
             counter_kind,
             count,
         } => !player_counter_gain_is_prohibited(state, payer, *counter_kind, *count),
+        // CR 118.12 + CR 701.7: the deterministic top-of-graveyard exile
+        // action is payable only when a matching card actually exists.
+        AbilityCost::EffectCost { effect, .. }
+            if top_graveyard_exile_target(effect.as_ref()).is_some() =>
+        {
+            let target = top_graveyard_exile_target(effect.as_ref())
+                .expect("top-graveyard exile shape was checked");
+            top_matching_graveyard_card_for_cost(state, payer, ability.source_id, target).is_some()
+        }
         // CR 118.3: every deterministic effect-cost payment admitted by the shared
         // support predicate has the resources to be paid; its resolver handles any
         // replacement effects while paying it.
@@ -2486,14 +2665,67 @@ mod tests {
     use super::*;
     use crate::game::scenario::GameScenario;
     use crate::types::ability::{
-        BeholdCostAction, CardSelectionMode, CostObjectCount, DiscardSelfScope, Effect,
-        NinjutsuVariant, QuantityExpr, SacrificeCost, TapCreaturesRequirement,
+        BeholdCostAction, CardSelectionMode, CostObjectCount, DiscardSelfScope, Effect, FilterProp,
+        NinjutsuVariant, QuantityExpr, SacrificeCost, TargetFilter, TapCreaturesRequirement,
         TapCreaturesSelectionMode,
     };
     use crate::types::counter::{CounterMatch, CounterType};
     use crate::types::mana::{ManaCost, ManaCostShard};
 
     const P0: PlayerId = PlayerId(0);
+
+    #[test]
+    fn top_graveyard_effect_cost_exiles_newest_matching_card() {
+        let mut scenario = GameScenario::new();
+        let source = scenario.add_creature(P0, "Barrow Ghoul", 3, 3).id();
+        let older_nonmatch = scenario
+            .add_land_to_graveyard(P0, "Older Land")
+            .id();
+        let top_match = scenario
+            .add_creature_to_graveyard(P0, "Top Creature", 2, 2)
+            .id();
+        let target = TargetFilter::Typed(
+            TypedFilter::creature()
+                .controller(ControllerRef::You)
+                .properties(vec![FilterProp::InZone {
+                    zone: Zone::Graveyard,
+                }]),
+        );
+        let cost = AbilityCost::EffectCost {
+            effect: Box::new(Effect::ChangeZone {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Exile,
+                target,
+                owner_library: false,
+                enter_transformed: false,
+                enters_under: None,
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enters_attacking: false,
+                up_to: false,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                face_down_profile: None,
+                enters_modified_if: None,
+            }),
+            player_scope: None,
+        };
+        let ability = ResolvedAbility::new(Effect::NoOp, vec![], source, P0);
+        let outcome = pay_ability_cost_for_resolution(
+            &mut scenario.state,
+            P0,
+            &cost,
+            &ability,
+            &mut Vec::new(),
+        )
+        .expect("top-graveyard effect cost should resolve");
+
+        assert_eq!(outcome, PaymentOutcome::Paid);
+        assert_eq!(scenario.state.objects[&top_match].zone, Zone::Exile);
+        assert_eq!(scenario.state.objects[&older_nonmatch].zone, Zone::Graveyard);
+        assert!(!scenario.state.players[P0.0 as usize]
+            .graveyard
+            .contains(&top_match));
+    }
 
     #[test]
     fn direct_resolution_executor_does_not_support_non_self_sacrifice() {

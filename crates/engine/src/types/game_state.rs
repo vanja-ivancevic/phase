@@ -5730,6 +5730,11 @@ pub(crate) fn settle_dig_delivery_outcome(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BatchCompletion {
+    /// CR 603.10a + CR 614.1 + CR 616.1: A runtime effect whose only
+    /// post-batch work is its ordinary completion marker. This keeps a
+    /// replacement-choice pause from losing `EffectResolved` for a
+    /// heterogeneous zone-change effect such as Morality Shift.
+    EmitEffectResolved { kind: EffectKind, source_id: ObjectId },
     /// CR 303.4g + CR 614.1 + CR 616.1: A return-as-Aura host had no legal
     /// object to enchant, and its proposed Battlefield→Graveyard move settled.
     /// The completion event waits for any replacement choice without carrying
@@ -18351,6 +18356,22 @@ declare_game_state! {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_set")]
     pub attacked_defenders_last_turn: Box<HashMap<PlayerId, HashSet<PlayerId>>>,
+    /// CR 508.1a + CR 514.2: For each player, the object IDs of creatures
+    /// declared as attackers during that player's most recently completed turn.
+    /// Snapshotted at cleanup from `creatures_attacked_this_turn`, keyed by the
+    /// ending active player. The object IDs intentionally survive zone changes
+    /// for CR 608.2h look-back queries, just like the current-turn ledger.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_set")]
+    pub creatures_attacked_last_turn: Box<HashMap<PlayerId, HashSet<ObjectId>>>,
+    /// CR 514.2: Players who cast a spell or put a nontoken permanent onto
+    /// the battlefield during their most recently completed turn.  The
+    /// ending player's entry is overwritten at cleanup, while other players'
+    /// entries persist until that player's own next completed turn.  This is
+    /// the player-relative history behind Arboria's attack restriction.
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+    pub players_who_cast_or_put_nontoken_permanent_last_turn: HashSet<PlayerId>,
     /// CR 508.6 + CR 508.1b: For each creature declared as an attacker this
     /// turn, the defending players it attacked. This is the source-specific
     /// counterpart to `attacked_defenders_this_turn` for text like "each player
@@ -23154,6 +23175,15 @@ impl GameState {
             .is_some_and(|defenders| defenders.contains(&defender))
     }
 
+    /// CR 514.2: True when `player` cast a spell or put a nontoken permanent
+    /// onto the battlefield during that player's most recently completed turn.
+    /// Reads the cleanup-time player-relative snapshot used by Arboria's
+    /// "can't attack a player unless" restriction.
+    pub fn player_cast_or_put_nontoken_permanent_last_turn(&self, player: PlayerId) -> bool {
+        self.players_who_cast_or_put_nontoken_permanent_last_turn
+            .contains(&player)
+    }
+
     /// CR 508.6: True if `attacker` was declared attacking `defender` this turn.
     pub fn creature_attacked_player_this_turn(
         &self,
@@ -23427,6 +23457,8 @@ impl GameState {
             attacking_creatures_this_turn: HashMap::new(),
             attacked_defenders_this_turn: HashMap::new(),
             attacked_defenders_last_turn: Box::default(),
+            creatures_attacked_last_turn: Box::default(),
+            players_who_cast_or_put_nontoken_permanent_last_turn: HashSet::new(),
             creature_attacked_defenders_this_turn: HashMap::new(),
             combat_phases_started_this_turn: 0,
             end_steps_started_this_turn: 0,
@@ -25457,6 +25489,8 @@ fn _gamestate_partition_is_total(s: &GameState) {
         attacking_creatures_this_turn: _,
         attacked_defenders_this_turn: _,
         attacked_defenders_last_turn: _,
+        creatures_attacked_last_turn: _,
+        players_who_cast_or_put_nontoken_permanent_last_turn: _,
         creature_attacked_defenders_this_turn: _,
         combat_phases_started_this_turn: _,
         end_steps_started_this_turn: _,
@@ -25790,6 +25824,9 @@ impl PartialEq for GameState {
             && self.attacking_creatures_this_turn == other.attacking_creatures_this_turn
             && self.attacked_defenders_this_turn == other.attacked_defenders_this_turn
             && self.attacked_defenders_last_turn == other.attacked_defenders_last_turn
+            && self.creatures_attacked_last_turn == other.creatures_attacked_last_turn
+            && self.players_who_cast_or_put_nontoken_permanent_last_turn
+                == other.players_who_cast_or_put_nontoken_permanent_last_turn
             && self.creature_attacked_defenders_this_turn
                 == other.creature_attacked_defenders_this_turn
             && self.combat_phases_started_this_turn == other.combat_phases_started_this_turn

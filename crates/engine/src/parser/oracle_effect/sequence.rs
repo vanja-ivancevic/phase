@@ -329,9 +329,15 @@ fn parse_put_chosen_cards_at_library_position(lower: &str) -> Option<LibraryPosi
             alt((
                 tag::<_, _, OracleError<'_>>("put those cards on top"),
                 tag("put the chosen cards on top"),
+                // CR 608.2c: older targeted-player wording refers to the
+                // selected hand cards as "them" (Stunted Growth), while the
+                // modern forms use "those cards" or "the chosen cards".
+                tag("put them on top"),
+                tag("puts them on top"),
             )),
             opt(alt((
                 tag(" of your library"),
+                tag(" of their library"),
                 tag(" of their owner's library"),
             ))),
             tag(" in any order"),
@@ -344,6 +350,17 @@ fn parse_put_chosen_cards_at_library_position(lower: &str) -> Option<LibraryPosi
 }
 
 fn parse_put_choice_partition_destinations(lower: &str) -> Option<(Zone, Zone)> {
+    // CR 401.1 + CR 608.2c: the one-card form uses "exile that card and put
+    // the other one ..." rather than the modern "put the chosen card ... and
+    // the rest ..." spelling. It still partitions the exact choice pool into
+    // the selected object and its remainder.
+    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("exile that card and ").parse(lower) {
+        let (rest, _) = opt(tag::<_, _, OracleError<'_>>("put ")).parse(rest).ok()?;
+        let (rest, _) = parse_rest_cards_reference(rest).ok()?;
+        let (_, rest_destination) = parse_choice_partition_destination(rest).ok()?;
+        return Some((Zone::Exile, rest_destination));
+    }
+
     let (rest, _) = tag::<_, _, OracleError<'_>>("put ").parse(lower).ok()?;
     let (rest, _) = parse_chosen_cards_reference(rest).ok()?;
     let (rest, chosen_destination) = parse_choice_partition_destination(rest).ok()?;
@@ -915,6 +932,7 @@ pub(super) fn is_foretell_cost_override_sentence(lower: &str) -> bool {
 
 fn parse_put_all_back_in_any_order(lower: &str) -> bool {
     (
+        opt(tag::<_, _, OracleError<'_>>("then ")),
         tag::<_, _, OracleError<'_>>("put "),
         alt((tag("them"), tag("those cards"), tag("the cards"))),
         tag(" back"),
@@ -1303,6 +1321,18 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
                         )
                         .parse(remainder_trimmed)
                         .is_ok();
+                        // CR 701.9a + CR 608.2c: "choose N cards in your hand
+                        // and discard the rest" is one keep/discard instruction.
+                        // The lowerer rewrites it to the equivalent dynamic
+                        // discard count (`hand size - N`), so splitting at the
+                        // bare `and` would discard the keep-selection context
+                        // and leave a standalone "discard the rest" with no
+                        // legal meaning. Keep both halves in one clause; the
+                        // grammar guard is deliberately narrow and accepts only
+                        // a complete hand-selection head followed by the rest
+                        // anaphor.
+                        let choose_discard_rest_remainder =
+                            is_choose_discard_rest_compound(&before_lower, remainder_trimmed);
                         // CR 109.5 + CR 608.2c + CR 800.4g: "you and that player each <body>"
                         // (and analogous "you and <player-noun> each <body>" compound
                         // subjects) is a SINGLE compound subject distributing the body
@@ -1463,6 +1493,7 @@ pub(super) fn split_clause_sequence(text: &str) -> Vec<ClauseChunk> {
                         .is_ok();
                         let suppress = (nom_primitives::scan_contains(&before_lower, "from among")
                         && !sacrifice_rest_remainder)
+                        || choose_discard_rest_remainder
                         || is_inside_temporal_prefix(&before_lower)
                         || targeted_compound_continuation
                         || prevent_then_put_continuation
@@ -2006,6 +2037,7 @@ fn current_ends_with_damage_recipient(current_lower: &str) -> bool {
 /// `X`. Each must be immediately followed by ` damage`.
 fn starts_with_damage_amount_continuation(trimmed_lower: &str) -> bool {
     if let Ok((rest, _)) = alt((
+        tag::<_, _, OracleError<'_>>("that damage"),
         tag::<_, _, OracleError<'_>>("twice that much damage"),
         tag("that much damage"),
     ))
@@ -3560,6 +3592,46 @@ fn next_token_is_player_action_count(s: &str) -> bool {
     (count, multispace1, noun).parse(trimmed).is_ok()
 }
 
+/// CR 701.9a + CR 608.2c: Recognize the indivisible compound
+/// "choose N cards in [a] hand and discard(s) the rest" for the clause
+/// splitter. The imperative lowerer owns the actual rewrite; this predicate
+/// exists only to prevent the generic bare-`and` splitter from severing the
+/// keep-selection head from its rest-discard tail.
+fn is_choose_discard_rest_compound(before_lower: &str, remainder: &str) -> bool {
+    let Ok((after_choose, _)) = tag::<_, _, OracleError<'_>>("choose ")
+        .parse(before_lower.trim_start())
+    else {
+        return false;
+    };
+    let Some((_keep_count, after_count)) = parse_count_expr(after_choose) else {
+        return false;
+    };
+    let Ok((after_in, _)) = alt((
+        tag::<_, _, OracleError<'_>>("card in "),
+        tag("cards in "),
+    ))
+    .parse(after_count)
+    else {
+        return false;
+    };
+    let Ok((after_hand, _)) = alt((
+        tag::<_, _, OracleError<'_>>("your hand"),
+        tag("their hand"),
+        tag("his or her hand"),
+    ))
+    .parse(after_in)
+    else {
+        return false;
+    };
+    after_hand.trim().is_empty()
+        && all_consuming(alt((
+            tag::<_, _, OracleError<'_>>("discard the rest"),
+            tag("discards the rest"),
+        )))
+        .parse(remainder.trim_end_matches('.').trim())
+        .is_ok()
+}
+
 /// Checks if text starts with a subject-prefixed damage verb.
 /// Matches: "it deals N damage", "~ deals N damage", "this creature deals N damage",
 /// "that creature deals N damage", bare "deals N damage", etc.
@@ -4190,6 +4262,18 @@ pub(super) fn apply_clause_continuation(
                     patched,
                     "CopySpellBearer membership must imply the mutator patches"
                 );
+            }
+        }
+        ContinuationAst::ChangeTargetsNewTargetFilter { filter } => {
+            let Some(previous) = defs.last_mut() else {
+                return;
+            };
+            if let Effect::ChangeTargets {
+                new_target_filter,
+                ..
+            } = &mut *previous.effect
+            {
+                *new_target_filter = Some(filter);
             }
         }
         ContinuationAst::SuspectLastCreated => {
@@ -5568,6 +5652,7 @@ pub(super) fn continuation_absorbs_current(
         // parse_followup_continuation_ast, so absorption is unconditional —
         // identical to the CounterSourceStatic precedent.
         ContinuationAst::CopyMayRetarget { .. } => true,
+        ContinuationAst::ChangeTargetsNewTargetFilter { .. } => true,
         ContinuationAst::SelfCostKeywordCostClarification => true,
         ContinuationAst::SearchDestination { .. } => false,
         ContinuationAst::SuspectLastCreated => matches!(current_effect, Effect::Suspect { .. }),
@@ -6984,6 +7069,22 @@ pub(super) fn parse_followup_continuation_ast(
     let face_down_profile_spec =
         parse_theyre_face_down_profile(&lower).or_else(|| parse_its_face_down_profile(&lower));
 
+    // CR 115.7a: Rebound and similar effects may state a constraint on the
+    // replacement target in a separate sentence. This is a destination
+    // restriction, not `forced_to`: the controller still chooses among the
+    // legal player targets when the retarget effect resolves.
+    if matches!(previous_effect, Effect::ChangeTargets { .. }) {
+        let normalized = lower.trim().trim_end_matches('.').trim();
+        if all_consuming(tag::<_, _, OracleError<'_>>("the new target must be a player"))
+            .parse(normalized)
+            .is_ok()
+        {
+            return Some(ContinuationAst::ChangeTargetsNewTargetFilter {
+                filter: TargetFilter::Player,
+            });
+        }
+    }
+
     match previous_effect {
         Effect::ChooseAndSacrificeRest { .. } => parse_choose_and_sacrifice_rest_followup(&lower),
         Effect::SearchLibrary { split: Some(_), .. }
@@ -6995,7 +7096,8 @@ pub(super) fn parse_followup_continuation_ast(
             Some(ContinuationAst::SearchRevealResult)
         }
         Effect::RevealHand { .. }
-            if nom_primitives::scan_contains(&lower, "card from it")
+            if (nom_primitives::scan_contains(&lower, "card")
+                && nom_primitives::scan_contains(&lower, "from it"))
                 || nom_primitives::scan_contains(&lower, "card from among")
                 || nom_primitives::scan_contains(&lower, "one of them")
                 || nom_primitives::scan_contains(&lower, "one of those") =>
@@ -8911,6 +9013,37 @@ mod tests {
         assert_eq!(rest, " into your hand");
     }
 
+    /// CR 401.1 + CR 608.2c: Phyrexian Grimoire's older partition wording
+    /// uses the singular selected-card/rest references.
+    #[test]
+    fn exile_that_card_and_put_the_other_into_hand_is_a_choice_partition() {
+        use crate::types::ability::{ChooseFromZoneConstraint, ZoneOwner};
+
+        let choose = Effect::ChooseFromZone {
+            count: 1,
+            zone: Zone::Graveyard,
+            additional_zones: Vec::new(),
+            zone_owner: ZoneOwner::Controller,
+            filter: None,
+            chooser: Chooser::Opponent,
+            up_to: false,
+            selection: crate::types::ability::CardSelectionMode::Chosen,
+            constraint: Some(ChooseFromZoneConstraint::TopCards { count: 2 }),
+        };
+        let result = parse_followup_continuation_ast(
+            "Exile that card and put the other one into your hand.",
+            &choose,
+            &mut ParseContext::default(),
+        );
+        assert_eq!(
+            result,
+            Some(ContinuationAst::ChoicePartitionDestinations {
+                chosen_destination: Zone::Exile,
+                rest_destination: Zone::Hand,
+            })
+        );
+    }
+
     /// Helper: extract just the text fields from split_clause_sequence output.
     fn clause_texts(input: &str) -> Vec<String> {
         split_clause_sequence(input)
@@ -10003,6 +10136,23 @@ mod tests {
         );
     }
 
+    /// CR 701.9a + CR 608.2c: Breakthrough's keep/discard compound must remain
+    /// one clause after the preceding draw. Splitting at the bare "and" would
+    /// leave "discard the rest" without the X-card keep count.
+    #[test]
+    fn bare_and_keeps_choose_x_discard_rest_together() {
+        let chunks = clause_texts(
+            "draw four cards, then choose X cards in your hand and discard the rest",
+        );
+        assert_eq!(
+            chunks,
+            vec![
+                "draw four cards",
+                "choose X cards in your hand and discard the rest"
+            ]
+        );
+    }
+
     #[test]
     fn bare_and_splits_search_and_cast() {
         let chunks = clause_texts(
@@ -10371,6 +10521,29 @@ mod tests {
         assert_eq!(
             result,
             Some(ContinuationAst::CopyMayRetarget { all_copies: false })
+        );
+    }
+
+    /// CR 115.7a: Rebound's separate "The new target must be a player."
+    /// sentence is a replacement-target constraint, not a forced destination.
+    #[test]
+    fn change_targets_new_player_constraint_is_a_followup() {
+        let change_targets = Effect::ChangeTargets {
+            target: TargetFilter::StackSpell,
+            scope: crate::types::game_state::RetargetScope::Single,
+            forced_to: None,
+            new_target_filter: None,
+        };
+        let result = parse_followup_continuation_ast(
+            "The new target must be a player.",
+            &change_targets,
+            &mut ParseContext::default(),
+        );
+        assert_eq!(
+            result,
+            Some(ContinuationAst::ChangeTargetsNewTargetFilter {
+                filter: TargetFilter::Player,
+            })
         );
     }
 
@@ -12407,6 +12580,32 @@ mod tests {
         let result = parse_followup_continuation_ast(
             "Put the chosen cards on top of your library in any order.",
             &search,
+            &mut ParseContext::default(),
+        );
+        assert_eq!(
+            result,
+            Some(ContinuationAst::PutChosenCardsAtLibraryPosition {
+                position: LibraryPosition::Top,
+            })
+        );
+    }
+
+    #[test]
+    fn put_them_on_top_of_their_library_parses_as_library_position_continuation() {
+        let choose = Effect::ChooseFromZone {
+            count: 3,
+            zone: Zone::Hand,
+            additional_zones: Vec::new(),
+            zone_owner: crate::types::ability::ZoneOwner::TargetedPlayer,
+            filter: Some(TargetFilter::Any),
+            chooser: Chooser::Controller,
+            up_to: false,
+            selection: crate::types::ability::CardSelectionMode::Chosen,
+            constraint: None,
+        };
+        let result = parse_followup_continuation_ast(
+            "puts them on top of their library in any order.",
+            &choose,
             &mut ParseContext::default(),
         );
         assert_eq!(

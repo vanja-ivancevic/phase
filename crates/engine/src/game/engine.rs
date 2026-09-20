@@ -11085,15 +11085,16 @@ fn apply_action(
         (
             WaitingFor::CostTypeChoice {
                 player,
+                choice_type,
                 options,
                 pending_cast,
-                ..
             },
             GameAction::ChooseOption { choice },
         ) => casting_costs::handle_cost_type_choice(
             state,
             *player,
             *pending_cast.clone(),
+            choice_type,
             options,
             &choice,
             &mut events,

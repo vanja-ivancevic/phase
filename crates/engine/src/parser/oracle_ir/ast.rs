@@ -330,6 +330,9 @@ pub(crate) enum ContinuationAst {
     /// source ability makes (Increasing Vengeance's primary + conditional
     /// second copy), where the singular "the copy" form binds only the nearest.
     CopyMayRetarget { all_copies: bool },
+    /// CR 115.7a: "The new target must be a player." after a ChangeTargets
+    /// effect constrains the replacement-target choice without forcing one.
+    ChangeTargetsNewTargetFilter { filter: TargetFilter },
     /// "create a ... token and suspect it" → chain Suspect { target: LastCreated }
     SuspectLastCreated,
     /// CR 701.15a + CR 701.15b: "The token(s) (is|are) goaded [duration]" after token
@@ -1508,6 +1511,17 @@ pub(crate) enum ChooseImperativeAst {
         /// CR 608.2d (override): `Random` for "choose one of them at random".
         selection: crate::types::ability::CardSelectionMode,
     },
+    /// CR 608.2c + CR 608.2d: "choose a [filter] card from among them/those
+    /// cards" — select from the preceding tracked set while retaining the
+    /// printed type restriction. Lowered to `Effect::ChooseFromZone` with the
+    /// filter applied to the tracked candidates (Animal Magnetism).
+    FromTrackedSetFiltered {
+        count: u32,
+        filter: crate::types::ability::TargetFilter,
+        chooser: crate::types::ability::Chooser,
+        /// CR 608.2d (override): `Random` for a random tracked-set pick.
+        selection: crate::types::ability::CardSelectionMode,
+    },
     /// "choose a [filter] card in/from [player's] [zone]" — direct selection
     /// from visible/resolution-scoped zone contents. Lowered to `Effect::ChooseFromZone`.
     FromZone {
@@ -1519,6 +1533,32 @@ pub(crate) enum ChooseImperativeAst {
         up_to: bool,
         /// CR 608.2d (override): `Random` for "choose ... at random".
         selection: crate::types::ability::CardSelectionMode,
+    },
+    /// "choose one of the top N cards of [a player's] [zone]" — a direct
+    /// ordered-zone choice. Lowered to `ChooseFromZone` with a `TopCards`
+    /// candidate constraint (Phyrexian Grimoire).
+    FromTopZone {
+        count: u32,
+        top_count: u32,
+        zone: crate::types::zones::Zone,
+        zone_owner: crate::types::ability::ZoneOwner,
+        chooser: crate::types::ability::Chooser,
+        selection: crate::types::ability::CardSelectionMode,
+    },
+    /// "that creature's controller chooses a creature that this card could
+    /// enchant" — an interactive battlefield choice made by the controller of
+    /// the parent/event creature (Takklemaggot). Lowered to
+    /// `Effect::ChooseObjectsIntoTrackedSet` with `ParentTargetController`.
+    ParentTargetControllerChoice {
+        filter: crate::types::ability::TargetFilter,
+    },
+    /// "choose a land of each basic land type" — one resolution-time choice
+    /// for each of the five CR 305.6 members, accumulated for a later
+    /// instruction such as "destroy those lands".
+    ForEachCategoryChoice {
+        category: crate::types::ability::IterationCategory,
+        target: crate::types::ability::TargetFilter,
+        chooser: crate::types::ability::Chooser,
     },
     /// "choose from among the permanents ... an artifact, a creature, ..." —
     /// multi-category selection where each player keeps one per type, then sacrifices the rest.

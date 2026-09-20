@@ -278,6 +278,15 @@ pub(crate) struct AbilityShellIr {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub(crate) min_x_value: u32,
 
+    /// CR 107.3c + CR 602.2b: an activated ability whose `{X}` cost is
+    /// defined by a trailing standalone `X is ...` sentence measures that
+    /// quantity at announcement. This is the activated-ability counterpart of
+    /// `AbilityDefinition::announced_x`; keeping it on the shell lets the
+    /// parser stamp it after the effect chain has been lowered and the cost is
+    /// known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) announced_x: Option<QuantityExpr>,
+
     /// CR 707.10: the stack-copy restriction printed as "This ability can't be
     /// copied" — CR 707.10 is the rule that defines copying an activated or
     /// triggered ability onto the stack, which is what the printed line forbids.
@@ -731,6 +740,12 @@ pub(crate) enum PriorModifier {
     /// and attacking (conditional modifier; carries the gate on the clause's
     /// `condition`, with the unpatched original stashed in `else_ability`).
     EntersTappedAttacking,
+    /// CR 601.2b + CR 615.1a: an additional-cost rider narrows an earlier
+    /// combat-prevention shield when the optional cost was paid (Undergrowth).
+    /// The assembler turns the prior shield into an
+    /// `AdditionalCostPaid`/`Not(AdditionalCostPaid)` branch pair so both
+    /// printed outcomes remain in the resolution tree.
+    AdditionalCostPreventDamageException,
 }
 
 /// CR 608.2c / CR 614.1a: which meaning-replacement the clause performs on the

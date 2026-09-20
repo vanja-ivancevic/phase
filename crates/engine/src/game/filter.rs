@@ -296,6 +296,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::Untapped
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -343,6 +344,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
         | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::AttackedLastTurn
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
@@ -361,6 +363,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         // CR 205.3m: reads the controller's COMMANDER, not whole-board population;
         // another object entering or leaving cannot change the commander's types.
         | FilterProp::SharesCreatureTypeWithCommander
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
     }
 }
@@ -563,6 +566,7 @@ fn filter_prop_characteristic_reads_at(prop: &FilterProp, depth: u32) -> Charact
     match prop {
         // ---- CR 613.1f (layer 6): keyword and ability reads. ----
         FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -699,6 +703,7 @@ fn filter_prop_characteristic_reads_at(prop: &FilterProp, depth: u32) -> Charact
         FilterProp::ControllerChoseLabel { .. }
         | FilterProp::Attacking { .. }
         | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::AttackedLastTurn
         // CR 108.3 fixes the RIGHT operand (the matched object's owner) at game
         // start, but this prop is a two-operand relation: the `ControllerRef`
         // LEFT operand resolves against the effect source's live controller
@@ -778,6 +783,7 @@ fn filter_prop_characteristic_reads_at(prop: &FilterProp, depth: u32) -> Charact
         | FilterProp::IsCommander
         // Unparsed leaf: evaluates fail-closed `false` for every object, so its
         // verdict can never be flipped by any layer.
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => CharacteristicKinds::EMPTY,
     }
 }
@@ -966,6 +972,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::Untapped
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -1013,6 +1020,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
         | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::AttackedLastTurn
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
@@ -1031,6 +1039,7 @@ fn entered_object_perturbs_filter_prop(
         // CR 205.3m: an entering object cannot perturb this — the commander's
         // creature types come from the deck-pool registration, not the board.
         | FilterProp::SharesCreatureTypeWithCommander
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
     }
 }
@@ -1709,6 +1718,7 @@ pub(crate) fn filter_prop_contains(
         | FilterProp::ProtectorMatches { .. }
         | FilterProp::HasHasteOrControlledSinceTurnBegan
         | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
         | FilterProp::HasKeywordKind { .. }
         | FilterProp::WithoutKeyword { .. }
         | FilterProp::WithoutKeywordKind { .. }
@@ -1761,6 +1771,7 @@ pub(crate) fn filter_prop_contains(
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
         | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::AttackedLastTurn
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
         | FilterProp::CountersPutOnThisTurn { .. }
@@ -1779,6 +1790,7 @@ pub(crate) fn filter_prop_contains(
         | FilterProp::NameMatchesAnyPermanent { .. }
         | FilterProp::IsCommander
         | FilterProp::SharesCreatureTypeWithCommander
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
     }
 }
@@ -2301,6 +2313,7 @@ pub fn context_free_prop_matches_face(face: &CardFace, prop: &FilterProp) -> Opt
         // family instead, as the module doc says.
         // allow-raw-authority: bare CardFace has no object, so no keyword grant can exist to miss
         FilterProp::WithKeyword { value } => Some(face.keywords.contains(value)),
+        FilterProp::HasChosenKeyword => None,
         // allow-raw-authority: bare CardFace has no object, so no keyword grant can exist to miss
         FilterProp::WithoutKeyword { value } => Some(!face.keywords.contains(value)),
         // The kind-level siblings (`HasKeywordKind` / `WithoutKeywordKind`) are
@@ -4751,6 +4764,7 @@ fn spell_object_matches_property(
                 .and_then(|source| source.chosen_card_type())
                 .is_some_and(|card_type| record.core_types.contains(&card_type))
         }),
+        FilterProp::HasChosenKeyword => false,
         FilterProp::MatchesLastChosenCardPredicate => context.is_some_and(|context| {
             matches_last_chosen_card_predicate(
                 &context.state.last_named_choice,
@@ -4865,6 +4879,7 @@ fn spell_record_matches_type_filter(
 fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) -> bool {
     match prop {
         FilterProp::WithKeyword { value } => record.keywords.iter().any(|k| k == value),
+        FilterProp::HasChosenKeyword => false,
         FilterProp::HasKeywordKind { value } => record.keywords.iter().any(|k| k.kind() == *value),
         FilterProp::WithoutKeyword { value } => !record.keywords.iter().any(|k| k == value),
         FilterProp::WithoutKeywordKind { value } => {
@@ -5026,6 +5041,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
         | FilterProp::AttackedThisTurn { .. }
+        | FilterProp::AttackedLastTurn
         | FilterProp::BlockedThisTurn
         | FilterProp::AttackedOrBlockedThisTurn
         // CR 122.6: A spell on the stack hasn't received counters as a
@@ -5054,6 +5070,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         // a resolution-time battlefield selection — a spell-cast snapshot is not
         // a member of a chosen-object set, so fail closed.
         | FilterProp::InTrackedSet { .. }
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
     }
 }
@@ -5099,6 +5116,16 @@ struct SourceContext<'a> {
     /// (e.g., target validation, spell-record matching, single-shot quantity
     /// resolution).
     recipient_id: Option<ObjectId>,
+}
+
+fn source_chosen_keyword<'a>(source: &'a SourceContext<'_>) -> Option<&'a Keyword> {
+    source
+        .chosen_attributes
+        .iter()
+        .find_map(|attribute| match attribute {
+            crate::types::ability::ChosenAttribute::Keyword(keyword) => Some(keyword),
+            _ => None,
+        })
 }
 
 /// CR 508.5 + CR 508.5a: `ControllerRef::DefendingPlayer` door for
@@ -5713,6 +5740,8 @@ fn matches_filter_prop(
                 && !combat::has_summoning_sickness(obj)
         }
         FilterProp::WithKeyword { value } => obj.has_keyword(value),
+        FilterProp::HasChosenKeyword => source_chosen_keyword(source)
+            .is_some_and(|chosen| obj.has_keyword(chosen)),
         // CR 115.1 + CR 707.10: Zada — "creature you control that the spell could target".
         FilterProp::CouldBeTargetedByTriggeringSpell => {
             crate::game::targeting::object_could_be_targeted_by_triggering_spell(state, object_id)
@@ -6381,6 +6410,13 @@ fn matches_filter_prop(
                         .any(|&d| attacking_defender_matches(state, source, d, defender.as_ref()))
                 }),
         },
+        // CR 508.1a + CR 514.2: read the cleanup snapshot belonging to the
+        // candidate object's current controller. This is deliberately not a
+        // global set: in multiplayer, "its last turn" is controller-relative.
+        FilterProp::AttackedLastTurn => state
+            .creatures_attacked_last_turn
+            .get(&obj.controller)
+            .is_some_and(|objects| objects.contains(&object_id)),
         // CR 509.1a: Creature was declared as a blocker this turn.
         FilterProp::BlockedThisTurn => state.creatures_blocked_this_turn.contains(&object_id),
         // CR 508.1a + CR 509.1a: Creature attacked or blocked this turn.
@@ -6441,6 +6477,10 @@ fn matches_filter_prop(
         // CR 701.27g: Match transformed permanents (a transforming DFC on the
         // battlefield with its back face up).
         FilterProp::Transformed => obj.transformed,
+        // CR 702.26b: Match the explicit phasing designation. The caller may
+        // still hide phased-out objects at the ordinary targeting choke point;
+        // this arm is reached by the explicit phase-in-aware matcher as well.
+        FilterProp::PhasedOut => obj.is_phased_out(),
         // CR 115.9c: If the object is a stack entry, ALL of its targets must match
         // the inner filter. Falls back permissive for non-stack objects so trigger
         // matchers remain the primary authority (they validate separately).
@@ -6579,6 +6619,15 @@ fn zone_change_record_matches_property(
         // -------- Group 1: snapshot-derivable --------
         // CR 702: Keyword presence on the event-time object.
         FilterProp::WithKeyword { value } => record.keywords.iter().any(|k| k == value),
+        // allow-raw-authority: zone-change snapshots intentionally compare the
+        // event-time keyword vector; no live object exists for the authority
+        // helper to resolve, and the chosen keyword is source state.
+        FilterProp::HasChosenKeyword => source_chosen_keyword(source)
+            .is_some_and(|chosen| {
+                // allow-raw-authority: this is the captured event-time keyword
+                // vector, not a live object's effective keyword set.
+                record.keywords.iter().any(|keyword| keyword == chosen) // allow-raw-authority: captured event-time keyword vector; no live object exists
+            }),
         FilterProp::HasKeywordKind { value } => record.keywords.iter().any(|k| k.kind() == *value),
         FilterProp::WithoutKeyword { value } => !record.keywords.iter().any(|k| k == value),
         FilterProp::WithoutKeywordKind { value } => {
@@ -6946,6 +6995,12 @@ fn zone_change_record_matches_property(
                         .any(|&d| attacking_defender_matches(state, source, d, defender.as_ref()))
                 }),
         },
+        // CR 608.2h: a look-back subject uses the exit-time controller from the
+        // LKI record to select that player's last-turn object snapshot.
+        FilterProp::AttackedLastTurn => state
+            .creatures_attacked_last_turn
+            .get(&record.controller)
+            .is_some_and(|objects| objects.contains(&record.object_id)),
         // CR 509.1a + CR 608.2h: sibling of `AttackedThisTurn` — same durable id-keyed ledger,
         // same look-back reasoning.
         FilterProp::BlockedThisTurn => state.creatures_blocked_this_turn.contains(&record.object_id),
@@ -7057,6 +7112,7 @@ fn zone_change_record_matches_property(
         // over battlefield objects; a zone-change snapshot is not consulted for
         // "chosen this way" / "the rest" filters. Fail closed.
         | FilterProp::InTrackedSet { .. }
+        | FilterProp::PhasedOut
         | FilterProp::Other { .. } => false,
     }
 }
@@ -11413,6 +11469,37 @@ mod tests {
         assert!(matches_target_filter(&state, attacker, &filter, attacker));
     }
 
+    /// CR 508.1a + CR 514.2: "attacked during your last turn" is keyed by the
+    /// matched creature's current controller, not by a global previous-turn
+    /// set. This matters in multiplayer and keeps the source-relative static
+    /// riders on Giant Turtle and Goblin Rock Sled authoritative.
+    #[test]
+    fn attacked_last_turn_matches_controller_scoped_snapshot() {
+        let mut state = GameState::new(FormatConfig::free_for_all(), 3, 42);
+        state.turn_number = 2;
+        let p0_attacker = add_creature(&mut state, PlayerId(0), "P0 Attacker");
+        let p1_attacker = add_creature(&mut state, PlayerId(1), "P1 Attacker");
+        let p0_bystander = add_creature(&mut state, PlayerId(0), "P0 Bystander");
+
+        state
+            .creatures_attacked_last_turn
+            .entry(PlayerId(0))
+            .or_default()
+            .insert(p0_attacker);
+        state
+            .creatures_attacked_last_turn
+            .entry(PlayerId(1))
+            .or_default()
+            .insert(p1_attacker);
+
+        let filter = TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::AttackedLastTurn]),
+        );
+        assert!(matches_target_filter(&state, p0_attacker, &filter, p0_attacker));
+        assert!(matches_target_filter(&state, p1_attacker, &filter, p1_attacker));
+        assert!(!matches_target_filter(&state, p0_bystander, &filter, p0_bystander));
+    }
+
     /// CR 508.6 + CR 508.1b: Jabari's Influence target legality — "creature that
     /// attacked you this turn" scopes to the caster (P0) as defending player. In
     /// a 3-player game, a creature that attacked ONLY another player (P2) must NOT
@@ -15454,9 +15541,11 @@ mod characteristic_read_classification_tests {
             | FilterProp::IsSaddled
             | FilterProp::SaddledSource
             | FilterProp::ConvokedSource
+            | FilterProp::AttackedLastTurn
             | FilterProp::HasHasteOrControlledSinceTurnBegan
-            | FilterProp::WithKeyword { .. }
-            | FilterProp::HasKeywordKind { .. }
+        | FilterProp::WithKeyword { .. }
+        | FilterProp::HasChosenKeyword
+        | FilterProp::HasKeywordKind { .. }
             | FilterProp::WithoutKeyword { .. }
             | FilterProp::WithoutKeywordKind { .. }
             | FilterProp::CanEnchant { .. }
@@ -15528,7 +15617,8 @@ mod characteristic_read_classification_tests {
             | FilterProp::SameNameAsExiledBySource
             | FilterProp::IsCommander
             | FilterProp::SharesCreatureTypeWithCommander
-            | FilterProp::Other { .. } => false,
+        | FilterProp::PhasedOut
+        | FilterProp::Other { .. } => false,
         }
     }
 

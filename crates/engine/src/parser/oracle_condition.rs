@@ -60,6 +60,16 @@ fn scan_source_zone_filter(text: &str) -> Option<Zone> {
 /// `RequiresCondition { condition: None }`.
 pub fn parse_restriction_condition(text: &str) -> Option<ParsedCondition> {
     let lower = text.trim().trim_end_matches('.').to_lowercase();
+    // CR 302.6 + CR 602.5b: old-border activation riders such as Rocket
+    // Launcher's "you've controlled ~ continuously since the beginning of
+    // your most recent turn" are the source-relative form of the same
+    // continuity predicate used by the filter/runtime layers. The shared
+    // static-condition grammar has no recipient slot for this phrase, so keep
+    // the restriction lowering explicit and typed rather than consuming the
+    // rider as an unimplemented annotation.
+    if let Some(condition) = parse_source_controlled_continuously_restriction(&lower) {
+        return Some(condition);
+    }
     // CR 404.1 + CR 602.5b: Ashen Ghoul's old-border activation rider counts
     // creature cards physically above the source in its owner's graveyard.
     // This is source-relative and ordered; it is not interchangeable with the
@@ -115,6 +125,57 @@ pub fn parse_restriction_condition(text: &str) -> Option<ParsedCondition> {
         SharedRestrictionParse::Unsupported => None,
         SharedRestrictionParse::NoMatch => parse_restriction_only_condition(&lower),
     }
+}
+
+/// CR 302.6 + CR 508.1a: Parse the source-relative activation form of
+/// "you've controlled ~ continuously since the beginning of your most recent
+/// turn". The object may be rendered as `~` by the normalized Oracle parser
+/// or as the older self-description "this artifact/creature/permanent".
+fn parse_source_controlled_continuously_restriction(
+    text: &str,
+) -> Option<ParsedCondition> {
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("you've controlled "),
+        tag("you have controlled "),
+    ))
+    .parse(text)
+    .ok()?;
+    let (rest, _) = alt((
+        tag::<_, _, OracleError<'_>>("~"),
+        tag("this artifact"),
+        tag("this creature"),
+        tag("this permanent"),
+        tag("this card"),
+    ))
+    .parse(rest)
+    .ok()?;
+    let (rest, _) = tag::<_, _, OracleError<'_>>(
+        " continuously since the beginning of your most recent turn",
+    )
+    .parse(rest)
+    .ok()?;
+    if !rest.trim().is_empty() {
+        return None;
+    }
+
+    Some(ParsedCondition::QuantityComparison {
+        lhs: QuantityExpr::Ref {
+            qty: QuantityRef::ObjectCount {
+                filter: TargetFilter::And {
+                    filters: vec![
+                        TargetFilter::SelfRef,
+                        TargetFilter::Typed(
+                            TypedFilter::default().properties(vec![
+                                FilterProp::ControlledContinuouslySinceTurnBegan,
+                            ]),
+                        ),
+                    ],
+                },
+            },
+        },
+        comparator: Comparator::GE,
+        rhs: QuantityExpr::Fixed { value: 1 },
+    })
 }
 
 /// CR 301.5 + CR 303.4 + CR 602.5b: Convert an attached-subject
@@ -458,9 +519,15 @@ fn static_condition_to_restriction_condition(
         StaticCondition::HasMaxSpeed => Some(ParsedCondition::HasMaxSpeed),
         // CR 702.195b: The enduring story designation is available to restrictions.
         StaticCondition::HasEnduringStory => Some(ParsedCondition::HasEnduringStory),
-        StaticCondition::OpponentPoisonAtLeast { count } => {
+        StaticCondition::OpponentPoisonAtLeast {
+            count,
+            player: None,
+        } => {
             Some(ParsedCondition::OpponentPoisonAtLeast { count })
         }
+        // Combat-relative poison is evaluated at attack declaration, not as a
+        // cast/activation restriction with a trigger-context player anchor.
+        StaticCondition::OpponentPoisonAtLeast { .. } => None,
         // CR 122.1: source-counter activation gate — "Activate only if it has no time
         // counters on it" (Temple of Cyclical Time) and the counter-threshold restriction
         // class generally. Adopted from #5677 (the L02 condition lane), which solved this
@@ -569,6 +636,7 @@ fn static_condition_to_restriction_condition(
         // it is evaluated via `layers::evaluate_condition` on the self-spell cost
         // path, so lowering here returns `None`.
         | StaticCondition::AnyPlayerAttackedYouLastTurn
+        | StaticCondition::DefendingPlayerCastOrPutNontokenPermanentLastTurn
         | StaticCondition::CastingAsVariant { .. } => None,
     }
 }
@@ -1059,6 +1127,33 @@ mod tests {
                 "{text:?} still produced a legacy special-case leaf: {parsed:?}"
             );
         }
+    }
+
+    /// CR 302.6 + CR 602.5b: Rocket Launcher's source-continuity rider must
+    /// lower to the same typed object property that runtime filtering already
+    /// enforces, rather than remain an activation-text coverage gap.
+    #[test]
+    fn source_control_continuity_activation_restriction_is_typed() {
+        let condition = parse_restriction_condition(
+            "you've controlled ~ continuously since the beginning of your most recent turn",
+        )
+        .expect("Rocket Launcher continuity rider should parse");
+        assert!(matches!(
+            condition,
+            ParsedCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::And { filters }
+                    }
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 1 },
+            } if filters.iter().any(|filter| matches!(
+                filter,
+                TargetFilter::Typed(typed)
+                    if typed.properties.contains(&FilterProp::ControlledContinuouslySinceTurnBegan)
+            ))
+        ));
     }
 
     /// CR 601.3: "you control a creature with power 4 or greater" is a presence check —

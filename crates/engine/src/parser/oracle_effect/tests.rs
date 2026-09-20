@@ -11,8 +11,9 @@ use crate::types::ability::CardPlayMode::{Cast, Play};
 use crate::types::ability::CastFromZoneDriver::{DuringResolution, LingeringPermission};
 use crate::types::ability::{
     AttachmentKind, CardSelectionMode, CastManaObjectScope, CastManaSpentMetric,
-    CommanderOwnership, DigRestOrder, ExcessRecipient, ForEachCategoryAction, ModalChoice,
-    PerpetualModification, SeatDirection, TurnJournalKind,
+    CommanderOwnership, DamageChannel, DamageKindFilter, DigRestOrder, ExcessRecipient,
+    ForEachCategoryAction, ManaModification, ModalChoice, PerpetualModification, SeatDirection,
+    TurnJournalKind,
 };
 use crate::types::card_type::CoreType;
 use crate::types::mana::{ManaCost, ManaCostShard};
@@ -4898,6 +4899,82 @@ fn where_x_named_cards_in_all_graveyards_uses_named_graveyard_count() {
 }
 
 #[test]
+fn where_x_cards_in_all_graveyards_can_follow_a_spell_name() {
+    for expression in [
+        "the number of cards in all graveyards with the same name as that spell",
+        "the number of cards in all graveyards with the same name as the spell",
+    ] {
+        let expr = parse_where_x_quantity_expression(expression)
+            .expect("Shrine where-X quantity must parse");
+        let QuantityExpr::Ref {
+            qty:
+                QuantityRef::ObjectCount {
+                    filter: TargetFilter::Typed(filter),
+                },
+        } = expr
+        else {
+            panic!("expected dynamic graveyard ObjectCount for {expression:?}");
+        };
+        assert!(filter.type_filters.contains(&TypeFilter::Card));
+        assert!(filter.properties.iter().any(
+            |property| matches!(property, FilterProp::InZone { zone } if *zone == Zone::Graveyard)
+        ));
+        assert!(filter
+            .properties
+            .contains(&FilterProp::SameNameAsParentTarget));
+    }
+
+    let twice = parse_where_x_quantity_expression(
+        "twice the number of cards in all graveyards with the same name as that spell",
+    )
+    .expect("Dwarven Shrine where-X quantity must parse");
+    assert!(matches!(
+        twice,
+        QuantityExpr::Multiply { factor: 2, inner } if matches!(
+            *inner,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { .. }
+            }
+        )
+    ));
+}
+
+/// CR 120.1 + CR 120.9 + CR 107.3c: Reverse Polarity's old-border X binding
+/// must retain both the artifact source filter and the "you" recipient scope.
+#[test]
+fn where_x_twice_artifact_damage_to_you_is_typed_damage_history() {
+    let expr = parse_where_x_quantity_expression(
+        "twice the damage dealt to you so far this turn by artifacts",
+    )
+    .expect("Reverse Polarity where-X quantity must parse");
+    let QuantityExpr::Multiply { factor: 2, inner } = expr else {
+        panic!("expected twice multiplier");
+    };
+    let QuantityExpr::Ref {
+        qty:
+            QuantityRef::DamageDealtThisTurn {
+                source,
+                target,
+                aggregate: AggregateFunction::Sum,
+                group_by: None,
+                damage_kind: DamageKindFilter::Any,
+                channel: DamageChannel::Total,
+            },
+    } = *inner
+    else {
+        panic!("expected typed damage-history reference");
+    };
+    assert!(matches!(
+        *source,
+        TargetFilter::Typed(ref filter) if filter.type_filters.contains(&TypeFilter::Artifact)
+    ));
+    assert!(matches!(
+        *target,
+        TargetFilter::Typed(ref filter) if filter.controller == Some(ControllerRef::You)
+    ));
+}
+
+#[test]
 fn where_x_times_kicked_uses_kicker_count() {
     let expr = parse_where_x_quantity_expression("the number of times this spell was kicked")
         .expect("where-X quantity");
@@ -4907,6 +4984,27 @@ fn where_x_times_kicked_uses_kicker_count() {
             qty: QuantityRef::KickerCount
         }
     );
+}
+
+/// CR 106.3 + CR 614.1a: Deep Water's resolving mana replacement must be
+/// installed as a typed floating replacement, rather than swallowed as the
+/// anaphoric "it" imperative.
+#[test]
+fn deep_water_effect_installs_blue_mana_replacement() {
+    let def = parse_effect_chain(
+        "Until end of turn, if you tap a land you control for mana, it produces {U} instead of any other type.",
+        AbilityKind::Spell,
+    );
+    let Effect::AddTargetReplacement { replacement, .. } = def.effect.as_ref() else {
+        panic!("expected Deep Water mana replacement, got {:?}", def.effect);
+    };
+    assert_eq!(replacement.event, ReplacementEvent::ProduceMana);
+    assert!(matches!(
+        replacement.mana_modification,
+        Some(ManaModification::ReplaceWith {
+            mana_type: crate::types::mana::ManaType::Blue
+        })
+    ));
 }
 
 #[test]
@@ -5498,6 +5596,79 @@ fn effect_damage_to_each_other_opponent_uses_player_scope() {
     );
 }
 
+/// CR 120.1 + CR 608.2c: "that damage" is the direct anaphor for the amount
+/// of damage dealt by the preceding event. Flaming Gambit uses the exact form
+/// in its optional redirection clause: "have Flaming Gambit deal that damage
+/// to it instead".
+#[test]
+fn effect_damage_that_damage_uses_event_context_amount() {
+    let e = parse_effect("deal that damage to it instead");
+    assert!(
+        matches!(
+            e,
+            Effect::DealDamage {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+                target: TargetFilter::ParentTarget,
+                ..
+            }
+        ),
+        "expected event-context damage to the selected target, got {e:?}"
+    );
+}
+
+/// CR 608.2c + CR 701.19: the tap effect publishes the affected creatures as
+/// the active tracked set, so the old-border "tapped this way" count must be a
+/// live `TrackedSetSize`, not an unresolved variable.
+#[test]
+fn effect_damage_counts_creatures_tapped_this_way() {
+    let e = parse_effect(
+        "deal damage to the player equal to the number of creatures tapped this way",
+    );
+    assert!(
+        matches!(
+            e,
+            Effect::DealDamage {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::TrackedSetSize,
+                },
+                target: TargetFilter::Player,
+                ..
+            }
+        ),
+        "expected tracked-set damage count, got {e:?}"
+    );
+}
+
+/// CR 120.9 + CR 608.2c: "that player" in a historical damage amount refers
+/// to the parent target of the preceding targeting instruction, just like the
+/// already-supported "it" form.
+#[test]
+fn effect_damage_history_to_that_player_uses_parent_target() {
+    let e = parse_effect(
+        "lose life equal to the damage already dealt to that player this turn",
+    );
+    assert!(
+        matches!(
+            e,
+            Effect::LoseLife {
+                amount: QuantityExpr::Ref {
+                    qty: QuantityRef::DamageDealtThisTurn {
+                        target,
+                        aggregate: AggregateFunction::Sum,
+                        damage_kind: DamageKindFilter::Any,
+                        channel: DamageChannel::Total,
+                        ..
+                    }
+                },
+                target: Some(TargetFilter::ParentTarget),
+            } if target.as_ref() == &TargetFilter::ParentTarget
+        ),
+        "expected parent-target damage history"
+    );
+}
+
 #[test]
 fn effect_damage_all_that_player_controls_uses_relative_player_scope() {
     let mut ctx = ParseContext {
@@ -5562,6 +5733,67 @@ fn effect_damage_to_defending_player_counts_defending_player_objects() {
         }
         other => panic!("expected defending-player artifact count damage, got {other:?}"),
     }
+}
+
+/// CR 120.1 + CR 102.2 + CR 608.2c: Antagonism's possessive in
+/// "one of their opponents" is anchored to the damaged player introduced by
+/// the trigger. It must lower as a resolution condition rather than remain an
+/// unsupported `unless` rider or silently fall back to the source controller.
+#[test]
+fn antagonism_unless_reads_damage_to_scoped_players_opponents() {
+    let mut ctx = ParseContext {
+        relative_player_scope: Some(ControllerRef::TriggeringPlayer),
+        ..ParseContext::default()
+    };
+    let ability = parse_effect_chain_with_context(
+        "~ deals 2 damage to that player unless one of their opponents was dealt damage this turn",
+        AbilityKind::Spell,
+        &mut ctx,
+    );
+
+    assert_eq!(
+        ability.condition,
+        Some(AbilityCondition::Not {
+            condition: Box::new(AbilityCondition::ScopedPlayerOpponentDealtDamageThisTurn),
+        }),
+        "Antagonism's unless rider must keep the damaged-player anchor"
+    );
+    assert!(
+        !matches!(ability.effect.as_ref(), Effect::Unimplemented { .. }),
+        "Antagonism's damage effect must remain executable: {:?}",
+        ability.effect
+    );
+}
+
+/// CR 115.1 + CR 118.12a: Pia's Revolution declares the opponent who may
+/// accept the damage as a target inside its unless clause. The parser must
+/// preserve that opponent-only target constraint so target selection can offer
+/// the payment target and resolution can read the chosen player.
+#[test]
+fn pias_revolution_unless_damage_preserves_target_opponent_payer() {
+    let def = parse_effect_chain(
+        "return that card to your hand unless target opponent has this enchantment deal 3 damage to them",
+        AbilityKind::Spell,
+    );
+    let unless = def
+        .unless_pay
+        .as_ref()
+        .expect("Pia's Revolution's damage alternative must lower");
+    assert_eq!(
+        unless.payer,
+        TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::Opponent))
+    );
+    assert!(
+        matches!(&unless.cost, AbilityCost::EffectCost { effect, .. } if matches!(
+            effect.as_ref(),
+            Effect::DealDamage {
+                amount: QuantityExpr::Fixed { value: 3 },
+                ..
+            }
+        )),
+        "the unless payment must be a deterministic 3-damage effect cost: {:?}",
+        unless.cost
+    );
 }
 
 /// CR 120.3: Composite "each opponent and each [type] you don't control"
@@ -8192,20 +8424,26 @@ fn effect_counter_unless_rejects_unparsed_dynamic_x_tail() {
 }
 
 #[test]
-fn effect_counter_unless_rejects_that_player_unparsed_dynamic_x_tail() {
+fn effect_counter_unless_accepts_that_player_dynamic_x_tail() {
     let text = "counter that spell unless that player pays {X}, where X is the number of cards in all graveyards with the same name as the spell";
     let def = parse_effect_chain(text, AbilityKind::Spell);
-    let Effect::Unimplemented { name, .. } = def.effect.as_ref() else {
-        panic!(
-            "unparsed trigger-relative X unless rider must not become a plain counter: {:?}",
-            def.effect
-        );
-    };
-    assert_eq!(name, "unless_payment");
+    assert!(matches!(def.effect.as_ref(), Effect::Counter { .. }));
+    let unless_pay = def
+        .unless_pay
+        .expect("Shrine-style dynamic X must attach its unless payment");
     assert!(
-        def.unless_pay.is_none(),
-        "unparsed trigger-relative X unless rider must not attach a partial cost: {:?}",
-        def.unless_pay
+        matches!(
+            unless_pay.cost,
+            AbilityCost::ManaDynamic {
+                quantity: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(_),
+                    },
+                },
+            }
+        ),
+        "unexpected typed unless cost: {:#?}",
+        unless_pay.cost
     );
 }
 
@@ -18707,6 +18945,22 @@ fn choose_a_color() {
     );
 }
 
+#[test]
+fn choose_a_random_color_records_random_selection() {
+    // CR 608.2d: Gem Bazaar says "choose a random color", not the newer
+    // "choose a color at random" spelling. It still uses the existing random
+    // named-choice resolver rather than a bespoke color effect.
+    let e = parse_effect("Choose a random color");
+    assert_eq!(
+        e,
+        Effect::Choose {
+            choice_type: ChoiceType::color(),
+            persist: false,
+            selection: crate::types::ability::TargetSelectionMode::Random,
+        }
+    );
+}
+
 /// Issue #327: Skrelv, Defector Mite — the third sub-ability in the
 /// chained "Choose color → grant hexproof+toxic → grant can't-be-blocked"
 /// composition must bind "It" to `ParentTarget` (not `SelfRef`), produce
@@ -19055,6 +19309,47 @@ fn effect_add_mana_of_chosen_color_base() {
             },
             ..
         }
+    ));
+}
+
+#[test]
+fn effect_add_mana_of_color_last_chosen_is_source_chosen_color() {
+    // CR 106.1 + CR 105.4: Gem Bazaar's older wording names the same live
+    // source attribute as modern "mana of the chosen color" text.
+    let e = parse_effect("add one mana of the color last chosen");
+    assert!(matches!(
+        e,
+        Effect::Mana {
+            produced: ManaProduction::ChosenColor {
+                count: QuantityExpr::Fixed { value: 1 },
+                contribution: ManaContribution::Base,
+                ..
+            },
+            ..
+        }
+    ));
+}
+
+#[test]
+fn gem_bazaar_mana_then_random_color_chain_parses() {
+    let def = parse_effect_chain(
+        "Add one mana of the color last chosen. Then choose a random color.",
+        AbilityKind::Spell,
+    );
+    assert!(matches!(
+        def.effect.as_ref(),
+        Effect::Mana {
+            produced: ManaProduction::ChosenColor { .. },
+            ..
+        }
+    ));
+    assert!(matches!(
+        def.sub_ability.as_deref().map(|ability| ability.effect.as_ref()),
+        Some(Effect::Choose {
+            choice_type: ChoiceType::Color { .. },
+            selection: crate::types::ability::TargetSelectionMode::Random,
+            ..
+        })
     ));
 }
 
@@ -20753,6 +21048,36 @@ fn look_at_top_cards_put_them_back_reorders_all_cards() {
 }
 
 #[test]
+fn look_at_top_cards_then_put_them_back_reorders_all_cards() {
+    let def = parse_effect_chain(
+        "Look at the top three cards of your library, then put them back in any order.",
+        AbilityKind::Spell,
+    );
+
+    let Effect::Dig {
+        count,
+        keep_count,
+        destination,
+        rest_destination,
+        rest_order,
+        ..
+    } = &*def.effect
+    else {
+        panic!("expected Effect::Dig at top level, got {:?}", def.effect);
+    };
+
+    assert_eq!(*count, QuantityExpr::Fixed { value: 3 });
+    assert_eq!(*keep_count, None);
+    assert_eq!(*destination, Some(Zone::Library));
+    assert_eq!(*rest_destination, Some(Zone::Library));
+    assert_eq!(*rest_order, DigRestOrder::Preserve);
+    assert!(
+        def.sub_ability.is_none(),
+        "then-put-them-back clause must be absorbed into Dig"
+    );
+}
+
+#[test]
 fn strip_any_number_exile() {
     let (text, spec) = strip_any_number_quantifier("exile any number of creatures");
     assert_eq!(text, "exile creatures");
@@ -22333,6 +22658,27 @@ fn cant_regenerate_destroy_all() {
         "Expected DestroyAll {{ cant_regenerate: true }}, got {:?}",
         def.effect
     );
+}
+
+#[test]
+fn legacy_bury_lowers_to_nonregenerable_destruction() {
+    let single = parse_effect_chain("Bury target creature.", AbilityKind::Spell);
+    assert!(matches!(
+        single.effect.as_ref(),
+        Effect::Destroy {
+            cant_regenerate: true,
+            target: TargetFilter::Typed(_),
+        }
+    ));
+
+    let mass = parse_effect_chain("Bury all creatures.", AbilityKind::Spell);
+    assert!(matches!(
+        mass.effect.as_ref(),
+        Effect::DestroyAll {
+            cant_regenerate: true,
+            target: TargetFilter::Typed(_),
+        }
+    ));
 }
 
 #[test]
@@ -28619,6 +28965,7 @@ fn change_targets_spell_or_ability_with_single_target() {
         target,
         scope,
         forced_to,
+        ..
     } = e
     else {
         panic!("Expected ChangeTargets, got {e:?}");
@@ -28649,6 +28996,7 @@ fn choose_new_targets_spell_or_ability_deflecting_swat() {
         target,
         scope,
         forced_to,
+        ..
     } = e
     else {
         panic!("Expected ChangeTargets, got {e:?}");
@@ -28677,6 +29025,7 @@ fn choose_new_targets_instant_or_sorcery_spell() {
         target,
         scope,
         forced_to,
+        ..
     } = e
     else {
         panic!("Expected ChangeTargets, got {e:?}");
@@ -31352,6 +31701,70 @@ fn effect_exchange_control_self_ref_slot() {
         }
         other => panic!("Expected ExchangeControl, got {other:?}"),
     }
+}
+
+#[test]
+fn effect_cultural_exchange_anaphoric_control_swap_uses_existing_targets() {
+    // CR 701.12a + CR 608.2c: Cultural Exchange announces the two players and
+    // the two creatures before this residual clause.  The clause itself must
+    // retain the object-swap operation rather than becoming an Unimplemented
+    // anaphor.
+    let e = parse_effect("Those players exchange control of those creatures");
+    assert!(matches!(
+        e,
+        Effect::ExchangeControl {
+            target_a: TargetFilter::ParentTarget,
+            target_b: TargetFilter::ParentTarget,
+        }
+    ));
+}
+
+#[test]
+fn effect_morality_shift_preserves_dedicated_zone_exchange() {
+    let e = parse_effect("Exchange your graveyard and library");
+    assert!(matches!(
+        e,
+        Effect::RuntimeHandled {
+            handler: crate::types::ability::RuntimeHandler::MoralityShift
+        }
+    ));
+}
+
+#[test]
+fn effect_private_object_look_preserves_face_down_target() {
+    let e = parse_effect("Look at target face-down creature");
+    assert!(matches!(
+        e,
+        Effect::RuntimeHandled {
+            handler: crate::types::ability::RuntimeHandler::LookAtObject {
+                target: TargetFilter::Typed(_)
+            }
+        }
+    ));
+    let Effect::RuntimeHandled {
+        handler: crate::types::ability::RuntimeHandler::LookAtObject { target },
+    } = e
+    else {
+        unreachable!();
+    };
+    let TargetFilter::Typed(filter) = target else {
+        panic!("face-down object look must retain a typed target filter");
+    };
+    assert!(filter
+        .properties
+        .contains(&crate::types::ability::FilterProp::FaceDown));
+}
+
+#[test]
+fn effect_private_object_look_at_it_inherits_parent_target() {
+    assert!(matches!(
+        parse_effect("Look at it"),
+        Effect::RuntimeHandled {
+            handler: crate::types::ability::RuntimeHandler::LookAtObject {
+                target: TargetFilter::ParentTarget
+            }
+        }
+    ));
 }
 
 // =============================================================================
@@ -42617,6 +43030,20 @@ fn named_choice_accepts_land_card_name() {
     assert_eq!(
         super::try_parse_named_choice("choose a creature card name"),
         Some(ChoiceType::CardName)
+    );
+}
+
+/// CR 800.4a: Goblin Festival's older "choose one of your opponents" wording
+/// is a typed single-opponent choice, not an untyped label list.
+#[test]
+fn named_choice_accepts_one_of_your_opponents() {
+    assert_eq!(
+        super::try_parse_named_choice("choose one of your opponents"),
+        Some(ChoiceType::opponent())
+    );
+    assert_eq!(
+        super::try_parse_named_choice("choose an opponent"),
+        Some(ChoiceType::opponent())
     );
 }
 
