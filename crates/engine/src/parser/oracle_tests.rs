@@ -25358,6 +25358,36 @@ fn legacy_if_attack_requirements_route_as_triggers() {
     }
 }
 
+/// CR 118.9 + CR 701.9: Foil's alternative cost is a conjoined hand discard —
+/// "discard an Island card and another card rather than pay this spell's mana
+/// cost". Both halves carry meaning: the Island restriction and the second card
+/// (paid in sequence, so "another" holds because the first is already gone).
+#[test]
+fn foil_alternative_cost_is_a_conjoined_hand_discard() {
+    let oracle = "You may discard an Island card and another card rather than pay this \
+                  spell's mana cost.\nCounter target spell.";
+    let parsed = parse(oracle, "Foil", &[], &["Instant"], &[]);
+    let options = &parsed.casting_options;
+    assert!(
+        !options.is_empty(),
+        "Foil must expose an alternative cost option; got: {options:#?}"
+    );
+    let rendered = format!("{options:#?}");
+    let lowered = rendered.to_lowercase();
+    assert!(
+        lowered.contains("discard"),
+        "the option must be a discard cost; got: {rendered}"
+    );
+    assert!(
+        lowered.contains("island"),
+        "the Island-card restriction must survive; got: {rendered}"
+    );
+    assert!(
+        rendered.matches("Discard").count() >= 2,
+        "both halves of \"an Island card and another card\" must be costs; got: {rendered}"
+    );
+}
+
 #[test]
 fn activated_draw_for_each_color_among_permanents_uses_distinct_colors_quantity() {
     let parsed = parse(
