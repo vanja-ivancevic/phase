@@ -41,6 +41,70 @@ use crate::types::zones::Zone;
 // Shared helpers for building card faces from MTGJSON data
 // ---------------------------------------------------------------------------
 
+/// Exact primary Oracle-parser input prepared by the production face builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OracleParserInput {
+    pub oracle_text: String,
+    pub card_name: String,
+    pub keyword_names: Vec<String>,
+    pub types: Vec<String>,
+    pub subtypes: Vec<String>,
+    pub has_cleave_variant: bool,
+    cleave_oracle_text: Option<String>,
+}
+
+/// Prepare the single primary parse performed by `build_oracle_face_inner`.
+pub fn prepare_oracle_parser_input(
+    mtgjson: &AtomicCard,
+    skip_mtgjson_keywords: bool,
+) -> OracleParserInput {
+    let mtgjson_keyword_names = mtgjson
+        .keywords
+        .as_ref()
+        .map(|keywords| {
+            keywords
+                .iter()
+                .map(|keyword| keyword.to_ascii_lowercase())
+                .collect()
+        })
+        .unwrap_or_default();
+    let keyword_names = if skip_mtgjson_keywords {
+        vec!["__force_keyword_extract__".to_string()]
+    } else {
+        mtgjson_keyword_names
+    };
+    let raw_oracle_text = mtgjson.text.as_deref().unwrap_or("");
+    let (oracle_text, cleave_text) = prepare_cleave_oracle_text(raw_oracle_text, &keyword_names);
+    OracleParserInput {
+        oracle_text,
+        card_name: mtgjson
+            .face_name
+            .as_deref()
+            .unwrap_or(&mtgjson.name)
+            .to_string(),
+        keyword_names,
+        types: mtgjson.types.clone(),
+        subtypes: mtgjson.subtypes.clone(),
+        has_cleave_variant: cleave_text.is_some(),
+        cleave_oracle_text: cleave_text,
+    }
+}
+
+/// CR 702.148a-b + CR 612: Cleave removes bracketed rules text as a text-changing effect.
+fn prepare_cleave_oracle_text(
+    raw_oracle_text: &str,
+    keyword_names: &[String],
+) -> (String, Option<String>) {
+    if keyword_names.iter().any(|name| name == "cleave") {
+        (
+            apply_bracket_mode(raw_oracle_text, BracketMode::KeepContent),
+            Some(apply_bracket_mode(raw_oracle_text, BracketMode::RemoveSpan)),
+        )
+    } else {
+        (raw_oracle_text.to_string(), None)
+    }
+}
+
 /// CR 702.148a-b + CR 612: Parse a face's Oracle text under Cleave's
 /// text-changing semantics, returning the printed-cost parse and (when the face
 /// has Cleave) the bracket-removed cleave variant.
@@ -69,19 +133,34 @@ pub(crate) fn parse_oracle_with_cleave_brackets(
     crate::parser::oracle::ParsedAbilities,
     Option<CleaveVariant>,
 ) {
-    let has_cleave = keyword_names.iter().any(|n| n == "cleave");
+    let (base_oracle_text, cleave_text) =
+        prepare_cleave_oracle_text(raw_oracle_text, keyword_names);
+    parse_prepared_oracle_text(
+        &base_oracle_text,
+        cleave_text.as_deref(),
+        card_name,
+        keyword_names,
+        types,
+        subtypes,
+    )
+}
 
-    let base_oracle_text = if has_cleave {
-        apply_bracket_mode(raw_oracle_text, BracketMode::KeepContent)
-    } else {
-        raw_oracle_text.to_string()
-    };
-    let parsed = parse_oracle_text(&base_oracle_text, card_name, keyword_names, types, subtypes);
+fn parse_prepared_oracle_text(
+    base_oracle_text: &str,
+    cleave_text: Option<&str>,
+    card_name: &str,
+    keyword_names: &[String],
+    types: &[String],
+    subtypes: &[String],
+) -> (
+    crate::parser::oracle::ParsedAbilities,
+    Option<CleaveVariant>,
+) {
+    let parsed = parse_oracle_text(base_oracle_text, card_name, keyword_names, types, subtypes);
 
-    let cleave_variant = if has_cleave {
-        let cleave_text = apply_bracket_mode(raw_oracle_text, BracketMode::RemoveSpan);
+    let cleave_variant = if let Some(cleave_text) = cleave_text {
         let cleave_parsed =
-            parse_oracle_text(&cleave_text, card_name, keyword_names, types, subtypes);
+            parse_oracle_text(cleave_text, card_name, keyword_names, types, subtypes);
         Some(CleaveVariant {
             abilities: cleave_parsed.abilities,
             triggers: cleave_parsed.triggers,
@@ -2991,13 +3070,16 @@ pub fn synthesize_madness_intrinsics(face: &mut CardFace) {
 /// replacement whose execute mills N then returns this card from the graveyard
 /// to hand.
 ///
-/// The replacement functions while the card is in the graveyard. Two pieces make
-/// that work: (1) the draw-replacement default player-scope follows the dredge
-/// card's effective source player (CR 109.4 + CR 108.4a), so a graveyard card
-/// applies on its owner's draw — no `valid_player`/`valid_card` needed (and
+/// CR 113.6b: the replacement functions from the graveyard and ONLY from the
+/// graveyard, which the definition states via `active_zones = [Graveyard]` —
+/// without it the card would keep offering dredge from the battlefield, where
+/// CR 702.52a says the ability doesn't function. Two more pieces complete it:
+/// (1) the draw-replacement default player-scope follows the dredge card's
+/// effective source player (CR 109.4 + CR 108.4a), so a graveyard card applies
+/// on its owner's draw — no `valid_player`/`valid_card` needed (and
 /// `valid_card: SelfRef` would not match a `Draw`, which has no affected object);
-/// (2) `find_applicable_replacements` includes graveyard dredge cards on that
-/// player's draw, gated on library size >= N (CR 702.52b enforced at offer time).
+/// (2) `find_applicable_replacements` gates the offer on library size >= N
+/// (CR 702.52b), the one half that depends on live game state.
 pub fn synthesize_dredge(face: &mut CardFace) {
     let Some(n) = face.keywords.iter().find_map(|k| match k {
         Keyword::Dredge(n) => Some(*n),
@@ -3042,9 +3124,14 @@ pub fn synthesize_dredge(face: &mut CardFace) {
     mill.sub_ability = Some(Box::new(return_to_hand));
 
     // CR 702.52a + CR 121.6b: Dredge replaces a single individual card draw
-    // ("if you would draw a card, you may instead mill N"), not the instruction count.
+    // ("if you would draw a card, you may instead mill N"), not the instruction
+    // count — and CR 702.52a + CR 113.6b, it "functions only while the card with
+    // dredge is in a player's graveyard." Declaring that zone on the definition
+    // is what keeps a dredge creature on the BATTLEFIELD, where the ability does
+    // not function, from offering its dredge on your draws.
     let mut replacement = ReplacementDefinition::new(ReplacementEvent::Draw)
-        .draw_scope(crate::types::ability::DrawReplacementScope::IndividualDraw);
+        .draw_scope(crate::types::ability::DrawReplacementScope::IndividualDraw)
+        .active_zones(vec![Zone::Graveyard]);
     replacement.mode = crate::types::ability::ReplacementMode::Optional { decline: None };
     replacement.description = Some(
         "CR 702.52a: Dredge — instead of drawing, you may mill N cards and return this \
@@ -3785,7 +3872,9 @@ pub(crate) fn entry_replacement_for_grant_static(
 fn build_absorb_replacement(n: u32) -> ReplacementDefinition {
     ReplacementDefinition::new(ReplacementEvent::DamageDone)
         .valid_card(TargetFilter::SelfRef)
-        .damage_modification(DamageModification::PreventionMinus { value: n })
+        .damage_modification(DamageModification::PreventionMinus {
+            value: crate::types::ability::PreventionFormula::fixed(n),
+        })
         .description(format!(
             "CR 702.64a: Absorb {n} — if a source would deal damage to this creature, \
              prevent {n} of that damage."
@@ -3801,7 +3890,9 @@ fn is_absorb_replacement(r: &ReplacementDefinition, n: u32) -> bool {
         && matches!(r.valid_card, Some(TargetFilter::SelfRef))
         && matches!(
             r.damage_modification,
-            Some(DamageModification::PreventionMinus { value }) if value == n
+            Some(DamageModification::PreventionMinus {
+                value: crate::types::ability::PreventionFormula::Fixed(value),
+            }) if value == n
         )
 }
 
@@ -6622,6 +6713,8 @@ fn build_suspend_last_counter_cast_trigger() -> TriggerDefinition {
             // sorcery-speed timing bypass for an upkeep recast (issue #1520).
             driver: CastFromZoneDriver::DuringResolution,
             mana_spend_permission: None,
+            additional_cost: None,
+            cast_cost_modifier: None,
         },
     )
     .optional();
@@ -9885,6 +9978,8 @@ pub fn synthesize_siege_intrinsics(face: &mut CardFace) {
                 // the explicit discriminator preserves that.)
                 driver: CastFromZoneDriver::DuringResolution,
                 mana_spend_permission: None,
+                additional_cost: None,
+                cast_cost_modifier: None,
             },
         )
         .optional();
@@ -10124,11 +10219,7 @@ fn build_oracle_face_inner(
         .as_ref()
         .map(|kws| kws.iter().map(|s| s.to_ascii_lowercase()).collect())
         .unwrap_or_default();
-    let parser_keyword_names: Vec<String> = if skip_mtgjson_keywords {
-        vec!["__force_keyword_extract__".to_string()]
-    } else {
-        mtgjson_keyword_names.clone()
-    };
+    let parser_input = prepare_oracle_parser_input(mtgjson, skip_mtgjson_keywords);
 
     // B8: For multi-face cards, skip MTGJSON-provided keywords entirely.
     // MTGJSON duplicates keywords across both faces of Transform/DFC cards,
@@ -10150,21 +10241,19 @@ fn build_oracle_face_inner(
     };
 
     let raw_oracle_text = mtgjson.text.as_deref().unwrap_or("");
-    let face_name = mtgjson.face_name.as_deref().unwrap_or(&mtgjson.name);
-
-    let types: Vec<String> = mtgjson.types.clone();
-    let subtypes: Vec<String> = mtgjson.subtypes.clone();
+    let face_name = parser_input.card_name.as_str();
 
     // CR 702.148a-b + CR 612: Cleave's text-changing effect removes every
     // square-bracketed span from the spell's rules text. `parse_oracle_with_cleave_brackets`
     // is the single authority for the dual (printed-cost / cleave-cost) parse,
     // shared with the test scenario harness so the two pipelines cannot diverge.
-    let (parsed, cleave_variant) = parse_oracle_with_cleave_brackets(
-        raw_oracle_text,
-        face_name,
-        &parser_keyword_names,
-        &types,
-        &subtypes,
+    let (parsed, cleave_variant) = parse_prepared_oracle_text(
+        &parser_input.oracle_text,
+        parser_input.cleave_oracle_text.as_deref(),
+        &parser_input.card_name,
+        &parser_input.keyword_names,
+        &parser_input.types,
+        &parser_input.subtypes,
     );
 
     let extracted_keywords = parsed.extracted_keywords;
@@ -11226,6 +11315,44 @@ mod cycling_synthesis_tests {
         }
     }
 
+    #[test]
+    fn oracle_parser_input_uses_face_name_and_multiface_keyword_mode() {
+        let mut card = counter_phrase_card("Combined Name", "Flying", &["Flying"]);
+        card.face_name = Some("Front Face".to_string());
+        let single = prepare_oracle_parser_input(&card, false);
+        let multi = prepare_oracle_parser_input(&card, true);
+        assert_eq!(single.card_name, "Front Face");
+        assert_eq!(single.keyword_names, vec!["flying"]);
+        assert_eq!(multi.keyword_names, vec!["__force_keyword_extract__"]);
+    }
+
+    #[test]
+    fn oracle_parser_input_uses_production_cleave_base_text() {
+        let card = counter_phrase_card("Cleave Test", "Draw [two] cards.", &["Cleave"]);
+        let input = prepare_oracle_parser_input(&card, false);
+        assert_eq!(input.oracle_text, "Draw two cards.");
+        assert!(input.has_cleave_variant);
+        let (production, cleave) = parse_oracle_with_cleave_brackets(
+            card.text.as_deref().expect("fixture text"),
+            &input.card_name,
+            &input.keyword_names,
+            &input.types,
+            &input.subtypes,
+        );
+        assert_eq!(
+            serde_json::to_value(parse_oracle_text(
+                &input.oracle_text,
+                &input.card_name,
+                &input.keyword_names,
+                &input.types,
+                &input.subtypes,
+            ))
+            .expect("serialize prepared parse"),
+            serde_json::to_value(production).expect("serialize production parse")
+        );
+        assert!(cleave.is_some());
+    }
+
     /// CR 122.1b: a keyword counter grants its keyword only while the counter is
     /// on the object — the card itself does not have the ability. MTGJSON still
     /// phantom-tags Reluctant Role Model with "Lifelink" because its Survival
@@ -11733,6 +11860,14 @@ mod madness_synthesis_tests {
             }
         ));
         assert!(is_dredge_draw_replacement(repl));
+        // CR 702.52a + CR 113.6b: dredge "functions only while the card with
+        // dredge is in a player's graveyard" — the definition must SAY so, or
+        // the pipeline's default battlefield/command scan offers it in play.
+        assert_eq!(
+            repl.active_zones,
+            vec![Zone::Graveyard],
+            "dredge must declare graveyard-only zone of function"
+        );
     }
 
     #[test]
@@ -13657,8 +13792,8 @@ mod undying_persist_runtime_tests {
     /// the `ObjectId` across the zone change). When the second trigger
     /// resolves, its `Effect::ChangeZone` evaluates `from_zone =
     /// Zone::Battlefield`, which fails the `expected_origin ==
-    /// Some(Zone::Graveyard)` guard at `change_zone.rs:501-505` and the
-    /// move silently no-ops. `enter_with_counters` runs only on a successful
+    /// Some(Zone::Graveyard)` guard in `change_zone::process_one_zone_move_with_terminal`
+    /// and the move silently no-ops. `enter_with_counters` runs only on a successful
     /// move, so the second trigger places no counter either.
     ///
     /// Post-condition pinned by this test: exactly one battlefield object
@@ -13706,7 +13841,7 @@ mod undying_persist_runtime_tests {
             count_in_battlefield, 1,
             "dual-keyword permanent must not be double-returned"
         );
-        // The origin guard at change_zone.rs:501-505 prevents the
+        // The origin guard in `change_zone::process_one_zone_move_with_terminal` prevents the
         // second-to-resolve trigger from executing its move, so its
         // `enter_with_counters` never runs. Exactly one counter ends up on
         // the returned permanent (polarity = whichever trigger resolved
@@ -15894,6 +16029,7 @@ mod annihilator_runtime_tests {
             attacker_ids: vec![attacker_id],
             defending_player,
             attacks: vec![(attacker_id, AttackTarget::Player(defending_player))],
+            declaration_records: Vec::new(),
         }
     }
 
@@ -16486,7 +16622,7 @@ mod myriad_runtime_tests {
         // Make Muddle become a copy of the target "except it has myriad".
         let copy_ability = ResolvedAbility::new(
             Effect::BecomeCopy {
-                recipient: TargetFilter::SelfRef,
+                recipient: crate::types::ability::CopyRecipient::Source,
                 target: TargetFilter::Any,
                 duration: Some(Duration::UntilEndOfTurn),
                 mana_value_limit: None,
@@ -25939,7 +26075,9 @@ mod absorb_synthesis_tests {
         assert!(
             matches!(
                 r.damage_modification,
-                Some(DamageModification::PreventionMinus { value: 2 })
+                Some(DamageModification::PreventionMinus {
+                    value: crate::types::ability::PreventionFormula::Fixed(2),
+                })
             ),
             "CR 702.64a: prevent N (=2) of the damage (prevention provenance)"
         );
@@ -26003,6 +26141,163 @@ mod absorb_synthesis_tests {
             marked_damage_after_absorb_damage(vec![Keyword::Absorb(1), Keyword::Absorb(1)], 3),
             1,
             "CR 702.64c: two Absorb 1 instances each prevent 1 damage"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tiered_synthesis_tests {
+    //! CR 702.183a: Tiered's runtime structure lives in the spell's
+    //! `ModalChoice` (choose exactly one) plus the per-mode additional costs
+    //! (CR 700.2h), not in an independent keyword handler. These tests drive the
+    //! production MTGJSON→face path (`build_oracle_face`) to prove the
+    //! `"tiered"` keyword maps to the typed variant and the modal carries the
+    //! per-mode costs.
+    use super::*;
+    use crate::database::mtgjson::AtomicIdentifiers;
+
+    /// Fire Magic's verbatim Oracle text (U+2022 bullets, U+2014 em-dashes).
+    const FIRE_MAGIC_ORACLE: &str = "Tiered (Choose one additional cost.)\n\
+        \u{2022} Fire \u{2014} {0} \u{2014} Fire Magic deals 1 damage to each creature.\n\
+        \u{2022} Fira \u{2014} {2} \u{2014} Fire Magic deals 2 damage to each creature.\n\
+        \u{2022} Firaga \u{2014} {5} \u{2014} Fire Magic deals 3 damage to each creature.";
+
+    fn tiered_atomic_card(name: &str, oracle: &str, keywords: Option<Vec<String>>) -> AtomicCard {
+        AtomicCard {
+            name: name.to_string(),
+            mana_cost: Some("{1}{R}".to_string()),
+            colors: vec!["R".to_string()],
+            color_identity: vec!["R".to_string()],
+            power: None,
+            toughness: None,
+            loyalty: None,
+            defense: None,
+            text: Some(oracle.to_string()),
+            layout: "normal".to_string(),
+            type_line: Some("Instant".to_string()),
+            types: vec!["Instant".to_string()],
+            subtypes: vec![],
+            supertypes: vec![],
+            keywords,
+            side: None,
+            face_name: None,
+            mana_value: 2.0,
+            legalities: Default::default(),
+            leadership_skills: None,
+            printings: Vec::new(),
+            rulings: Vec::new(),
+            is_game_changer: false,
+            identifiers: AtomicIdentifiers {
+                scryfall_oracle_id: Some(format!("{}-oracle", name.to_lowercase())),
+                scryfall_id: Some(format!("{}-face", name.to_lowercase())),
+            },
+            foreign_data: Vec::new(),
+            related_cards: crate::database::mtgjson::SetRelatedCards::default(),
+        }
+    }
+
+    /// Production `build_oracle_face`: MTGJSON's real Fire Magic keyword array
+    /// (`["Fira","Firaga","Fire","Tiered"]`) maps its one real keyword to
+    /// `Keyword::Tiered` — the three mode-name entries stay `Unknown` and are
+    /// filtered — and the Tiered header lowers to a `ModalChoice` whose per-mode
+    /// additional costs (CR 700.2h) are `{0}` / `{2}` / `{5}`.
+    ///
+    /// Revert-red: deleting the `"tiered"` `FromStr` arm leaves `face.keywords`
+    /// empty, failing the first assertion.
+    #[test]
+    fn tiered_fire_magic_face_carries_keyword_and_modal_mode_costs() {
+        let card = tiered_atomic_card(
+            "Fire Magic",
+            FIRE_MAGIC_ORACLE,
+            Some(vec![
+                "Fira".to_string(),
+                "Firaga".to_string(),
+                "Fire".to_string(),
+                "Tiered".to_string(),
+            ]),
+        );
+        let face = build_oracle_face(&card, None);
+
+        assert_eq!(
+            face.keywords,
+            vec![Keyword::Tiered],
+            "the MTGJSON \"Tiered\" keyword must map; the mode names stay Unknown"
+        );
+
+        let modal = face
+            .modal
+            .as_ref()
+            .expect("Tiered lowers to a modal choice");
+        assert_eq!(modal.min_choices, 1, "CR 702.183a: choose exactly one");
+        assert_eq!(modal.max_choices, 1, "CR 702.183a: choose exactly one");
+        assert_eq!(modal.mode_count, 3);
+        assert_eq!(
+            modal.mode_costs,
+            vec![ManaCost::zero(), ManaCost::generic(2), ManaCost::generic(5)],
+            "CR 700.2h: each mode's listed cost is an additional cost"
+        );
+
+        // Positive reach-guard: the three modes lowered to real abilities, not
+        // Unimplemented placeholders.
+        assert_eq!(face.abilities.len(), 3);
+        assert!(
+            !face
+                .abilities
+                .iter()
+                .any(|ability| matches!(&*ability.effect, Effect::Unimplemented { .. })),
+            "no Tiered mode may be an Unimplemented placeholder"
+        );
+
+        // Hostile rows — the mapping is not case-sensitive, and the Spree
+        // sibling arm is unaffected by the Tiered addition.
+        let lower = build_oracle_face(
+            &tiered_atomic_card(
+                "Fire Magic",
+                FIRE_MAGIC_ORACLE,
+                Some(vec!["tiered".to_string()]),
+            ),
+            None,
+        );
+        assert_eq!(
+            lower.keywords,
+            vec![Keyword::Tiered],
+            "\"tiered\" must map as well"
+        );
+        let upper = build_oracle_face(
+            &tiered_atomic_card(
+                "Fire Magic",
+                FIRE_MAGIC_ORACLE,
+                Some(vec!["Tiered".to_string()]),
+            ),
+            None,
+        );
+        assert_eq!(
+            upper.keywords,
+            vec![Keyword::Tiered],
+            "\"Tiered\" must map as well"
+        );
+
+        let spree = build_oracle_face(
+            &tiered_atomic_card(
+                "Modal Spree Test",
+                "Spree\n+ {1} \u{2014} Draw a card.",
+                Some(vec!["Spree".to_string()]),
+            ),
+            None,
+        );
+        assert_eq!(
+            spree.keywords,
+            vec![Keyword::Spree],
+            "the Spree arm must still map after the Tiered sibling lands"
+        );
+
+        let absent = build_oracle_face(
+            &tiered_atomic_card("Fire Magic", FIRE_MAGIC_ORACLE, None),
+            None,
+        );
+        assert!(
+            absent.keywords.is_empty(),
+            "no MTGJSON keyword array means no Tiered keyword on the face"
         );
     }
 }

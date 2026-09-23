@@ -4,6 +4,7 @@ import { useTranslation } from "react-i18next";
 
 import { ManaCostPips } from "../mana/ManaCostPips.tsx";
 import { spellCostDisplay } from "../../viewmodel/costLabel.ts";
+import { useBackFaceSpellCost } from "../../hooks/useBackFaceSpellCost.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { usePreferencesStore } from "../../stores/preferencesStore.ts";
@@ -26,7 +27,11 @@ import { StormCopyBadge } from "./StormCopyBadge.tsx";
 const EMPTY_OBJECTS: Record<string, GameObject> = {};
 const EMPTY_STORM_COUNTS: Record<string, number> = {};
 
-export function MobileHandDrawer() {
+interface MobileHandDrawerProps {
+  interactionDisabled?: boolean;
+}
+
+export function MobileHandDrawer({ interactionDisabled = false }: MobileHandDrawerProps) {
   const { t } = useTranslation("game");
   const isOpen = useUiStore((s) => s.mobileHandOpen);
   const setOpen = useUiStore((s) => s.setMobileHandOpen);
@@ -53,6 +58,14 @@ export function MobileHandDrawer() {
     if (wf?.type === "TargetSelection") return wf.data.pending_cast.object_id;
     return null;
   });
+
+  useEffect(() => {
+    if (!interactionDisabled) return;
+    setOpen(false);
+    if (useUiStore.getState().previewSource === "playerHand") {
+      useUiStore.getState().dismissPreview();
+    }
+  }, [interactionDisabled, setOpen]);
 
   useEffect(() => {
     if (
@@ -133,7 +146,7 @@ export function MobileHandDrawer() {
     [hasPriority, objects, legalActionsByObject, inspectObject, setPendingAbilityChoice, setOpen],
   );
 
-  if (!player || !objects) return null;
+  if (interactionDisabled || !player || !objects) return null;
 
   return (
     <AnimatePresence>
@@ -208,6 +221,7 @@ export function MobileHandDrawer() {
                     isToken={obj.display_source === "Token"}
                     tokenImageRef={obj.token_image_ref}
                     manaCost={obj.mana_cost}
+                    backFaceManaCost={obj.back_face?.mana_cost}
                     isPlayable={isPlayable}
                     hasPriority={hasPriority}
                     stormCopyCount={prospectiveStormCounts[String(obj.id)]}
@@ -232,6 +246,7 @@ interface DrawerCardProps {
   isToken: boolean;
   tokenImageRef?: GameObject["token_image_ref"];
   manaCost: ManaCost;
+  backFaceManaCost?: ManaCost;
   isPlayable: boolean;
   hasPriority: boolean;
   stormCopyCount?: number;
@@ -247,6 +262,7 @@ const DrawerCard = memo(function DrawerCard({
   isToken,
   tokenImageRef,
   manaCost,
+  backFaceManaCost,
   isPlayable,
   hasPriority,
   stormCopyCount,
@@ -264,6 +280,7 @@ const DrawerCard = memo(function DrawerCard({
     tokenImageRef,
   });
   const { displayCost, isReduced } = spellCostDisplay(effectiveCost, manaCost);
+  const backFace = useBackFaceSpellCost(objectId, backFaceManaCost);
 
   // Mouse hover (desktop) + long-press (touch) both open the card preview, and
   // the hook tags the element with `data-card-hover` so usePreviewDismiss's
@@ -271,7 +288,7 @@ const DrawerCard = memo(function DrawerCard({
   // This is what lets a player read any card in the full-hand modal: the fanned
   // hand overlaps cards, so the modal is the only place to inspect the ones
   // hidden behind others — and that inspection must work for mouse and touch.
-  const { handlers, firedRef } = useCardHover(objectId);
+  const { handlers, firedRef } = useCardHover(objectId, "playerHand");
 
   const handleClick = useCallback(
     (e: React.MouseEvent) => {
@@ -291,7 +308,7 @@ const DrawerCard = memo(function DrawerCard({
       if (isPlayable) {
         onPlay(objectId);
       } else {
-        inspectObject(objectId);
+        inspectObject(objectId, undefined, "hover", "cursor", "playerHand");
         setPreviewSticky(true);
       }
     },
@@ -324,7 +341,7 @@ const DrawerCard = memo(function DrawerCard({
       {/* @container overlay sized to the card so the pips scale in cqi with the
           drawer card's width instead of a fixed px size. */}
       <div className="pointer-events-none absolute inset-0 @container">
-        <ManaCostPips cost={displayCost} isReduced={isReduced} size="fluid" />
+        <ManaCostPips cost={displayCost} isReduced={isReduced} backFace={backFace} size="fluid" />
       </div>
       {stormCopyCount !== undefined && (
         <StormCopyBadge count={stormCopyCount} variant="drawer" />

@@ -12,7 +12,7 @@ use super::oracle_cost::parse_oracle_cost;
 use super::oracle_nom::primitives as nom_primitives;
 use super::oracle_nom::primitives::{scan_at_word_boundaries, scan_contains, split_once_on};
 use super::oracle_quantity::parse_cda_quantity;
-use super::oracle_target::parse_type_phrase;
+use super::oracle_target::parse_type_phrase_folding;
 use super::oracle_util::{strip_reminder_text, strip_where_x_is_clause};
 use crate::types::ability::{
     AbilityCost, ActivationRestriction, AdditionalCost, ControllerRef, CostObjectCount,
@@ -768,7 +768,7 @@ fn parse_ward_cost_single(lower: &str) -> Option<WardCost> {
                     .or(rest.strip_prefix("an "))
                     .unwrap_or(rest),
             ));
-        let (filter, _) = parse_type_phrase(after_count);
+        let (filter, _) = parse_type_phrase_folding(after_count);
         return Some(WardCost::Sacrifice { count, filter });
     }
 
@@ -1187,7 +1187,7 @@ fn parse_craft_materials(input: &str) -> Option<(&str, (TargetFilter, CostObject
     {
         return None;
     } else {
-        let (filter, rest) = parse_type_phrase(materials_text);
+        let (filter, rest) = parse_type_phrase_folding(materials_text);
         if !rest.trim().is_empty() {
             return None;
         }
@@ -1990,7 +1990,7 @@ fn parse_emerge_from_quality_keyword_line(text: &str) -> Option<(Keyword, &str)>
     let (after_prefix, _) = tag::<_, _, OracleError<'_>>("emerge from ")
         .parse(text)
         .ok()?;
-    let (sacrifice_filter, after_quality) = parse_type_phrase(after_prefix);
+    let (sacrifice_filter, after_quality) = parse_type_phrase_folding(after_prefix);
     if after_quality.len() == after_prefix.len() {
         return None;
     }
@@ -2517,6 +2517,7 @@ pub fn keyword_display_name(keyword: &Keyword) -> String {
         Keyword::Gift(_) => "gift".to_string(),
         Keyword::Discover(n) => format!("discover {n}"),
         Keyword::Spree => "spree".to_string(),
+        Keyword::Tiered => "tiered".to_string(),
         Keyword::Ravenous => "ravenous".to_string(),
         Keyword::Daybound => "daybound".to_string(),
         Keyword::Nightbound => "nightbound".to_string(),
@@ -2820,7 +2821,7 @@ fn type_filter_subject_name(tf: &TypeFilter) -> String {
 /// exactly how a candidate recognizer starts silently swallowing card text.
 ///
 /// CR 702.29e adds the one NON-fixed rule (typecycling), handled separately below.
-pub(crate) const KEYWORD_COST_PREFIXES: [&str; 96] = [
+pub(crate) const KEYWORD_COST_PREFIXES: [&str; 97] = [
     "cycling",
     "basic landcycling",
     "flashback",
@@ -2910,6 +2911,7 @@ pub(crate) const KEYWORD_COST_PREFIXES: [&str; 96] = [
     "modular",
     "partner",
     "spree",
+    "tiered",
     "casualty",
     "bargain",
     "storied",
@@ -3759,6 +3761,14 @@ mod tests {
         assert!(is_keyword_cost_line("gift a card"));
         assert!(is_keyword_cost_line("gift a treasure"));
         assert!(is_keyword_cost_line("gift a tapped fish"));
+    }
+
+    /// CR 702.183a: the Tiered header is a bare keyword line. It is consumed at
+    /// Priority 0 by the modal block (`parse_oracle_block`), so the candidate
+    /// recognizer must nominate it exactly as it does Spree's.
+    #[test]
+    fn tiered_is_keyword_cost_line() {
+        assert!(is_keyword_cost_line("tiered"));
     }
 
     #[test]
@@ -5925,6 +5935,11 @@ mod router_registry_tests {
             reach: ProductionReach::SpecializedTypedRoute,
         },
         RouterKeywordCase {
+            prefix: "tiered",
+            valid_line: "Tiered",
+            reach: ProductionReach::SpecializedTypedRoute,
+        },
+        RouterKeywordCase {
             prefix: "bargain",
             valid_line: "Bargain",
             reach: ProductionReach::KeywordCostLine,
@@ -6052,7 +6067,7 @@ mod router_registry_tests {
         // "Champion an Elf", "Splice onto Arcane {G}", "Craft with Cave {5}{G}",
         // bare "Partner", "Bloodthirst 1" — so the mana-cost combinator cannot
         // measure where the parameter ends, and each needs its own
-        // remainder-preserving noun/filter sub-parser (`parse_type_phrase` already
+        // remainder-preserving noun/filter sub-parser (`parse_type_phrase_folding` already
         // returns a remainder and is the obvious substrate).
         //
         // Pinned as an EXACT set so the gate still bites: a NEW leaking family, or a

@@ -11,9 +11,15 @@ import type {
 } from "./workspacePlacement";
 import type {
   DraftWorkspaceDragController,
+  WorkspaceDragOrigin,
   WorkspaceDragSource,
+  WorkspaceDragPreviewImage,
 } from "./useDraftWorkspaceDrag";
-import { WorkspaceCard } from "./WorkspaceCard";
+import {
+  WorkspaceCard,
+  WorkspaceDragProjectionSlot,
+  type WorkspaceDragProjection,
+} from "./WorkspaceCard";
 import type { DraftBoardSort } from "./workspacePreferences";
 
 const SORT_GROUPS: Record<DraftBoardSort, ReadonlySet<DraftPoolGroupKind>> = {
@@ -30,12 +36,22 @@ interface CardPoolColumnProps {
   dragController?: DraftWorkspaceDragController;
   touchDragEnabled?: boolean;
   touchScrollEnabled?: boolean;
+  desktopCardAreaMinHeight?: boolean;
+  compactPhoneDraft?: boolean;
   registerRoot?: RefCallback<HTMLElement>;
+  draggedSourceInstanceId?: string;
+  dragProjection?: WorkspaceDragProjection;
   showHeader: boolean;
   canRemove: boolean;
   registerCard(instanceId: string): RefCallback<HTMLButtonElement>;
   registerHeader(column: number): RefCallback<HTMLElement>;
-  makeDragSource(card: WorkspaceCardEntryModel, width: number, height: number): WorkspaceDragSource;
+  makeDragSource(
+    card: WorkspaceCardEntryModel,
+    width: number,
+    height: number,
+    previewImage: WorkspaceDragPreviewImage,
+    origin: WorkspaceDragOrigin,
+  ): WorkspaceDragSource;
   onRemoveColumn(column: number): void;
   onCardHover(card: WorkspaceCardEntryModel | null): void;
   onCardActivate(card: WorkspaceCardEntryModel): void;
@@ -123,7 +139,11 @@ export function CardPoolColumn({
   dragController,
   touchDragEnabled = false,
   touchScrollEnabled = false,
+  desktopCardAreaMinHeight = false,
+  compactPhoneDraft = false,
   registerRoot,
+  draggedSourceInstanceId,
+  dragProjection,
   showHeader,
   canRemove,
   registerCard,
@@ -156,14 +176,15 @@ export function CardPoolColumn({
   const visualDescriptor = !hasIncompatibleDescriptor && visualDescriptors.length === 1
     ? visualDescriptors[0]
     : null;
+  const projectionRow = dragProjection?.column === column.column ? dragProjection.row : null;
 
   return (
     <section
       ref={registerRoot}
       style={column.rows.length === 2 ? { borderColor: "transparent", gridTemplateRows: "subgrid" } : undefined}
       className={`h-full min-w-0 select-none overflow-visible border caret-transparent ${column.rows.length === 2
-        ? "row-span-3 grid grid-rows-subgrid bg-transparent shadow-none"
-        : "rounded-[8px] border-hairline bg-black/28 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)] transition-colors hover:border-hairline-hover"
+        ? `row-span-3 grid grid-rows-subgrid bg-transparent shadow-none ${desktopCardAreaMinHeight ? "min-h-[300px]" : ""}`
+        : "flex flex-col rounded-[8px] border-hairline bg-black/28 shadow-[inset_0_1px_0_rgba(255,255,255,0.035)] transition-colors hover:border-hairline-hover"
       }`}
       data-board-column={column.column}
       data-drop-state={column.drop.state}
@@ -181,10 +202,10 @@ export function CardPoolColumn({
         <header
           ref={registerHeader(column.column)}
           tabIndex={-1}
-          className="relative row-start-1 flex h-8 min-h-8 items-center gap-1 overflow-hidden whitespace-nowrap rounded-t-[7px] border-b border-hairline bg-white/[0.045] px-2 text-xs text-fg-muted"
+          className={`relative z-10 row-start-1 flex items-center gap-1 overflow-hidden whitespace-nowrap rounded-t-[7px] border-b border-hairline bg-white/[0.045] text-fg-muted ${compactPhoneDraft ? "h-7 min-h-7 px-1 text-[10px]" : "h-8 min-h-8 px-2 text-xs"}`}
           aria-label={headerName}
         >
-          <span data-card-count aria-hidden="true" className="shrink-0 font-mono text-sm tabular-nums text-fg">{column.header.count}</span>
+          <span data-card-count aria-hidden="true" className={`shrink-0 font-mono tabular-nums text-fg ${compactPhoneDraft ? "text-xs" : "text-sm"}`}>{column.header.count}</span>
           {visualDescriptor !== null && (
             <span
               data-sort-designation
@@ -211,65 +232,71 @@ export function CardPoolColumn({
       )}
       <div
         data-card-area
-        className={column.rows.length === 2 ? "contents" : "relative grid flex-1 gap-2"}
+        className={`${column.rows.length === 2
+          ? `relative row-start-2 row-span-2 grid min-h-0 min-w-0 grid-rows-subgrid ${showHeader ? "rounded-b-[8px]" : "rounded-[8px]"} border border-hairline bg-black/28`
+          : `relative grid min-h-0 flex-1 gap-2 ${desktopCardAreaMinHeight ? "min-h-[300px]" : ""} ${showHeader ? "rounded-b-[7px]" : "rounded-[7px]"}`
+        } ${column.rows.length === 1 && column.drop.active ? "draft-card-area-drop-active" : ""}`}
         style={column.rows.length === 2
-          ? undefined
+          ? { gridTemplateRows: "subgrid" }
           : { gridTemplateRows: `repeat(${column.rows.length}, minmax(0, 1fr))` }
         }
       >
-        {column.drop.active && column.rows.length === 1 && (
-          <span
-            aria-hidden="true"
-            data-drop-highlight="active"
-            className="pointer-events-none absolute inset-0 z-20 border-2 border-white"
-          />
-        )}
-        {column.rows.map((row) => (
+        {column.rows.map((row) => {
+          const visibleCards = draggedSourceInstanceId === undefined
+            ? row.cards
+            : row.cards.filter((card) => card.instanceId !== draggedSourceInstanceId);
+          let visibleStackIndex = 0;
+          return (
             <div
               key={row.key}
-              className={`${column.rows.length === 2 ? `${row.row === 1 ? "mt-2 rounded-[7px]" : "rounded-b-[7px]"} border border-hairline bg-black/28` : ""} relative grid min-w-0`}
-              style={column.rows.length === 2 ? { gridRow: row.row + 2 } : undefined}
+              className={`${column.rows.length === 2 ? `${row.row === 1 ? "mt-2 rounded-[7px]" : ""} border border-hairline ${desktopCardAreaMinHeight ? "min-h-[300px]" : ""} ${row.drop.active ? "draft-card-area-drop-active" : ""}` : ""} relative grid min-w-0`}
+              style={column.rows.length === 2 ? { gridRow: row.row + 1 } : undefined}
               data-board-row={row.row}
               data-drop-state={row.drop.state}
               aria-describedby={row.drop.active ? `${row.key}:drop-description` : undefined}
             >
               <span aria-hidden="true" data-card-height-baseline className="block aspect-[488/680] w-full self-start [grid-area:1/1]" />
               {row.drop.active && (
-                <>
-                  <span id={`${row.key}:drop-description`} className="sr-only">
-                    {t(row.drop.descriptionKey!)}
-                  </span>
-                  <span
-                    aria-hidden="true"
-                    data-drop-highlight="active"
-                    className={`pointer-events-none absolute inset-0 z-20 border-2 border-white ${row.row === 1 ? "rounded-[6px]" : "rounded-b-[6px]"}`}
-                  />
-                </>
+                <span id={`${row.key}:drop-description`} className="sr-only">
+                  {t(row.drop.descriptionKey!)}
+                </span>
               )}
               <div data-card-stack className="min-w-0 [grid-area:1/1]">
-                {row.cards.map((card, stackIndex) => (
-                  <WorkspaceCard
-                    key={card.key}
-                    card={card}
-                    stackIndex={stackIndex}
-                    registerCard={registerCard(card.key)}
-                    onHover={onCardHover}
-                    onActivate={onCardActivate}
-                    onKeyDown={onCardKeyDown}
-                    interactionLocked={interactionLocked}
-                    drag={dragController === undefined
-                      ? undefined
-                      : {
-                        controller: dragController,
-                        makeSource: makeDragSource,
-                        touchDragEnabled,
-                        touchScrollEnabled,
-                      }}
+                {row.cards.map((card) => {
+                  const hidden = draggedSourceInstanceId === card.instanceId;
+                  const stackIndex = hidden ? 0 : visibleStackIndex++;
+                  return (
+                    <WorkspaceCard
+                      key={card.key}
+                      card={card}
+                      stackIndex={stackIndex}
+                      registerCard={registerCard(card.key)}
+                      onHover={onCardHover}
+                      onActivate={onCardActivate}
+                      onKeyDown={onCardKeyDown}
+                      interactionLocked={interactionLocked}
+                      dragHidden={hidden}
+                      drag={dragController === undefined
+                        ? undefined
+                        : {
+                          controller: dragController,
+                          makeSource: makeDragSource,
+                          touchDragEnabled,
+                          touchScrollEnabled,
+                        }}
+                    />
+                  );
+                })}
+                {projectionRow === row.row && dragProjection !== undefined && (
+                  <WorkspaceDragProjectionSlot
+                    sourceInstanceId={dragProjection.sourceInstanceId}
+                    stackIndex={visibleCards.length}
                   />
-                ))}
+                )}
               </div>
             </div>
-        ))}
+          );
+        })}
       </div>
     </section>
   );

@@ -26,7 +26,8 @@ use crate::types::counter::CounterType;
 use crate::types::events::GameEvent;
 use crate::types::game_state::{
     ActionResult, CastOfferKind, CastPaymentMode, CastingVariant, CastingVariantChoiceOption,
-    ConvokeMode, GameState, ManaChoice, ManaChoicePrompt, PendingCast, WaitingFor,
+    CastingVariantFace, ConvokeMode, GameState, ManaChoice, ManaChoicePrompt, PendingCast,
+    WaitingFor,
 };
 use crate::types::identifiers::{CardId, ObjectId};
 use crate::types::keywords::Keyword;
@@ -614,6 +615,27 @@ impl GameScenario {
         }
     }
 
+    /// Add a land card to a player's exile. Returns a `CardBuilder` for fluent
+    /// chaining. Used to stage land-play permissions from exile.
+    pub fn add_land_to_exile(&mut self, player: PlayerId, name: &str) -> CardBuilder<'_> {
+        let card_id = CardId(self.state.next_object_id);
+        let id = create_object(
+            &mut self.state,
+            card_id,
+            player,
+            name.to_string(),
+            Zone::Exile,
+        );
+        let obj = self.state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(CoreType::Land);
+        obj.base_card_types = obj.card_types.clone();
+
+        CardBuilder {
+            state: &mut self.state,
+            id,
+        }
+    }
+
     // --- Oracle text convenience constructors ---
 
     /// Add a creature to the battlefield with abilities parsed from Oracle text.
@@ -745,9 +767,9 @@ impl GameScenario {
     /// already on it.
     ///
     /// Mirrors [`Self::add_enchantment_from_oracle`], plus the two things a
-    /// planeswalker needs that no other permanent does: the loyalty counters
-    /// (CR 306.5b — a planeswalker with none is put into its owner's graveyard
-    /// as a state-based action, so a fixture without them evaporates), and the
+    /// planeswalker needs that no other permanent does: its starting loyalty —
+    /// seeded on BOTH the `loyalty` field and the counter map, see the comment
+    /// at the seeding itself for why both and why after the face — and the
     /// `Gideon`-style planeswalker subtype the caller supplies.
     pub fn add_planeswalker_from_oracle(
         &mut self,
@@ -776,21 +798,38 @@ impl GameScenario {
         // planeswalker animated by its own ability would otherwise inherit the
         // flag.
         obj.summoning_sick = false;
-        // CR 306.5b: a planeswalker's loyalty IS the count of loyalty counters on
-        // it, but the engine keeps a `loyalty` field alongside the counter map —
-        // the activation gate reads the counters (CR 606.3) while the
-        // zero-loyalty state-based action reads the field (CR 704.5i). Seed BOTH
-        // so they start in sync; seeding only one produces a planeswalker that
-        // can be activated but can never die.
-        obj.loyalty = Some(loyalty);
-        obj.counters
-            .insert(crate::types::counter::CounterType::Loyalty, loyalty);
-
         let mut builder = CardBuilder {
             state: &mut self.state,
             id,
         };
         builder.from_oracle_text(oracle_text);
+
+        // CR 306.5c: a planeswalker's loyalty IS the count of loyalty counters on
+        // it, but the engine keeps a `loyalty` FIELD alongside the counter map,
+        // and that field is what the readers of "how much loyalty is there" ask —
+        // the affordability gate for a `[−N]` cost (`planeswalker.rs`:
+        // `obj.loyalty.unwrap_or(0)`) and the CR 704.5i zero-loyalty state-based
+        // action (`sba.rs`: `obj.loyalty.is_some_and(|l| l == 0)`) among them.
+        // Seed both so they start in sync.
+        //
+        // Seeded AFTER the Oracle face is applied, and that ordering is
+        // load-bearing: `apply_card_face_to_object` assigns `obj.loyalty` from
+        // the face's own printed loyalty, and a face built from Oracle text alone
+        // carries none — so seeding first was silently overwritten with `None`.
+        //
+        // The counters survived, and `evaluate_layers` re-derives the field from
+        // them (`layers.rs`), so the damage was NOT permanent: a fixture that ran
+        // a layer pass before activating recovered. One that did not — this
+        // builder returns straight to the caller — held a planeswalker whose
+        // counters said eight and whose field said nothing, so a `[−N]` cost was
+        // unaffordable and the zero-loyalty action could not fire either
+        // (`is_some_and` is false for `None`). Seeding here removes the
+        // dependency on an incidental layer pass rather than repairing a
+        // permanent loss.
+        let obj = builder.state.objects.get_mut(&id).unwrap();
+        obj.loyalty = Some(loyalty);
+        obj.counters
+            .insert(crate::types::counter::CounterType::Loyalty, loyalty);
         builder
     }
 
@@ -1299,6 +1338,17 @@ impl<'a> CardBuilder<'a> {
         self
     }
 
+    /// Add the Snow supertype (CR 205.4a: supertypes are printed before card types;
+    /// CR 205.4g: any permanent with the supertype "snow" is a snow permanent).
+    pub fn as_snow(&mut self) -> &mut Self {
+        let obj = self.obj();
+        if !obj.card_types.supertypes.contains(&Supertype::Snow) {
+            obj.card_types.supertypes.push(Supertype::Snow);
+        }
+        self.sync_base_card_types();
+        self
+    }
+
     // --- Special modifiers ---
 
     /// CR 903.3: Mark this object as its owner's commander IN PLACE, without
@@ -1369,6 +1419,14 @@ impl<'a> CardBuilder<'a> {
         let color = crate::game::printed_cards::derive_colors_from_mana_cost(&cost);
         obj.color = color.clone();
         obj.base_color = color;
+        self
+    }
+
+    /// Set the color and base color of this card (CR 105.1).
+    pub fn with_color(&mut self, colors: Vec<crate::types::mana::ManaColor>) -> &mut Self {
+        let obj = self.obj();
+        obj.color = colors.clone();
+        obj.base_color = colors;
         self
     }
 
@@ -1962,11 +2020,14 @@ impl GameRunner {
             WaitingFor::ReturnAsAuraTarget { .. } => "ReturnAsAuraTarget",
             WaitingFor::EquipTarget { .. } => "EquipTarget",
             WaitingFor::ScryChoice { .. } => "ScryChoice",
+            WaitingFor::RippleRevealChoice { .. } => "RippleRevealChoice",
+            WaitingFor::RippleBottomOrder { .. } => "RippleBottomOrder",
             WaitingFor::ArrangePlanarDeckTopChoice { .. } => "ArrangePlanarDeckTopChoice",
             WaitingFor::RepeatPaidLibraryLookPayment { .. } => "RepeatPaidLibraryLookPayment",
             WaitingFor::ReorderLibraryChoice { .. } => "ReorderLibraryChoice",
             WaitingFor::RedistributeLifeTotals { .. } => "RedistributeLifeTotals",
             WaitingFor::CoinFlipKeepChoice { .. } => "CoinFlipKeepChoice",
+            WaitingFor::DieKeepChoice { .. } => "DieKeepChoice",
             WaitingFor::DigChoice { .. } => "DigChoice",
             WaitingFor::SurveilChoice { .. } => "SurveilChoice",
             WaitingFor::RevealChoice { .. } => "RevealChoice",
@@ -1995,6 +2056,7 @@ impl GameRunner {
             WaitingFor::CostTypeChoice { .. } => "CostTypeChoice",
             WaitingFor::SpliceOffer { .. } => "SpliceOffer",
             WaitingFor::DefilerPayment { .. } => "DefilerPayment",
+            WaitingFor::OrderCostReductions { .. } => "OrderCostReductions",
             WaitingFor::CastOffer {
                 kind: CastOfferKind::Adventure { .. },
                 ..
@@ -2216,6 +2278,7 @@ pub struct SpellCast<'a> {
     alternative_cast: Option<AlternativeCastDecision>,
     adventure_creature: Option<bool>,
     casting_variant: Option<CastingVariant>,
+    casting_variant_face: Option<CastingVariantFace>,
     free_cast: bool,
     modes: Option<Vec<usize>>,
     x: Option<u32>,
@@ -2244,6 +2307,7 @@ impl<'a> SpellCast<'a> {
             alternative_cast: None,
             adventure_creature: None,
             casting_variant: None,
+            casting_variant_face: None,
             free_cast: false,
             modes: None,
             x: None,
@@ -2310,6 +2374,18 @@ impl<'a> SpellCast<'a> {
     /// surfaces a variant choice without an explicit test intent.
     pub fn casting_variant(mut self, variant: CastingVariant) -> Self {
         self.casting_variant = Some(variant);
+        self
+    }
+
+    /// Choose an exact `(variant, face)` casting tuple. Required for a Fuse
+    /// pair's two independently castable normal halves.
+    pub fn casting_variant_face(
+        mut self,
+        variant: CastingVariant,
+        face: CastingVariantFace,
+    ) -> Self {
+        self.casting_variant = Some(variant);
+        self.casting_variant_face = Some(face);
         self
     }
 
@@ -2463,6 +2539,7 @@ impl<'a> SpellCast<'a> {
             alternative_cast,
             adventure_creature,
             casting_variant,
+            casting_variant_face,
             free_cast,
             modes,
             x,
@@ -2593,15 +2670,22 @@ impl<'a> SpellCast<'a> {
                                  .casting_variant(..) was declared — declare the intended cast variant"
                             )
                         });
-                        options
+                        let matching: Vec<_> = options
                             .iter()
-                            .position(|option| option.variant == variant)
-                            .unwrap_or_else(|| {
-                                panic!(
-                                    "SpellCast could not find requested cast variant {:?} in options {:?}",
-                                    variant, options
-                                )
+                            .enumerate()
+                            .filter_map(|(index, option)| {
+                                (option.variant == variant
+                                    && casting_variant_face.is_none_or(|face| option.face == face))
+                                .then_some(index)
                             })
+                            .collect();
+                        if matching.len() != 1 {
+                            panic!(
+                                "SpellCast .casting_variant({variant:?}) is ambiguous in options {:?}; use .casting_variant_face(variant, face)",
+                                options
+                            );
+                        }
+                        matching[0]
                     };
                     selected_casting_variant = Some(options[index].clone());
                     act_collect(
@@ -2908,6 +2992,18 @@ impl<'a> CastCommit<'a> {
         self.selected_casting_variant.as_ref()
     }
 
+    /// Accept optional ("you may") effects/costs during resolution (CR 608.2d).
+    pub fn accept_optional(mut self) -> Self {
+        self.optional = OptionalPolicy::Accept;
+        self
+    }
+
+    /// Decline optional ("you may") effects/costs during resolution.
+    pub fn decline_optional(mut self) -> Self {
+        self.optional = OptionalPolicy::Decline;
+        self
+    }
+
     /// Resolve the committed spell and return the usual behavior delta.
     pub fn resolve(self) -> CastOutcome {
         self.try_resolve()
@@ -3047,6 +3143,7 @@ fn waiting_for_variant_name(waiting: &WaitingFor) -> &'static str {
         WaitingFor::SurveilChoice { .. } => "SurveilChoice",
         WaitingFor::RedistributeLifeTotals { .. } => "RedistributeLifeTotals",
         WaitingFor::CoinFlipKeepChoice { .. } => "CoinFlipKeepChoice",
+        WaitingFor::DieKeepChoice { .. } => "DieKeepChoice",
         WaitingFor::ReplacementChoice { .. } => "ReplacementChoice",
         WaitingFor::NamedChoice { .. } => "NamedChoice",
         WaitingFor::TributeChoice { .. } => "TributeChoice",
@@ -3146,6 +3243,7 @@ pub struct AbilityActivation<'a> {
     pay_with: Vec<ObjectId>,
     search_pick: SearchPolicy,
     optional: OptionalPolicy,
+    named_choice: Option<String>,
     spellbook_pick: Option<String>,
 }
 
@@ -3162,6 +3260,7 @@ impl<'a> AbilityActivation<'a> {
             pay_with: Vec::new(),
             search_pick: SearchPolicy::default(),
             optional: OptionalPolicy::default(),
+            named_choice: None,
             spellbook_pick: None,
         }
     }
@@ -3233,6 +3332,14 @@ impl<'a> AbilityActivation<'a> {
         self
     }
 
+    /// Choose a named/string option at a `NamedChoice` prompt during
+    /// resolution. Mirrors [`SpellCast::choose_option`]; the shared
+    /// [`drive_resolution`] honours [`ResolutionPolicy::named_choice`].
+    pub fn choose_option(mut self, choice: &str) -> Self {
+        self.named_choice = Some(choice.to_string());
+        self
+    }
+
     /// Draft this card name at any `SpellbookDraft` prompt during resolution
     /// (Alchemy `Effect::DraftFromSpellbook`). Mirrors [`SpellCast::spellbook_pick`].
     pub fn spellbook_pick(mut self, name: &str) -> Self {
@@ -3254,6 +3361,7 @@ impl<'a> AbilityActivation<'a> {
             pay_with,
             search_pick,
             optional,
+            named_choice,
             spellbook_pick,
         } = self;
 
@@ -3392,7 +3500,7 @@ impl<'a> AbilityActivation<'a> {
             search_pick,
             optional,
             replacement_choice: None,
-            named_choice: None,
+            named_choice,
             discard_cards: Vec::new(),
             effect_zone_cards: Vec::new(),
             copy_target: None,
@@ -3530,6 +3638,26 @@ fn drive_resolution(
                 act_collect(
                     runner,
                     GameAction::SelectCoinFlips { keep_indices },
+                    &mut events,
+                )?;
+            }
+            // CR 706.6: with a die-roll ignore replacement in play, ignore the
+            // first offered tied-lowest roll deterministically. Every offered
+            // index holds the same natural result, so the choice cannot change
+            // any observable outcome.
+            WaitingFor::DieKeepChoice {
+                ignorable_indices,
+                ignore_count,
+                ..
+            } => {
+                let ignore_indices = ignorable_indices
+                    .iter()
+                    .take(*ignore_count)
+                    .copied()
+                    .collect();
+                act_collect(
+                    runner,
+                    GameAction::SelectDieRolls { ignore_indices },
                     &mut events,
                 )?;
             }
@@ -4351,6 +4479,14 @@ impl GameSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::combat::AttackTarget;
+    use crate::types::ability::{
+        AbilityCondition, ControllerRef, FilterProp, TargetChoiceTiming, TypedFilter,
+    };
+    use crate::types::replacements::ReplacementEvent;
+
+    const CARRION_RATS_ORACLE: &str = "Whenever this creature attacks or blocks, any player may exile a card from their graveyard. If a player does, this creature assigns no combat damage this turn.";
+    const CARRION_WURM_ORACLE: &str = "Whenever this creature attacks or blocks, any player may exile three cards from their graveyard. If a player does, this creature assigns no combat damage this turn.";
 
     #[test]
     fn scenario_new_creates_valid_game_state() {
@@ -4596,6 +4732,416 @@ mod tests {
             hand_after, hand_before,
             "no card should be drawn because no sacrifice happened"
         );
+    }
+
+    fn attack_until_optional_prompt(runner: &mut GameRunner, attacker: ObjectId) {
+        runner.advance_to_combat();
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::DeclareAttackers { .. }
+        ));
+        runner
+            .declare_attackers(&[(attacker, AttackTarget::Player(P1))])
+            .expect("declare Carrion attacker");
+        runner.advance_until_stack_empty();
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::OpponentMayChoice { .. }
+        ));
+    }
+
+    fn scoped_owned_card_in(zone: Zone) -> TargetFilter {
+        TargetFilter::Typed(TypedFilter::card().properties(vec![
+            FilterProp::Owned {
+                controller: ControllerRef::ScopedPlayer,
+            },
+            FilterProp::InZone { zone },
+        ]))
+    }
+
+    fn move_zone_effect(origin: Option<Zone>, destination: Zone, target: TargetFilter) -> Effect {
+        Effect::ChangeZone {
+            origin,
+            destination,
+            target,
+            owner_library: false,
+            enter_transformed: false,
+            enters_under: None,
+            enter_tapped: Default::default(),
+            enters_attacking: false,
+            up_to: false,
+            enter_with_counters: Vec::new(),
+            conditional_enter_with_counters: Vec::new(),
+            face_down_profile: None,
+            enters_modified_if: None,
+        }
+    }
+
+    /// CR 101.4 + CR 608.2d: an impossible exact-three acceptance is skipped
+    /// without recording acceptance, and the APNAP offer advances to the next
+    /// player whose selection is feasible.
+    #[test]
+    fn carrion_wurm_impossible_first_accept_advances_to_feasible_player() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let wurm = scenario
+            .add_creature_from_oracle(P0, "Carrion Wurm", 6, 5, CARRION_WURM_ORACLE)
+            .id();
+        let p0_cards = [
+            scenario.add_spell_to_graveyard(P0, "P0 Card A", true).id(),
+            scenario.add_spell_to_graveyard(P0, "P0 Card B", true).id(),
+        ];
+        let p1_cards = [
+            scenario.add_spell_to_graveyard(P1, "P1 Card A", true).id(),
+            scenario.add_spell_to_graveyard(P1, "P1 Card B", true).id(),
+            scenario.add_spell_to_graveyard(P1, "P1 Card C", true).id(),
+        ];
+        let mut runner = scenario.build();
+
+        attack_until_optional_prompt(&mut runner, wurm);
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("infeasible first acceptance advances");
+        assert!(matches!(
+            &runner.state().waiting_for,
+            WaitingFor::OpponentMayChoice { player: P1, .. }
+        ));
+        assert!(!runner.state().player_actions_this_way.contains(&(
+            P0,
+            crate::types::events::PlayerActionKind::AcceptedOptionalEffect
+        )));
+        assert!(p0_cards
+            .iter()
+            .all(|card| runner.state().objects[card].zone == Zone::Graveyard));
+
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("feasible second acceptance opens exact choice");
+        match &runner.state().waiting_for {
+            WaitingFor::EffectZoneChoice {
+                player,
+                cards,
+                count,
+                min_count,
+                up_to,
+                zone: Zone::Graveyard,
+                destination: Some(Zone::Exile),
+                ..
+            } => {
+                assert_eq!(*player, P1);
+                assert_eq!((*count, *min_count, *up_to), (3, 3, false));
+                assert_eq!(cards.len(), 3);
+                assert!(p1_cards.iter().all(|card| cards.contains(card)));
+                assert!(p0_cards.iter().all(|card| !cards.contains(card)));
+            }
+            other => panic!("expected exact scoped graveyard choice, got {other:?}"),
+        }
+        assert!(
+            !runner.state().objects[&wurm].assigns_no_combat_damage,
+            "the dependent rider must wait for the selection"
+        );
+
+        runner
+            .act(GameAction::SelectCards {
+                cards: p1_cards.to_vec(),
+            })
+            .expect("exact-three selection resolves");
+        assert!(p1_cards
+            .iter()
+            .all(|card| runner.state().objects[card].zone == Zone::Exile));
+        assert!(runner.state().objects[&wurm].assigns_no_combat_damage);
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+        assert!(runner.state().active_ability_continuation().is_none());
+    }
+
+    /// CR 603.5 + CR 608.2c + CR 510.1a: the singular Carrion Rats path
+    /// completes synchronously, then applies its dependent combat-damage rider.
+    #[test]
+    fn carrion_rats_direct_acceptance_moves_one_card_then_applies_rider() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let rats = scenario
+            .add_creature_from_oracle(P0, "Carrion Rats", 2, 1, CARRION_RATS_ORACLE)
+            .id();
+        let p1_card = scenario
+            .add_spell_to_graveyard(P1, "P1 Graveyard Card", true)
+            .id();
+        let p0_decoy = scenario
+            .add_spell_to_graveyard(P0, "P0 Graveyard Card", true)
+            .id();
+        let mut runner = scenario.build();
+
+        attack_until_optional_prompt(&mut runner, rats);
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: false })
+            .expect("controller declines");
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("opponent accepts singular exile");
+
+        assert_eq!(runner.state().objects[&p1_card].zone, Zone::Exile);
+        assert_eq!(runner.state().objects[&p0_decoy].zone, Zone::Graveyard);
+        assert!(runner.state().objects[&rats].assigns_no_combat_damage);
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+    }
+
+    /// CR 608.2d: when every player lacks three eligible cards, exhausting the
+    /// APNAP offers with impossible acceptances is equivalent to no player
+    /// performing the instruction.
+    #[test]
+    fn carrion_wurm_all_infeasible_acceptances_leave_rider_false() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let wurm = scenario
+            .add_creature_from_oracle(P0, "Carrion Wurm", 6, 5, CARRION_WURM_ORACLE)
+            .id();
+        scenario.add_spell_to_graveyard(P0, "P0 Only Card", true);
+        scenario.add_spell_to_graveyard(P1, "P1 Only Card", true);
+        let mut runner = scenario.build();
+
+        attack_until_optional_prompt(&mut runner, wurm);
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("controller cannot make exact selection");
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::OpponentMayChoice { player: P1, .. }
+        ));
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("last player also cannot make the exact selection");
+
+        assert!(!runner.state().objects[&wurm].assigns_no_combat_damage);
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+        assert!(runner.state().active_ability_continuation().is_none());
+    }
+
+    /// CR 608.2d + CR 101.4: explicit declines from every player exhaust the
+    /// APNAP offer without satisfying the dependent "if a player does" rider.
+    #[test]
+    fn carrion_wurm_all_players_decline_leaves_rider_false() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let wurm = scenario
+            .add_creature_from_oracle(P0, "Carrion Wurm", 6, 5, CARRION_WURM_ORACLE)
+            .id();
+        for (player, name) in [
+            (P0, "P0 Grave A"),
+            (P0, "P0 Grave B"),
+            (P0, "P0 Grave C"),
+            (P1, "P1 Grave A"),
+            (P1, "P1 Grave B"),
+            (P1, "P1 Grave C"),
+        ] {
+            scenario.add_spell_to_graveyard(player, name, true);
+        }
+        let mut runner = scenario.build();
+
+        attack_until_optional_prompt(&mut runner, wurm);
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: false })
+            .expect("controller declines");
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::OpponentMayChoice { player: P1, .. }
+        ));
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: false })
+            .expect("opponent declines");
+
+        assert!(!runner.state().objects[&wurm].assigns_no_combat_damage);
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+        assert!(runner.state().active_ability_continuation().is_none());
+    }
+
+    /// CR 608.2c: the player bound by "their" remains the accepting player
+    /// throughout the dependent local ability chain. Controller-owned cards in
+    /// both relevant zones make a root-only scope assignment fail this test.
+    #[test]
+    fn carrion_wurm_accepting_player_scope_reaches_downstream_zone_move() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let wurm = scenario
+            .add_creature_from_oracle(P0, "Carrion Wurm", 6, 5, CARRION_WURM_ORACLE)
+            .id();
+
+        let downstream = AbilityDefinition::new(
+            AbilityKind::Database,
+            move_zone_effect(
+                Some(Zone::Hand),
+                Zone::Exile,
+                scoped_owned_card_in(Zone::Hand),
+            ),
+        )
+        .target_choice_timing(TargetChoiceTiming::Resolution);
+        let object = scenario
+            .state
+            .objects
+            .get_mut(&wurm)
+            .expect("Carrion Wurm exists");
+        let triggers = Arc::make_mut(&mut object.base_trigger_definitions);
+        let root = triggers[0]
+            .execute
+            .as_mut()
+            .expect("parsed Carrion Wurm trigger has an effect");
+        let rider = root
+            .sub_ability
+            .as_mut()
+            .expect("parsed Carrion Wurm trigger has its dependent rider");
+        assert!(rider
+            .condition
+            .as_ref()
+            .is_some_and(AbilityCondition::is_optional_effect_performed));
+        rider.sub_ability = Some(Box::new(downstream));
+        object.materialize_base_trigger_definitions();
+
+        let p0_graveyard_decoys = [
+            scenario.add_spell_to_graveyard(P0, "P0 Grave A", true).id(),
+            scenario.add_spell_to_graveyard(P0, "P0 Grave B", true).id(),
+            scenario.add_spell_to_graveyard(P0, "P0 Grave C", true).id(),
+        ];
+        let p1_graveyard_cards = [
+            scenario.add_spell_to_graveyard(P1, "P1 Grave A", true).id(),
+            scenario.add_spell_to_graveyard(P1, "P1 Grave B", true).id(),
+            scenario.add_spell_to_graveyard(P1, "P1 Grave C", true).id(),
+        ];
+        let p0_hand_decoy = scenario.add_card_to_hand(P0, "P0 Hand Decoy");
+        let p1_hand_card = scenario.add_card_to_hand(P1, "P1 Hand Card");
+        let mut runner = scenario.build();
+
+        attack_until_optional_prompt(&mut runner, wurm);
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: false })
+            .expect("controller declines");
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("opponent accepts");
+        let WaitingFor::EffectZoneChoice { player, cards, .. } = &runner.state().waiting_for else {
+            panic!(
+                "expected accepting-player graveyard choice, got {:?}",
+                runner.state().waiting_for
+            );
+        };
+        assert_eq!(*player, P1);
+        assert!(p1_graveyard_cards.iter().all(|card| cards.contains(card)));
+        assert!(p0_graveyard_decoys.iter().all(|card| !cards.contains(card)));
+
+        runner
+            .act(GameAction::SelectCards {
+                cards: p1_graveyard_cards.to_vec(),
+            })
+            .expect("opponent's exact selection resolves the complete chain");
+
+        assert!(p1_graveyard_cards
+            .iter()
+            .all(|card| runner.state().objects[card].zone == Zone::Exile));
+        assert_eq!(runner.state().objects[&p1_hand_card].zone, Zone::Exile);
+        assert_eq!(runner.state().objects[&p0_hand_decoy].zone, Zone::Hand);
+        assert!(p0_graveyard_decoys
+            .iter()
+            .all(|card| runner.state().objects[card].zone == Zone::Graveyard));
+        assert!(runner.state().objects[&wurm].assigns_no_combat_damage);
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+        assert!(runner.state().active_ability_continuation().is_none());
+    }
+
+    /// CR 608.2c + CR 616.1: accepting the exact exile parks the selected
+    /// ChangeZone iteration when two applicable redirects compete. The rider
+    /// waits for that iteration to settle, then runs even though a replacement
+    /// redirected the first selected card away from exile.
+    #[test]
+    fn carrion_wurm_replacement_pause_resumes_before_dependent_rider() {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let wurm = scenario
+            .add_creature_from_oracle(P0, "Carrion Wurm", 6, 5, CARRION_WURM_ORACLE)
+            .id();
+        let selected = [
+            scenario.add_spell_to_graveyard(P0, "Selected A", true).id(),
+            scenario.add_spell_to_graveyard(P0, "Selected B", true).id(),
+            scenario.add_spell_to_graveyard(P0, "Selected C", true).id(),
+        ];
+
+        for (name, destination) in [
+            ("Redirect Selected Move to Hand", Zone::Hand),
+            ("Redirect Selected Move to Library", Zone::Library),
+        ] {
+            let replacement = ReplacementDefinition::new(ReplacementEvent::Moved)
+                .execute(AbilityDefinition::new(
+                    AbilityKind::Database,
+                    move_zone_effect(None, destination, TargetFilter::SelfRef),
+                ))
+                .valid_card(TargetFilter::Any)
+                .destination_zone(Zone::Exile);
+            scenario
+                .add_creature(P1, name, 0, 1)
+                .with_replacement_definition(replacement);
+        }
+        let mut runner = scenario.build();
+
+        attack_until_optional_prompt(&mut runner, wurm);
+        runner
+            .act(GameAction::DecideOptionalEffect { accept: true })
+            .expect("feasible controller acceptance opens exact selection");
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::EffectZoneChoice { .. }
+        ));
+        assert!(!runner.state().objects[&wurm].assigns_no_combat_damage);
+
+        runner
+            .act(GameAction::SelectCards {
+                cards: selected.to_vec(),
+            })
+            .expect("selected move parks for replacement ordering");
+
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::ReplacementChoice { .. }
+        ));
+        assert!(runner.state().active_change_zone_frame().is_some());
+        assert!(runner.state().resolution_stack.iter().any(|frame| matches!(
+            frame,
+            crate::types::resolution::ResolutionFrame::AbilityContinuation(_)
+        )));
+        assert!(!runner.state().objects[&wurm].assigns_no_combat_damage);
+
+        for _ in 0..selected.len() {
+            if !matches!(
+                runner.state().waiting_for,
+                WaitingFor::ReplacementChoice { .. }
+            ) {
+                break;
+            }
+            assert!(!runner.state().objects[&wurm].assigns_no_combat_damage);
+            runner
+                .act(GameAction::ChooseReplacement { index: 0 })
+                .expect("chosen redirect advances the selected move");
+        }
+
+        assert_ne!(runner.state().objects[&selected[0]].zone, Zone::Exile);
+        assert!(runner.state().objects[&wurm].assigns_no_combat_damage);
+        assert!(matches!(
+            runner.state().waiting_for,
+            WaitingFor::Priority { .. }
+        ));
+        assert!(runner.state().active_change_zone_frame().is_none());
+        assert!(runner.state().active_ability_continuation().is_none());
     }
 
     /// CR 608.2d + CR 101.4 (issue #3236): Browbeat-class — when ALL players

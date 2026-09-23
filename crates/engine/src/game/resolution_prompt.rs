@@ -167,13 +167,25 @@ fn resolution_probe_verdict(
 /// a NEW `QuantityExpr` variant must be classified before it compiles, so an
 /// `UpTo` can never be smuggled in under a newly-added wrapper.
 ///
-/// MEASURED DISCREPANCY, and the reason this guard exists at all:
-/// `game/quantity.rs` resolves `UpTo { max } => recurse(max)` — it SILENTLY
-/// ANSWERS the CR 107.1c / CR 608.2d resolution-time count choice as the maximum
-/// rather than surfacing it. Only the resolvers that call
-/// `QuantityExpr::peel_up_to` honour the flag, and none of the six allow-listed
-/// classes does. So an unguarded arm would probe choice-free on an ability whose
-/// resolution opens a count prompt.
+/// WHY THIS GUARD EXISTS, and why it is right in BOTH directions — which is the
+/// point, because the two allow-listed groups now behave differently:
+///
+/// * `Draw` genuinely prompts. Since #8543 `draw::resolve` peels the wrapper via
+///   `QuantityExpr::peel_up_to` and opens a `ChooseOneOfBranch` count choice, so
+///   the guard AGREES with the probe and merely reaches the same verdict without
+///   paying for a whole-`GameState` clone.
+/// * The remaining allow-listed quantity arms (`GainLife`, `LoseLife`,
+///   `DealDamage`, `PutCounter`, `Token`) do NOT peel. `game/quantity.rs` folds
+///   `UpTo { max } => recurse(max)`, SILENTLY ANSWERING the CR 107.1c /
+///   CR 608.2d resolution-time count choice as the maximum rather than surfacing
+///   it. For those the guard is load-bearing: without it the probe would observe
+///   no prompt and report choice-free on an ability whose resolution is supposed
+///   to open a count choice.
+///
+/// So the guard stays on EVERY quantity-carrying arm regardless of whether that
+/// arm's resolver has been fixed yet. It is fail-closed — it can only turn a
+/// verdict into `MayPrompt`, never the reverse — so a resolver gaining a real
+/// prompt never invalidates it.
 fn quantity_offers_up_to_choice(q: &QuantityExpr) -> bool {
     match q {
         QuantityExpr::UpTo { .. } => true,
@@ -265,9 +277,18 @@ fn effect_offers_choice(e: &Effect) -> bool {
             quantity_offers_up_to_choice(count)
         }
         // HEAD's own arm shape, kept verbatim (single arm + inner `if`, no match
-        // guard). CR 608.2d: an "up to N" draw is a resolution-time COUNT choice
-        // the probe would ANSWER rather than surface, because the count is read,
-        // not prompted, inside `draw::resolve`.
+        // guard). CR 608.2d: an "up to N" draw is a resolution-time COUNT choice.
+        //
+        // The arm's JUSTIFICATION CHANGED at #8543 while its verdict did not.
+        // It was written because the probe would ANSWER the choice rather than
+        // surface it — the count was read, not prompted, inside `draw::resolve`.
+        // `draw::resolve` now peels the wrapper and opens a real
+        // `ChooseOneOfBranch` count prompt, so the probe WOULD observe it and
+        // reach `MayPrompt` on its own. The arm is kept because it reaches that
+        // verdict from the AST alone, skipping the probe's whole-`GameState`
+        // clone, and because it is fail-closed: it is still the only thing
+        // standing between an `UpTo` and a choice-free verdict should the
+        // prompt ever regress.
         Effect::Draw { count, target: _ } => {
             quantity_offers_up_to_choice(count)
         }
@@ -381,6 +402,9 @@ fn effect_offers_choice(e: &Effect) -> bool {
         | Effect::FlipPermanent { .. }
         | Effect::SearchLibrary { .. }
         | Effect::SearchOutsideGame { .. }
+        // CR 400.11 + CR 608.2d: opening a pack prompts the controller to choose
+        // which of the revealed cards to take.
+        | Effect::OpenBoosterPack { .. }
         | Effect::RevealHand { .. }
         | Effect::RevealFromHand { .. }
         | Effect::Reveal { .. }
@@ -569,6 +593,7 @@ pub(crate) fn chain_offers_choice(a: &ResolvedAbility) -> bool {
         force_block_attacker: _, // exact force-block referent, no choice
         target_incarnations: _, // CR 400.7 referent pins, no choice
         selected_target_incarnations: _, // CR 400.7 selected-target pins, no choice
+        illegal_target_slots: _, // CR 608.2b resolution legality stamp, no choice
         controller: _, // player id
         original_controller: _, // player id
         scoped_player: _, // player id (iteration binding)
@@ -639,8 +664,10 @@ pub(crate) fn chain_offers_choice(a: &ResolvedAbility) -> bool {
     // CR 608.2d + CR 107.1c: an "up to N" REPEAT COUNT is a resolution-time choice
     // exactly like an "up to N" damage/draw/counter count, and it is answered in the
     // same silent way — `game/quantity.rs` resolves `UpTo { max } => recurse(max)`,
-    // taking the maximum, and none of the six allow-listed classes calls
-    // `QuantityExpr::peel_up_to`. This field was previously bound `_` and justified as
+    // taking the maximum, and nothing peels a REPEAT count via
+    // `QuantityExpr::peel_up_to` (unlike `Effect::Draw`'s own count, which
+    // `draw::resolve` peels and prompts on since #8543 — the repeat axis was not
+    // part of that fix). This field was previously bound `_` and justified as
     // "pure quantity eval (game/quantity.rs)", which cites the very mechanism
     // `quantity_offers_up_to_choice`'s own doc comment exists to distrust: the count is
     // READ, not prompted. An allow-listed repeated ability carrying an `UpTo` repeat
@@ -723,7 +750,7 @@ mod tests {
     use crate::types::counter::CounterType;
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::player::PlayerId;
-    use crate::types::proposed_event::CounterPlacement;
+    use crate::types::proposed_event::{CounterPlacement, DrawEventStage};
     use crate::types::zones::Zone;
     use std::collections::BTreeMap;
 
@@ -863,10 +890,20 @@ mod tests {
                 // variant's own axis is the damage ledger.
                 ProposedEvent::Damage { .. } => axes.damage_records += 1,
                 // CR 121.1: the zone write is the companion `ZoneChange`'s; this
-                // variant's own axis is the draw ledger.
+                // variant's own axis is the draw ledger. CR 121.2a: the
+                // instruction writes that ledger only through the individual
+                // draws it is split into, which are recorded separately.
                 ProposedEvent::Draw {
-                    player_id, count, ..
-                } => *axes.cards_drawn.entry(*player_id).or_default() += i64::from(*count),
+                    player_id,
+                    count,
+                    stage,
+                    ..
+                } => match stage {
+                    DrawEventStage::Instruction => {}
+                    DrawEventStage::Individual => {
+                        *axes.cards_drawn.entry(*player_id).or_default() += i64::from(*count)
+                    }
+                },
                 other => unreachable!(
                     "accounted variant with no axis arm — the partition and this witness \
                      have drifted: {other:?}"
@@ -1046,6 +1083,8 @@ mod tests {
             player: PlayerId(0),
             candidate_count: 2,
             candidates: Vec::new(),
+            kind: Default::default(),
+            last_applied_decides: false,
         };
         assert!(
             !matches!(base.waiting_for, WaitingFor::ReplacementChoice { .. }),
@@ -1461,6 +1500,7 @@ mod tests {
                 replacement::event_is_accounted(&ProposedEvent::Draw {
                     player_id: PlayerId(0),
                     count,
+                    stage: DrawEventStage::Individual,
                     applied: Default::default(),
                 }),
                 accounted
@@ -1472,11 +1512,13 @@ mod tests {
     /// ARM, not only `Draw`.
     ///
     /// `game/quantity.rs` resolves `UpTo { max }` as the maximum instead of
-    /// prompting, and none of the six allow-listed classes calls
-    /// `QuantityExpr::peel_up_to`. So an unguarded arm reports choice-free on an
-    /// ability whose resolution opens a count choice — a fail-OPEN, not a
-    /// coverage gap. Both directions are asserted per arm so neither can go
-    /// vacuous.
+    /// prompting, and of the allow-listed classes only `Draw` peels it via
+    /// `QuantityExpr::peel_up_to` and prompts (since #8543). For the other five
+    /// an unguarded arm reports choice-free on an ability whose resolution is
+    /// supposed to open a count choice — a fail-OPEN, not a coverage gap. `Draw`
+    /// stays in the case list precisely so the guard is pinned independently of
+    /// whether its resolver happens to prompt today. Both directions are
+    /// asserted per arm so neither can go vacuous.
     #[test]
     fn an_up_to_count_is_may_prompt_on_every_quantity_carrying_arm() {
         let state = probe_board();

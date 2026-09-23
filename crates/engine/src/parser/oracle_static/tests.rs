@@ -4340,7 +4340,7 @@ fn static_cant_be_blocked_by_more_than_two_creatures() {
 
 #[test]
 fn static_attach_only_restriction_power_ge_lowers_to_filter() {
-    // CR 301.5 + CR 303.4 + CR 701.3a: Strata Scythe class — a positive
+    // CR 301.5 + CR 303.4 + CR 701.3a: O-Naginata class — a positive
     // attachment restriction lowers to `AttachmentRestriction` whose `filter` is
     // the reused `TargetFilter` for "a creature with power 3 or greater".
     let def =
@@ -6661,9 +6661,88 @@ fn static_spells_cost_less() {
     ));
 }
 
+// CR 118.7b/c/d: "This effect reduces only the amount of colored mana you pay"
+// is a card-level override of the default spillover, so it must survive parsing
+// as a `CostReductionReach` on the emitted reducer. Covers all seven printed
+// cards in the class that lower to `ModifyCost` (the Defiler cycle carries the
+// same rider but lowers to `DefilerCostReduction`, tested in `oracle_tests`),
+// plus the counterexample that established the default (Aang, Master of
+// Elements #6405).
+#[test]
+fn colored_only_rider_sets_the_cost_reduction_reach() {
+    use crate::types::statics::CostReductionReach;
+
+    fn reach(line: &str) -> CostReductionReach {
+        let def = parse_static_line(line).unwrap_or_else(|| panic!("line must parse: {line}"));
+        let StaticMode::ModifyCost { reach, .. } = def.mode else {
+            panic!(
+                "expected a ModifyCost static for {line}, got {:?}",
+                def.mode
+            );
+        };
+        reach
+    }
+
+    // Printed cards whose reduction sentence carries the rider.
+    for line in [
+        // Morophon, the Boundless (the reported bug, #8432).
+        "Spells of the chosen type you cast cost {W}{U}{B}{R}{G} less to cast. This effect reduces only the amount of colored mana you pay.",
+        // Bard Class, level 2.
+        "Legendary spells you cast cost {R}{G} less to cast. This effect reduces only the amount of colored mana you pay.",
+        // Edgewalker (its reminder text gives the worked example {1}{W} → {1}).
+        "Cleric spells you cast cost {W}{B} less to cast. This effect reduces only the amount of colored mana you pay.",
+        // Head of the Class.
+        "The first spell you cast during each of your turns that targets a creature costs {W}{B} less to cast. This effect reduces only the amount of colored mana you pay.",
+        // Nekrataal Avatar.
+        "Creature spells you cast cost {B} less to cast. This effect reduces only the amount of colored mana you pay.",
+        // Ragemonger (reminder text: {2}{R} → {2}).
+        "Minotaur spells you cast cost {B}{R} less to cast. This effect reduces only the amount of colored mana you pay.",
+        // Vorthos, Steward of Myth — the "name, flavor text, or art" subject is
+        // the odd one out in this class, so it gets its own row.
+        "Each spell you cast with the chosen character in its name, flavor text, or art costs {W}{U}{B}{R}{G} less to cast. This effect reduces only the amount of colored mana you pay.",
+    ] {
+        assert_eq!(
+            reach(line),
+            CostReductionReach::ColoredManaOnly,
+            "the colored-only rider must suppress CR 118.7b spillover: {line}"
+        );
+    }
+
+    // CR 118.7b default — no rider. Aang, Master of Elements spells it out with
+    // "(This can reduce generic costs.)"; the reminder is stripped before this
+    // point, so the bare sentence is what the parser sees.
+    for line in [
+        "Spells you cast cost {W}{U}{B}{R}{G} less to cast.",
+        "Spells you cast cost {1} less to cast.",
+        "Creature spells you cast cost {B} less to cast.",
+    ] {
+        assert_eq!(
+            reach(line),
+            CostReductionReach::SpillsToGeneric,
+            "a reduction with no rider keeps the CR 118.7b default: {line}"
+        );
+    }
+
+    // Sentence-boundary guard: a longer sentence that merely OPENS with the
+    // rider wording says something the engine has not been taught, so it must
+    // NOT be read as the rider. Without the boundary check these fall through
+    // to `ColoredManaOnly` and silently narrow the reduction.
+    for line in [
+        "Creature spells you cast cost {B} less to cast. This effect reduces only the amount of colored mana you pay for that spell's kicker.",
+        "Creature spells you cast cost {B} less to cast. This effect reduces only the amount of colored mana you pay during your turn.",
+    ] {
+        assert_eq!(
+            reach(line),
+            CostReductionReach::SpillsToGeneric,
+            "an unsupported continuation of the rider wording must not be \
+             classified as the rider: {line}"
+        );
+    }
+}
+
 // CR 205.4a: Kethis, the Hidden Hand — "Legendary spells you cast cost {1} less
 // to cast" must restrict to legendary spells via a HasSupertype filter, not drop
-// the restriction (spell_filter: None) and cheapen EVERY spell. `parse_type_phrase`
+// the restriction (spell_filter: None) and cheapen EVERY spell. `parse_type_phrase_folding`
 // doesn't consume a lone supertype word, so it needed an explicit arm.
 #[test]
 fn static_legendary_spells_cost_less_keeps_supertype_filter() {
@@ -7294,7 +7373,7 @@ fn static_instant_sorcery_spells_cost_less() {
             "Expected spell_filter for instant/sorcery"
         );
         let filter = spell_filter.as_ref().unwrap();
-        // parse_type_phrase("instant and sorcery") → TargetFilter::Or { [Typed(Instant), Typed(Sorcery)] }
+        // parse_type_phrase_folding("instant and sorcery") → TargetFilter::Or { [Typed(Instant), Typed(Sorcery)] }
         fn contains_type(f: &TargetFilter, expected: TypeFilter) -> bool {
             match f {
                 TargetFilter::Typed(tf) => tf.type_filters.contains(&expected),
@@ -7467,6 +7546,7 @@ fn static_spells_with_chosen_name_cost_more_disruptor_flute() {
         amount,
         spell_filter,
         dynamic_count,
+        ..
     } = def.mode
     else {
         panic!("expected RaiseCost, got {:?}", def.mode);
@@ -8303,7 +8383,8 @@ fn static_top_of_library_creature_gate_mul_daya_channelers() {
     .unwrap();
 
     assert_eq!(def.mode, StaticMode::Continuous);
-    let (creature_filter, _) = crate::parser::oracle_target::parse_type_phrase("creature card");
+    let (creature_filter, _) =
+        crate::parser::oracle_target::parse_type_phrase_folding("creature card");
     assert_eq!(
         def.condition,
         Some(StaticCondition::TopOfLibraryMatches {
@@ -10803,7 +10884,7 @@ fn static_as_long_as_equipped_creature_is_attacking_grants_first_strike_to_host(
 
     // CR 509.1c: the lure is the typed MustBeBlocked { by: Some(Dalek) }, gated
     // on the same attacking condition, affecting the equipped creature.
-    let dalek = crate::parser::oracle_target::parse_type_phrase("a dalek").0;
+    let dalek = crate::parser::oracle_target::parse_type_phrase_folding("a dalek").0;
     assert_ne!(dalek, TargetFilter::Any, "Dalek subtype must be recognized");
     assert_eq!(defs[1].mode, StaticMode::MustBeBlocked { by: Some(dalek) });
     assert_eq!(defs[1].affected, Some(equipped_creature_filter()));
@@ -11101,7 +11182,7 @@ fn slayers_cleaver_lure_conjunct_models_typed_must_be_blocked() {
         .contains(&ContinuousModification::AddToughness { value: 1 }));
     assert_eq!(defs[0].condition, None);
 
-    let eldrazi = crate::parser::oracle_target::parse_type_phrase("an eldrazi").0;
+    let eldrazi = crate::parser::oracle_target::parse_type_phrase_folding("an eldrazi").0;
     assert_ne!(
         eldrazi,
         TargetFilter::Any,
@@ -11130,7 +11211,7 @@ fn attached_subject_pure_filtered_lure_models_typed_must_be_blocked() {
         1,
         "pure filtered lure → one static, got {defs:?}"
     );
-    let eldrazi = crate::parser::oracle_target::parse_type_phrase("an eldrazi").0;
+    let eldrazi = crate::parser::oracle_target::parse_type_phrase_folding("an eldrazi").0;
     assert_eq!(
         defs[0].mode,
         StaticMode::MustBeBlocked { by: Some(eldrazi) }
@@ -11158,11 +11239,11 @@ fn parse_must_be_blocked_by_filter_building_block() {
     // Filter lowering for both known subtypes (case-insensitive canonicalization).
     assert_eq!(
         parse_must_be_blocked_by_filter("must be blocked by a Dalek if able"),
-        Some(crate::parser::oracle_target::parse_type_phrase("a dalek").0),
+        Some(crate::parser::oracle_target::parse_type_phrase_folding("a dalek").0),
     );
     assert_eq!(
         parse_must_be_blocked_by_filter("must be blocked by an Eldrazi if able"),
-        Some(crate::parser::oracle_target::parse_type_phrase("an eldrazi").0),
+        Some(crate::parser::oracle_target::parse_type_phrase_folding("an eldrazi").0),
     );
     // Bare form yields no filter.
     assert_eq!(
@@ -11190,7 +11271,7 @@ fn extract_must_be_blocked_by_conjunct_classifies_quality() {
 
     // Guard: the fixture quality is genuinely unrecognized — it constrains no
     // blocker, so the lowering helper rejects it (returns no filter). NOTE:
-    // `parse_type_phrase` yields an empty `Typed` (not `TargetFilter::Any`) here.
+    // `parse_type_phrase_folding` yields an empty `Typed` (not `TargetFilter::Any`) here.
     assert!(parse_must_be_blocked_by_filter("must be blocked by a splorf if able").is_none());
     // Unrecognized quality → Unrecognized(diagnostic), NOT collapsed to None.
     let conjunct = extract_must_be_blocked_by_conjunct("must be blocked by a Splorf if able");
@@ -11704,6 +11785,98 @@ fn static_enchanted_creature_it_entered_this_turn_stays_unrecognized() {
         def.condition,
         Some(StaticCondition::Unrecognized {
             text: "it entered this turn".to_string(),
+        })
+    );
+}
+
+/// CR 508.1a + CR 611.3a + CR 613.1f + CR 702.12a (P4): Agent Frank Horrigan —
+/// "Agent Frank Horrigan has indestructible as long as it attacked this turn."
+/// For a SelfRef static the bound pronoun "it" co-refers with the source, so
+/// `rewrite_self_pronoun_subject` normalizes "it attacked this turn" to the
+/// canonical "~ attacked this turn" templating before the condition is typed,
+/// and the context-free grammar lowers that to `SourceMatchesFilter` over the
+/// type-free `FilterProp::AttackedThisTurn` runtime property. Previously this
+/// dropped to `Unrecognized`, which `evaluate_condition_with_context` treats as
+/// TRUE — i.e. the card was permanently indestructible. Generalizes to The Lunar
+/// Whale ("As long as The Lunar Whale attacked this turn, ...").
+#[test]
+fn static_indestructible_as_long_as_it_attacked_this_turn() {
+    let expected_condition = StaticCondition::SourceMatchesFilter {
+        filter: TargetFilter::Typed(
+            TypedFilter::default()
+                .properties(vec![FilterProp::AttackedThisTurn { defender: None }]),
+        ),
+    };
+
+    let def = parse_static_line(
+        "Agent Frank Horrigan has indestructible as long as it attacked this turn.",
+    )
+    .expect("the indestructible gate must parse");
+    // The SelfRef path is what enables the "it" rewrite — assert it explicitly.
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.modifications,
+        vec![ContinuousModification::AddKeyword {
+            keyword: Keyword::Indestructible,
+        }]
+    );
+    assert_eq!(def.condition, Some(expected_condition.clone()));
+
+    // Same gate on the generic printed-subject shape.
+    let generic =
+        parse_static_line("This creature has indestructible as long as it attacked this turn.")
+            .expect("the generic subject form must parse");
+    assert_eq!(generic.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(generic.condition, Some(expected_condition));
+}
+
+/// CR 611.3a (P5, attached-subject NEGATIVE regression): for an Aura/Equipment
+/// static the "it" in "as long as it attacked this turn" binds the
+/// ENCHANTED/EQUIPPED creature, NOT the Aura/Equipment source. The SelfRef
+/// rewrite must NOT fire: the affected subject is the enchanted creature, the
+/// else branch of `parse_continuous_gets_has` skips the rewrite, and the pronoun
+/// stays an honest gap rather than being mis-bound to the source's combat
+/// history. Mirrors the "it entered this turn" attached-subject guard above.
+#[test]
+fn static_enchanted_creature_it_attacked_this_turn_stays_unrecognized() {
+    let def = parse_static_line(
+        "Enchanted creature has indestructible as long as it attacked this turn.",
+    )
+    .expect("should parse the attached-subject grant");
+    // Attached subject — the enchanted creature, decidedly NOT SelfRef.
+    assert_eq!(
+        def.affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![FilterProp::EnchantedBy]),
+        ))
+    );
+    // "it" binds the enchanted creature, so it is an honest gap, not the source.
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Unrecognized {
+            text: "it attacked this turn".to_string(),
+        })
+    );
+}
+
+/// CR 611.3a (P7): the new gate composes through the " unless " splitter, which
+/// wraps the typed condition in `Not` (the modification applies precisely when
+/// the gate is FALSE). Proves the arm is reached by every condition consumer of
+/// `parse_affected_scoped_static_condition`, not just " as long as ".
+#[test]
+fn static_keyword_unless_it_attacked_this_turn_negates() {
+    let def = parse_static_line("~ has hexproof unless it attacked this turn.")
+        .expect("the unless-gated grant must parse");
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::SourceMatchesFilter {
+                filter: TargetFilter::Typed(
+                    TypedFilter::default()
+                        .properties(vec![FilterProp::AttackedThisTurn { defender: None }]),
+                ),
+            }),
         })
     );
 }
@@ -12919,6 +13092,43 @@ fn static_cant_cause_sacrifice_or_exile_creature_tokens() {
             ..
         })) if properties.contains(&FilterProp::Token)
     ));
+}
+
+#[test]
+fn static_cant_cause_forced_action_sacrifice_only() {
+    // CR 701.21a + CR 609.3 + CR 109.5: Sigarda, Host of Herons / Tajuru
+    // Preserver — protects the player wholesale against ANY opponent-
+    // controlled spell or ability forcing a sacrifice, with no affected-object
+    // filter (unlike CantCauseSacrificeOrExile).
+    let def = parse_static_line(
+        "Spells and abilities your opponents control can't cause you to sacrifice permanents.",
+    )
+    .unwrap();
+    assert_eq!(
+        def.mode,
+        StaticMode::CantCauseForcedAction {
+            cause: ProhibitionScope::Opponents,
+            actions: vec![CostCategory::SacrificesPermanent],
+        }
+    );
+    assert!(def.affected.is_none());
+}
+
+#[test]
+fn static_cant_cause_forced_action_discard_or_sacrifice() {
+    // CR 701.9a + CR 701.21a + CR 609.3: Tamiyo, Collector of Tales — the same
+    // static family, listing two forced actions in one clause.
+    let def = parse_static_line(
+        "Spells and abilities your opponents control can't cause you to discard cards or sacrifice permanents.",
+    )
+    .unwrap();
+    assert_eq!(
+        def.mode,
+        StaticMode::CantCauseForcedAction {
+            cause: ProhibitionScope::Opponents,
+            actions: vec![CostCategory::Discards, CostCategory::SacrificesPermanent],
+        }
+    );
 }
 
 #[test]
@@ -14299,7 +14509,7 @@ fn graveyard_cast_permission_gisa_geralf() {
             ..
         }
     ));
-    // "zombie creature" → parse_type_phrase recognizes "zombie" as subtype.
+    // "zombie creature" → parse_type_phrase_folding recognizes "zombie" as subtype.
     // card_type may be None (subtype alone) or Creature depending on parser —
     // either is functionally correct since Zombie is exclusively a creature subtype.
     if let Some(TargetFilter::Typed(tf)) = &def.affected {
@@ -15657,6 +15867,356 @@ fn graveyard_cast_permission_unmodeled_additional_cost_declines() {
     );
 }
 
+/// CR 601.2f + CR 118.8 + CR 701.21a: Wickerfolk Indomitable — "You may cast
+/// this card from your graveyard by paying 2 life and sacrificing an artifact
+/// or creature in addition to paying its other costs." lowers to a
+/// graveyard-cast permission whose ADDITIONAL composite cost pays 2 life AND
+/// sacrifices one artifact-or-creature. Revert-failing: before per-component
+/// de-conjugation the sacrifice leg stayed `Unimplemented`, so the permission
+/// either paid only life (Wickerfolk) or declined (after the collapse).
+#[test]
+fn graveyard_cast_permission_composite_gerund_pay_life_and_sacrifice() {
+    use crate::types::ability::{AbilityCost, SacrificeCost, SacrificeRequirement};
+    use crate::types::statics::{CastCostMode, CastExtraCost};
+    let text = "You may cast this card from your graveyard by paying 2 life and sacrificing an artifact or creature in addition to paying its other costs.";
+    let def = parse_static_line(text).expect("Wickerfolk static must parse");
+    let StaticMode::GraveyardCastPermission {
+        play_mode,
+        ref extra_cost,
+        ..
+    } = def.mode
+    else {
+        panic!("expected GraveyardCastPermission, got {:?}", def.mode);
+    };
+    assert_eq!(play_mode, CardPlayMode::Cast);
+    assert_eq!(
+        def.active_zones,
+        vec![Zone::Graveyard],
+        "the \"this card … from your graveyard\" self-reference must scope the \
+         permission to the graveyard"
+    );
+    let Some(CastExtraCost { cost, mode }) = extra_cost else {
+        panic!("expected an additional composite extra cost, got {extra_cost:?}");
+    };
+    assert_eq!(*mode, CastCostMode::Additional);
+    let AbilityCost::Composite { costs } = cost else {
+        panic!("Wickerfolk's rider must be a two-leg Composite, got {cost:?}");
+    };
+    assert_eq!(costs.len(), 2, "{costs:?}");
+    assert_eq!(
+        costs[0],
+        AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value: 2 },
+        },
+    );
+    assert!(
+        matches!(
+            &costs[1],
+            AbilityCost::Sacrifice(SacrificeCost {
+                target: TargetFilter::Or { .. },
+                requirement: SacrificeRequirement::Count { count: 1 },
+            })
+        ),
+        "the sacrifice leg must union artifact/creature at count 1, got {:?}",
+        costs[1]
+    );
+}
+
+/// CR 601.2f + CR 118.8 + CR 701.9a: Demonic Embrace — "You may cast this card
+/// from your graveyard by paying 3 life and discarding a card in addition to
+/// paying its other costs." lowers to a composite additional cost of 3 life AND
+/// a discard, not a pay-life-only permission with the discard leg dropped.
+#[test]
+fn graveyard_cast_permission_composite_gerund_pay_life_and_discard() {
+    use crate::types::ability::{AbilityCost, QuantityExpr};
+    let text = "You may cast this card from your graveyard by paying 3 life and discarding a card in addition to paying its other costs.";
+    let def = parse_static_line(text).expect("Demonic Embrace static must parse");
+    let StaticMode::GraveyardCastPermission {
+        play_mode,
+        ref extra_cost,
+        ..
+    } = def.mode
+    else {
+        panic!("expected GraveyardCastPermission, got {:?}", def.mode);
+    };
+    assert_eq!(play_mode, CardPlayMode::Cast);
+    let Some(crate::types::statics::CastExtraCost { cost, .. }) = extra_cost else {
+        panic!("expected an additional composite extra cost, got {extra_cost:?}");
+    };
+    let AbilityCost::Composite { costs } = cost else {
+        panic!("Demonic Embrace's rider must be a two-leg Composite, got {cost:?}");
+    };
+    assert_eq!(costs.len(), 2, "{costs:?}");
+    assert_eq!(
+        costs[0],
+        AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value: 3 },
+        },
+    );
+    assert!(
+        matches!(
+            &costs[1],
+            AbilityCost::Discard {
+                count: QuantityExpr::Fixed { value: 1 },
+                ..
+            }
+        ),
+        "the discard leg must be one card, got {:?}",
+        costs[1]
+    );
+}
+
+/// CR 601.2f + CR 118.8 + CR 614.1a + CR 607.1: Maestros Ascendancy — the
+/// trailing destination sentence must be peeled BEFORE the additional-cost
+/// rider, so the sacrifice cost parses against the destination-stripped tail
+/// and the permission carries `Some(Exile)`. Full-dispatch reach-guard: the
+/// whole line routes to the static with no `static_structure` gap.
+#[test]
+fn graveyard_cast_permission_maestros_cost_and_exile_rider() {
+    use crate::types::ability::{AbilityCost, SacrificeCost, SacrificeRequirement};
+    use crate::types::statics::{CastCostMode, CastExtraCost};
+    let text = "Once during each of your turns, you may cast an instant or sorcery spell from your graveyard by sacrificing a creature in addition to paying its other costs. If a spell cast this way would be put into your graveyard, exile it instead.";
+    let def = parse_static_line(text).expect("Maestros Ascendancy static must parse");
+    let StaticMode::GraveyardCastPermission {
+        frequency,
+        play_mode,
+        graveyard_destination_replacement,
+        ref extra_cost,
+        ..
+    } = def.mode
+    else {
+        panic!("expected GraveyardCastPermission, got {:?}", def.mode);
+    };
+    assert_eq!(frequency, CastFrequency::OncePerTurn);
+    assert_eq!(play_mode, CardPlayMode::Cast);
+    assert_eq!(
+        graveyard_destination_replacement,
+        Some(Zone::Exile),
+        "the trailing destination sentence must lower to Some(Exile)"
+    );
+    let Some(CastExtraCost { cost, mode }) = extra_cost else {
+        panic!("expected an additional sacrifice extra cost, got {extra_cost:?}");
+    };
+    assert_eq!(*mode, CastCostMode::Additional);
+    assert!(
+        matches!(
+            cost,
+            AbilityCost::Sacrifice(SacrificeCost {
+                target: TargetFilter::Typed(TypedFilter { type_filters, .. }),
+                requirement: SacrificeRequirement::Count { count: 1 },
+            }) if type_filters == &[TypeFilter::Creature]
+        ),
+        "expected an additional sacrifice-a-creature cost, got {cost:?}"
+    );
+
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        text,
+        "Maestros Ascendancy",
+        &[],
+        &["Enchantment".to_string()],
+        &[],
+    );
+    assert!(
+        parsed
+            .statics
+            .iter()
+            .any(|parsed_def| parsed_def.mode == def.mode),
+        "full Oracle dispatch must route Maestros's line to the cost+destination \
+         permission, got {:?}",
+        parsed.statics
+    );
+    assert!(
+        !serde_json::to_string(&parsed.abilities)
+            .unwrap()
+            .contains("static_structure"),
+        "the destination sentence must be peeled before the cost rider, leaving \
+         no static_structure gap; abilities = {:?}",
+        parsed.abilities
+    );
+}
+
+/// CR 601.2f + CR 118.8: a composite additional-cost rider with one unmodeled
+/// leg must DECLINE the whole permission rather than emit a permission that
+/// pays a partial cost. Paired with the fully-modeled identical shape so the
+/// decline is proven cost-specific.
+#[test]
+fn graveyard_cast_permission_composite_with_unmodeled_leg_declines() {
+    let modeled = "You may cast this card from your graveyard by paying 2 life and discarding a card in addition to paying its other costs.";
+    let unmodeled = "You may cast this card from your graveyard by paying 2 life and frobnicating a card in addition to paying its other costs.";
+    assert!(
+        try_parse_graveyard_cast_permission(modeled, &modeled.to_lowercase()).is_some(),
+        "the fully modeled composite rider must still emit a permission"
+    );
+    assert!(
+        try_parse_graveyard_cast_permission(unmodeled, &unmodeled.to_lowercase()).is_none(),
+        "a composite with an unmodeled leg must decline the whole permission, \
+         not emit one that drops a required cost"
+    );
+}
+
+/// CR 614.1a + CR 607.1: a destination sentence that is not the trailing suffix
+/// must DECLINE the permission rather than silently drop the replacement
+/// clause. Reach-guard: the modeled trailing-suffix ordering emits the
+/// permission with `Some(Exile)`.
+#[test]
+fn graveyard_cast_permission_destination_not_suffix_declines() {
+    let modeled = "Once during each of your turns, you may cast an instant or sorcery spell from your graveyard by sacrificing a creature in addition to paying its other costs. If a spell cast this way would be put into your graveyard, exile it instead.";
+    let modeled_def = try_parse_graveyard_cast_permission(modeled, &modeled.to_lowercase())
+        .expect("reach-guard: the trailing destination sentence must still emit the permission");
+    assert!(
+        matches!(
+            modeled_def.mode,
+            StaticMode::GraveyardCastPermission {
+                graveyard_destination_replacement: Some(Zone::Exile),
+                ..
+            }
+        ),
+        "reach-guard: the modeled ordering must lower to Some(Exile), got {:?}",
+        modeled_def.mode
+    );
+
+    let hostile = "You may cast this card from your graveyard. If a spell cast this way would be put into your graveyard, exile it instead. By paying 2 life in addition to its other costs.";
+    assert!(
+        try_parse_graveyard_cast_permission(hostile, &hostile.to_lowercase()).is_none(),
+        "a destination sentence followed by further rider text must decline the \
+         permission, not drop the CR 614.1a replacement"
+    );
+}
+
+/// CR 607.1 + CR 614.1a: an enters-with-counter rider followed by the
+/// destination sentence is an unmodeled ordering — the enters-with peel must
+/// NOT commit on the counter clause and silently drop the sentence; the whole
+/// permission declines. The trailing-finality shape is the reach-guard.
+///
+/// The assertions are helper-level (`try_parse_graveyard_cast_permission`) and
+/// the decline is terminal in full dispatch for this class: the document
+/// dispatcher emits a typed `static_structure` residual for a declined
+/// cast-from-graveyard permission line rather than letting the Priority-8
+/// replacement fallback reclaim it (see `oracle.rs`). 0 corpus cards carry
+/// these orderings.
+#[test]
+fn graveyard_cast_permission_destination_after_enters_with_rider_declines() {
+    let modeled = "You may cast this card from your graveyard by paying 3 life in addition to paying its other costs. If you cast a spell this way, that creature enters with a finality counter on it.";
+    let def = try_parse_graveyard_cast_permission(modeled, &modeled.to_lowercase())
+        .expect("reach-guard: the trailing enters-with rider must still emit the permission");
+    assert!(
+        matches!(
+            def.mode,
+            StaticMode::GraveyardCastPermission {
+                enters_with_counter: Some(CounterType::Finality),
+                ..
+            }
+        ),
+        "reach-guard: the modeled enters-with ordering must keep its counter, got {:?}",
+        def.mode
+    );
+
+    let hostile = "You may cast this card from your graveyard by paying 3 life in addition to paying its other costs. If you cast a spell this way, that creature enters with a finality counter on it. If a spell cast this way would be put into your graveyard, exile it instead.";
+    assert!(
+        try_parse_graveyard_cast_permission(hostile, &hostile.to_lowercase()).is_none(),
+        "an enters-with rider before the destination sentence must decline the \
+         permission, not drop the CR 614.1a replacement"
+    );
+
+    // No-cost-rider variant: the enters-with rider is still not the trailing
+    // suffix, so the permission must decline rather than emit without the
+    // counter — the peel's non-commit branch is load-bearing here too.
+    let no_cost_hostile = "You may cast this card from your graveyard. If you cast a spell this way, that creature enters with a finality counter on it. If a spell cast this way would be put into your graveyard, exile it instead.";
+    assert!(
+        try_parse_graveyard_cast_permission(no_cost_hostile, &no_cost_hostile.to_lowercase())
+            .is_none(),
+        "an enters-with rider before the destination sentence must decline even \
+         without a cost rider, not drop the counter rider"
+    );
+
+    // Counter + type-grant tail is not modeled on the static path; it must
+    // decline rather than silently dropping the tail.
+    let tail_hostile = "You may cast this card from your graveyard. If you do, it enters with a finality counter on it and is a Vampire in addition to its other types.";
+    assert!(
+        try_parse_graveyard_cast_permission(tail_hostile, &tail_hostile.to_lowercase()).is_none(),
+        "an enters-with rider with an unmodeled type-grant tail must decline"
+    );
+}
+
+/// CR 601.2a + CR 607.1: full-document strict-gap regression for a recognized
+/// cast-from-graveyard permission carrying an unmodeled prefix before its
+/// destination rider. The permission must not be emitted with the prefix
+/// silently dropped, and the decline must survive document dispatch as a typed
+/// `static_structure` gap rather than being reclaimed as a partial replacement.
+#[test]
+fn graveyard_cast_permission_unmodeled_prefix_is_a_strict_gap() {
+    let text = "You may cast this card from your graveyard. It gains haste. If a spell cast this way would be put into your graveyard, exile it instead.";
+    let parsed = crate::parser::oracle::parse_oracle_text(
+        text,
+        "Test Card",
+        &[],
+        &["Creature".to_string()],
+        &[],
+    );
+    assert!(
+        !parsed
+            .statics
+            .iter()
+            .any(|d| matches!(d.mode, StaticMode::GraveyardCastPermission { .. })),
+        "the permission must not be emitted with its prefix dropped; statics = {:#?}",
+        parsed.statics
+    );
+    assert!(
+        parsed.replacements.is_empty(),
+        "the declined permission must not be reclaimed as a replacement; replacements = {:#?}",
+        parsed.replacements
+    );
+    assert!(
+        parsed.abilities.iter().any(|a| matches!(
+            &*a.effect,
+            Effect::Unimplemented { name, .. } if name == "static_structure"
+        )),
+        "the decline must surface as a static_structure gap; abilities = {:#?}",
+        parsed.abilities
+    );
+}
+
+/// CR 607.1 + CR 614.1a: the same full-document strict-gap contract for the
+/// unmodeled enters-with permutations (rider before the destination sentence,
+/// and a counter + type-grant tail): the counter clause must not be silently
+/// dropped, and the decline must not be reclaimed as a replacement.
+#[test]
+fn graveyard_cast_permission_unmodeled_enters_with_rider_is_a_strict_gap() {
+    for text in [
+        "You may cast this card from your graveyard. If you cast a spell this way, that creature enters with a finality counter on it. If a spell cast this way would be put into your graveyard, exile it instead.",
+        "You may cast this card from your graveyard. If you do, it enters with a finality counter on it and is a Vampire in addition to its other types.",
+    ] {
+        let parsed = crate::parser::oracle::parse_oracle_text(
+            text,
+            "Test Card",
+            &[],
+            &["Creature".to_string()],
+            &[],
+        );
+        assert!(
+            !parsed
+                .statics
+                .iter()
+                .any(|d| matches!(d.mode, StaticMode::GraveyardCastPermission { .. })),
+            "the permission must not be emitted with the counter rider dropped; text = {text}; statics = {:#?}",
+            parsed.statics
+        );
+        assert!(
+            parsed.replacements.is_empty(),
+            "the declined permission must not be reclaimed as a replacement; text = {text}; replacements = {:#?}",
+            parsed.replacements
+        );
+        assert!(
+            parsed.abilities.iter().any(|a| matches!(
+                &*a.effect,
+                Effect::Unimplemented { name, .. } if name == "static_structure"
+            )),
+            "the decline must surface as a static_structure gap; text = {text}; abilities = {:#?}",
+            parsed.abilities
+        );
+    }
+}
+
 /// Issue #1524 — Serpent's Soul-Jar: persistent exile pool without "this turn".
 #[test]
 fn exile_cast_permission_soul_jar_persistent_creature_pool() {
@@ -16038,7 +16598,7 @@ fn continuous_subject_filter_nontoken_is_negation_not_subtype() {
     // CR 111.1 / CR 205.3: "Nontoken creatures you control" (Ashaya, Soul of
     // the Wild) is a type phrase with a token-identity negation, NOT a
     // subtype. The negation guard in `parse_creature_subject_filter` must
-    // return None so the phrase falls through to `parse_type_phrase`, which
+    // return None so the phrase falls through to `parse_type_phrase_folding`, which
     // produces a `Creature` filter with the `NonToken` property.
     let filter = parse_continuous_subject_filter("Nontoken creatures you control")
         .expect("nontoken creature subject should parse");
@@ -16262,7 +16822,7 @@ fn continuous_subject_filter_capitalized_subtype_still_works() {
 fn continuous_subject_filter_noncreature_word_boundary_anchor() {
     // Word-boundary anchor check: the `non` guard fires for genuine negation
     // descriptors ("Nonland creatures"), and the negated word reaches
-    // `classify_negation` via `parse_type_phrase`. This confirms the guard
+    // `classify_negation` via `parse_type_phrase_folding`. This confirms the guard
     // is not over-broad — it only fires when `non` heads a real descriptor
     // token, which is always true for a `parse_creature_subject_filter`
     // descriptor extracted by stripping " creatures".
@@ -16291,7 +16851,7 @@ fn static_pump_line_nontoken_subject_routes_through_negation_guard() {
     // negation descriptor ("Nontoken creatures you control get/have ...")
     // must NOT fabricate a `Subtype("Nontoken")`. This exercises the
     // `parse_typed_you_control` negation guard (`:2764`/`:2783`): the guard
-    // returns None, dispatch falls through, and `parse_type_phrase`'s
+    // returns None, dispatch falls through, and `parse_type_phrase_folding`'s
     // negation loop yields the correct `Creature` + `NonToken` filter.
     for line in [
         "Nontoken creatures you control get +1/+1.",
@@ -23818,7 +24378,7 @@ fn static_reduce_exhaust_ability_cost_other_permanents() {
     // less to activate." The generalized "<keyword> abilities of [subject]" arm
     // keys the reduction on the "exhaust" ability tag (CR 602.1 / CR 601.2f) and
     // routes the "other permanents you control" self-exclusion through
-    // parse_type_phrase.
+    // parse_type_phrase_folding.
     let def = parse_static_line(
         "Exhaust abilities of other permanents you control cost {2} less to activate.",
     )
@@ -24778,7 +25338,7 @@ fn apply_spell_keyword_subject_constraints_recurses_and() {
 //  (1) `Keyword::from_str("affinity for creatures")` previously returned
 //      `Keyword::Unknown` — so `apply_affinity_reduction` silently skipped
 //      the granted keyword and no cost reduction was applied at cast time.
-//  (2) `parse_type_phrase("Instant and sorcery")` returns `TargetFilter::Or`,
+//  (2) `parse_type_phrase_folding("Instant and sorcery")` returns `TargetFilter::Or`,
 //      which the old `match TargetFilter::Typed(tf) => tf, _ => card()`
 //      arm discarded — leaving the static affecting every spell card the
 //      player casts (CR 113.3a: affected filter must scope recipients).
@@ -25341,7 +25901,7 @@ fn death_baron_compound_get_have_predicate_unaffected_by_typed_you_control_guard
 // CR 205.4a (supertype) + CR 105.2 (color count). Amazing Spider-Man's back
 // face grants web-slinging only to "legendary spells … that's one or more
 // colors"; the affected filter must carry BOTH qualifiers, and the supertype
-// must be emitted exactly once (no parse_type_phrase double-emit).
+// must be emitted exactly once (no parse_type_phrase_folding double-emit).
 
 #[test]
 fn static_legendary_colored_spells_have_web_slinging() {
@@ -25394,7 +25954,7 @@ fn static_legendary_colored_spells_have_web_slinging() {
 #[test]
 fn static_legendary_creature_spells_emit_supertype_once() {
     // Compound subject: supertype must be emitted exactly once (peel here OR
-    // parse_type_phrase, never both) and the Creature type must be present.
+    // parse_type_phrase_folding, never both) and the Creature type must be present.
     let def = parse_static_line("Each legendary creature spell you cast has flash.").unwrap();
     assert_eq!(
         def.mode,
@@ -26385,7 +26945,7 @@ fn cant_be_activated_clarion_multi_type_filter() {
     // CR 602.5 + CR 603.2a: Clarion Conqueror — "Activated abilities of artifacts,
     // creatures, and planeswalkers your opponents control can't be activated."
     // The activator axis is AllPlayers; opponent-ness rides on the filter's
-    // `ControllerRef::Opponent`. `parse_type_phrase` emits an `Or`-disjunction of
+    // `ControllerRef::Opponent`. `parse_type_phrase_folding` emits an `Or`-disjunction of
     // `Typed` filters when a comma-separated type list is present — each variant
     // inherits the shared controller suffix via the post-process pass.
     let def = parse_static_line(
@@ -28491,6 +29051,271 @@ fn top_of_library_cast_permission_future_sight_compound() {
     assert!(matches!(def.affected, Some(TargetFilter::Any)));
 }
 
+/// CR 601.3 + CR 601.1a: The direct-object surface form — "you may [play|cast]
+/// the top card of your library" (The Lunar Whale) — is the same
+/// `TopOfLibraryCastPermission` class as the perimeter forms, with no
+/// eligibility filter (`affected: Any`) because the verb's object names the
+/// singular top card itself. Also proves the line reaches the static parser
+/// through the ungated leftover-static fallback (no classifier widening).
+#[test]
+fn top_of_library_object_form_unconditional() {
+    let text = "You may play the top card of your library.";
+    let lower = text.to_lowercase();
+    let def =
+        try_parse_top_of_library_cast_permission(text, &lower).expect("object form must parse");
+    match def.mode {
+        StaticMode::TopOfLibraryCastPermission {
+            play_mode,
+            frequency,
+            ref alt_cost,
+        } => {
+            assert_eq!(play_mode, CardPlayMode::Play);
+            assert_eq!(frequency, CastFrequency::Unlimited);
+            assert!(alt_cost.is_none());
+        }
+        other => panic!("expected TopOfLibraryCastPermission, got {other:?}"),
+    }
+    assert!(matches!(def.affected, Some(TargetFilter::Any)));
+    assert!(def.condition.is_none(), "no printed gate → no condition");
+
+    // Reachability through the full static dispatcher, not just the arm.
+    let dispatched = parse_static_line("You may play the top card of your library.")
+        .expect("direct-orientation object form must reach the static parser");
+    assert!(
+        matches!(
+            dispatched.mode,
+            StaticMode::TopOfLibraryCastPermission { .. }
+        ),
+        "expected TopOfLibraryCastPermission from parse_static_line, got {dispatched:?}"
+    );
+}
+
+/// CR 601.3: the "cast" verb selects `CardPlayMode::Cast` — the verb, not a
+/// filter, is the play-mode axis of the object form.
+#[test]
+fn top_of_library_object_form_cast_verb() {
+    let text = "You may cast the top card of your library.";
+    let lower = text.to_lowercase();
+    let def = try_parse_top_of_library_cast_permission(text, &lower)
+        .expect("object form cast verb must parse");
+    match def.mode {
+        StaticMode::TopOfLibraryCastPermission { play_mode, .. } => {
+            assert_eq!(play_mode, CardPlayMode::Cast);
+        }
+        other => panic!("expected TopOfLibraryCastPermission, got {other:?}"),
+    }
+}
+
+/// CR 611.3a: a fully-typed trailing gate attaches to the object form through
+/// the class's condition authority (`parse_top_of_library_permission_condition`
+/// → `nom_condition::parse_inner_condition`). "~ is untapped" lowers to
+/// `Not(SourceIsTapped)` (`parse_tapped_untapped`).
+#[test]
+fn top_of_library_object_form_typed_gate() {
+    let text = "You may play the top card of your library as long as ~ is untapped.";
+    let lower = text.to_lowercase();
+    let def = try_parse_top_of_library_cast_permission(text, &lower)
+        .expect("object form with a typed gate must parse");
+    assert!(matches!(
+        def.mode,
+        StaticMode::TopOfLibraryCastPermission { .. }
+    ));
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::SourceIsTapped),
+        }),
+        "the typed gate must be attached, not dropped"
+    );
+}
+
+/// CR 611.3a: an " as long as " gate whose condition does not type declines the
+/// direct-object form entirely — claiming the line would emit an UNCONDITIONAL
+/// permission with the printed gate dropped (the inverted-"as long as" rewrite
+/// re-attaches the split condition only when it types).
+///
+/// The untypeable fixtures use a condition no parser arm claims, so the
+/// property stays tested independently of which condition arms exist (a real
+/// gate that later gains an arm must NOT be used here — the assertion would
+/// flip for the wrong reason). The Lunar Whale's own gate ("~ attacked this
+/// turn") will be exercised by the composition check once the in-flight
+/// condition arm (PR #8887) lands, not by this test.
+///
+/// Reach guard: the same test first proves the identical inverted sentence with
+/// a typed gate produces the permission, so the negative cannot pass vacuously
+/// on an unreachable arm.
+#[test]
+fn top_of_library_object_form_fails_closed_on_untyped_gate() {
+    let reach =
+        parse_static_line("As long as ~ is untapped, you may play the top card of your library.")
+            .expect("reach guard: the inverted sentence with a typed gate must parse");
+    assert!(
+        matches!(&reach.mode, StaticMode::TopOfLibraryCastPermission { .. }),
+        "reach guard: expected the permission with a typed gate, got {reach:?}"
+    );
+    assert_eq!(
+        reach.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::SourceIsTapped),
+        }),
+        "reach guard: the typed gate must survive the inverted rewrite"
+    );
+
+    for text in [
+        "As long as ~ is fluorescent, you may play the top card of your library.",
+        "As long as this creature is fluorescent, you may play the top card of your library.",
+        "You may play the top card of your library as long as ~ is fluorescent.",
+    ] {
+        let parsed = parse_static_line(text);
+        assert!(
+            !matches!(
+                parsed.as_ref().map(|def| &def.mode),
+                Some(StaticMode::TopOfLibraryCastPermission { .. })
+            ),
+            "an untypeable gate must never yield an unconditional permission for {text:?}, \
+             got {parsed:?}"
+        );
+    }
+
+    // A rider stacked with an untypeable gate — in either order — must decline
+    // too: the rider helper scans for its anchor anywhere, so the gate-marker
+    // decline is what keeps a dropped gate from being laundered through it.
+    for text in [
+        "You may play the top card of your library. If you cast a spell this way, \
+         pay life equal to its mana value rather than paying its mana cost \
+         as long as ~ is fluorescent.",
+        "You may play the top card of your library as long as ~ is fluorescent. \
+         If you cast a spell this way, pay life equal to its mana value rather than \
+         paying its mana cost.",
+    ] {
+        assert!(
+            try_parse_top_of_library_cast_permission(text, &text.to_lowercase()).is_none(),
+            "gate+rider stacking must decline for {text:?}"
+        );
+    }
+}
+
+/// CR 401.5 + CR 601.3: the object-form arm must not shadow its neighbours —
+/// the "look at" line, the "play with … revealed" line, the perimeter filtered
+/// forms, and the "their library" object (Xanathar) all keep their own
+/// lowering.
+#[test]
+fn top_of_library_object_form_does_not_shadow_neighbours() {
+    let look = parse_static_line("You may look at the top card of your library any time.")
+        .expect("look-at line must still parse");
+    assert!(
+        matches!(look.mode, StaticMode::MayLookAtTopOfLibrary),
+        "expected MayLookAtTopOfLibrary, got {look:?}"
+    );
+
+    let revealed = parse_static_line("You may play with the top card of your library revealed.")
+        .expect("play-with-top-revealed line must still parse");
+    assert!(
+        matches!(revealed.mode, StaticMode::RevealTopOfLibrary { .. }),
+        "expected RevealTopOfLibrary, got {revealed:?}"
+    );
+
+    // Perimeter filtered forms keep their eligibility filter.
+    let lands = "You may play lands from the top of your library.";
+    let def = try_parse_top_of_library_cast_permission(lands, &lands.to_lowercase())
+        .expect("perimeter form must still parse");
+    assert!(
+        matches!(&def.affected, Some(TargetFilter::Typed(tf)) if tf.type_filters.contains(&TypeFilter::Land)),
+        "perimeter land filter must survive, got {:?}",
+        def.affected
+    );
+
+    // "their library" (Xanathar) is an EFFECT, not this permission.
+    let their = "You may play the top card of their library.";
+    assert!(
+        try_parse_top_of_library_cast_permission(their, &their.to_lowercase()).is_none(),
+        "the 'their library' object must not match the 'your library' anchor"
+    );
+}
+
+/// CR 118.9: the class's alt-cost rider attaches to the object form too. The
+/// rider must open the tail (after an optional sentence period) — pinning the
+/// anchor is what stops a dropped gate from being laundered through it.
+#[test]
+fn top_of_library_object_form_alt_cost_rider() {
+    let text = "You may play the top card of your library. If you cast a spell this way, \
+                pay life equal to its mana value rather than paying its mana cost.";
+    let lower = text.to_lowercase();
+    let def = try_parse_top_of_library_cast_permission(text, &lower)
+        .expect("object form with an alt-cost rider must parse");
+    match &def.mode {
+        StaticMode::TopOfLibraryCastPermission {
+            play_mode,
+            alt_cost,
+            ..
+        } => {
+            assert_eq!(*play_mode, CardPlayMode::Play);
+            assert!(alt_cost.is_some(), "the rider must be stamped, not dropped");
+        }
+        other => panic!("expected TopOfLibraryCastPermission, got {other:?}"),
+    }
+    assert!(def.condition.is_none());
+}
+
+/// CR 611.3a + CR 118.9: a typed gate followed by a supported alt-cost rider
+/// preserves BOTH components — the gate attaches as the condition and the
+/// rider stamps `alt_cost`, the same independent field assignment the
+/// perimeter siblings perform.
+#[test]
+fn top_of_library_object_form_gate_with_alt_cost_rider() {
+    let text = "You may play the top card of your library as long as ~ is untapped. \
+                If you cast a spell this way, pay life equal to its mana value rather \
+                than paying its mana cost.";
+    let lower = text.to_lowercase();
+    let def = try_parse_top_of_library_cast_permission(text, &lower)
+        .expect("gate + rider object form must parse");
+    match &def.mode {
+        StaticMode::TopOfLibraryCastPermission {
+            play_mode,
+            alt_cost,
+            ..
+        } => {
+            assert_eq!(*play_mode, CardPlayMode::Play);
+            assert!(alt_cost.is_some(), "the rider must be stamped, not dropped");
+        }
+        other => panic!("expected TopOfLibraryCastPermission, got {other:?}"),
+    }
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::SourceIsTapped),
+        }),
+        "the typed gate must be preserved alongside the rider"
+    );
+}
+
+/// CR 118.9: the rider must be the tail's LAST sentence — the class's cost
+/// recognizer consumes nothing, so any further sentence would be silently
+/// dropped. Also rejects a rider whose opening does not lead the tail, and any
+/// unmodeled remainder after a typed gate.
+#[test]
+fn top_of_library_object_form_rejects_unmodeled_rider_trailer() {
+    for text in [
+        // A second sentence after the rider would be dropped by the scan-based
+        // cost recognizer.
+        "You may play the top card of your library. If you cast a spell this way, \
+         pay life equal to its mana value rather than paying its mana cost. Draw a card.",
+        // A typed gate followed by something other than a supported rider
+        // declines rather than dropping the remainder.
+        "You may play the top card of your library as long as ~ is untapped. \
+         Anything else at all.",
+        // The rider's opening must lead the tail (text before it would be
+        // skipped over by the recognizer).
+        "You may play the top card of your library. Meanwhile if you cast a spell this way, \
+         pay life equal to its mana value rather than paying its mana cost.",
+    ] {
+        assert!(
+            try_parse_top_of_library_cast_permission(text, &text.to_lowercase()).is_none(),
+            "unmodeled rider trailing must decline for {text:?}"
+        );
+    }
+}
+
 /// CR 700.6 + CR 401.5: Crystal Skull — "You may play historic lands and cast
 /// historic spells from the top of your library." lowers to a disjunctive
 /// `TopOfLibraryCastPermission` whose `affected` is an `Or` of historic Land
@@ -29346,7 +30171,7 @@ fn tiered_enters_with_additional_counters_static_one_counter_otherwise_singular(
 /// Sliver) must land as a TOP-LEVEL continuous static granting Shroud to a
 /// `Typed(Subtype:"Sliver")` subject — NOT a spell-resolution GenericEffect.
 /// The "all " universal quantifier on the rule-static subject must be stripped
-/// and delegated to `parse_type_phrase`.
+/// and delegated to `parse_type_phrase_folding`.
 #[test]
 fn static_all_slivers_have_shroud_top_level_typed_subtype() {
     let def =
@@ -30832,7 +31657,13 @@ fn ichormoon_gauntlet_grants_loyalty_abilities_to_planeswalkers() {
         grants[1].cost
     );
     assert!(
-        matches!(*grants[1].effect, Effect::ExtraTurn { .. }),
+        matches!(
+            *grants[1].effect,
+            Effect::ExtraTurn {
+                target: TargetFilter::Controller,
+                count: QuantityExpr::Fixed { value: 1 },
+            }
+        ),
         "second grant effect should be ExtraTurn, got {:?}",
         grants[1].effect
     );
@@ -31100,6 +31931,7 @@ fn cost_mod_color_and_or_disjunction_builds_anyof_filter() {
         amount,
         spell_filter,
         dynamic_count,
+        ..
     } = def.mode
     else {
         panic!("expected ModifyCost{{Reduce}}, got {:?}", def.mode);
@@ -31294,7 +32126,7 @@ fn static_creatures_enchanted_player_controls_get_minus_1_minus_1() {
 fn static_creatures_target_player_controls_not_via_suffix_parser() {
     // Negative test: "target player controls" must NOT be accepted by
     // parse_static_controller_suffix (the restricted subject-suffix grammar).
-    // The full parse_static_line may still succeed via the parse_type_phrase
+    // The full parse_static_line may still succeed via the parse_type_phrase_folding
     // fallback, but the controller must NOT originate from our suffix helper.
     // We verify by checking parse_creature_subject_filter directly — it should
     // return None for this subject since the suffix parser rejects TargetPlayer.
@@ -31643,48 +32475,112 @@ fn heroic_defiance_pt_grant_gated_on_most_common_color() {
     );
 }
 
-/// CR 105.2 (Goham/Halam/Ruham/Sulam/Zanam Djinn): the Prophecy djinn P/T
-/// penalty must parse the modification AND attach the fixed-color condition —
-/// "gets -2/-2 as long as black is the most common color among all permanents
-/// or is tied for most common" gates on `ColorIsMostCommonAmongPermanents`.
-/// Both phrasings (with and without the redundant tie tail) lower to the same
-/// condition, and the condition must NOT fall through to `Unrecognized`.
+/// CR 105.2: A Djinn's penalty switches on only while its named color is
+/// actually tied for the largest permanent-color population. Both Oracle
+/// phrasings must make the same decision, including an all-colorless board.
 #[test]
-fn prophecy_djinn_pt_penalty_gated_on_fixed_most_common_color() {
-    for text in [
-        "This creature gets -2/-2 as long as black is the most common color among \
-         all permanents or is tied for most common.",
-        "This creature gets -2/-2 as long as blue is the most common color among \
-         all permanents.",
-    ] {
+fn prophecy_djinn_penalty_follows_most_common_color() {
+    let conditions = [
+        (
+            ManaColor::Black,
+            "This creature gets -2/-2 as long as black is the most common color among \
+             all permanents or is tied for most common.",
+        ),
+        (
+            ManaColor::Blue,
+            "This creature gets -2/-2 as long as blue is the most common color among \
+             all permanents.",
+        ),
+    ]
+    .map(|(_, text)| {
         let defs = parse_static_line_multi(text);
         let penalty = defs
             .iter()
-            .find(|d| d.mode == StaticMode::Continuous)
-            .unwrap_or_else(|| panic!("a continuous P/T penalty for {text}"));
-        assert!(
-            penalty
-                .modifications
-                .contains(&ContinuousModification::AddPower { value: -2 })
-                && penalty
-                    .modifications
-                    .contains(&ContinuousModification::AddToughness { value: -2 }),
-            "penalty must be -2/-2, got {:?}",
-            penalty.modifications
-        );
-        let expected = if text.contains("black") {
-            ManaColor::Black
-        } else {
-            ManaColor::Blue
-        };
-        assert_eq!(
-            penalty.condition,
-            Some(StaticCondition::ColorIsMostCommonAmongPermanents {
-                color: expected,
-            }),
-            "the -2/-2 must be gated on the fixed-color most-common condition"
-        );
-    }
+            .find(|def| def.mode == StaticMode::Continuous)
+            .unwrap_or_else(|| panic!("missing P/T penalty: {text}"));
+        assert!(penalty
+            .modifications
+            .contains(&ContinuousModification::AddPower { value: -2 }));
+        assert!(penalty
+            .modifications
+            .contains(&ContinuousModification::AddToughness { value: -2 }));
+        penalty.condition.clone().expect("missing color gate")
+    });
+    let [black_condition, blue_condition] = &conditions;
+
+    let mut state = crate::types::game_state::GameState::new_two_player(42);
+    let source = crate::game::zones::create_object(
+        &mut state,
+        crate::types::identifiers::CardId(1),
+        crate::types::player::PlayerId(0),
+        "Djinn".to_string(),
+        crate::types::zones::Zone::Battlefield,
+    );
+    state
+        .objects
+        .get_mut(&source)
+        .unwrap()
+        .card_types
+        .core_types
+        .push(crate::types::card_type::CoreType::Creature);
+    let applies = |state: &crate::types::game_state::GameState, condition: &StaticCondition| {
+        crate::game::layers::evaluate_condition(
+            state,
+            condition,
+            crate::types::player::PlayerId(0),
+            source,
+        )
+    };
+    assert!(!applies(&state, black_condition));
+    assert!(!applies(&state, blue_condition));
+
+    let black = crate::game::zones::create_object(
+        &mut state,
+        crate::types::identifiers::CardId(2),
+        crate::types::player::PlayerId(0),
+        "Black permanent".to_string(),
+        crate::types::zones::Zone::Battlefield,
+    );
+    let black_object = state.objects.get_mut(&black).unwrap();
+    black_object
+        .card_types
+        .core_types
+        .push(crate::types::card_type::CoreType::Artifact);
+    black_object.color = vec![ManaColor::Black];
+    assert!(applies(&state, black_condition));
+    assert!(!applies(&state, blue_condition));
+
+    let blue = crate::game::zones::create_object(
+        &mut state,
+        crate::types::identifiers::CardId(3),
+        crate::types::player::PlayerId(0),
+        "Blue permanent".to_string(),
+        crate::types::zones::Zone::Battlefield,
+    );
+    let blue_object = state.objects.get_mut(&blue).unwrap();
+    blue_object
+        .card_types
+        .core_types
+        .push(crate::types::card_type::CoreType::Artifact);
+    blue_object.color = vec![ManaColor::Blue];
+    assert!(applies(&state, black_condition));
+    assert!(applies(&state, blue_condition));
+
+    let second_blue = crate::game::zones::create_object(
+        &mut state,
+        crate::types::identifiers::CardId(4),
+        crate::types::player::PlayerId(0),
+        "Second blue permanent".to_string(),
+        crate::types::zones::Zone::Battlefield,
+    );
+    let second_blue_object = state.objects.get_mut(&second_blue).unwrap();
+    second_blue_object
+        .card_types
+        .core_types
+        .push(crate::types::card_type::CoreType::Artifact);
+    second_blue_object.color = vec![ManaColor::Blue];
+    assert!(!applies(&state, black_condition));
+    assert!(applies(&state, blue_condition));
 }
 
 /// CR 509.1b (#4590 review): a granted ability's OWN inner "unless" must stay
@@ -32130,7 +33026,7 @@ fn static_self_dynamic_pump_for_each_other_creature_you_control_with_counter() {
 /// granted instance. It must also carry `InZone{Hand}`.
 #[test]
 fn without_foretell_routes_to_keyword_kind_not_concrete() {
-    let (filter, remainder) = crate::parser::oracle_target::parse_type_phrase(
+    let (filter, remainder) = crate::parser::oracle_target::parse_type_phrase_folding(
         "nonland card in your hand without foretell",
     );
     assert!(
@@ -33989,7 +34885,7 @@ fn parse_legendary_black_creatures_you_control() {
     )));
 }
 
-// Decline guard: the new fallback delegates to `parse_type_phrase` and
+// Decline guard: the new fallback delegates to `parse_type_phrase_folding` and
 // requires FULL consumption of the subject as a single `Typed` filter. An
 // unrecognized leading word before "legendary" must not be silently accepted
 // as a fabricated filter — it must still fall through to `Unimplemented`
@@ -34003,7 +34899,7 @@ fn parse_unrecognized_word_legendary_creatures_you_control_declines() {
 }
 
 // Review finding: the compound-descriptor fallback must decline for a
-// descriptor `parse_type_phrase` fully consumes but that carries NEITHER a
+// descriptor `parse_type_phrase_folding` fully consumes but that carries NEITHER a
 // color NOR a supertype — a full-consumption check alone is not a narrow
 // enough acceptance gate. Saryth, the Viper's Fang and Augusta, Dean of Order
 // both read "Other tapped creatures you control have/get <predicate>." and
@@ -34011,7 +34907,7 @@ fn parse_unrecognized_word_legendary_creatures_you_control_declines() {
 // "untapped" are combat-status words, not colors or supertypes. Before the
 // property gate, `parse_typed_you_control`'s unconditional final `else`
 // wrongly claimed BOTH of these (each fully consumes through
-// `parse_type_phrase` as a bare `Typed(Creature)` filter with a `Tapped`/
+// `parse_type_phrase_folding` as a bare `Typed(Creature)` filter with a `Tapped`/
 // `Untapped` property, satisfying the old remainder-only check), preventing
 // dispatch from ever reaching whichever OTHER handler correctly resolves
 // these two real, unrelated cards and silently changing their parsed
@@ -35422,11 +36318,10 @@ fn veterans_voice_bare_untapped_activation_gate_is_absorbed() {
 
     // Coverage honesty: no clause of either ability may remain Unimplemented.
     fn chain_clean(def: &crate::types::ability::AbilityDefinition) -> bool {
-        !matches!(&*def.effect, crate::types::ability::Effect::Unimplemented { .. })
-            && def
-                .sub_ability
-                .as_deref()
-                .is_none_or(chain_clean)
+        !matches!(
+            &*def.effect,
+            crate::types::ability::Effect::Unimplemented { .. }
+        ) && def.sub_ability.as_deref().is_none_or(chain_clean)
     }
     assert!(
         parsed.abilities.iter().all(chain_clean),
@@ -35507,5 +36402,698 @@ fn bare_attached_tap_state_restriction_parses() {
         )
         .is_some(),
         "'enchanted creature is untapped' must parse as a restriction condition"
+    );
+}
+
+/// Havi's static condition is a live, controller-scoped historic-card graveyard
+/// count. The historic adjective remains on the typed zone filter.
+#[test]
+fn havi_historic_graveyard_gate_parses_with_reminder_text() {
+    let def = parse_static_line(
+        "Havi has indestructible as long as there are four or more historic cards in your graveyard. (Artifacts, legendaries, and Sagas are historic.)",
+    )
+    .expect("Havi's first Oracle line must parse as a static");
+    assert_eq!(def.affected, Some(TargetFilter::SelfRef));
+    assert_eq!(
+        def.modifications,
+        vec![ContinuousModification::AddKeyword {
+            keyword: Keyword::Indestructible,
+        }]
+    );
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ZoneCardCount {
+                    zone: ZoneRef::Graveyard,
+                    card_types: vec![],
+                    filter: Some(TargetFilter::Typed(TypedFilter {
+                        type_filters: vec![TypeFilter::Card],
+                        controller: None,
+                        properties: vec![FilterProp::Historic],
+                    })),
+                    scope: CountScope::Controller,
+                },
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: 4 },
+        })
+    );
+}
+
+// ===========================================================================
+// Issue #8395 — the animation clause silently dropped from compound continuous
+// statics. Idol of False Gods is the type specimen. Each test names the
+// verification-matrix row it discharges and carries an explicit reach-guard:
+// positive evidence the changed path ran, never the mere absence of a failure.
+// ===========================================================================
+
+/// V1 + V2 (CR 613.1d + CR 613.4b + CR 613.1f): Idol of False Gods' printed line,
+/// with the card's self-reference normalized to `~` exactly as the production
+/// pipeline does upstream (`oracle.rs:449` runs `normalize_card_name_refs`
+/// before line splitting).
+///
+/// The whole defect in one assertion set. The line reaches the legacy `" has "`
+/// arm only AFTER `try_split_inverted_as_long_as` rewrites the inverted
+/// "As long as <cond>, <effect>" form into canonical
+/// "<effect> as long as <cond>" order — and in THAT order the conjunct's
+/// `" has "` precedes the gate's `" as long as "`. The old arm sliced from that
+/// `" has "`, discarded the entire animation clause, and hardcoded `SelfRef`,
+/// exporting `[AddKeyword{Annihilator(2)}]` and nothing else.
+///
+/// REACH-GUARD: the Annihilator assertion passes both before and after the fix.
+/// That is precisely what makes it evidence the static was CLAIMED rather than
+/// vanishing — it is deliberately not independent coverage.
+#[test]
+fn idol_of_false_gods_animates_and_keeps_annihilator() {
+    let def = parse_static_line(
+        "As long as ~ has eight or more +1/+1 counters on it, it's a 0/0 creature in addition to its other types and it has annihilator 2.",
+    )
+    .expect("Idol's compound animation static must parse");
+    let mods = &def.modifications;
+    assert!(
+        mods.contains(&ContinuousModification::AddKeyword {
+            keyword: Keyword::Annihilator(2),
+        }),
+        "reach-guard: Annihilator 2 must still be granted, proving the line was claimed; mods = {mods:?}"
+    );
+    assert!(
+        mods.contains(&ContinuousModification::AddType {
+            core_type: CoreType::Creature,
+        }),
+        "CR 613.1d (Layer 4): Idol must become a creature; mods = {mods:?}"
+    );
+    assert!(
+        mods.contains(&ContinuousModification::SetPower { value: 0 })
+            && mods.contains(&ContinuousModification::SetToughness { value: 0 }),
+        "CR 613.4b (Layer 7b): base P/T 0/0 must be set; mods = {mods:?}"
+    );
+    assert!(
+        !mods
+            .iter()
+            .any(|m| matches!(m, ContinuousModification::SetCardTypes { .. })),
+        "CR 205.1b: \"in addition to its other types\" RETAINS the prior card types, \
+         so no replacing SetCardTypes may be emitted; mods = {mods:?}"
+    );
+    assert!(
+        def.condition
+            .as_ref()
+            .is_some_and(|c| !c.contains_unrecognized()),
+        "CR 611.3a: the eight-counter gate must type, not fall back to Unrecognized; \
+         condition = {:?}",
+        def.condition
+    );
+}
+
+/// V6 (CR 613.1d Layer 4 + CR 613.4b Layer 7b + CR 613.1f Layer 6): the conjunct
+/// axis across all four grant verbs — the two pronoun forms times the two verb
+/// families, exercised as one `opt` and one `alt` rather than a permutation
+/// chain.
+///
+/// REACH-GUARD: every case asserts the ANIMATION half and the KEYWORD half in
+/// the SAME definition. A test asserting only the keyword would pass against the
+/// legacy arm that dropped the animation entirely; one asserting only the
+/// animation would pass against a peel that swallowed the conjunct.
+#[test]
+fn animation_conjunct_emits_both_halves_for_every_grant_verb() {
+    for (line, keyword) in [
+        (
+            "it's a 0/0 creature in addition to its other types and it has annihilator 2",
+            Keyword::Annihilator(2),
+        ),
+        (
+            "it's a 0/0 creature in addition to its other types and has trample",
+            Keyword::Trample,
+        ),
+        (
+            "it's a 0/0 creature in addition to its other types and it gains flying",
+            Keyword::Flying,
+        ),
+        (
+            "they're a 0/0 creature in addition to their other types and they gain vigilance",
+            Keyword::Vigilance,
+        ),
+    ] {
+        let def = parse_static_line(line)
+            .unwrap_or_else(|| panic!("compound animation static must parse; line = {line:?}"));
+        let mods = &def.modifications;
+        assert!(
+            mods.contains(&ContinuousModification::AddType {
+                core_type: CoreType::Creature,
+            }),
+            "animation half (CR 613.1d) must survive the conjunct; line = {line:?}, mods = {mods:?}"
+        );
+        assert!(
+            mods.contains(&ContinuousModification::SetPower { value: 0 })
+                && mods.contains(&ContinuousModification::SetToughness { value: 0 }),
+            "base P/T (CR 613.4b) must survive the conjunct; line = {line:?}, mods = {mods:?}"
+        );
+        assert!(
+            mods.contains(&ContinuousModification::AddKeyword {
+                keyword: keyword.clone(),
+            }),
+            "conjunct keyword (CR 613.1f) must be carried; line = {line:?}, mods = {mods:?}"
+        );
+    }
+}
+
+/// V6 hostile sibling: a NON-grant conjunct verb must not be peeled. "and loses
+/// defender" is an ability-REMOVING clause (still CR 613.1f, Layer 6) already
+/// owned elsewhere; the new boundary combinator matches only the four grant
+/// verbs, so this line must keep its existing shape.
+#[test]
+fn animation_conjunct_boundary_ignores_non_grant_verbs() {
+    let def =
+        parse_static_line("it's a 0/0 creature in addition to its other types and loses defender")
+            .expect(
+                "a non-grant conjunct must retain its existing parse path; the previous `if let \
+         Some(def)` let an unintended decline satisfy this test without asserting anything",
+            );
+    assert!(
+        !def.modifications.is_empty(),
+        "a non-grant conjunct must not be turned into an empty-modification static; \
+         mods = {:?}",
+        def.modifications
+    );
+}
+
+/// V7: an unrecognized conjunct is honest, not swallowed.
+///
+/// REACH-GUARD: the SAME line minus the conjunct must still parse fully. That
+/// pairing is what proves the decline is a DECISION taken by the conjunct peel
+/// rather than an unrelated upstream miss — without it, a `None` from any
+/// earlier arm would satisfy the test.
+#[test]
+fn unrecognized_animation_conjunct_declines_rather_than_half_parsing() {
+    let with_nonsense = "it's a 0/0 creature in addition to its other types and it has florblewick";
+    let claimed = parse_static_line(with_nonsense);
+    assert!(
+        claimed.is_none(),
+        "an unmappable conjunct must decline the whole line so it surfaces as unimplemented, \
+         rather than emitting the animation and silently dropping the ability; got {claimed:?}"
+    );
+
+    let without = "it's a 0/0 creature in addition to its other types";
+    let def = parse_static_line(without)
+        .expect("reach-guard: the bare animation clause must still parse");
+    assert!(
+        def.modifications
+            .contains(&ContinuousModification::AddType {
+                core_type: CoreType::Creature,
+            }),
+        "reach-guard: the animation half is supported on its own, so the decline above is \
+         attributable to the conjunct; mods = {:?}",
+        def.modifications
+    );
+}
+
+/// V8 (CR 604.1): a quoted-ability conjunct no longer vanishes. Before this
+/// change the line exported `[]` — a total silent loss of both halves.
+///
+/// REACH-GUARD: the animation half is asserted alongside the grant, so the test
+/// cannot pass on a downstream arm that claims the line while emitting only one
+/// of the two.
+#[test]
+fn quoted_ability_animation_conjunct_is_granted_not_dropped() {
+    let line = "it's a 0/0 creature in addition to its other types and it has \
+                \"When this creature dies, draw a card.\"";
+    let def = parse_static_line(line)
+        .expect("a quoted-ability conjunct must be claimed by the shared quoted-ability authority");
+    let mods = &def.modifications;
+    assert!(
+        mods.contains(&ContinuousModification::AddType {
+            core_type: CoreType::Creature,
+        }),
+        "reach-guard: the animation half must survive; mods = {mods:?}"
+    );
+    assert!(
+        mods.iter().any(|m| matches!(
+            m,
+            ContinuousModification::GrantTrigger { .. }
+                | ContinuousModification::GrantAbility { .. }
+        )),
+        "CR 604.1: the quoted ability must be granted, not dropped; mods = {mods:?}"
+    );
+}
+
+/// V9: the rewritten `dispatch.rs` self-ref keyword arm keeps its legitimate
+/// coverage, in BOTH printed orientations — the postfix form and the inverted
+/// form that `try_split_inverted_as_long_as` rewrites into it.
+///
+/// REACH-GUARD: assert the condition is a TYPED `IsPresent`, not `Unrecognized`.
+/// A bare "still returns AddKeyword" would pass even if some other arm claimed
+/// the line. This is also where a case-preservation regression surfaces: the new
+/// combinator runs on LOWERED text, so a lowercased "you control a forest"
+/// reaching `parse_static_condition` would degrade the gate to `Unrecognized`
+/// and fail here.
+#[test]
+fn self_ref_keyword_as_long_as_keeps_typed_condition_in_both_orders() {
+    for line in [
+        "~ has flying as long as you control a Forest.",
+        "As long as you control a Forest, ~ has trample.",
+    ] {
+        let def = parse_static_line(line)
+            .unwrap_or_else(|| panic!("legitimate self-ref keyword static must parse; {line:?}"));
+        assert_eq!(
+            def.affected,
+            Some(TargetFilter::SelfRef),
+            "CR 613.1f: a self-referential grant affects its own source; line = {line:?}"
+        );
+        assert!(
+            def.condition
+                .as_ref()
+                .is_some_and(|c| !c.contains_unrecognized()),
+            "the Forest gate must type; a lowercased subject would degrade it to Unrecognized; \
+             line = {line:?}, condition = {:?}",
+            def.condition
+        );
+    }
+}
+
+/// V10: the empty-modification mouth is closed. The legacy arm returned `Some`
+/// with `modifications: []` whenever the keyword text failed to map — a static
+/// that claims support and does nothing, with no honesty marker at all.
+///
+/// REACH-GUARD: the same shape with a MAPPABLE keyword must still return `Some`
+/// carrying its `AddKeyword`. Without that pair a blanket decline would also
+/// satisfy the first assertion.
+#[test]
+fn self_ref_keyword_as_long_as_never_returns_empty_modifications() {
+    let unmappable = parse_static_line("~ has florblewick as long as you control a Forest.");
+    assert!(
+        unmappable.is_none(),
+        "an unmappable keyword must DECLINE. The weaker `!is_some_and(|d| \
+         d.modifications.is_empty())` this replaces was also satisfied by a `Some` carrying \
+         NON-empty modifications — a static that claims the line while granting something \
+         other than the keyword it failed to map; got {unmappable:?}"
+    );
+
+    let mappable = parse_static_line("~ has flying as long as you control a Forest.")
+        .expect("reach-guard: the mappable sibling must still parse");
+    assert!(
+        mappable
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: Keyword::Flying,
+            }),
+        "reach-guard: the arm still runs and only the empty case declines; mods = {:?}",
+        mappable.modifications
+    );
+}
+
+/// V5 (CR 613.1d + CR 613.4b + CR 613.1f): the shared additive-type leaf must
+/// return the COMPLETE modification set for a clause that also states P/T and
+/// keywords.
+///
+/// The input is Case of the Gorgon's Kiss's PRODUCTION string — the
+/// subject-stripped, un-`~`-normalized description the effect pipeline actually
+/// hands the leaf (measured at `/abilities[0]/effect/static_abilities[0]`), not
+/// the printed line. Testing the printed line would exercise a route this card
+/// never takes and could go green while the card stayed broken.
+///
+/// REACH-GUARD: the pre-existing `AddSubtype{Gorgon}` and `AddType{Creature}`
+/// must still be present ALONGSIDE the new `SetPower{4}`. That proves the
+/// pre-marker span is now animation-parsed rather than the leaf merely
+/// declining and something else filling in.
+#[test]
+fn additive_type_leaf_keeps_base_pt_and_pre_marker_keywords() {
+    let mods = parse_additive_type_clause_modifications(
+        "is a 4/4 Gorgon creature with deathtouch and lifelink in addition to its other types",
+    )
+    .expect("the additive-type leaf must claim this clause");
+    for expected in [
+        ContinuousModification::SetPower { value: 4 },
+        ContinuousModification::SetToughness { value: 4 },
+        ContinuousModification::AddKeyword {
+            keyword: Keyword::Deathtouch,
+        },
+        ContinuousModification::AddKeyword {
+            keyword: Keyword::Lifelink,
+        },
+        ContinuousModification::AddType {
+            core_type: CoreType::Creature,
+        },
+        ContinuousModification::AddSubtype {
+            subtype: "Gorgon".to_string(),
+        },
+    ] {
+        assert!(
+            mods.contains(&expected),
+            "missing {expected:?}; mods = {mods:?}"
+        );
+    }
+}
+
+/// V5 hostile sibling — the DOUBLE-EMIT GUARD. A clause with no leading `N/M`
+/// must keep the word-classification path: the new animation route is keyed on
+/// a LEADING fixed P/T precisely so it stays disjoint from the trailing
+/// "base power and toughness N/M" form that callers already emit themselves.
+/// If that keying ever loosened, this is what fails.
+#[test]
+fn additive_type_leaf_without_leading_pt_emits_no_base_pt() {
+    let mods =
+        parse_additive_type_clause_modifications("is a Gorgon in addition to its other types")
+            .expect("the type-only clause must still parse");
+    assert!(
+        mods.contains(&ContinuousModification::AddSubtype {
+            subtype: "Gorgon".to_string(),
+        }),
+        "reach-guard: the type-only clause still yields its subtype; mods = {mods:?}"
+    );
+    assert!(
+        !mods.iter().any(|m| matches!(
+            m,
+            ContinuousModification::SetPower { .. } | ContinuousModification::SetToughness { .. }
+        )),
+        "a clause with no leading N/M must not acquire a base P/T; mods = {mods:?}"
+    );
+}
+
+// --- Gourmand's Talent: leading turn-window composition (parse_static_line_inner terminal arm) ---
+//
+// CR 604.1 + CR 102.1 + CR 611.3a: "During your turn, <static>" / "During turns
+// other than yours, <static>" is a printed leading timing clause that scopes
+// WHEN a static ability's statement is true. The terminal arm of
+// `parse_static_line_inner` peels this window with the single authority
+// `static_helpers::parse_leading_turn_scope`, recurses on the remainder, and
+// composes the resulting `StaticCondition` onto whatever the recursed static
+// already carries — giving the composition ONE HOME instead of N ad hoc peels.
+//
+// `GOURMAND_L1` is the level-1 line of Gourmand's Talent (BLC) with the Class
+// pre-parser's self-reference normalization already applied ("this artifact"
+// -> `~`), matching what `oracle_class.rs` hands to `parse_static_line`.
+const GOURMAND_L1: &str = "During your turn, artifacts you control are Foods in addition to \
+their other types and have \"{2}, {T}, Sacrifice ~: You gain 3 life.\"";
+
+/// V1 — the level-1 line parses to a `Continuous` static carrying both
+/// `AddSubtype{Food}` and `GrantAbility`, gated `DuringYourTurn`. Today (before
+/// this change) this line returns `None` from every static parser and the
+/// card falls through to `Effect::Unimplemented`.
+#[test]
+fn during_your_turn_additive_food_grant_composes_turn_condition() {
+    let def = parse_static_line(GOURMAND_L1).expect("the windowed additive-type grant must parse");
+    assert_eq!(
+        def.mode,
+        StaticMode::Continuous,
+        "the composed static must remain Continuous: {def:?}"
+    );
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::DuringYourTurn),
+        "the leading window must become the static's condition: {def:?}"
+    );
+    assert_eq!(
+        def.affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::new(TypeFilter::Artifact).controller(ControllerRef::You)
+        )),
+        "affected must be artifacts you control: {def:?}"
+    );
+    assert!(
+        def.modifications
+            .contains(&ContinuousModification::AddSubtype {
+                subtype: "Food".to_string(),
+            }),
+        "must add the Food subtype: {:?}",
+        def.modifications
+    );
+    assert!(
+        def.modifications
+            .iter()
+            .any(|m| matches!(m, ContinuousModification::GrantAbility { .. })),
+        "must grant the quoted sacrifice-for-life ability: {:?}",
+        def.modifications
+    );
+}
+
+/// V2 — the negated polarity ("During turns other than yours, ") composes
+/// symmetrically, producing `Not{DuringYourTurn}` rather than dropping the
+/// window or emitting a bare `DuringYourTurn`.
+#[test]
+fn during_turns_other_than_yours_additive_grant_composes_negated_condition() {
+    let negated = GOURMAND_L1.replacen("During your turn, ", "During turns other than yours, ", 1);
+    let def = parse_static_line(&negated).expect("the negated windowed grant must parse");
+    assert_eq!(
+        def.condition,
+        Some(StaticCondition::Not {
+            condition: Box::new(StaticCondition::DuringYourTurn),
+        }),
+        "the negated window must become Not{{DuringYourTurn}}: {def:?}"
+    );
+    assert!(
+        def.modifications
+            .contains(&ContinuousModification::AddSubtype {
+                subtype: "Food".to_string(),
+            }),
+        "the negated line must still compose the same modifications: {:?}",
+        def.modifications
+    );
+}
+
+/// V3 — the class, not the card: three non-Gourmand shapes (subtype, land
+/// type, color) all compose with the leading window through the same terminal
+/// arm. Each is `None` at BASE (P-2 p02/p03/p05).
+#[test]
+fn during_your_turn_composes_onto_subtype_land_and_color_statics() {
+    let subtype_line =
+        "During your turn, creatures you control are Zombies in addition to their other types.";
+    let land_line =
+        "During your turn, lands you control are Mountains in addition to their other types.";
+    let color_line =
+        "During your turn, creatures you control are green in addition to their other colors.";
+
+    // Pin the CONCRETE subtype and the affected filter, not just non-emptiness:
+    // a non-empty check passes even when the parser recovers the wrong subtype
+    // or scopes the grant to the wrong controller, which is most of what could
+    // actually go wrong on these two lines.
+    let subtype_def =
+        parse_static_line(subtype_line).expect("subtype-granting windowed line must parse");
+    assert_eq!(subtype_def.condition, Some(StaticCondition::DuringYourTurn));
+    assert_eq!(
+        subtype_def.modifications,
+        vec![ContinuousModification::AddSubtype {
+            subtype: "Zombie".to_string()
+        }],
+        "{subtype_def:?}"
+    );
+    assert_eq!(
+        subtype_def.affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You)
+        )),
+        "the grant must be scoped to creatures YOU control: {subtype_def:?}"
+    );
+
+    let land_def = parse_static_line(land_line).expect("land-type windowed line must parse");
+    assert_eq!(land_def.condition, Some(StaticCondition::DuringYourTurn));
+    assert_eq!(
+        land_def.modifications,
+        vec![ContinuousModification::AddSubtype {
+            subtype: "Mountain".to_string()
+        }],
+        "{land_def:?}"
+    );
+    assert_eq!(
+        land_def.affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::land().controller(ControllerRef::You)
+        )),
+        "the grant must be scoped to lands YOU control: {land_def:?}"
+    );
+
+    let color_def = parse_static_line(color_line).expect("color-granting windowed line must parse");
+    assert_eq!(color_def.condition, Some(StaticCondition::DuringYourTurn));
+    assert!(
+        color_def
+            .modifications
+            .iter()
+            .any(|m| matches!(m, ContinuousModification::AddColor { .. })),
+        "{:?}",
+        color_def.modifications
+    );
+}
+
+/// V4 — ORDERING INVARIANT: Bello, Bard of the Brambles is still claimed by
+/// its dedicated owner (`type_change::parse_each_compound_subject_type_change`),
+/// not by the general terminal arm reached through recursion. The fingerprint
+/// is modification ORDER: the dedicated owner emits `SetPower`/`SetToughness`
+/// FIRST (from the leading "is a 4/4 ... creature" clause), whereas the
+/// terminal arm's own recursion into `anthem::parse_subject_continuous_static`
+/// would emit `AddSubtype` first on the bare remainder. This is a regression
+/// guard, not a revert-failing test: Bello parses identically before and after
+/// this change (measured, P-2 p14).
+#[test]
+fn bello_verbatim_line_retains_each_compound_subject_owner() {
+    let line = "During your turn, each non-Equipment artifact and non-Aura enchantment you \
+                control with mana value 4 or greater is a 4/4 Elemental creature in addition \
+                to its other types and has indestructible, haste, and \"Whenever this creature \
+                deals combat damage to a player, draw a card.\"";
+    let defs = parse_static_line_multi(line);
+    assert_eq!(defs.len(), 1, "Bello is one compound static: {defs:?}");
+    let def = &defs[0];
+    assert_eq!(
+        def.modifications.first(),
+        Some(&ContinuousModification::SetPower { value: 4 }),
+        "the dedicated compound-subject owner must emit SetPower first: {:?}",
+        def.modifications
+    );
+    assert_eq!(
+        def.modifications.get(1),
+        Some(&ContinuousModification::SetToughness { value: 4 }),
+        "then SetToughness: {:?}",
+        def.modifications
+    );
+}
+
+/// V5 — HOSTILE / lying-green: an unenforceable recursed static (Elvish
+/// Refueler's remainder parses to `Continuous` with ZERO modifications) is
+/// REFUSED by `is_enforceable_continuous_static`, so the card stays an honest
+/// `Effect::Unimplemented` rather than becoming a silent no-op that reports as
+/// supported.
+///
+/// PAIRED POSITIVE REACH-GUARD (mandatory): the remainder alone is asserted to
+/// parse to `Some(Continuous, [])`, proving the recursion reached a real parse
+/// and was refused by the `!modifications.is_empty()` gate — not vacuously
+/// because the peel itself failed to fire.
+#[test]
+fn during_your_turn_unenforceable_remainder_stays_unsupported() {
+    const ELVISH_REFUELER_LINE: &str = "During your turn, as long as you haven't activated an \
+        exhaust ability this turn, you may activate exhaust abilities as though they haven't \
+        been activated.";
+    const ELVISH_REFUELER_REMAINDER: &str = "as long as you haven't activated an exhaust ability \
+        this turn, you may activate exhaust abilities as though they haven't been activated.";
+
+    assert!(
+        parse_static_line(ELVISH_REFUELER_LINE).is_none(),
+        "an unenforceable recursed static must not be accepted through the window"
+    );
+
+    let remainder_def = parse_static_line(ELVISH_REFUELER_REMAINDER)
+        .expect("reach-guard: the bare remainder must still parse on its own");
+    assert_eq!(
+        remainder_def.mode,
+        StaticMode::Continuous,
+        "{remainder_def:?}"
+    );
+    assert!(
+        remainder_def.modifications.is_empty(),
+        "reach-guard: the remainder must be the zero-modification shape the gate refuses: {:?}",
+        remainder_def.modifications
+    );
+}
+
+/// V5b — HOSTILE / silently-inert gate: a remainder that DOES carry
+/// modifications but whose condition tree contains `StaticCondition::Unrecognized`
+/// must also be refused.
+///
+/// This is the other half of V5's hazard and the more dangerous one. V5's
+/// remainder is refused for having zero modifications; this one would sail past
+/// that conjunct. `game::layers::evaluate_condition` maps `Unrecognized` to
+/// `true`, so composing the window onto it would apply `AddSubtype{Food}` for
+/// the whole of the controller's turn while silently discarding the printed
+/// "as long as …" restriction — wrong game behavior, not merely absent
+/// behavior. Refusing keeps the line an honest `Effect::Unimplemented`.
+#[test]
+fn during_your_turn_unrecognized_condition_remainder_stays_unsupported() {
+    const LINE: &str = "During your turn, artifacts you control are Foods in addition to their \
+                        other types as long as the harvest moon is waxing.";
+    const REMAINDER: &str = "artifacts you control are Foods in addition to their other types as \
+                             long as the harvest moon is waxing.";
+
+    assert!(
+        parse_static_line(LINE).is_none(),
+        "a remainder whose condition tree is Unrecognized must not be composed with the window"
+    );
+
+    // PAIRED POSITIVE REACH-GUARD: the bare remainder really does reach a parse
+    // and really does produce the dangerous shape — Continuous, NON-empty
+    // modifications, Unrecognized condition — so the refusal above comes from
+    // the new `contains_unrecognized` conjunct and not vacuously from a peel
+    // that never fired or a remainder that never parsed.
+    let remainder_def = parse_static_line(REMAINDER)
+        .expect("reach-guard: the bare remainder must still parse on its own");
+    assert_eq!(
+        remainder_def.mode,
+        StaticMode::Continuous,
+        "{remainder_def:?}"
+    );
+    assert!(
+        !remainder_def.modifications.is_empty(),
+        "reach-guard: this remainder must clear V5's non-empty conjunct, so that the \
+         Unrecognized conjunct is what refuses it: {remainder_def:?}"
+    );
+    assert!(
+        remainder_def
+            .condition
+            .as_ref()
+            .is_some_and(StaticCondition::contains_unrecognized),
+        "reach-guard: the remainder's condition must be the Unrecognized shape: {:?}",
+        remainder_def.condition
+    );
+}
+
+/// V6 — HOSTILE / two authorities: a remainder that already carries its own
+/// `as long as` condition must COMPOSE with the leading window via
+/// `StaticCondition::And`, never drop either one.
+#[test]
+fn during_your_turn_composes_with_remainder_condition() {
+    let line = "During your turn, artifacts you control are Foods in addition to their other \
+                types as long as you control a Forest.";
+    let def = parse_static_line(line).expect("the two-condition composed line must parse");
+    let Some(StaticCondition::And { conditions }) = def.condition.clone() else {
+        panic!(
+            "expected And{{DuringYourTurn, <inner>}}, got {:?}",
+            def.condition
+        );
+    };
+    assert_eq!(conditions.len(), 2, "{conditions:?}");
+    assert_eq!(
+        conditions[0],
+        StaticCondition::DuringYourTurn,
+        "the outer (peeled) condition must be first: {conditions:?}"
+    );
+    // Pin the CONCRETE inner variant, not merely "not DuringYourTurn". A bare
+    // `assert_ne!` would also pass on a duplicated window or on any wrong
+    // variant that happens not to equal `DuringYourTurn`, so it proves far less
+    // than it appears to. `IsPresent` is the shape "as long as you control a
+    // <type>" actually produces (measured through the export pipeline, not
+    // assumed).
+    //
+    // The always-true `StaticCondition::Unrecognized` shape is NOT what this
+    // assertion guards: `is_enforceable_continuous_static` now refuses it
+    // upstream via `contains_unrecognized`, so such a line never reaches a
+    // composed `And` at all — see
+    // `during_your_turn_unrecognized_condition_remainder_stays_unsupported`,
+    // which pins that refusal directly.
+    assert!(
+        matches!(conditions[1], StaticCondition::IsPresent { .. }),
+        "the inner (recursed) condition must be the remainder's own concrete \
+         IsPresent gate, never a duplicate window and never the always-true \
+         Unrecognized fallback: {conditions:?}"
+    );
+}
+
+/// V7 — Regression: an already-claimed windowed line (Bedrock Tortoise) is
+/// untouched by the new terminal arm, because its dedicated per-parser peel
+/// (or an earlier dispatcher arm) still claims it first.
+#[test]
+fn during_your_turn_keyword_grant_unchanged() {
+    let line = "During your turn, creatures you control have hexproof.";
+    let def = parse_static_line(line).expect("Bedrock Tortoise's first line must parse");
+    assert_eq!(def.condition, Some(StaticCondition::DuringYourTurn));
+    assert_eq!(
+        def.affected,
+        Some(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You)
+        )),
+        "{def:?}"
+    );
+    assert_eq!(
+        def.modifications,
+        vec![ContinuousModification::AddKeyword {
+            keyword: Keyword::Hexproof
+        }],
+        "{:?}",
+        def.modifications
     );
 }

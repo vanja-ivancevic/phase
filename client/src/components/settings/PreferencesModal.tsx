@@ -40,7 +40,6 @@ import type {
   CardSizePreference,
   CommandZoneDisplay,
   DraftCardPreviewMode,
-  LogDefaultState,
   MultiplayerBoardLayout,
   SpellPaymentMode,
   ZoneCollapseMode,
@@ -58,6 +57,9 @@ import { useCloudSyncStore } from "../../stores/cloudSyncStore.ts";
 import { useSetCatalog } from "../../hooks/useSetSymbols.ts";
 import { DiscordIcon, GoogleIcon } from "../ui/ProviderIcons";
 import { VisualPackManager } from "./visual-packs/VisualPackManager.tsx";
+import { OfflinePreparationSection } from "./OfflinePreparationSection.tsx";
+
+import { TroubleshootingDialog } from "../help/TroubleshootingDialog";
 
 export type SettingsHighlight = "board-background";
 
@@ -78,6 +80,7 @@ const LANGUAGE_OPTIONS: { value: SupportedLng; label: string }[] = [
   { value: "it", label: "Italiano" },
   { value: "pt", label: "Português" },
   { value: "pl", label: "Polski" },
+  { value: "ja", label: "日本語" },
 ];
 
 const CARD_SIZES: CardSizePreference[] = ["small", "medium", "large"];
@@ -87,7 +90,6 @@ const CARD_PREVIEW_MODES: CardPreviewMode[] = ["follow", "side", "shift"];
 const DRAFT_CARD_PREVIEW_MODES: DraftCardPreviewMode[] = ["none", ...CARD_PREVIEW_MODES];
 const DRAFT_DOUBLE_CLICK_CONFIRM_PICK_OPTIONS: Array<"disabled" | "enabled"> = ["disabled", "enabled"];
 const SPELL_PAYMENT_MODES: SpellPaymentMode[] = ["auto", "autoExceptSacrificialMana", "manual"];
-const LOG_DEFAULTS: LogDefaultState[] = ["open", "closed"];
 const VFX_QUALITIES: VfxQuality[] = ["full", "reduced", "minimal"];
 const MULTIPLAYER_BOARD_LAYOUTS: MultiplayerBoardLayout[] = ["auto", "focused", "split"];
 
@@ -101,6 +103,7 @@ function formatSpeed(value: number, max: number, labels: { instant: string; slow
 }
 const SETTINGS_TABS = [
   { id: "gameplay" },
+  { id: "experimental" },
   { id: "visual" },
   { id: "combat" },
   { id: "audio" },
@@ -153,6 +156,8 @@ export function PreferencesModal({
   returnFocusRef,
 }: PreferencesModalProps) {
   const { t } = useTranslation("settings");
+  const [troubleshootingOpen, setTroubleshootingOpen] = useState(false);
+  const troubleshootingButtonRef = useRef<HTMLButtonElement>(null);
   const setFlexEditMode = useUiStore((s) => s.setFlexEditMode);
   const boardBackgroundRef = useRef<HTMLDivElement | null>(null);
   const visualTabRef = useRef<HTMLButtonElement>(null);
@@ -177,10 +182,10 @@ export function PreferencesModal({
   const commandZoneDisplay = usePreferencesStore((s) => s.commandZoneDisplay);
   const collapseLands = usePreferencesStore((s) => s.collapseLands);
   const collapseSupport = usePreferencesStore((s) => s.collapseSupport);
-  const logDefaultState = usePreferencesStore((s) => s.logDefaultState);
   const multiplayerBoardLayout = usePreferencesStore((s) => s.multiplayerBoardLayout);
   const spellPaymentMode = usePreferencesStore((s) => s.spellPaymentMode);
   const priorityPassingMode = usePreferencesStore((s) => s.priorityPassingMode);
+  const experimentalTournamentsEnabled = usePreferencesStore((s) => s.experimentalTournamentsEnabled);
   const boardBackground = usePreferencesStore((s) => s.boardBackground);
   const vfxQuality = usePreferencesStore((s) => s.vfxQuality);
   const animationSpeedMultiplier = usePreferencesStore((s) => s.animationSpeedMultiplier);
@@ -189,10 +194,10 @@ export function PreferencesModal({
   const setCommandZoneDisplay = usePreferencesStore((s) => s.setCommandZoneDisplay);
   const setCollapseLands = usePreferencesStore((s) => s.setCollapseLands);
   const setCollapseSupport = usePreferencesStore((s) => s.setCollapseSupport);
-  const setLogDefaultState = usePreferencesStore((s) => s.setLogDefaultState);
   const setMultiplayerBoardLayout = usePreferencesStore((s) => s.setMultiplayerBoardLayout);
   const setSpellPaymentMode = usePreferencesStore((s) => s.setSpellPaymentMode);
   const setPriorityPassingMode = usePreferencesStore((s) => s.setPriorityPassingMode);
+  const setExperimentalTournamentsEnabled = usePreferencesStore((s) => s.setExperimentalTournamentsEnabled);
   const setBoardBackground = usePreferencesStore((s) => s.setBoardBackground);
   const customBackgroundUrl = usePreferencesStore((s) => s.customBackgroundUrl);
   const setCustomBackgroundUrl = usePreferencesStore((s) => s.setCustomBackgroundUrl);
@@ -325,6 +330,8 @@ export function PreferencesModal({
   const [activeTab, setActiveTab] = useState<SettingsTabId>(initialTab);
 
   return (
+    <>
+    {troubleshootingOpen && <TroubleshootingDialog onClose={() => setTroubleshootingOpen(false)} returnFocusRef={troubleshootingButtonRef} />}
     <ModalPanelShell
       title={t("modal.title")}
       subtitle={t("modal.subtitle")}
@@ -351,6 +358,7 @@ export function PreferencesModal({
                   </button>
                 ))}
               </nav>
+              <button ref={troubleshootingButtonRef} type="button" onClick={() => setTroubleshootingOpen(true)} className="mt-2 min-h-11 rounded-xl border border-white/10 bg-white/5 px-3 py-2 text-sm text-slate-200 hover:bg-white/10 active:bg-white/20 focus-visible:outline focus-visible:outline-2 focus-visible:outline-cyan-300">{t("common:troubleshooting.title")}</button>
               <div className="hidden shrink-0 border-t border-white/5 pt-6 pb-8 md:block">
                 <ResetAllFooter resetAllPreferences={resetAllPreferences} />
               </div>
@@ -441,15 +449,6 @@ export function PreferencesModal({
                     />
                   </SettingGroup>
 
-                  <SettingGroup label={t("gameplay.logDefault")}>
-                    <SegmentedControl
-                      options={LOG_DEFAULTS}
-                      value={logDefaultState}
-                      onChange={setLogDefaultState}
-                      renderLabel={(opt) => t(`gameplay.logDefaultOptions.${opt}`)}
-                    />
-                  </SettingGroup>
-
                   <SettingGroup label={t("gameplay.spellPayment")}>
                     <SegmentedControl
                       options={SPELL_PAYMENT_MODES}
@@ -506,6 +505,27 @@ export function PreferencesModal({
                       )}
                     </SettingGroup>
                   </div>
+                </SettingsSection>
+              )}
+
+              {activeTab === "experimental" && (
+                <SettingsSection title={t("experimental.title")}>
+                  <SettingGroup label={t("experimental.tournaments")}>
+                    <label className="flex min-h-11 items-start gap-2">
+                      <input
+                        type="checkbox"
+                        checked={experimentalTournamentsEnabled}
+                        onChange={(event) => setExperimentalTournamentsEnabled(event.target.checked)}
+                        className="mt-1 accent-cyan-500"
+                      />
+                      <span className="text-sm text-slate-200">
+                        {t("experimental.showTournaments")}
+                        <span className="mt-0.5 block text-xs leading-relaxed text-slate-400">
+                          {t("experimental.showTournamentsDescription")}
+                        </span>
+                      </span>
+                    </label>
+                  </SettingGroup>
                 </SettingsSection>
               )}
 
@@ -820,6 +840,13 @@ export function PreferencesModal({
 
               {activeTab === "data" && (
         <>
+          {/* Not gated on the desktop shell. The service worker precaches the
+              app shell, engine WASM and card data for the browser too, so a
+              readiness checklist is meaningful there — and the browser is where
+              a player is most likely to be surprised by a broken offline
+              session. The native-engine row reports "not applicable" off
+              desktop, which is exactly what it is. */}
+          <OfflinePreparationSection nativeEngineEnabled={nativeEngineEnabled} />
           <VisualPackManager />
           <CloudSyncSection />
           <DataSection />
@@ -831,6 +858,7 @@ export function PreferencesModal({
             </div>
           </div>
     </ModalPanelShell>
+    </>
   );
 }
 
@@ -952,6 +980,7 @@ function CloudSyncSection() {
   const available = useCloudSyncStore((s) => s.available);
   const identity = useCloudSyncStore((s) => s.identity);
   const sessionResolved = useCloudSyncStore((s) => s.sessionResolved);
+  const paused = useCloudSyncStore((s) => s.paused);
   const status = useCloudSyncStore((s) => s.status);
   const error = useCloudSyncStore((s) => s.error);
   const lastSyncedAt = useCloudSyncStore((s) => s.lastSyncedAt);
@@ -966,9 +995,9 @@ function CloudSyncSection() {
   // who keep file backup as their data-portability path.
   if (!available) return null;
 
-  const syncing = status === "syncing";
+  const syncing = !paused && status === "syncing";
 
-  const statusLine =
+  const statusDetail =
     status === "error" ? (
       <span className="text-rose-400">
         {t("sync.statusError")}
@@ -984,6 +1013,8 @@ function CloudSyncSection() {
       })
     );
 
+  const statusLine = paused ? t("sync.statusPaused") : statusDetail;
+
   return (
     <SettingsSection title={t("sync.title")}>
       <p className="text-xs text-slate-400">{t("sync.description")}</p>
@@ -992,27 +1023,34 @@ function CloudSyncSection() {
       {!sessionResolved ? (
         // Session restore in flight — withhold the sign-in CTA so a signed-in
         // user doesn't see the prompt flash before identity adopts.
-        <p className="text-xs text-slate-500">{t("sync.statusSyncing")}</p>
+        <p className="text-xs text-slate-500">
+          {paused ? statusLine : t("sync.statusSyncing")}
+        </p>
       ) : !identity ? (
-        <div className="flex flex-wrap gap-2">
-          <button
-            className={SYNC_BUTTON_CLASS}
-            onClick={() => void signIn("discord")}
-          >
-            <span className="flex items-center gap-2">
-              <DiscordIcon className="h-4 w-4" />
-              {t("sync.signInWith", { provider: t("sync.providerDiscord") })}
-            </span>
-          </button>
-          <button
-            className={SYNC_BUTTON_CLASS}
-            onClick={() => void signIn("google")}
-          >
-            <span className="flex items-center gap-2">
-              <GoogleIcon className="h-4 w-4" />
-              {t("sync.signInWith", { provider: t("sync.providerGoogle") })}
-            </span>
-          </button>
+        <div className="flex flex-col gap-3">
+          {paused && <p className="text-xs text-slate-500">{statusLine}</p>}
+          <div className="flex flex-wrap gap-2">
+            <button
+              className={SYNC_BUTTON_CLASS}
+              disabled={paused}
+              onClick={() => void signIn("discord")}
+            >
+              <span className="flex items-center gap-2">
+                <DiscordIcon className="h-4 w-4" />
+                {t("sync.signInWith", { provider: t("sync.providerDiscord") })}
+              </span>
+            </button>
+            <button
+              className={SYNC_BUTTON_CLASS}
+              disabled={paused}
+              onClick={() => void signIn("google")}
+            >
+              <span className="flex items-center gap-2">
+                <GoogleIcon className="h-4 w-4" />
+                {t("sync.signInWith", { provider: t("sync.providerGoogle") })}
+              </span>
+            </button>
+          </div>
         </div>
       ) : (
         <div className="flex flex-col gap-3">
@@ -1059,18 +1097,21 @@ function CloudSyncSection() {
               <div className="flex flex-wrap gap-2">
                 <button
                   className={SYNC_BUTTON_CLASS}
+                  disabled={paused}
                   onClick={() => void resolveConflict("cloud")}
                 >
                   {t("sync.keepCloud")}
                 </button>
                 <button
                   className={SYNC_BUTTON_CLASS}
+                  disabled={paused}
                   onClick={() => void resolveConflict("local")}
                 >
                   {t("sync.keepLocal")}
                 </button>
                 <button
                   className={SYNC_BUTTON_CLASS}
+                  disabled={paused}
                   onClick={() => void resolveConflict("merge")}
                 >
                   {t("sync.keepBothDecks")}
@@ -1081,7 +1122,7 @@ function CloudSyncSection() {
             <div className="flex flex-wrap items-center gap-2">
               <button
                 className={SYNC_BUTTON_CLASS}
-                disabled={syncing}
+                disabled={syncing || paused}
                 onClick={() => void syncNow()}
               >
                 <span className="flex items-center gap-2">
@@ -1091,6 +1132,7 @@ function CloudSyncSection() {
               </button>
               <button
                 className={SYNC_BUTTON_CLASS}
+                disabled={paused}
                 onClick={() => void signOut()}
               >
                 {t("sync.signOut")}
@@ -1098,7 +1140,10 @@ function CloudSyncSection() {
             </div>
           )}
 
-          <p className="text-xs text-slate-500">{statusLine}</p>
+          <div className="flex flex-col gap-1 text-xs text-slate-500">
+            <p>{statusLine}</p>
+            {paused && <p>{statusDetail}</p>}
+          </div>
         </div>
       )}
     </SettingsSection>

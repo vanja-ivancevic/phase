@@ -79,19 +79,18 @@ pub fn resolve(
             );
         }
         GiftKind::TappedFish => {
-            let obj_id =
-                create_gift_token(
-                    state,
-                    events,
-                    opponent,
-                    "Fish",
-                    ability.source_id,
-                    ability.controller,
-                    |ct| {
-                        ct.core_types.push(CoreType::Creature);
-                        ct.subtypes.push("Fish".to_string());
-                    },
-                );
+            let obj_id = create_gift_token(
+                state,
+                events,
+                opponent,
+                "Fish",
+                ability.source_id,
+                ability.controller,
+                |ct| {
+                    ct.core_types.push(CoreType::Creature);
+                    ct.subtypes.push("Fish".to_string());
+                },
+            );
             if let Some(obj) = state.objects.get_mut(&obj_id) {
                 obj.color = vec![ManaColor::Blue];
                 obj.base_color = vec![ManaColor::Blue];
@@ -109,13 +108,10 @@ pub fn resolve(
         //
         // "After this one" is the ANCHOR: the extra turn follows the turn during
         // which the gift resolved, which is `state.active_player`'s — not the
-        // recipient's next turn. `enqueue_extra_turn` takes that anchor as its
-        // third argument, exactly as the effect resolver passes it.
+        // recipient's next turn. `enqueue_extra_turn` takes that anchor exactly
+        // as the effect resolver passes it.
         GiftKind::ExtraTurn => {
-            // CR 805.8: with shared team turns the extra turn is taken by the
-            // recipient's team; the same normalization the effect resolver does.
-            let recipient = crate::game::topology::normalize_shared_turn_recipient(state, opponent);
-            crate::game::turns::enqueue_extra_turn(state, recipient, state.active_player);
+            crate::game::turns::enqueue_extra_turn(state, opponent, state.active_player, events);
         }
     }
 
@@ -272,6 +268,25 @@ mod tests {
             vec![(PlayerId(1), state.active_player)],
             "CR 702.174g: the CHOSEN player takes the extra turn, after this one"
         );
+        assert_eq!(
+            events,
+            vec![
+                GameEvent::ExtraTurnCreated {
+                    player_id: PlayerId(1),
+                    anchor: state.active_player,
+                },
+                GameEvent::EffectResolved {
+                    kind: EffectKind::GiftDelivery,
+                    source_id: ObjectId(100),
+                    subject: None,
+                },
+            ]
+        );
+        let turn = &state.extra_turns[0];
+        let GameEvent::ExtraTurnCreated { player_id, anchor } = &events[0] else {
+            unreachable!();
+        };
+        assert_eq!((*player_id, *anchor), (turn.player, turn.anchor));
     }
 
     /// The negative that keeps the row above honest: an unpromised gift queues
@@ -286,6 +301,10 @@ mod tests {
         resolve(&mut state, &ability, &mut events).unwrap();
 
         assert!(state.extra_turns.is_empty());
+        assert!(events.is_empty());
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, GameEvent::ExtraTurnCreated { .. })));
     }
 
     #[test]

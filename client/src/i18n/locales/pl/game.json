@@ -1,19 +1,27 @@
 {
+  "playerLatency": {"host":"Host","waiting":"Oczekiwanie","value":"{{ms}} ms","description":"Opóźnienie w obie strony do hosta. Brak odpowiedzi nie rozłącza gry."},
   "abilityBlock": {
     "badge": "Zablokowana",
     "cantBeActivated": "Tej zdolności nie można aktywować",
     "cantActivateDuring": "Nie można teraz aktywować",
-    "prohibited": "Aktywacja tej zdolności jest zabroniona"
+    "prohibited": "Aktywacja tej zdolności jest zabroniona",
+    "costNotPayableNow": "Nie możesz teraz zapłacić tego kosztu"
   },
-  "manaSourceSelection": { "title": "Wybierz źródło many", "description": "Ta zdolność many wymaga poświęcenia permanenta.", "sacrifice": "Poświęć", "back": "Wróć do płatności many", "unknownSource": "Źródło many" },
+  "manaSourceSelection": {
+    "title": "Wybierz źródło many",
+    "description": "Ta zdolność many wymaga poświęcenia permanenta.",
+    "sacrifice": "Poświęć",
+    "back": "Wróć do płatności many",
+    "unknownSource": "Źródło many"
+  },
   "comboShortcut": {
     "declareTitle": "Loop Shortcut",
     "declareSubtitle": "You control a loop with a determined outcome. Take the shortcut to resolve it.",
     "respondTitle": "Loop Shortcut Proposed",
-    "respondSubtitle": "An opponent proposes taking a loop shortcut. Accept it, or break out to keep playing manually.",
+    "respondSubtitle": "An opponent proposes taking a loop shortcut. Accept it, or name the place where the sequence stops.",
     "confirm": "Take the shortcut",
     "accept": "Accept",
-    "shorten": "Break out",
+    "shorten": "Shorten it",
     "decline": "Decline the shortcut",
     "untilLethal": "Repeat until the game ends.",
     "fixedCount_one": "Repeat at most once.",
@@ -21,10 +29,27 @@
     "convokeInfo_one": "Auto-taps up to 1 creature for convoke each iteration.",
     "convokeInfo_other": "Auto-taps up to {{count}} creatures for convoke each iteration.",
     "countAria": "Number of iterations",
+    "countDecreaseAria": "Zmniejsz liczbę powtórzeń",
+    "countIncreaseAria": "Zwiększ liczbę powtórzeń",
     "previewTitle_one": "Repeating once produces:",
     "previewTitle_other": "Repeating {{count}} times produces:",
     "previewEntry": "{{amount}} {{resource}}",
     "previewEntryPlayer": "{{amount}} {{resource}} — {{player}}",
+    "allocationTitle": "Rozdziel powtórzenia pomiędzy cele:",
+    "allocationAria": "Powtórzenia dla {{subject}}",
+    "allocationDecreaseAria": "Zmniejsz powtórzenia dla {{subject}}",
+    "allocationIncreaseAria": "Zwiększ powtórzenia dla {{subject}}",
+    "allocationSum": "Przydzielono {{allocated}} z {{total}} powtórzeń.",
+    "evenSplit": "Przywróć równy podział",
+    "customDistribution": "Własny podział — silnik nie przygotował podglądu tego podziału.",
+    "announceTitle": "Wybierz cel ogłaszany w każdym powtórzeniu:",
+    "announce": "Ogłoś",
+    "announceAria": "Ogłoś {{subject}}",
+    "mayTitle": "Zdolność opcjonalna {{group}} — powtórzyć ten wybór w każdej iteracji?",
+    "mayTake": "Skorzystaj",
+    "mayDecline": "Odrzuć",
+    "mayTakeAria": "Skorzystaj ze zdolności opcjonalnej {{group}}",
+    "mayDeclineAria": "Odrzuć zdolność opcjonalną {{group}}",
     "winKind": {
       "LethalDamage": "This loop deals lethal damage.",
       "PoisonLoss": "This loop gives lethal poison counters.",
@@ -32,6 +57,13 @@
       "ImmediateWin": "This loop wins the game.",
       "ExtraTurns": "This loop takes infinite extra turns.",
       "Advantage": "This loop generates unbounded advantage."
+    },
+    "respondDeclaredTitle": "Proponowana deklaracja:",
+    "respondAllocationEntry": "{{subject}} — ×{{repetitions}}",
+    "respondOrderEntry": "{{position}}. {{subject}}",
+    "respondDecision": {
+      "take": "{{subject}} — wykorzystanie w każdej iteracji",
+      "decline": "{{subject}} — odrzucenie w każdej iteracji"
     }
   },
   "precastShortcut": {
@@ -46,9 +78,23 @@
   },
   "restoredAutomation": {
     "dismiss": "Zamknij",
-    "noop": {"title": "Wczytano zapisaną grę", "summary_one": "Nie trzeba było wznawiać automatyzacji stosu.", "summary_other": "Nie trzeba było wznawiać automatyzacji stosu."},
-    "progressed": {"title": "Wznowiono automatyzację stosu", "summary_one": "Silnik ukończył {{count}} automatyczne rozpatrzenie.", "summary_other": "Silnik ukończył {{count}} automatyczne rozpatrzenia.", "omitted_one": "Pominięto {{count}} zdarzenie pośrednie.", "omitted_other": "Pominięto {{count}} zdarzeń pośrednich."},
-    "zeroResolutionRepair": {"title": "Naprawiono automatyzację stosu", "summary_one": "Zapisana automatyzacja została bezpiecznie naprawiona przed wznowieniem gry.", "summary_other": "Zapisana automatyzacja została bezpiecznie naprawiona przed wznowieniem gry."}
+    "noop": {
+      "title": "Wczytano zapisaną grę",
+      "summary_one": "Nie trzeba było wznawiać automatyzacji stosu.",
+      "summary_other": "Nie trzeba było wznawiać automatyzacji stosu."
+    },
+    "progressed": {
+      "title": "Wznowiono automatyzację stosu",
+      "summary_one": "Silnik ukończył {{count}} automatyczne rozpatrzenie.",
+      "summary_other": "Silnik ukończył {{count}} automatyczne rozpatrzenia.",
+      "omitted_one": "Pominięto {{count}} zdarzenie pośrednie.",
+      "omitted_other": "Pominięto {{count}} zdarzeń pośrednich."
+    },
+    "zeroResolutionRepair": {
+      "title": "Naprawiono automatyzację stosu",
+      "summary_one": "Zapisana automatyzacja została bezpiecznie naprawiona przed wznowieniem gry.",
+      "summary_other": "Zapisana automatyzacja została bezpiecznie naprawiona przed wznowieniem gry."
+    }
   },
   "resolveAllConsent": {
     "eyebrow": "Rozpatrz wszystko",
@@ -59,6 +105,7 @@
   },
   "debugCreate": {
     "copies": "Kopie",
+    "asToken": "Utwórz jako żeton",
     "tokenPower": "Power",
     "tokenToughness": "Toughness",
     "tokenPowerPlaceholder": "Power",
@@ -265,8 +312,10 @@
     "underAttack_one": "Atakowany przez {{count}} stwora",
     "underAttack_other": "Atakowany przez {{count}} stworów",
     "target": "Cel",
+    "token": "Żeton",
+    "tokenTooltip": "Żeton będący kopią prawdziwej karty",
     "copy": "Kopia",
-    "copyTooltip": "Kopia tokenowa prawdziwej karty",
+    "copyTooltip": "Nietokenowy permanent kopiujący inną kartę",
     "cantBeBlocked": "Nie może zostać zablokowana",
     "ringBearer": "Pierścień",
     "ringBearerTooltip": "Powiernik Pierścienia",
@@ -466,6 +515,8 @@
     "enduringStoryTooltip": "Trwała historia — zdobyta za kontrolowanie permanenta ze Storied i co najmniej trzech artefaktów, legendarnych permanentów i/lub Sag; trwa do końca gry",
     "dungeonAriaLabel": "Wyprawa w {{name}}, {{roomName}}, pokój {{room}} z {{total}}",
     "dungeonRoomTooltip": "{{roomName}} — pokój {{room}} z {{total}}",
+    "dungeonMapLoading": "Wczytywanie karty lochu…",
+    "dungeonMapUnavailable": "Obraz karty lochu niedostępny",
     "dungeonTooltip": "Wyprawa w {{name}}",
     "poisonAriaLabel_one": "{{count}} znacznik trucizny",
     "poisonAriaLabel_other": "{{count}} znaczników trucizny",
@@ -513,6 +564,8 @@
     "unboundedConditionalYouTooltip": "Nieograniczone: {{resource}} (∞) — zwinięcie oczekuje; może pozostać nieograniczone, a jeśli nie — podasz liczbę",
     "unboundedMixedTooltip": "Nieograniczone: {{resource}} (∞) — część tej grupy ma oczekujące zwinięcie; część pozostaje nieograniczona",
     "unboundedConditionalGlyph": "∞→?",
+    "boundedLoopGlyph": "≤{{bound}}×",
+    "boundedLoopTooltip": "{{resource}} z wykrytej pętli, maksymalnie {{bound}} powtórzeń",
     "unboundedManaPoolMarker": "Nieograniczona mana (∞)",
     "unboundedMana": "mana",
     "unboundedLife": "życie",
@@ -917,6 +970,7 @@
     "genericEvent": "Zdarzenie: {{type}}",
     "searchPlaceholder": "Search log…",
     "allTurns": "All turns",
+    "turnFilterLabel": "Filtruj według tury",
     "turnChip": "T{{turn}}",
     "entryCount": "{{count}} entries",
     "copy": "Copy",
@@ -1730,6 +1784,12 @@
     "untapSubset": {
       "title": "Choose permanents to untap",
       "subtitle": "Untap up to {{count}} of these permanents."
+    },
+    "rippleBottom": {
+      "title": "Order the rest on the bottom",
+      "subtitle_one": "Put {{count}} revealed card on the bottom of your library",
+      "subtitle_other": "Put {{count}} revealed cards on the bottom of your library, in any order",
+      "hint": "Drag to reorder · position 1 ends up on top of this pile"
     }
   },
   "specializeColor": {
@@ -1942,10 +2002,15 @@
     "subtitleCascade": "Cascade wygnało {{name}} (wartość many poniżej {{sourceMv}}). Rzuć go bez płacenia jego kosztu many lub odmów i przetasuj wszystkie {{total}} wygnanych kart na spód swojej biblioteki.",
     "subtitleDiscover": "Discover wygnało {{name}}. Rzuć go bez płacenia jego kosztu many lub weź go do ręki i przetasuj pozostałe {{missCount}} wygnanych kart na spód swojej biblioteki.",
     "subtitleRipple": "Ripple ujawniło {{name}}. Rzuć go bez płacenia jego kosztu many lub odmów i umieść wszystkie {{total}} ujawnionych kart na spodzie swojej biblioteki w losowej kolejności.",
-    "subtitleGraveyardPaid": "Rzuć {{name}} z cmentarza, płacąc jej koszt many — można wydać manę dowolnego typu. Albo odmów i zostaw ją na cmentarzu.",
+    "subtitleGraveyardPaid": "Rzuć {{name}} z cmentarza, płacąc jej koszt many{{extra}}{{concession}}. Albo odmów i zostaw ją na cmentarzu.",
     "castNamed": "Rzuć {{name}}",
     "castSuffix": "(bez płacenia jego kosztu many)",
-    "castPaidSuffix": "(zapłać jej koszt many — można wydać manę dowolnego typu)",
+    "castPaidSuffix": "(zapłać jej koszt many{{extra}}{{concession}})",
+    "paidExtraFragment": " plus {{extra}}",
+    "paidAnyTypeSubtitleFragment": " — można wydać manę dowolnego typu",
+    "paidAnyColorSubtitleFragment": " — można wydać manę dowolnego koloru",
+    "paidAnyTypeSuffixFragment": " — można wydać manę dowolnego typu",
+    "paidAnyColorSuffixFragment": " — można wydać manę dowolnego koloru",
     "putIntoHand": "Weź do ręki",
     "decline": "Odmów",
     "discoverDeclineSuffix": "(połóż resztę na spód)",
@@ -2057,6 +2122,7 @@
     "exportClientSnapshot": "Eksportuj migawkę klienta",
     "exported": "Wyeksportowano",
     "exportFailed": "Eksport nie powiódł się",
+    "exportRequested": "Eksport niepotwierdzony",
     "copyDiagnostic": "Kopiuj diagnostykę",
     "copied": "Skopiowano!",
     "reportOnGithub": "Zgłoś na GitHub",
@@ -2160,7 +2226,7 @@
     "yes": "Tak",
     "no": "Nie",
     "dontAskAgain": "Nie pytaj ponownie w tej grze",
-    "dontAskAgainForSameCard": "Zastosuj do każdej kopii tej karty"
+    "dontAskAgainForSameCard": "Użyj tego wyboru dla każdej kopii tej karty w tej grze"
   },
   "resolutionOptionalPayment": {
     "title": "Wybierz opcjonalną opłatę",
@@ -2227,8 +2293,21 @@
   "replacement": {
     "eyebrow": "Kolejność rozpatrywania",
     "title": "Efekty zastępujące",
-    "subtitle": "Wybierz, który efekt zastępujący zastosować jako pierwszy.",
-    "candidateFallback": "Efekt zastępujący {{number}}"
+    "orderSubtitle": "Wszystkie te efekty zmieniają przebieg tego zdarzenia. Przeciągnij, aby ustalić kolejność — ostatni zastosowany efekt jest tym, który zadziała (CR 616.1).",
+    "appliedFirst": "Zastosowany pierwszy (zostanie nadpisany)",
+    "appliedLast": "Zastosowany ostatni — ten zadziała",
+    "resultLabel": "Wynik: {{outcome}}",
+    "confirmOrder": "Potwierdź kolejność",
+    "dragHint": "Przeciągnij, aby zmienić kolejność, lub użyj strzałek.",
+    "chooseSubtitle": "Wybierz, który efekt zastępujący zastosować.",
+    "candidateFallback": "Efekt zastępujący {{number}}",
+    "orderSubtitleComposing": "Wszystkie te efekty zmieniają przebieg tego zdarzenia. Przeciągnij, aby ustawić kolejność ich zastosowania — każdy zostanie zastosowany, więc kolejność zmienia wynik (CR 616.1).",
+    "appliedEarlier": "Zastosowany wcześniej",
+    "appliedLater": "Zastosowany później",
+    "composesNote": "Każdy efekt zostaje zastosowany — kolejność zmienia sposób ich połączenia.",
+    "moveUpNamed": "Przenieś {{name}} wcześniej",
+    "moveDownNamed": "Przenieś {{name}} później",
+    "positionAnnounce": "Pozycja {{position}} z {{total}}"
   },
   "retargetChoice": {
     "title": "Zmień cel",
@@ -2281,6 +2360,24 @@
     "moveDown": "Przesuń w dół",
     "triggerFallback": "Wyzwalacz {{number}}"
   },
+  "costReductionOrder": {
+    "eyebrow": "Kolejność obniżek kosztu",
+    "title": "Ustal kolejność swoich obniżek kosztu",
+    "subtitle": "Te obniżki ustalają inny koszt całkowity w zależności od kolejności, w jakiej je zastosujesz (CR 601.2f). Wierzch tej listy stosowany jest jako pierwszy.",
+    "appliedFirst": "Stosowana jako pierwsza",
+    "appliedLast": "Stosowana jako ostatnia",
+    "lockedCost": "Ustalony koszt całkowity",
+    "lockedCostUnknown": "Taki sam jak jeden z poniższych kosztów",
+    "outcomesHeading": "Koszty, które możesz ustalić",
+    "reachColoredOnly": "Obniża tylko kolorową manę",
+    "reachSpills": "Może obniżyć manę ogólną",
+    "multiplier": "×{{count}}",
+    "confirmOrder": "Potwierdź kolejność",
+    "cancelCast": "Anuluj rzucanie",
+    "moveUp": "Przesuń w górę",
+    "moveDown": "Przesuń w dół",
+    "reductionFallback": "Obniżka {{number}}"
+  },
   "unhandledWaitingFor": {
     "title": "Wymagana akcja, ale brakuje interfejsu",
     "body": "Gra oczekuje na twoją akcję, ale ta wersja phase.rs nie ma jeszcze do tego interfejsu. To błąd — prosimy go zgłosić, abyśmy mogli go naprawić. Użyj przycisku poniżej, aby opuścić grę.",
@@ -2307,7 +2404,17 @@
   },
   "outsideGame": {
     "fromExile": "Z wygnania",
-    "fromSideboard": "Z zaplecza"
+    "fromSideboard": "Z zaplecza",
+    "fromBoosterPack": "Z boostera {{setCode}}",
+    "fromCubeBoosterPack": "Z boostera cube"
+  },
+  "boosterPack": {
+    "title": "Booster {{setCode}}",
+    "cubeTitle": "Booster cube",
+    "subtitleExact_one": "Wybierz {{count}} kartę do zatrzymania – reszta zostaje usunięta z gry",
+    "subtitleExact_other": "Wybierz {{count}} kart do zatrzymania – reszta zostaje usunięta z gry",
+    "subtitleUpTo_one": "Wybierz do {{count}} karty do zatrzymania – reszta zostaje usunięta z gry",
+    "subtitleUpTo_other": "Wybierz do {{count}} kart do zatrzymania – reszta zostaje usunięta z gry"
   },
   "phaseName": {
     "Untap": "Odwracanie",
@@ -2341,6 +2448,18 @@
     },
     "buttons": {
       "keep": "Keep this"
+    }
+  },
+  "dieRoll": {
+    "ignore": {
+      "title": "Ignore a Roll",
+      "subtitle_one": "Choose which of the tied lowest rolls to ignore.",
+      "subtitle_other": "Choose {{count}} of the tied lowest rolls to ignore."
+    },
+    "buttons": {
+      "ignore": "Ignore this",
+      "ignoring": "Ignoring",
+      "keep": "Kept"
     }
   },
   "spectator": {
@@ -2427,6 +2546,7 @@
       "mulligan": "mulligan decision",
       "discarding": "discarding",
       "orderingTriggers": "ordering triggers",
+      "orderingCostReductions": "ordering cost reductions",
       "respondingToStack": "responding to the stack",
       "priorityCombat": "combat",
       "priorityMain": "main phase",
@@ -2442,11 +2562,21 @@
       "mulligan": "Mulligan",
       "discarding": "Discarding",
       "orderingTriggers": "Ordering triggers",
+      "orderingCostReductions": "Ordering cost reductions",
       "respondingToStack": "Responding",
       "priorityCombat": "Combat",
       "priorityMain": "Main phase",
       "priority": "Priority",
       "thinking": "Thinking"
     }
+  },
+  "rippleReveal": {
+    "eyebrow": "Ripple",
+    "title": "Reveal the top of your library?",
+    "subtitle_one": "You may reveal the top {{count}} card. Same-named cards can be cast free; the rest go to the bottom.",
+    "subtitle_other": "You may reveal the top {{count}} cards. Same-named cards can be cast free; the rest go to the bottom.",
+    "reveal_one": "Reveal {{count}} card",
+    "reveal_other": "Reveal {{count}} cards",
+    "decline": "Don't reveal"
   }
 }

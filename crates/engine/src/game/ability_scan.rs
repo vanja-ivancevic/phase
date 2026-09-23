@@ -96,9 +96,10 @@ use crate::types::ability::{
     ControllerRef, CountScope, DelayedTriggerCondition, Duration, EachDamageRecipient, Effect,
     EffectScope, FilterProp, ForEachCategoryAction, GuessSubject, KeeperConstraint, ManaProduction,
     ModalChoice, MultiTargetSpec, ObjectScope, PlayerFilter, PlayerScope, PtValue, QuantityExpr,
-    QuantityRef, RepeatContinuation, ReplacementCondition, ResolvedAbility, StaticCondition,
-    TargetFilter, TrackedAnaphorSource, TriggerCondition, TriggerConstraint, TriggerDefinition,
-    TypedFilter, UnlessPayModifier, ZoneChangeClause,
+    QuantityRef, ReciprocalZoneChoiceRole, RepeatContinuation, ReplacementCondition,
+    ResolvedAbility, StaticCondition, TargetFilter, TrackedAnaphorSource, TriggerCondition,
+    TriggerConstraint, TriggerDefinition, TypedFilter, UnlessPayModifier, ZoneChangeClause,
+    ZoneChoiceCandidateSource,
 };
 use crate::types::game_state::TargetSelectionConstraint;
 use crate::types::keywords::{DisguiseCost, Keyword};
@@ -245,6 +246,7 @@ fn resolved_ability_axes(a: &ResolvedAbility, mode: ScanMode) -> Axes {
         force_block_attacker: _,   // exact force-block referent, no dynamic read
         target_incarnations: _,    // CR 400.7 referent pins, no dynamic read
         selected_target_incarnations: _, // CR 400.7 selected-target pins, no dynamic read
+        illegal_target_slots: _,   // CR 608.2b resolution legality stamp, no dynamic read
         controller: _,             // player id
         original_controller: _,    // player id
         scoped_player: _,          // player id (iteration binding)
@@ -429,6 +431,45 @@ fn scan_target_selection_constraint(c: &TargetSelectionConstraint, mode: ScanMod
             value,
             comparator: _,
         } => scan_quantity_expr(value, mode),
+    }
+}
+
+/// Classify the candidate provenance of a zone choice on the read axes.
+///
+/// `Direct` reads only the named zone, so only a battlefield population can
+/// grow with the loop class. `Tracked` and `Legacy` can instead consume the
+/// current resolution-chain set, whose producer is not visible at this local
+/// effect node; classify both fail-closed. This is intentionally separate from
+/// the choice filter, which is scanned by the caller.
+fn scan_zone_choice_candidate_source(
+    candidate_source: ZoneChoiceCandidateSource,
+    zone: crate::types::zones::Zone,
+) -> Axes {
+    match candidate_source {
+        ZoneChoiceCandidateSource::Direct => {
+            if zone == crate::types::zones::Zone::Battlefield {
+                Axes {
+                    event: true,
+                    sibling: true,
+                    projected: false,
+                }
+            } else {
+                Axes::NONE
+            }
+        }
+        ZoneChoiceCandidateSource::Tracked | ZoneChoiceCandidateSource::Legacy => {
+            Axes::CONSERVATIVE
+        }
+    }
+}
+
+/// A reciprocal consumer reads the fresh set published by its producer. The
+/// producer writes that continuation-local set but performs no corresponding
+/// read, so it is read-free on this walk's three axes.
+fn scan_reciprocal_zone_choice_role(role: Option<ReciprocalZoneChoiceRole>) -> Axes {
+    match role {
+        None | Some(ReciprocalZoneChoiceRole::Produce) => Axes::NONE,
+        Some(ReciprocalZoneChoiceRole::Consume) => Axes::CONSERVATIVE,
     }
 }
 
@@ -697,7 +738,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc = acc.or(scan_target_filter(target, target_ctx, mode));
             acc
         }
-        Effect::ChooseCounterKind { target } => {
+        Effect::ChooseCounterKind { target, .. } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_target_filter(target, target_ctx, mode));
             acc
@@ -1195,6 +1236,20 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc = acc.or(scan_quantity_expr(count, mode));
             acc
         }
+        // CR 400.11b: identical scan shape to `SearchOutsideGame` — the only
+        // reads are the effect's own candidate filter and its take count. The
+        // pack's contents come from the shelf, not from board state.
+        Effect::OpenBoosterPack {
+            filter,
+            count,
+            destination: _,
+            reveal: _,
+        } => {
+            let mut acc = Axes::NONE;
+            acc = acc.or(scan_target_filter(filter, target_ctx, mode));
+            acc = acc.or(scan_quantity_expr(count, mode));
+            acc
+        }
         Effect::RevealHand {
             target,
             card_filter,
@@ -1534,20 +1589,18 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
         Effect::ProcessRadCounters => Axes::NONE,
         Effect::GrantCastingPermission { .. } => Axes::CONSERVATIVE,
         Effect::ChooseFromZone {
+            zone,
             filter,
-            count: _,
-            zone: _,
-            additional_zones: _,
-            zone_owner: _,
-            chooser: _,
-            up_to: _,
-            selection: _,
-            constraint: _,
+            candidate_source,
+            reciprocal_role,
+            ..
         } => {
             let mut acc = Axes::NONE;
             if let Some(x) = filter {
                 acc = acc.or(scan_target_filter(x, target_ctx, mode));
             }
+            acc = acc.or(scan_zone_choice_candidate_source(*candidate_source, *zone));
+            acc = acc.or(scan_reciprocal_zone_choice_role(*reciprocal_role));
             acc
         }
         // CR 608.2c: `target` is a SINGLE-OBJECT slot — the one recorded card
@@ -1589,10 +1642,7 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             ForEachCategoryAction::ExileFromPool { .. } => Axes::NONE,
         },
         Effect::ChooseObjectsIntoTrackedSet {
-            chooser,
-            filter,
-            min: _,
-            max: _,
+            chooser, filter, ..
         } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_target_filter(chooser, target_ctx, mode));
@@ -1798,9 +1848,10 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc = acc.or(scan_target_filter(target, target_ctx, mode));
             acc
         }
-        Effect::ExtraTurn { target } => {
+        Effect::ExtraTurn { target, count } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_target_filter(target, target_ctx, mode));
+            acc = acc.or(scan_quantity_expr(count, mode));
             acc
         }
         Effect::GrantExtraLoyaltyActivations { amount, target } => {
@@ -1853,9 +1904,14 @@ fn scan_effect(x: &Effect, mode: ScanMode) -> Axes {
             acc = acc.or(scan_quantity_expr(count, mode));
             acc
         }
-        Effect::Amass { count, subtype: _ } => {
+        Effect::Amass {
+            count,
+            subtype: _,
+            player,
+        } => {
             let mut acc = Axes::NONE;
             acc = acc.or(scan_quantity_expr(count, mode));
+            acc = acc.or(scan_target_filter(player, target_ctx, mode));
             acc
         }
         Effect::Monstrosity { count } => {
@@ -2905,7 +2961,7 @@ fn scan_ability_condition(x: &AbilityCondition, mode: ScanMode) -> Axes {
         AbilityCondition::TargetHasKeywordInstead { keyword: _ } => Axes::NONE,
         // `subject_slot: _` is a target-slot INDEX selector (CR 608.2c): `Some(n)`
         // tests `filter` against declared chain slot `n` (via
-        // `resolve_parent_slot_from_root`), `None` against the local most-recent
+        // `resolve_live_parent_slot_from_root`), `None` against the local most-recent
         // target. It reroutes WHICH already-declared target the filter reads and
         // introduces no new event/sibling/projected resource — the game-state read
         // is entirely through `filter` (scanned below). Axes-neutral; destructured
@@ -2923,7 +2979,7 @@ fn scan_ability_condition(x: &AbilityCondition, mode: ScanMode) -> Axes {
             ));
             acc
         }
-        AbilityCondition::HasObjectTarget => Axes::NONE,
+        AbilityCondition::HasObjectTarget | AbilityCondition::AllDeclaredTargetsLegal => Axes::NONE,
         AbilityCondition::TriggeringSpellTargetsFilter { filter } => {
             let mut acc = Axes {
                 event: true,
@@ -3071,7 +3127,16 @@ fn scan_ability_condition(x: &AbilityCondition, mode: ScanMode) -> Axes {
         }
         AbilityCondition::DayNightIsNeither => Axes::NONE,
         AbilityCondition::DayNightIs { state: _ } => Axes::NONE,
-        AbilityCondition::NthResolutionThisTurn { n: _ } => Axes {
+        // Both tallies are per-turn counters projected from this ability's own
+        // `(source_id, ability_index)` ledger entry — neither reads the
+        // triggering event nor any sibling's output, so the axes are identical
+        // for `Resolved` and `Activated`. Destructured without `..` so a future
+        // field forces re-classification here.
+        AbilityCondition::AbilityUseCountThisTurn {
+            tally: _,
+            comparator: _,
+            n: _,
+        } => Axes {
             event: false,
             sibling: false,
             projected: true,
@@ -3249,6 +3314,14 @@ fn scan_target_filter(x: &TargetFilter, ctx: FilterReadContext, mode: ScanMode) 
             sibling: false,
             projected: false,
         },
+        // Engine classification: reads `DamageDealt.target` off the firing
+        // event, so it carries the same `event` walker axis as `EventTarget`
+        // and `TriggeringSourceController`. Not a rules decision.
+        TargetFilter::EventTargetController => Axes {
+            event: true,
+            sibling: false,
+            projected: false,
+        },
         TargetFilter::ParentTarget => Axes {
             event: true,
             sibling: false,
@@ -3347,6 +3420,10 @@ fn scan_object_scope(x: &ObjectScope) -> Axes {
         // CR 120.1: per-iteration batch source — a resolution-filtered object
         // with no event/sibling axis (mirrors Source/Target).
         ObjectScope::BatchSource => Axes::NONE,
+        // CR 601.2c: the chain-root spell's own declared target, carried on the
+        // resolving ability's context — no event/sibling projected axis
+        // (mirrors Target/Demonstrative).
+        ObjectScope::ChainRootTarget => Axes::NONE,
         ObjectScope::EventTarget => Axes {
             event: true,
             sibling: false,
@@ -4000,12 +4077,15 @@ fn scan_delayed_trigger_condition(c: &DelayedTriggerCondition, mode: ScanMode) -
         // A phase coordinate. No payload position reaches a `TargetFilter` or a
         // `QuantityExpr`, so there is nothing to walk.
         DelayedTriggerCondition::AtNextPhase { phase: _ } => Axes::NONE,
-        // The same coordinate plus a `PlayerId` and a `TurnGate` turn-floor — a named
-        // player and a turn number. Neither reaches a filter or a quantity.
+        // The same coordinate plus a `PlayerId`, a `TurnGate` turn-floor, and a
+        // `DelayedTriggerPlayerBinding` (which player `player` resolves to at
+        // creation) — a named player, a turn number, and a binding tag. None
+        // reaches a filter or a quantity.
         DelayedTriggerCondition::AtNextPhaseForPlayer {
             phase: _,
             player: _,
             gate: _,
+            binding: _,
         } => Axes::NONE,
         // CR 603.7c: a delayed triggered ability that refers to a particular object.
         // `object_id` is already resolved, so there is no filter to walk and no
@@ -4423,6 +4503,7 @@ fn scan_filter_prop(x: &FilterProp, mode: ScanMode) -> Axes {
         }
         FilterProp::ProtectorMatches { controller } => scan_controller_ref(controller),
         FilterProp::Owned { controller } => scan_controller_ref(controller),
+        FilterProp::AttachedToPlayer { player } => scan_controller_ref(player),
         FilterProp::HasAttachment { controller, .. } => {
             controller.as_ref().map_or(Axes::NONE, scan_controller_ref)
         }
@@ -4452,7 +4533,7 @@ fn scan_filter_prop(x: &FilterProp, mode: ScanMode) -> Axes {
         // per-turn journal a loop pumps and `project_out_resources` clears — a
         // projected-resource read, PROVEN projected, fail closed (mirrors the
         // passive `WasDealtDamageThisTurn` arm above).
-        FilterProp::DealtDamageThisTurn => Axes::CONSERVATIVE,
+        FilterProp::DealtDamageThisTurn { .. } => Axes::CONSERVATIVE,
         // CR 400 / CR 603.6a: runtime eval reads `state.zone_changes_this_turn`, an
         // append-only event journal a loop pumps, cleared by `project_out_resources`
         // and strict-compared by nothing in gate (1). A flicker/blink loop keeps the
@@ -4762,7 +4843,13 @@ fn scan_replacement_condition(x: &ReplacementCondition, mode: ScanMode) -> Axes 
         ReplacementCondition::OnlyExtraTurn => Axes::NONE,
         ReplacementCondition::TokenSubtypeMatches { subtypes: _ } => Axes::NONE,
         ReplacementCondition::TokenCoreTypeMatches { core_types: _ } => Axes::NONE,
-        ReplacementCondition::FirstTokenCreationEachTurn { player: _ } => Axes::NONE,
+        ReplacementCondition::FirstTokenCreationEachTurn { active_player_req } => {
+            let mut acc = Axes::NONE;
+            if let Some(x) = active_player_req {
+                acc = acc.or(scan_controller_ref(x));
+            }
+            acc
+        }
         ReplacementCondition::ExceptFirstDrawInDrawStep => Axes::NONE,
         ReplacementCondition::IfControlsMatching { filter, minimum: _ } => {
             let mut acc = Axes::NONE;
@@ -4825,6 +4912,12 @@ fn scan_controller_ref(x: &ControllerRef) -> Axes {
         // restriction is enforced at target selection, not a walker axis).
         ControllerRef::TargetOpponent => Axes::NONE,
         ControllerRef::ParentTargetController => Axes {
+            event: true,
+            sibling: false,
+            projected: false,
+        },
+        // Engine classification: event-axis read, same as the sibling above.
+        ControllerRef::EventTargetController => Axes {
             event: true,
             sibling: false,
             projected: false,
@@ -4991,6 +5084,14 @@ fn ability_definition_axes(def: &AbilityDefinition, mode: ScanMode) -> Axes {
         sub_link: _,
         iteration_kind_binding: _,
         sibling_condition: _,
+        // Parser scratch, not runtime state: `parse_oracle_pipeline` settles every
+        // deferred guard verdict before it hands a tree out, so this is `None` on
+        // every tree that pipeline produces — which is every tree a runtime walker
+        // sees — and expresses no resolution-time read. (NOT a universal claim about
+        // the field: `parse_effect_chain` outside the pipeline leaves marks intact,
+        // and no runtime path reaches such a tree. See
+        // `types::ability::UnloweredGuard`.)
+        unlowered_guard: _,
     } = def;
 
     let mut acc = scan_effect(effect, mode);
@@ -5397,6 +5498,7 @@ pub(crate) fn keyword_cost_reads_growing_class(kw: &Keyword) -> bool {
         | Keyword::Spectacle(_)
         | Keyword::SplitSecond
         | Keyword::Spree
+        | Keyword::Tiered
         | Keyword::Squad(_)
         | Keyword::Storm
         | Keyword::Surge(_)
@@ -5617,6 +5719,7 @@ fn scan_keyword(kw: &Keyword, mode: ScanMode) -> Axes {
         | Keyword::WebSlinging(_)
         | Keyword::Discover(_)
         | Keyword::Spree
+        | Keyword::Tiered
         | Keyword::Ravenous
         | Keyword::Daybound
         | Keyword::Nightbound
@@ -6037,6 +6140,20 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         //     `battlefield_phased_in_ids()` for a non-targeted "double the counters on
         //     each matching permanent" when `ability.targets.is_empty()`.
         | Effect::MultiplyCounter { .. }
+        //   CR 701.10e (Double{Counters}): `double.rs` `resolve_double_counters` falls
+        //     through to `counters::nontargeted_counter_population_ids`, which mass-scans
+        //     `battlefield_phased_in_ids()` for a non-targeted "double the number of each
+        //     kind of counter on each matching permanent". Nothing STATIC separates
+        //     that mass mode from the announced-target mode — both are
+        //     `Double{Counters}` and only the resolved ability tells them apart — so
+        //     the counter-doubling sub-variant must census. `target_kind` WOULD let
+        //     the arm be narrowed to exclude the `LifeTotal` / `ManaPool` modes (the
+        //     `Effect::Suspect { scope: EffectScope::All, .. }` arm above field-gates
+        //     exactly that way); censusing the whole variant is a deliberate choice
+        //     for arm simplicity, and it is safe because it only over-vetoes — a
+        //     missed combo shortcut certificate, never a wrong game result. Narrowing
+        //     it needs its own census re-measurement, not just a tighter pattern.
+        | Effect::Double { .. }
         //   CR 608.2d + CR 122.1: a typed counter-kind source domain enumerates
         //     every matching permanent at resolution and unions the kinds of
         //     counters on them, so the read scales with battlefield growth.
@@ -6153,6 +6270,8 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         | Effect::FlipPermanent { .. }
         | Effect::SearchLibrary { .. }
         | Effect::SearchOutsideGame { .. }
+        // CR 400.11: the filter reads the OPENED PACK's cards, never the board.
+        | Effect::OpenBoosterPack { .. }
         | Effect::RevealHand { .. }
         | Effect::RevealFromHand { .. }
         | Effect::Reveal { .. }
@@ -6249,7 +6368,6 @@ fn effect_target_ctx(e: &Effect, mode: ScanMode) -> FilterReadContext {
         | Effect::SkipNextTurn { .. }
         | Effect::SkipNextStep { .. }
         | Effect::AdditionalPhase { .. }
-        | Effect::Double { .. }
         | Effect::RuntimeHandled { .. }
         | Effect::Incubate { .. }
         | Effect::Amass { .. }
@@ -6390,6 +6508,11 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::TurnFaceUp { .. }
         | Effect::TurnFaceDown { .. }
         | Effect::MultiplyCounter { .. }
+        // CR 701.10e: `Double{Counters}` shares `MultiplyCounter`'s non-targeted mass
+        // tier via `counters::nontargeted_counter_population_ids`; the variant carries
+        // no static discriminator for that mode, so it censuses whole. Mirror of the
+        // `effect_target_ctx` census member.
+        | Effect::Double { .. }
         // CR 608.2d + CR 122.1: a typed counter-kind source domain scans the
         // matching battlefield population and unions its counter kinds.
         | Effect::ChooseCounterKind { .. }
@@ -6440,6 +6563,8 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::Seek { .. }
         | Effect::SearchLibrary { .. }
         | Effect::SearchOutsideGame { .. }
+        // CR 400.11: reads a pack from OUTSIDE the game — no board population at all.
+        | Effect::OpenBoosterPack { .. }
         | Effect::RevealHand { .. }
         | Effect::RevealFromHand { .. }
         | Effect::Reveal { .. }
@@ -6621,7 +6746,6 @@ fn effect_census_role(e: &Effect) -> CensusRole {
         | Effect::SkipNextTurn { .. }
         | Effect::SkipNextStep { .. }
         | Effect::AdditionalPhase { .. }
-        | Effect::Double { .. }
         | Effect::RuntimeHandled { .. }
         | Effect::Incubate { .. }
         | Effect::Amass { .. }
@@ -6679,6 +6803,12 @@ pub(crate) fn effect_is_randomness_bearing(e: &Effect) -> bool {
         | Effect::ChaosEnsues
         | Effect::RollToVisitAttractions
         | Effect::AssembleContraptionsFromRollDifference
+        // CR 400.11 + CR 701.9b: opening a booster pack draws the seeded RNG
+        // twice — the shelf product and the pack's collation — and the cards it
+        // produces determine what the controller may then take. Unpredictable at
+        // pin time, so a loop body containing one is not a legal CR 732.2a
+        // shortcut.
+        | Effect::OpenBoosterPack { .. }
         // CR 701.30a: a clash reveals the top card of each player's (shuffled) library — hidden
         // information the recast injector cannot know at pin time. CR 701.30d: the winner is
         // decided by comparing those revealed mana values, so the outcome (and any action it
@@ -6948,8 +7078,9 @@ mod tests {
     use crate::types::ability::{
         AbilityKind, AggregateFunction, CastManaObjectScope, CastManaSpentMetric, Comparator,
         CostDerivation, DamageKindFilter, DelayedTriggerLifetime, DestinationConstraint,
-        ManaContribution, OriginConstraint, ReplacementDefinition, StaticDefinition, TurnGate,
-        WheneverEventExpiry, ZoneChangeClause,
+        ManaContribution, OriginConstraint, ReciprocalZoneChoiceRole, ReplacementDefinition,
+        StaticDefinition, TurnGate, WheneverEventExpiry, ZoneChangeClause,
+        ZoneChoiceCandidateSource, ZoneChoiceChooser, ZoneOwner,
     };
     use crate::types::counter::CounterType;
     use crate::types::identifiers::ObjectId;
@@ -6960,6 +7091,108 @@ mod tests {
     use crate::types::statics::StaticMode;
     use crate::types::triggers::TriggerMode;
     use crate::types::zones::Zone;
+
+    #[test]
+    fn extra_turn_scan_reaches_dynamic_count() {
+        let axes = scan_effect(
+            &Effect::ExtraTurn {
+                target: TargetFilter::Controller,
+                count: QuantityExpr::Ref {
+                    qty: QuantityRef::EventContextAmount,
+                },
+            },
+            ScanMode::LoopFirewall,
+        );
+        assert!(axes.event);
+    }
+
+    fn zone_choice_for_scan(
+        zone: Zone,
+        candidate_source: ZoneChoiceCandidateSource,
+        reciprocal_role: Option<ReciprocalZoneChoiceRole>,
+    ) -> Effect {
+        Effect::ChooseFromZone {
+            count: 1,
+            zone,
+            additional_zones: vec![],
+            zone_owner: ZoneOwner::Controller,
+            filter: None,
+            chooser: ZoneChoiceChooser::Controller,
+            candidate_source,
+            reciprocal_role,
+            up_to: false,
+            selection: Default::default(),
+            constraint: None,
+        }
+    }
+
+    /// Candidate provenance and reciprocal role carry resolution-chain reads
+    /// even though their direct graveyard/filter payloads are inert.
+    #[test]
+    fn zone_choice_provenance_and_reciprocal_reads_are_classified() {
+        let axes = |effect| scan_effect(&effect, ScanMode::LoopFirewall);
+        assert_eq!(
+            {
+                let x = axes(zone_choice_for_scan(
+                    Zone::Graveyard,
+                    ZoneChoiceCandidateSource::Direct,
+                    None,
+                ));
+                (x.event, x.sibling, x.projected)
+            },
+            (false, false, false),
+            "a direct graveyard scan has no growing-class read"
+        );
+        for (label, effect) in [
+            (
+                "tracked provenance",
+                zone_choice_for_scan(Zone::Graveyard, ZoneChoiceCandidateSource::Tracked, None),
+            ),
+            (
+                "legacy provenance",
+                zone_choice_for_scan(Zone::Graveyard, ZoneChoiceCandidateSource::Legacy, None),
+            ),
+            (
+                "reciprocal consumer",
+                zone_choice_for_scan(
+                    Zone::Graveyard,
+                    ZoneChoiceCandidateSource::Direct,
+                    Some(ReciprocalZoneChoiceRole::Consume),
+                ),
+            ),
+        ] {
+            let x = axes(effect);
+            assert_eq!(
+                (x.event, x.sibling, x.projected),
+                (true, true, true),
+                "{label} must fail closed because it consumes a resolution-chain set"
+            );
+        }
+        let producer = axes(zone_choice_for_scan(
+            Zone::Graveyard,
+            ZoneChoiceCandidateSource::Direct,
+            Some(ReciprocalZoneChoiceRole::Produce),
+        ));
+        assert_eq!(
+            (producer.event, producer.sibling, producer.projected),
+            (false, false, false),
+            "a reciprocal producer publishes, but does not read, its fresh tracked set"
+        );
+        let battlefield = axes(zone_choice_for_scan(
+            Zone::Battlefield,
+            ZoneChoiceCandidateSource::Direct,
+            None,
+        ));
+        assert_eq!(
+            (
+                battlefield.event,
+                battlefield.sibling,
+                battlefield.projected
+            ),
+            (true, true, false),
+            "a direct battlefield candidate pool is a live board census"
+        );
+    }
 
     #[test]
     fn property_aggregate_source_scan_axes_are_exhaustive() {
@@ -7439,7 +7672,7 @@ mod tests {
         // from `typed_filter_axes`, so this IS that arm's verdict for this shape.
         let by_target = typed_filter_axes(&target, ScanMode::LoopFirewall);
         let by_condition = scan_ability_condition(
-            &AbilityCondition::NthResolutionThisTurn { n: 2 },
+            &AbilityCondition::nth_resolution_this_turn(2),
             ScanMode::LoopFirewall,
         );
         let refs = [
@@ -7473,7 +7706,7 @@ mod tests {
         ];
         for (label, axes) in [
             ("ControllerMatches{OpponentLostLife}", by_target),
-            ("NthResolutionThisTurn", by_condition),
+            ("AbilityUseCountThisTurn", by_condition),
         ]
         .into_iter()
         .chain(
@@ -8184,6 +8417,7 @@ mod tests {
             // variant censuses, fail-closed). See the census-arm comment for CR cites.
             "BecomeCopy",
             "CopyTokenBlockingAttacker",
+            "Double",
             "GainActivatedAbilitiesOfTarget",
             "MultiplyCounter",
             "PhaseIn",
@@ -8196,7 +8430,7 @@ mod tests {
             got, want,
             "census tag set drifted from the enumeration-derived mass-population set"
         );
-        assert_eq!(got.len(), 31, "exactly 31 mass-population census tags");
+        assert_eq!(got.len(), 32, "exactly 32 mass-population census tags");
     }
 
     /// With `SnapshotOrEvent` the DEFAULT, the obligation-(ii)-PROVEN census-role
@@ -8343,7 +8577,7 @@ mod tests {
             etc_census, ecr_census,
             "effect_census_role Census set diverged from effect_target_ctx"
         );
-        assert_eq!(ecr_census.len(), 31, "exactly 31 census members");
+        assert_eq!(ecr_census.len(), 32, "exactly 32 census members");
 
         // -- Behavioral: the two oracles agree on the Census/Relax boundary for every
         // discriminator. `census(e, true)` requires BOTH `effect_census_role == Census`
@@ -8398,7 +8632,14 @@ mod tests {
         census(&settap, false);
         census(&Effect::HeistExile, false);
         census(&Effect::NoOp, false);
-        census(&Effect::ChooseCounterKind { target: f() }, true);
+        census(
+            &Effect::ChooseCounterKind {
+                target: f(),
+                domain: Default::default(),
+                chooser: Default::default(),
+            },
+            true,
+        );
         // CR 701.27a + CR 115.10a: mass Transform is a battlefield census in BOTH oracles
         // (scope:All), and a bounded single-target read (scope:Single) that relaxes. It is
         // a true Census, NOT the SetTapState relax exception (ObjectPt/ability write).
@@ -8475,8 +8716,9 @@ mod tests {
     /// CR 732.2a: the dual-mode mass-battlefield resolvers each census in BOTH
     /// oracles under `LoopFirewall`. Each
     /// enumerates the battlefield and applies the effect to EVERY matching object (scales
-    /// with the growing class) — six via a dual-mode "no explicit target ⇒ mass scan"
-    /// fallback, `CopyTokenBlockingAttacker` UNCONDITIONALLY — so relaxing its filter read
+    /// with the growing class) — each entry below via a dual-mode "no explicit target ⇒
+    /// mass scan" fallback, except `CopyTokenBlockingAttacker`, which scans
+    /// UNCONDITIONALLY — so relaxing its filter read
     /// risks a false combo certificate. There is no static discriminator between
     /// announced-single and mass modes, so the entire variant censuses.
     ///
@@ -8485,6 +8727,7 @@ mod tests {
     /// `effect_census_role`) flips its assertion below to a mismatch, turning this RED.
     #[test]
     fn round2_mass_battlefield_resolvers_census_in_both_oracles() {
+        use crate::types::ability::DoubleTarget;
         use crate::types::ability::GrantedAbilityScope;
         use ScanMode::LoopFirewall;
         let f = || TargetFilter::Typed(TypedFilter::creature());
@@ -8501,7 +8744,7 @@ mod tests {
             },
             Effect::BecomeCopy {
                 target: f(),
-                recipient: f(),
+                recipient: crate::types::ability::CopyRecipient::Untargeted(f()),
                 duration: None,
                 mana_value_limit: None,
                 additional_modifications: vec![],
@@ -8520,8 +8763,15 @@ mod tests {
                 source_filter: f(),
                 owner: TargetFilter::Controller,
             },
+            // CR 701.10e: `Double{Counters}` joined the dual-mode class when
+            // `resolve_double_counters` gained the shared non-targeted population
+            // fall-through (`counters::nontargeted_counter_population_ids`).
+            Effect::Double {
+                target_kind: DoubleTarget::Counters { counter_type: None },
+                target: f(),
+            },
         ];
-        assert_eq!(cases.len(), 8, "the eight round-2 census additions");
+        assert_eq!(cases.len(), 9, "the nine round-2 census additions");
         for e in &cases {
             assert_eq!(
                 effect_target_ctx(e, LoopFirewall),
@@ -8601,8 +8851,10 @@ mod tests {
             (
                 "counters.rs",
                 true,
-                "PutCounterAll (resolve_add_all) + MultiplyCounter (resolve_defined_or_\
-                 targets, targets-empty) mass battlefield counter scans",
+                "PutCounterAll (resolve_add_all) + the shared nontargeted_counter_\
+                 population_ids mass battlefield counter scan, consumed by \
+                 MultiplyCounter (resolve_defined_or_targets, targets-empty) here \
+                 and by Double{Counters} in double.rs",
             ),
             (
                 "goad.rs",
@@ -8943,7 +9195,7 @@ mod tests {
         ));
         // Ability-condition branch selector reading the per-ability resolution count.
         assert!(ability_condition_reads_projected_resource(
-            &AbilityCondition::NthResolutionThisTurn { n: 10 }
+            &AbilityCondition::nth_resolution_this_turn(10)
         ));
         // Static-condition dormant reader (poison).
         assert!(static_condition_reads_projected_resource(
@@ -9892,6 +10144,7 @@ mod tests {
                     phase: Phase::Upkeep,
                     player: PlayerId(0),
                     gate: TurnGate::AfterCreationTurn,
+                    binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
                 },
             ),
             (

@@ -64,7 +64,7 @@ pub(crate) fn parse_ignore_hexproof_static(
 
     // Map the subject phrase to a typed filter; require it to fully consume so a
     // partial parse never silently scopes the bypass wider than written.
-    let (filter, filter_remainder) = parse_type_phrase(subject.trim());
+    let (filter, filter_remainder) = parse_type_phrase_folding(subject.trim());
     if !filter_remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return None;
     }
@@ -1825,7 +1825,7 @@ pub(crate) fn parse_static_line_multi_inner(text: &str) -> Vec<StaticDefinition>
 /// keywords. Modeling it as one static with a shared condition (the prior fallback
 /// left the condition `Unrecognized`) made every keyword apply unconditionally.
 fn parse_keyword_grant_from_exiled_object_static(text: &str) -> Option<Vec<StaticDefinition>> {
-    // "As long as a[n] exiled " → the object phrase (original case for parse_type_phrase).
+    // "As long as a[n] exiled " → the object phrase (original case for parse_type_phrase_folding).
     let lower = text.to_lowercase();
     let (_, obj) = nom_on_lower(text, &lower, |i| {
         let (i, _) = tag::<_, _, OracleError<'_>>("as long as ").parse(i)?;
@@ -1835,7 +1835,7 @@ fn parse_keyword_grant_from_exiled_object_static(text: &str) -> Option<Vec<Stati
     })?;
 
     // The object type phrase; the remainder begins at " has <keyword>".
-    let (base_filter, remainder) = parse_type_phrase(obj);
+    let (base_filter, remainder) = parse_type_phrase_folding(obj);
     let TargetFilter::Typed(mut typed) = base_filter else {
         return None;
     };
@@ -2085,7 +2085,7 @@ fn parse_cant_attack_you_or_block_predicate(
 /// production in [`parse_subject_combat_rule_static`], so the object lowers
 /// through one grammar in both.
 ///
-/// Delegates to the full `parse_type_phrase` grammar, so the class covers any
+/// Delegates to the full `parse_type_phrase_folding` grammar, so the class covers any
 /// object that grammar can express — a subtype ("Warriors"), a controller
 /// scope ("creatures you control"), a card type ("artifact creatures"), a
 /// color ("black creatures"), a static or dynamic power comparison — rather
@@ -2098,7 +2098,7 @@ fn parse_cant_attack_you_or_block_predicate(
 /// callers that must additionally reject a self-referential object apply that
 /// rule themselves, so no caller inherits a restriction it did not ask for.
 pub(crate) fn parse_block_object_filter(input: &str) -> OracleResult<'_, TargetFilter> {
-    let (filter, rest) = parse_type_phrase(input);
+    let (filter, rest) = parse_type_phrase_folding(input);
     if rest.len() >= input.len() || matches!(filter, TargetFilter::Any) {
         return Err(super::oracle_nom::error::oracle_err(input));
     }
@@ -3486,14 +3486,6 @@ pub(crate) fn parse_static_condition(text: &str) -> Option<StaticCondition> {
         return Some(condition);
     }
 
-    // CR 105.2: "<color> is the most common color among all permanents[ or is
-    // tied for most common]" (the Prophecy djinns). The tie tail is redundant —
-    // the runtime predicate treats every color at the maximum histogram count
-    // as most-common — so both phrasings map to the same condition.
-    if let Some(condition) = parse_color_is_most_common_color_condition(tp.lower) {
-        return Some(condition);
-    }
-
     // "the chosen color is [color]"
     if let Some(color_name) = nom_tag_lower(tp.lower, tp.lower, "the chosen color is ") {
         let trimmed = color_name.trim().trim_end_matches('.');
@@ -4327,29 +4319,6 @@ pub(crate) fn parse_shares_most_common_color_condition(lower: &str) -> Option<St
         .then_some(StaticCondition::SharesColorWithMostCommonColorAmongPermanents)
 }
 
-/// CR 105.2: "<color> is the most common color among all permanents[ or is
-/// tied for most common]" (Goham/Halam/Ruham/Sulam/Zanam Djinn) →
-/// `ColorIsMostCommonAmongPermanents { color }`. The optional "or is tied for
-/// most common" tail is redundant — the runtime predicate already treats every
-/// color at the maximum count as most-common — so both phrasings map to the
-/// same condition.
-pub(crate) fn parse_color_is_most_common_color_condition(lower: &str) -> Option<StaticCondition> {
-    let (rest, color) = nom_primitives::parse_color.parse(lower).ok()?;
-    let (rest, _) = tag::<_, _, OracleError<'_>>(
-        " is the most common color among all permanents",
-    )
-    .parse(rest)
-    .ok()?;
-    let (rest, _) = opt(tag::<_, _, OracleError<'_>>(
-        " or is tied for most common",
-    ))
-    .parse(rest)
-    .ok()?;
-    rest.trim()
-        .is_empty()
-        .then_some(StaticCondition::ColorIsMostCommonAmongPermanents { color })
-}
-
 /// CR 611.3a: "[N] or more [type] are on the battlefield" → a count
 /// `QuantityComparison` (Limited Resources: "ten or more lands are on the
 /// battlefield"). Modeled as `ObjectCount(type) >= N`; the gate is then attached
@@ -4384,7 +4353,7 @@ pub(crate) fn parse_there_are_count_on_battlefield_condition(
 /// `exists_on_battlefield_condition`, which anchors "is on the battlefield").
 ///
 /// The indefinite article "a "/"an " is stripped, but "another " is preserved so
-/// `parse_type_phrase` attaches the source-exclusion `Another` prop — "another
+/// `parse_type_phrase_folding` attaches the source-exclusion `Another` prop — "another
 /// creature" must count creatures OTHER than the source (else the source itself
 /// would satisfy its own gate and the restriction would never lift).
 pub(crate) fn parse_there_is_exists_on_battlefield_condition(
@@ -4403,7 +4372,7 @@ fn there_is_exists_on_battlefield_condition(input: &str) -> OracleResult<'_, Sta
     // Strip the indefinite article ("a"/"an") but keep "another " — parse_article's
     // trailing-space word boundary leaves "another <type>" (source exclusion) intact.
     let (type_text, _) = opt(nom_primitives::parse_article).parse(subject)?;
-    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    let (filter, remainder) = parse_type_phrase_folding(type_text.trim());
     if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
         return Err(nom::Err::Error(OracleError::new(
             input,
@@ -4428,7 +4397,7 @@ fn there_are_count_on_battlefield_condition(input: &str) -> OracleResult<'_, Sta
     let (input, _) = tag(" or more ").parse(input)?;
     let (input, type_text) = take_until(" on the battlefield").parse(input)?;
     let (input, _) = tag(" on the battlefield").parse(input)?;
-    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    let (filter, remainder) = parse_type_phrase_folding(type_text.trim());
     if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
         return Err(nom::Err::Error(OracleError::new(
             input,
@@ -4452,7 +4421,7 @@ fn count_on_battlefield_condition(input: &str) -> OracleResult<'_, StaticConditi
     let (input, _) = tag(" or more ").parse(input)?;
     let (input, type_text) = take_until(" are on the battlefield").parse(input)?;
     let (input, _) = tag(" are on the battlefield").parse(input)?;
-    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    let (filter, remainder) = parse_type_phrase_folding(type_text.trim());
     if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
         return Err(nom::Err::Error(OracleError::new(
             input,
@@ -4487,7 +4456,7 @@ fn exists_on_battlefield_condition(input: &str) -> OracleResult<'_, StaticCondit
     let (input, _) = alt((tag("an "), tag("a "))).parse(input)?;
     let (input, type_text) = take_until(" is on the battlefield").parse(input)?;
     let (input, _) = tag(" is on the battlefield").parse(input)?;
-    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    let (filter, remainder) = parse_type_phrase_folding(type_text.trim());
     if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
         return Err(nom::Err::Error(OracleError::new(
             input,
@@ -4538,7 +4507,7 @@ pub(crate) fn find_continuous_predicate_start(lower: &str) -> Option<usize> {
 /// silently dropped from the affected filter. Returns the
 /// `FilterProp::Owned { Opponent }` property ("controller doesn't own it") and
 /// the remaining predicate text when the qualifier is present. The companion
-/// "but don't own" handling in `parse_type_phrase` covers the full-subject path
+/// "but don't own" handling in `parse_type_phrase_folding` covers the full-subject path
 /// (Laughing Jasper Flint's "Creatures you control but don't own are
 /// Mercenaries …"); this is the controller-prefix-consumed sibling.
 pub(crate) fn strip_negated_ownership_qualifier(after_prefix: &str) -> Option<(FilterProp, &str)> {
@@ -4767,7 +4736,7 @@ pub(crate) fn parse_hand_cards_have_derived_cost_keyword(text: &str) -> Option<S
     // Affected: the parsed type phrase (e.g. "nonland card"), owned by "you",
     // restricted to your hand. The off-zone applier reads each recipient's mana
     // cost to derive the granted cost.
-    let (base_filter, rest) = parse_type_phrase(type_tp.original.trim());
+    let (base_filter, rest) = parse_type_phrase_folding(type_tp.original.trim());
     if !rest.trim().is_empty() {
         return None;
     }
@@ -4800,7 +4769,7 @@ fn parse_controlled_by_anchor_subject_filter(subject: &TextPair<'_>) -> Option<T
     let (type_tp, label_tp) = subject
         .split_around(" controlled by players who last chose ")
         .or_else(|| subject.split_around(" controlled by player who last chose "))?;
-    let (type_filter, rest) = parse_type_phrase(type_tp.original.trim());
+    let (type_filter, rest) = parse_type_phrase_folding(type_tp.original.trim());
     if !rest.trim().is_empty() || matches!(type_filter, TargetFilter::Any) {
         return None;
     }
@@ -4892,7 +4861,7 @@ pub(crate) fn parse_continuous_subject_filter(subject: &str) -> Option<TargetFil
     // Strip "Each " / "All " quantifier prefixes — "Each creature you control" and
     // "All Sliver creatures" are semantically identical to the bare type phrase for
     // filter purposes (CR 205.3 / CR 700.1). Without this, "All Sliver creatures"
-    // flows into parse_type_phrase which treats "All Sliver" as a verbatim subtype
+    // flows into parse_type_phrase_folding which treats "All Sliver" as a verbatim subtype
     // string and matches zero real creatures.
     if let Some(rest_tp) = nom_tag_tp(&tp, "each ").or_else(|| nom_tag_tp(&tp, "all ")) {
         return parse_continuous_subject_filter(rest_tp.original.trim());
@@ -4999,7 +4968,7 @@ pub(crate) fn parse_continuous_subject_filter(subject: &str) -> Option<TargetFil
         nom_primitives::split_once_on(tp.lower, " with the chosen name")
     {
         let type_part_original = tp.original[..type_part.len()].trim();
-        let (type_filter, type_rest) = parse_type_phrase(type_part_original);
+        let (type_filter, type_rest) = parse_type_phrase_folding(type_part_original);
         if type_rest.trim().is_empty() && !matches!(type_filter, TargetFilter::Any) {
             return Some(TargetFilter::And {
                 filters: vec![type_filter, TargetFilter::HasChosenName],
@@ -5053,13 +5022,13 @@ pub(crate) fn parse_continuous_subject_filter(subject: &str) -> Option<TargetFil
     // Revisit once an off-zone characteristics path exists for non-keyword
     // modifications.
 
-    let (filter, rest) = parse_type_phrase(trimmed);
+    let (filter, rest) = parse_type_phrase_folding(trimmed);
     if rest.trim().is_empty() {
         // CR 109.2: a bare "spell(s)" head noun in a static-ability subject
         // ("permanent spells you control", Secret Arcade) means the affected
         // objects sit on the stack, not the battlefield — the same rule
         // `parse_target_with_ctx` already applies to targeting noun phrases.
-        // `parse_type_phrase` has no notion of this (it's a bare type-phrase
+        // `parse_type_phrase_folding` has no notion of this (it's a bare type-phrase
         // grammar shared by many non-targeting callers), so without this the
         // "spell(s)" word is silently swallowed and the filter collapses to a
         // battlefield-permanent filter that never reaches the stack.
@@ -5107,7 +5076,7 @@ pub(crate) fn parse_owned_off_battlefield_subject_filter(subject: &str) -> Optio
     .parse(remainder)
     .ok()?;
     let type_part = &trimmed[..prefix.len()];
-    let (base_filter, rest) = parse_type_phrase(type_part);
+    let (base_filter, rest) = parse_type_phrase_folding(type_part);
     if !rest.trim().is_empty() {
         return None;
     }
@@ -5242,7 +5211,7 @@ pub(crate) fn strip_one_trailing_ascii_s(text: &str) -> &str {
 
 /// CR 205.3m: Parse "creature [you control] that's a Wolf or a Werewolf" subjects.
 /// Splits on "that's a " / "that is a ", parses the base phrase (with controller/zone
-/// suffix) via `parse_type_phrase`, then parses a comma/or/and-separated subtype list
+/// suffix) via `parse_type_phrase_folding`, then parses a comma/or/and-separated subtype list
 /// and composes with `TargetFilter::And`.
 pub(crate) fn parse_thats_a_subject_filter(text: &str, lower: &str) -> Option<TargetFilter> {
     type VE<'a> = OracleError<'a>;
@@ -5257,7 +5226,7 @@ pub(crate) fn parse_thats_a_subject_filter(text: &str, lower: &str) -> Option<Ta
     let base_text = text[..before.len()].trim();
     let subtype_text = text[text.len() - subtype_lower.len()..].trim();
 
-    let (base_filter, base_rest) = parse_type_phrase(base_text);
+    let (base_filter, base_rest) = parse_type_phrase_folding(base_text);
     if !base_rest.trim().is_empty() || matches!(base_filter, TargetFilter::Any) {
         return None;
     }
@@ -5612,7 +5581,7 @@ pub(crate) fn parse_commander_subject_filter_prefix(subject: &str) -> Option<(Ta
 /// descriptor and then route capitalized descriptors through a
 /// `subtype`-fabricating fallback. A sentence-leading "Nontoken" is
 /// capitalized but is NOT a subtype — it is a type/token-identity negation.
-/// This guard lets such descriptors fall through to `parse_type_phrase`, whose
+/// This guard lets such descriptors fall through to `parse_type_phrase_folding`, whose
 /// negation loop maps the negated word to `FilterProp`/`TypeFilter::Non` via
 /// `classify_negation` (the single authority).
 ///
@@ -5633,7 +5602,7 @@ pub(crate) fn descriptor_is_negation(descriptor: &str) -> bool {
 
 /// CR 205.4a: Supertype descriptors include legendary, basic, snow, and world;
 /// parse supported supertype words through the shared target combinator so they
-/// fall through to `parse_type_phrase` instead of becoming fabricated subtypes.
+/// fall through to `parse_type_phrase_folding` instead of becoming fabricated subtypes.
 pub(crate) fn descriptor_is_supertype(descriptor: &str) -> bool {
     let lower = descriptor.to_lowercase();
     let is_supertype = all_consuming(nom_target::parse_supertype_word)
@@ -5864,7 +5833,7 @@ pub(crate) fn parse_creature_subject_filter(subject: &str) -> Option<TargetFilte
     // (e.g. "Nontoken creatures") or a supertype descriptor (e.g. "Legendary
     // creatures") is NOT a subtype. `is_capitalized_words` below would
     // otherwise fabricate a bogus subtype. Bail so `parse_continuous_subject_filter`
-    // falls through to its own `parse_type_phrase` call, whose typed grammar
+    // falls through to its own `parse_type_phrase_folding` call, whose typed grammar
     // maps these descriptors onto properties.
     if descriptor_is_negation(descriptor) || descriptor_is_supertype(descriptor) {
         return None;
@@ -6093,12 +6062,12 @@ pub(crate) fn parse_rule_static_subject_filter(subject: &str) -> Option<TargetFi
 
     // CR 205.3 + CR 604.1: "All/Each <subtype>" universal-quantifier subject for a
     // rule-static grant (e.g. "All Slivers have shroud"). Strip the quantifier and
-    // delegate to parse_type_phrase (mirroring parse_target), so the subtype filter
+    // delegate to parse_type_phrase_folding (mirroring parse_target), so the subtype filter
     // is recognized and the line lands as a top-level continuous static (CR 604.1)
     // instead of a spell-resolution GenericEffect. Runs AFTER the player-scope match
     // above so it never shadows "all players"/"each player".
     if let Some(rest_tp) = nom_tag_tp(&tp, "all ").or_else(|| nom_tag_tp(&tp, "each ")) {
-        let (filter, rest) = parse_type_phrase(rest_tp.original);
+        let (filter, rest) = parse_type_phrase_folding(rest_tp.original);
         if rest.trim().is_empty() {
             return Some(match attachment_prop {
                 Some(prop) => merge_filter_prop(filter, prop),
@@ -6136,7 +6105,7 @@ pub(crate) fn parse_rule_static_subject_filter(subject: &str) -> Option<TargetFi
         });
     }
 
-    let (filter, rest) = parse_type_phrase(subject);
+    let (filter, rest) = parse_type_phrase_folding(subject);
     if rest.trim().is_empty() {
         return Some(match attachment_prop {
             Some(prop) => merge_filter_prop(filter, prop),

@@ -6,7 +6,10 @@ use engine::game::combat::{
 use engine::game::dungeon::DungeonProgress;
 use engine::game::game_object::{BackFaceData, GameObject, ProtectionStartSnapshot};
 use engine::game::printed_cards::intrinsic_copiable_values;
-use engine::types::ability::{Effect, KeywordAction, ResolvedAbility, ThisWayCause};
+use engine::types::ability::{
+    ControllerRef, CopyTargetPurpose, Effect, KeywordAction, ReplacementCondition, ResolvedAbility,
+    ThisWayCause,
+};
 use engine::types::attribution::ObjectAttribution;
 use engine::types::card_type::CardType;
 use engine::types::definitions::Definitions;
@@ -31,6 +34,7 @@ const HASH_SET: &str = "serialize_with=\"crate::types::deterministic_serde::hash
 const OPTION_HASH_SET: &str =
     "serialize_with=\"crate::types::deterministic_serde::option_hash_set\"";
 const HASH_MAP: &str = "serialize_with=\"crate::types::deterministic_serde::hash_map\"";
+const HASH_MAP_ENTRIES: &str = "with=\"crate::types::deterministic_serde::hash_map_entries\"";
 const OPTION_HASH_MAP: &str =
     "serialize_with=\"crate::types::deterministic_serde::option_hash_map\"";
 const VEC_HASH_MAP: &str = "serialize_with=\"crate::types::deterministic_serde::vec_hash_map\"";
@@ -52,7 +56,6 @@ enum Classification {
     Canonical(&'static str),
     SerdeSkip,
     DeserializeOnlyOrRuntime,
-    NonStringJsonMapKey,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +96,7 @@ const NUMERIC_MAP_ROUND_TRIP_OWNERS: &[NumericRoundTripOwner] = &[
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::attribution", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::tracked_object_sets", map_key_types: &["TrackedSetId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::tracked_set_member_causes", map_key_types: &["TrackedSetId", "ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
+    NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::tracked_set_participants", map_key_types: &["TrackedSetId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::commander_cast_count", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::commander_cast_owners", map_key_types: &["ObjectId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
     NumericRoundTripOwner { id: "src/types/game_state.rs::GameState::auto_pass", map_key_types: &["PlayerId"], group: RoundTripGroup::DirectGameState, numeric_deserializer: None },
@@ -262,6 +266,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "stack_paid_facts",
         "liminal_entries",
         "tracked_object_sets",
+        "tracked_set_participants",
         "commander_cast_count",
         "commander_cast_owners",
         "auto_pass",
@@ -364,11 +369,16 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "im::HashMap<im::HashMap>",
         Classification::Canonical(IM_HASH_MAP_OF_IM_HASH_MAP),
     );
+    add_spec(
+        &mut specs,
+        game_state,
+        "GameState",
+        None,
+        "trigger_fire_counts_this_turn",
+        "HashMap",
+        Classification::Canonical(HASH_MAP_ENTRIES),
+    );
     for (field, adapter) in [
-        (
-            "trigger_fire_counts_this_turn",
-            "with=\"trigger_definition_ref_map\"",
-        ),
         ("activated_abilities_this_turn", "with=\"tuple_key_map\""),
         ("activated_abilities_this_game", "with=\"tuple_key_map\""),
         ("ability_resolutions_this_turn", "with=\"tuple_key_map\""),
@@ -389,13 +399,12 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "remote_type_layer_recipients",
         "card_face_registry",
         "meld_pair_registry",
-        "momir_pool_faces",
         "pending_taps_for_mana_overrides",
         "combat_prevention_tally",
     ] {
         let shape = match field {
             "remote_type_layer_recipients" => "im::HashSet",
-            "card_face_registry" | "meld_pair_registry" | "momir_pool_faces" => "Arc<HashMap>",
+            "card_face_registry" | "meld_pair_registry" => "Arc<HashMap>",
             "combat_prevention_tally" => "Option<HashMap>",
             "static_gate_truth" => "im::HashMap",
             _ => "HashMap",
@@ -602,7 +611,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
             None,
             "protection_start_exempt_attachments",
             "HashMap",
-            Classification::NonStringJsonMapKey,
+            Classification::Canonical(HASH_MAP_ENTRIES),
         ),
         (
             "src/game/game_object.rs",
@@ -776,6 +785,7 @@ fn expected_manifest() -> BTreeMap<String, OwnerSpec> {
         "Scry",
         "Mill",
         "CoinFlip",
+        "RollDice",
         "Explore",
         "Connive",
         "Proliferate",
@@ -1154,17 +1164,12 @@ fn serde_hash_owner_census_is_exhaustive_and_every_canonical_owner_names_its_ada
                 actual.serde
             ),
             Classification::DeserializeOnlyOrRuntime => {}
-            Classification::NonStringJsonMapKey => assert!(
-                !actual.serde.contains("deterministic_serde"),
-                "{id}: the non-string JSON key owner must not invent a generic wire adapter; actual serde={}",
-                actual.serde
-            ),
         }
     }
 
     assert_eq!(
         NUMERIC_MAP_ROUND_TRIP_OWNERS.len(),
-        51,
+        52,
         "the reviewed numeric-map owner matrix must remain exact"
     );
     for group in [
@@ -1185,6 +1190,7 @@ fn serde_hash_owner_census_is_exhaustive_and_every_canonical_owner_names_its_ada
 fn back_face(name: &str) -> BackFaceData {
     BackFaceData {
         is_swap_snapshot: false,
+        trigger_printed_origins: Vec::new(),
         name: name.to_string(),
         power: None,
         toughness: None,
@@ -1495,6 +1501,19 @@ fn build_all_direct_numeric_maps_state() -> GameState {
             ]),
         ),
     ]);
+    state.tracked_set_participants = HashMap::from([
+        (
+            TrackedSetId(1),
+            vec![
+                (PlayerId(0), ThisWayCause::OwnerLibraryShuffleSubject),
+                (PlayerId(1), ThisWayCause::OwnerLibraryShuffleSubject),
+            ],
+        ),
+        (
+            TrackedSetId(2),
+            vec![(PlayerId(1), ThisWayCause::OwnerLibraryShuffleSubject)],
+        ),
+    ]);
     state.commander_cast_count = HashMap::from([(ObjectId(1), 1), (ObjectId(2), 2)]);
     state.commander_cast_owners =
         HashMap::from([(ObjectId(1), PlayerId(0)), (ObjectId(2), PlayerId(1))]);
@@ -1725,6 +1744,7 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
         "attribution",
         "tracked_object_sets",
         "tracked_set_member_causes",
+        "tracked_set_participants",
         "commander_cast_count",
         "commander_cast_owners",
         "auto_pass",
@@ -1762,7 +1782,7 @@ fn every_direct_numeric_key_game_state_map_round_trips_populated() {
     ];
     assert_eq!(
         direct_fields.len(),
-        40,
+        41,
         "private stack_trigger_firings is covered by its unit test"
     );
     for field in direct_fields {
@@ -2084,6 +2104,99 @@ fn declare_blockers_numeric_maps_round_trip_through_value_bare_raw_and_trusted()
     assert_waiting_round_trip_across_persistence_forms(state);
 }
 
+/// The `CopyTargetPurpose` wire surface.
+///
+/// **Discriminating half:** `CopyTokenSource` serializes under its
+/// `#[serde(tag = "type")]` tag and survives every persistence form. Removing
+/// the variant fails to compile, so this cannot pass on a tree without it.
+///
+/// **Not the discriminating half — a pre-existing-behaviour guard:** the
+/// `purpose`-less blob still loading as `BecomeCopy` passes *identically*
+/// before this change, because `#[serde(default)]` on the field and
+/// `#[default]` on `BecomeCopy` both already existed. It pins that back-compat
+/// against a future edit that moves `#[default]`; it demonstrates nothing this
+/// change added.
+#[test]
+fn copy_target_choice_purpose_round_trips_and_still_defaults_to_become_copy() {
+    let waiting = WaitingFor::CopyTargetChoice {
+        player: PlayerId(1),
+        source_id: ObjectId(7),
+        valid_targets: vec![ObjectId(9), ObjectId(8)],
+        max_mana_value: None,
+        purpose: CopyTargetPurpose::CopyTokenSource,
+    };
+    let value = waiting_value(&waiting);
+    assert_eq!(value["data"]["purpose"]["type"], "CopyTokenSource");
+
+    let mut without_purpose = value.clone();
+    without_purpose["data"]
+        .as_object_mut()
+        .expect("a CopyTargetChoice payload is a JSON object")
+        .remove("purpose");
+    let restored = serde_json::from_value::<WaitingFor>(without_purpose)
+        .expect("a purpose-less wait must still restore");
+    let WaitingFor::CopyTargetChoice { purpose, .. } = restored else {
+        panic!("a CopyTargetChoice blob must restore as CopyTargetChoice");
+    };
+    assert_eq!(purpose, CopyTargetPurpose::BecomeCopy);
+
+    let mut state = GameState::new(FormatConfig::standard(), 2, 42);
+    state.waiting_for = waiting;
+    assert_waiting_round_trip_across_persistence_forms(state);
+}
+
+/// The `FirstTokenCreationEachTurn` turn-scope slot on the wire.
+///
+/// Three distinct properties, each with its own measured revert-failing edit:
+///
+/// - `Some(You)` round-trips with the key **present**. Removing the field
+///   fails to compile.
+/// - `None` **omits** the key entirely. This is the only guard on
+///   `skip_serializing_if = "Option::is_none"`: drop that attribute and this
+///   assertion alone reds with `"active_player_req": null`, while the other
+///   two stay green.
+/// - A payload carrying the superseded required `player` key still loads, with
+///   the unknown key ignored and the new field defaulting to `None`.
+///   **Measured** revert-failing property for that last one: it reds if the
+///   field is made non-`Option`, or if `deny_unknown_fields` is added to
+///   `ReplacementCondition`. It does **not** red on dropping
+///   `#[serde(default)]` — serde resolves a missing `Option<T>` to `None`
+///   regardless, so that attribute is carried for consistency with the three
+///   sibling `active_player_req` hosts rather than for back-compat.
+#[test]
+fn first_token_creation_each_turn_turn_scope_round_trips_and_reads_the_superseded_shape() {
+    let scoped = ReplacementCondition::FirstTokenCreationEachTurn {
+        active_player_req: Some(ControllerRef::You),
+    };
+    let scoped_value = serde_json::to_value(&scoped).expect("condition should serialize");
+    assert_eq!(
+        scoped_value,
+        serde_json::json!({"type": "FirstTokenCreationEachTurn", "active_player_req": "You"})
+    );
+    assert_eq!(
+        serde_json::from_value::<ReplacementCondition>(scoped_value)
+            .expect("the turn-scoped form must restore"),
+        scoped
+    );
+
+    let unscoped = ReplacementCondition::FirstTokenCreationEachTurn {
+        active_player_req: None,
+    };
+    assert_eq!(
+        serde_json::to_value(&unscoped).expect("condition should serialize"),
+        serde_json::json!({"type": "FirstTokenCreationEachTurn"}),
+        "an absent turn scope must omit the key, not emit a null"
+    );
+
+    assert_eq!(
+        serde_json::from_value::<ReplacementCondition>(
+            serde_json::json!({"type": "FirstTokenCreationEachTurn", "player": "You"})
+        )
+        .expect("a payload in the superseded shape must still load"),
+        unscoped
+    );
+}
+
 #[test]
 fn real_game_state_hash_owners_are_canonical_and_round_trip_across_all_persistence_forms() {
     let forward = build_populated_state(false);
@@ -2131,7 +2244,9 @@ fn real_game_state_hash_owners_are_canonical_and_round_trip_across_all_persisten
         first_name < second_name,
         "objects must emit by typed numeric key order"
     );
-    let specialize = field_fragment(&forward_json, "specialize_faces", "foretold");
+    // Anchored on the next field that serializes unconditionally: `foretold` holds its
+    // default here and no longer emits a key.
+    let specialize = field_fragment(&forward_json, "specialize_faces", "base_power");
     assert!(
         specialize.find("\"White\"").expect("white face")
             < specialize.find("\"Blue\"").expect("blue face"),
@@ -2304,7 +2419,7 @@ fn populated_stack_resolution_session_round_trips_deterministically_through_raw_
 }
 
 #[test]
-fn populated_protection_tuple_map_keeps_its_existing_non_string_json_key_failure() {
+fn protection_tuple_map_round_trips_deterministically_through_all_persistence_forms() {
     let mut state = GameState::new(FormatConfig::standard(), 2, 42);
     let mut object = GameObject::new(
         ObjectId(1),
@@ -2313,17 +2428,122 @@ fn populated_protection_tuple_map_keeps_its_existing_non_string_json_key_failure
         "Protection Fixture".to_string(),
         Zone::Battlefield,
     );
-    object.protection_start_exempt_attachments.insert(
-        (0, 0, ObjectId(2)),
-        ProtectionStartSnapshot {
-            resolved_quality: ProtectionTarget::Color(ManaColor::White),
-            attachment_ids: vec![ObjectId(3)],
-        },
+    assert!(
+        serde_json::to_value(&object)
+            .expect("empty protection fixture serializes")
+            .get("protection_start_exempt_attachments")
+            .is_none(),
+        "the empty transient map remains omitted"
     );
-    assert_eq!(object.protection_start_exempt_attachments.len(), 1);
+
+    let lower_key = (0, 2, ObjectId(1));
+    let lower_snapshot = ProtectionStartSnapshot {
+        resolved_quality: ProtectionTarget::Color(ManaColor::White),
+        attachment_ids: vec![ObjectId(3), ObjectId(4)],
+    };
+    let upper_key = (1, 0, ObjectId(1));
+    let upper_snapshot = ProtectionStartSnapshot {
+        resolved_quality: ProtectionTarget::CardType("Artifact".to_string()),
+        attachment_ids: vec![ObjectId(5)],
+    };
+    object
+        .protection_start_exempt_attachments
+        .insert(upper_key, upper_snapshot.clone());
+    object
+        .protection_start_exempt_attachments
+        .insert(lower_key, lower_snapshot.clone());
+    assert_eq!(object.protection_start_exempt_attachments.len(), 2);
     state.objects.insert(ObjectId(1), object);
 
-    let error = serde_json::to_value(&state)
-        .expect_err("the existing tuple-key map has no nonempty JSON representation");
-    assert_eq!(error.to_string(), "key must be a string");
+    let mut opposite_insertion = state.clone();
+    let opposite_map = &mut opposite_insertion
+        .objects
+        .get_mut(&ObjectId(1))
+        .expect("fixture object exists")
+        .protection_start_exempt_attachments;
+    opposite_map.clear();
+    opposite_map.insert(lower_key, lower_snapshot);
+    opposite_map.insert(upper_key, upper_snapshot);
+
+    let bare_bytes = serde_json::to_string(&state).expect("populated bare state serializes");
+    assert_eq!(
+        serde_json::to_string(&opposite_insertion)
+            .expect("opposite-insertion bare state serializes"),
+        bare_bytes,
+        "hash insertion order must not affect canonical state bytes"
+    );
+    let bare_value: serde_json::Value =
+        serde_json::from_str(&bare_bytes).expect("bare state bytes are JSON");
+    assert_eq!(
+        bare_value["objects"]["1"]["protection_start_exempt_attachments"],
+        serde_json::json!([
+            [
+                [0, 2, 1],
+                {
+                    "resolved_quality": {"Color": "White"},
+                    "attachment_ids": [3, 4]
+                }
+            ],
+            [
+                [1, 0, 1],
+                {
+                    "resolved_quality": {"CardType": "Artifact"},
+                    "attachment_ids": [5]
+                }
+            ]
+        ]),
+        "the nonempty field is a typed-key-sorted sequence of exact key/value tuples"
+    );
+
+    let bare_restored: GameState =
+        serde_json::from_str(&bare_bytes).expect("bare state round trips");
+    assert_eq!(
+        bare_restored
+            .objects
+            .get(&ObjectId(1))
+            .expect("restored bare object exists")
+            .protection_start_exempt_attachments,
+        state
+            .objects
+            .get(&ObjectId(1))
+            .expect("source fixture object exists")
+            .protection_start_exempt_attachments
+    );
+    assert_eq!(
+        serde_json::to_string(&bare_restored).expect("restored bare state reserializes"),
+        bare_bytes,
+        "bare-state bytes remain stable after restore"
+    );
+
+    for (persistence_name, persisted) in [
+        ("raw", PersistedGameState::Raw(Box::new(state.clone()))),
+        ("trusted", PersistedGameState::capture(state.clone())),
+    ] {
+        let bytes = serde_json::to_string(&persisted)
+            .unwrap_or_else(|error| panic!("{persistence_name} state serializes: {error}"));
+        let restored: PersistedGameState = serde_json::from_str(&bytes)
+            .unwrap_or_else(|error| panic!("{persistence_name} state deserializes: {error}"));
+        assert_eq!(
+            serde_json::to_string(&restored)
+                .unwrap_or_else(|error| panic!("{persistence_name} state reserializes: {error}")),
+            bytes,
+            "{persistence_name} persistence bytes remain stable after restore"
+        );
+        let restored = restored
+            .into_game_state()
+            .unwrap_or_else(|error| panic!("{persistence_name} state finalizes: {error}"));
+        assert_eq!(
+            restored
+                .objects
+                .get(&ObjectId(1))
+                .expect("restored persisted object exists")
+                .protection_start_exempt_attachments,
+            state
+                .objects
+                .get(&ObjectId(1))
+                .expect("source fixture object exists")
+                .protection_start_exempt_attachments,
+            "{persistence_name} persistence restores every protection snapshot"
+        );
+    }
 }

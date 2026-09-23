@@ -39,7 +39,7 @@
 //!
 //! | Type | before boxing | after | ceiling |
 //! |---|---:|---:|---:|
-//! | `GameState` | 30,112 | 13,360 | 13,824 |
+//! | `GameState` | 30,112 | 13,872 | 14,336 |
 //! | `StackEntry` | 5,336 | 344 | 768 |
 //! | `PendingCast` | 6,632 | 1,376 | 1,792 |
 //! | `PendingTrigger` | 6,000 | 744 | 1,024 |
@@ -49,11 +49,11 @@
 //!
 //! 64-bit only: `wasm32` has a different layout and its own (smaller) budget.
 
-#[cfg(target_pointer_width = "64")]
+#[cfg(all(target_pointer_width = "64", not(phase_measure_size)))]
 const _: () = {
     use core::mem::size_of;
     assert!(
-        size_of::<crate::types::game_state::GameState>() <= 13_824,
+        size_of::<crate::types::game_state::GameState>() <= 14_336,
         "GameState grew past its stack budget. It is moved by value through the \
          phase-server action + AI path, so an overrun is an uncatchable \
          guard-page abort, not a panic. Re-run the -Zprint-type-sizes command in \

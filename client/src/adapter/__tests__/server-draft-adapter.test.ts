@@ -5,6 +5,12 @@ import { ServerDraftAdapter } from "../server-draft-adapter";
 import { PROTOCOL_VERSION } from "../ws-adapter";
 import type { DraftPlayerView } from "../draft-adapter";
 import type { GameLogEntry, GameState, LegalActionsResult, ObjectAction } from "../types";
+import type {
+  InteractionChoiceId,
+  InteractionId,
+  InteractionPreviewRequest,
+  PreviewRequestId,
+} from "../generated/interaction";
 
 // ── MockWebSocket (copied from ws-adapter.test.ts) ─────────────────────
 
@@ -58,11 +64,46 @@ async function completeHandshake(): Promise<MockWebSocket> {
   return ws;
 }
 
+function receive(ws: MockWebSocket, type: string, data: unknown): void {
+  ws.dispatchSynthetic("message", JSON.stringify({ type, data }));
+}
+
+/**
+ * Starts observing `promise` immediately and returns a reader that yields the
+ * rejection reason — or the string `"never settled"` if the promise is still
+ * pending.
+ *
+ * Observation has to start before the first `await` so an already-rejected
+ * promise is handled in the same tick, and the drain is what turns an orphaned
+ * promise — the exact defect these settlement fixes prevent — into a readable
+ * assertion failure instead of a suite timeout.
+ *
+ * The reader yields a MACROTASK turn (`setTimeout(…, 0)`), not a microtask
+ * drain: that is strictly more generous than the settlement paths need, since
+ * both `dispose()` and `onclose` reject synchronously. The cost is that it
+ * couples the reader to real timers — a caller running it under
+ * `vi.useFakeTimers()` would hang. No current caller does; the only fake-timer
+ * scope in these suites is closed by a `finally { vi.useRealTimers(); }`.
+ */
+function trackRejection(promise: Promise<unknown>): () => Promise<unknown> {
+  let outcome: unknown = "never settled";
+  void promise.then(
+    (value) => { outcome = { resolvedWith: value }; },
+    (error) => { outcome = error; },
+  );
+  return async () => {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    return outcome;
+  };
+}
+
 function createMockDraftView(overrides: Partial<DraftPlayerView> = {}): DraftPlayerView {
   return {
     status: "Drafting",
     kind: "Premier",
     launch_capability: "None",
+    distribution: "PickAndPass",
+    commanders_required: 0,
     current_pack_number: 0,
     pick_number: 0,
     pass_direction: "Left",
@@ -130,6 +171,8 @@ const viewerInteraction = {
 const objectActions: Record<string, ObjectAction[]> = {
   "42": [{ type: "PassPriority" }],
 };
+
+const FULL_KEY = { game_code: "GAME01", generation: 7 };
 
 describe("ServerDraftAdapter", () => {
   let adapter: ServerDraftAdapter;
@@ -277,6 +320,7 @@ describe("ServerDraftAdapter", () => {
           match_id: "r1-t0",
           round: 1,
           game_code: "GAME01",
+          full_key: FULL_KEY,
           player_token: "gametok",
           your_player: 0,
           opponent_name: "Bob",
@@ -287,6 +331,42 @@ describe("ServerDraftAdapter", () => {
     expect(adapter.currentPhase).toBe("match");
     expect(adapter.playerId).toBe(0);
     expect(adapter.currentMatchId).toBe("r1-t0");
+  });
+
+  it("reattaches once with the draft credential carried by DraftMatchStart", () => {
+    const listener = vi.fn();
+    adapter.onEvent(listener);
+    const matchStart = {
+      match_id: "r1-t0",
+      round: 1,
+      game_code: "GAME01",
+      full_key: FULL_KEY,
+      player_token: "match-draft-token",
+      your_player: 0,
+      opponent_name: "Bob",
+    };
+    ws.send.mockClear();
+
+    receive(ws, "DraftMatchStart", matchStart);
+
+    expect(ws.send).toHaveBeenCalledExactlyOnceWith(
+      JSON.stringify({
+        type: "ReconnectDraft",
+        data: {
+          draft_code: "ABCD12",
+          player_token: "match-draft-token",
+        },
+      }),
+    );
+
+    ws.send.mockClear();
+    receive(ws, "DraftMatchStart", matchStart);
+
+    expect(ws.send).not.toHaveBeenCalled();
+    expect(listener).toHaveBeenCalledTimes(1);
+    expect(listener).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "matchStarting", matchId: "r1-t0" }),
+    );
   });
 
   it("routes submitAction only during match phase", async () => {
@@ -332,6 +412,7 @@ describe("ServerDraftAdapter", () => {
           match_id: "r1-t0",
           round: 1,
           game_code: "GAME01",
+          full_key: FULL_KEY,
           player_token: "gametok",
           your_player: 0,
           opponent_name: "Bob",
@@ -364,6 +445,7 @@ describe("ServerDraftAdapter", () => {
           match_id: "r1-t0",
           round: 1,
           game_code: "GAME01",
+          full_key: FULL_KEY,
           player_token: "gametok",
           your_player: 0,
           opponent_name: "Bob",
@@ -398,12 +480,26 @@ describe("ServerDraftAdapter", () => {
           match_id: "r1-t0",
           round: 1,
           game_code: "GAME01",
+          full_key: FULL_KEY,
           player_token: "gametok",
           your_player: 0,
           opponent_name: "Bob",
         },
       }),
     );
+
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "GameStarted",
+        data: {
+          state: matchState("server-draft-started"),
+          your_player: 0,
+          full_key: FULL_KEY,
+        },
+      }),
+    );
+    listener.mockClear();
 
     ws.dispatchSynthetic(
       "message",
@@ -415,6 +511,7 @@ describe("ServerDraftAdapter", () => {
           log_entries: logEntries,
           legal_actions: [],
           auto_pass_recommended: false,
+          full_key: FULL_KEY,
         },
       }),
     );
@@ -435,10 +532,26 @@ describe("ServerDraftAdapter", () => {
     ws.dispatchSynthetic(
       "message",
       JSON.stringify({
+        type: "DraftMatchStart",
+        data: {
+          match_id: "r1-t0",
+          round: 1,
+          game_code: "GAME01",
+          full_key: FULL_KEY,
+          player_token: "gametok",
+          your_player: 0,
+          opponent_name: "Bob",
+        },
+      }),
+    );
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
         type: "GameStarted",
         data: {
           state,
           your_player: 0,
+          full_key: FULL_KEY,
           legal_actions_by_object: objectActions,
           viewer_interaction: viewerInteraction,
         },
@@ -455,10 +568,37 @@ describe("ServerDraftAdapter", () => {
     ws.dispatchSynthetic(
       "message",
       JSON.stringify({
+        type: "DraftMatchStart",
+        data: {
+          match_id: "r1-t0",
+          round: 1,
+          game_code: "GAME01",
+          full_key: FULL_KEY,
+          player_token: "gametok",
+          your_player: 0,
+          opponent_name: "Bob",
+        },
+      }),
+    );
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "GameStarted",
+        data: {
+          state: matchState("server-draft-started"),
+          your_player: 0,
+          full_key: FULL_KEY,
+        },
+      }),
+    );
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
         type: "StateUpdate",
         data: {
           state: matchState("server-draft-update"),
           events: [],
+          full_key: FULL_KEY,
           legal_actions_by_object: objectActions,
           viewer_interaction: viewerInteraction,
         },
@@ -471,6 +611,58 @@ describe("ServerDraftAdapter", () => {
     });
   });
 
+  it("accepts game frames only for the Full generation announced by the draft", async () => {
+    const listener = vi.fn();
+    adapter.onEvent(listener);
+    const staleKey = { game_code: "GAME01", generation: 6 };
+    receive(ws, "DraftMatchStart", {
+      match_id: "r1-t0",
+      round: 1,
+      game_code: "GAME01",
+      full_key: FULL_KEY,
+      player_token: "gametok",
+      your_player: 0,
+      opponent_name: "Bob",
+    });
+    receive(ws, "GameStarted", {
+      state: matchState("stale-start"),
+      your_player: 0,
+      full_key: staleKey,
+    });
+    await expect(adapter.getState()).rejects.toThrow("No game state available");
+
+    receive(ws, "GameStarted", {
+      state: matchState("current-start"),
+      your_player: 0,
+      full_key: FULL_KEY,
+    });
+    listener.mockClear();
+    receive(ws, "StateUpdate", {
+      state: matchState("stale-update"),
+      events: [],
+      full_key: staleKey,
+    });
+    receive(ws, "OpponentDisconnected", { grace_seconds: 30, full_key: staleKey });
+
+    await expect(adapter.getState()).resolves.toMatchObject({ label: "current-start" });
+    expect(listener).not.toHaveBeenCalled();
+
+    receive(ws, "StateUpdate", {
+      state: matchState("current-update"),
+      events: [],
+      full_key: FULL_KEY,
+    });
+    receive(ws, "OpponentDisconnected", { grace_seconds: 30, full_key: FULL_KEY });
+    receive(ws, "OpponentReconnected", { full_key: FULL_KEY });
+
+    await expect(adapter.getState()).resolves.toMatchObject({ label: "current-update" });
+    expect(listener).toHaveBeenCalledWith({
+      type: "opponentDisconnected",
+      graceSeconds: 30,
+    });
+    expect(listener).toHaveBeenCalledWith({ type: "opponentReconnected" });
+  });
+
   it("does not send ReportMatchResult on GameOver", () => {
     // Enter match phase.
     ws.dispatchSynthetic(
@@ -481,6 +673,7 @@ describe("ServerDraftAdapter", () => {
           match_id: "r1-t0",
           round: 1,
           game_code: "GAME01",
+          full_key: FULL_KEY,
           player_token: "gametok",
           your_player: 0,
           opponent_name: "Bob",
@@ -582,6 +775,105 @@ describe("ServerDraftAdapter", () => {
     expect(result.pick_number).toBe(2);
   });
 
+  /**
+   * ONE SLOT, ONE ACTION. `draftResolve`/`draftReject` is a single pair, and
+   * every submit path used to assign straight into it. A second action
+   * overwrote the first's callbacks; the next `DraftStateUpdate` then resolved
+   * only the survivor and nulled both, so the first caller's promise never
+   * settled at all -- a permanently pending `await`, not a lost result.
+   *
+   * REVERT-FAILING: drop the `claimDraftAction` guard back to bare assignment
+   * and the first leg reds (the second action is accepted) and the last leg
+   * hangs until the test times out (the pick never settles).
+   */
+  it("refuses a second draft action while one is still in flight", async () => {
+    const pickPromise = adapter.submitPick("card-inflight");
+
+    // The intruder is refused IMMEDIATELY and by name, rather than silently
+    // taking the slot.
+    await expect(adapter.submitDeck(["deck-card"], [])).rejects.toThrow(
+      /Another draft action is still in flight; SubmitDeck was not sent/,
+    );
+
+    // Reach guard: exactly one action reached the wire. Without this the
+    // rejection above could be satisfied by an adapter that sends nothing.
+    const draftActions = ws.send.mock.calls.filter(([raw]) =>
+      typeof raw === "string" && raw.includes("\"DraftAction\""));
+    expect(draftActions).toHaveLength(1);
+
+    // THE POINT. The first action is untouched by the refusal and still settles.
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftStateUpdate",
+        data: { view: createMockDraftView({ pick_number: 7 }) },
+      }),
+    );
+    await expect(pickPromise).resolves.toMatchObject({ pick_number: 7 });
+  });
+
+  /**
+   * The paired positive: the guard is a single-flight gate, not a one-shot
+   * latch. Every settle site nulls both callbacks together, which is what
+   * releases it — so the action after a completed one must be accepted. Without
+   * this, "refuse everything after the first action" would pass the test above
+   * and break the draft entirely.
+   */
+  it("accepts the next draft action once the previous one has settled", async () => {
+    const first = adapter.submitPick("card-first");
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftStateUpdate",
+        data: { view: createMockDraftView({ pick_number: 1 }) },
+      }),
+    );
+    await first;
+
+    const second = adapter.submitPick("card-second");
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftStateUpdate",
+        data: { view: createMockDraftView({ pick_number: 2 }) },
+      }),
+    );
+    await expect(second).resolves.toMatchObject({ pick_number: 2 });
+  });
+
+  /**
+   * THE RELEASE PATH, ON THE ROUTE THAT REJECTS.
+   *
+   * This is the leg whose failure is WORSE than the bug the guard fixes. The
+   * gate reads "in flight" off the callback pair itself, so a settle site that
+   * rejects without nulling BOTH callbacks leaves the slot claimed forever and
+   * every later action for the rest of the session is refused with "Another
+   * draft action is still in flight" -- a permanent wedge, where the unguarded
+   * behaviour merely stranded one promise.
+   *
+   * `DraftActionRejected` is the live rejection route (a refused pick, a refused
+   * shared-stack decision), so it is the one that has to release.
+   */
+  it("releases the action slot when the server rejects the action", async () => {
+    const rejected = adapter.submitPick("card-refused");
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({ type: "DraftActionRejected", data: { reason: "PileNotActive" } }),
+    );
+    await expect(rejected).rejects.toThrow("PileNotActive");
+
+    // THE CLAIM: the next action is accepted, not refused as "still in flight".
+    const next = adapter.submitPick("card-after-refusal");
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftStateUpdate",
+        data: { view: createMockDraftView({ pick_number: 9 }) },
+      }),
+    );
+    await expect(next).resolves.toMatchObject({ pick_number: 9 });
+  });
+
   it("DraftStateUpdate resolves pending pick promise", async () => {
     const pickPromise = adapter.submitPick("card-002");
 
@@ -660,6 +952,41 @@ describe("ServerDraftAdapter", () => {
     expect(adapter.currentMatchId).toBeNull();
   });
 
+  // `dispose()` used to null all three handle pairs instead of rejecting them,
+  // so every caller awaiting a server reply was orphaned — and a gameplay
+  // caller holds the module-level dispatch mutex while it waits.
+  it("dispose rejects the in-flight submit, draft and init promises", async () => {
+    ws.dispatchSynthetic(
+      "message",
+      JSON.stringify({
+        type: "DraftMatchStart",
+        data: {
+          match_id: "r1-t0",
+          round: 1,
+          game_code: "GAME01",
+          full_key: FULL_KEY,
+          player_token: "gametok",
+          your_player: 0,
+          opponent_name: "Bob",
+        },
+      }),
+    );
+
+    const submit = trackRejection(adapter.submitAction({ type: "PassPriority" }, 0));
+    const pick = trackRejection(adapter.submitPick("card-1"));
+    const reconnect = trackRejection(adapter.reconnectDraft());
+
+    adapter.dispose();
+
+    // Asserted as one tuple rather than three statements: a per-leg assertion
+    // would abort on the first orphan and leave the other two unprobeable.
+    expect([await submit(), await pick(), await reconnect()]).toMatchObject([
+      { code: "WS_CLOSED", message: "Adapter disposed during action", recoverable: true },
+      { code: "WS_CLOSED", message: "Adapter disposed during draft operation", recoverable: true },
+      { code: "WS_CLOSED", message: "Adapter disposed before draft started", recoverable: true },
+    ]);
+  });
+
   it("DraftOver sets phase to complete", () => {
     ws.dispatchSynthetic(
       "message",
@@ -704,6 +1031,7 @@ describe("ServerDraftAdapter", () => {
             match_id: "r1-t0",
             round: 1,
             game_code: "GAME01",
+            full_key: FULL_KEY,
             player_token: "gametok",
             your_player: 0,
             opponent_name: "Bob",
@@ -823,6 +1151,126 @@ describe("ServerDraftAdapter", () => {
         message: "preview lookup failed",
         recoverable: false,
       });
+    });
+
+    /**
+     * An allocation whose segments are UNEQUAL and whose `choiceId` order is
+     * NOT the candidate publication order, so a sort or a canonicalisation in
+     * the adapter layer is caught rather than coinciding.
+     */
+    const cid = (id: string) => id as InteractionChoiceId;
+    const previewRequest = {
+      requestId: "preview-req-1" as PreviewRequestId,
+      interactionId: "interaction-1" as InteractionId,
+      response: {
+        type: "shortcut",
+        data: {
+          decision: { type: "fixed", data: { iterations: 6 } },
+          pins: [{
+            group: 0,
+            choiceIds: [cid("choice-c"), cid("choice-a"), cid("choice-b")],
+            amounts: [
+              { choiceId: cid("choice-c"), amount: 3 },
+              { choiceId: cid("choice-a"), amount: 1 },
+              { choiceId: cid("choice-b"), amount: 2 },
+            ],
+          }],
+        },
+      },
+    } satisfies InteractionPreviewRequest;
+
+    const previewAnswer = (requestId: string) => ({
+      requestId,
+      interactionId: "interaction-1",
+      status: { type: "confirmable" },
+      progress: { selected: 3, minimum: 1, maximum: 3, aggregate: 6, confirmable: true },
+      outcome: "advanced",
+      summaries: ["confirmAvailable", "progress"],
+    });
+
+    function sentPreviewFrame() {
+      const calls = ws.send.mock.calls;
+      for (let i = calls.length - 1; i >= 0; i--) {
+        const parsed = JSON.parse(calls[i][0] as string);
+        if (parsed.type === "PreviewInteraction") return parsed;
+      }
+      throw new Error("no PreviewInteraction frame was sent");
+    }
+
+    // Row 8, draft-adapter leg.
+    it("sends the authored request verbatim and resolves its own answer", async () => {
+      ws.send.mockClear();
+      const pending = adapter.previewInteraction(previewRequest, 0);
+
+      const frame = sentPreviewFrame();
+      expect(frame.type).toBe("PreviewInteraction");
+      expect(frame.data.request).toEqual(previewRequest);
+      const pin = frame.data.request.response.data.pins[0];
+      // Reach guard: more than one segment, so dropping all but the first fails.
+      expect(pin.amounts.length).toBeGreaterThan(1);
+      expect(pin.amounts).toEqual([
+        { choiceId: "choice-c", amount: 3 },
+        { choiceId: "choice-a", amount: 1 },
+        { choiceId: "choice-b", amount: 2 },
+      ]);
+      expect(pin.amounts.map((a: { choiceId: string }) => a.choiceId)).toEqual(pin.choiceIds);
+
+      ws.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "InteractionPreview",
+          data: { preview: previewAnswer("preview-req-1") },
+        }),
+      );
+      await expect(pending).resolves.toMatchObject({ requestId: "preview-req-1" });
+    });
+
+    // Row 12, close-site leg on this adapter.
+    it("rejects in-flight previews on socket close, keeping answered ones", async () => {
+      const answered = adapter.previewInteraction(previewRequest, 0);
+      const unanswered = adapter.previewInteraction(
+        { ...previewRequest, requestId: "preview-req-2" as PreviewRequestId },
+        0,
+      );
+
+      ws.dispatchSynthetic(
+        "message",
+        JSON.stringify({
+          type: "InteractionPreview",
+          data: { preview: previewAnswer("preview-req-1") },
+        }),
+      );
+      await expect(answered).resolves.toMatchObject({ requestId: "preview-req-1" });
+
+      ws.dispatchSynthetic("close");
+      await expect(answered).resolves.toMatchObject({ requestId: "preview-req-1" });
+      await expect(unanswered).rejects.toMatchObject({
+        code: "WS_CLOSED",
+        message: "Connection closed during interaction preview",
+      });
+    });
+
+    // Row 12, dispose-site leg. THIS is the site a single-site wiring drops —
+    // measured on the mana twin, deleting only the `dispose` call leaves this
+    // promise never settling while the close-site leg above still passes.
+    it("rejects in-flight previews when the adapter is disposed", async () => {
+      const pending = adapter.previewInteraction(previewRequest, 0);
+      adapter.dispose();
+      await expect(pending).rejects.toMatchObject({
+        code: "WS_CLOSED",
+        message: "Adapter disposed during interaction preview",
+      });
+    });
+
+    // The draft adapter's own precondition, which its WS twin does not carry.
+    it("refuses a preview outside the match phase", async () => {
+      const lobbyAdapter = new ServerDraftAdapter("ws://localhost:9374/ws");
+      await expect(lobbyAdapter.previewInteraction(previewRequest, 0)).rejects.toMatchObject({
+        code: "PHASE_ERROR",
+      });
+      // Reach guard: the adapter under test IS in the match phase, so the
+      // refusal above is the precondition and not a universally-throwing method.
+      expect(adapter.currentPhase).toBe("match");
     });
   });
 });

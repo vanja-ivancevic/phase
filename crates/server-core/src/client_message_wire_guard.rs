@@ -20,10 +20,11 @@ use lobby_broker::inbound_guard::{
 use lobby_broker::validation::{
     validate_create_tournament_fields, validate_drop_from_tournament_fields,
     validate_end_tournament_fields, validate_get_tournament_fields,
-    validate_join_tournament_fields, validate_report_match_result_fields,
-    validate_start_tournament_round_fields, validate_unregister_lobby_fields,
-    validate_update_lobby_metadata_fields, CreateTournamentFields, DropFromTournamentFields,
-    EndTournamentFields, JoinTournamentFields, ReportMatchResultFields, StartTournamentRoundFields,
+    validate_join_tournament_fields, validate_renew_tournament_credential_fields,
+    validate_report_match_result_fields, validate_start_tournament_round_fields,
+    validate_unregister_lobby_fields, validate_update_lobby_metadata_fields,
+    CreateTournamentFields, DropFromTournamentFields, EndTournamentFields, JoinTournamentFields,
+    RenewTournamentCredentialFields, ReportMatchResultFields, StartTournamentRoundFields,
     UpdateLobbyMetadataFields,
 };
 
@@ -43,7 +44,28 @@ use crate::legacy_join_guard::guard_legacy_join_game;
 use crate::protocol::{resolve_draft_source_intent_ref, ClientMessage, ServerMessage, ServerMode};
 use crate::seat_mutation_wire_guard::guard_seat_mutation;
 use crate::spectator_wire_guard::{guard_spectate_draft, guard_spectator_join};
+use engine::game::interaction::MAX_INTERACTION_STRING_LEN;
 use engine::types::action_rejection::{ActionRejection, ActionRejectionCode};
+use engine::types::interaction::{InteractionPreviewRequest, InteractionSubmission};
+use lobby_broker::inbound_guard::validate_deck_list;
+
+/// A Cube source is larger than a constructed deck but still must be bounded
+/// before the Full-mode handler persists it. Order and duplicates are data.
+pub const MAX_BOOSTER_PACK_POOL_ENTRIES: usize = 8_192;
+
+/// The creating client names the pool, and with it every card an in-game pack
+/// can contain. A casual Cube match accepts that; a rated game must not let one
+/// participant choose what a pack opener finds, so a ranked room refuses any
+/// supplied pool, an empty one included.
+fn guard_booster_pack_pool(pool: &Option<Vec<String>>, ranked: bool) -> Result<(), String> {
+    let Some(pool) = pool else {
+        return Ok(());
+    };
+    if ranked {
+        return Err("booster_pack_pool is not accepted for a ranked game".to_string());
+    }
+    validate_deck_list("booster_pack_pool", pool, MAX_BOOSTER_PACK_POOL_ENTRIES)
+}
 
 /// Validate wire fields for any inbound `ClientMessage` before handler work.
 ///
@@ -67,6 +89,9 @@ pub fn guard_client_message_before_dispatch(
         ClientMessage::Interaction { submission } => {
             guard_interaction_submission_payload(submission)
         }
+        ClientMessage::PreviewInteraction { request } => {
+            guard_interaction_preview_request_payload(request)
+        }
         ClientMessage::Reconnect {
             game_code,
             player_token,
@@ -85,6 +110,7 @@ pub fn guard_client_message_before_dispatch(
         | ClientMessage::Concede
         | ClientMessage::ConcedeMatch
         | ClientMessage::AbandonGame
+        | ClientMessage::ExportAuthoritativeState
         | ClientMessage::RequestTakeback(_)
         | ClientMessage::RespondTakeback { .. }
         | ClientMessage::CancelTakeback => Ok(()),
@@ -123,6 +149,8 @@ pub fn guard_client_message_before_dispatch(
             room_name,
             host_peer_id,
             draft_metadata,
+            ranked,
+            booster_pack_pool,
             ..
         } => {
             guard_create_game_settings_inbound(CreateGameSettingsInbound {
@@ -136,7 +164,8 @@ pub fn guard_client_message_before_dispatch(
                 host_peer_id: host_peer_id.as_deref(),
                 draft_metadata: draft_metadata.as_ref(),
             })?;
-            guard_create_ai_seats(ai_seats, *player_count)
+            guard_create_ai_seats(ai_seats, *player_count)?;
+            guard_booster_pack_pool(booster_pack_pool, *ranked)
         }
         ClientMessage::JoinGameWithPassword {
             game_code,
@@ -186,9 +215,16 @@ pub fn guard_client_message_before_dispatch(
         // validation the broker crate cannot depend on. The identical calls
         // appear in `guard_broker_projection_inbound`; `both_inbound_guards_agree_
         // on_every_tournament_variant` is what keeps the two from drifting.
-        ClientMessage::CreateTournament { name, .. } => {
-            validate_create_tournament_fields(CreateTournamentFields { name })
-        }
+        ClientMessage::CreateTournament {
+            name,
+            total_rounds,
+            plus_rounds,
+            ..
+        } => validate_create_tournament_fields(CreateTournamentFields {
+            name,
+            total_rounds: *total_rounds,
+            plus_rounds: *plus_rounds,
+        }),
         ClientMessage::JoinTournament {
             code,
             player_key,
@@ -199,32 +235,53 @@ pub fn guard_client_message_before_dispatch(
             display_name,
         }),
         ClientMessage::GetTournament { code } => validate_get_tournament_fields(code),
+        // `request_id: _` on all four: the gated actions' correlator is an
+        // opaque echoed integer with no bounds to check, and binding it
+        // explicitly shows it was considered. `ReportMatchResult` gives up its
+        // `..` rest pattern for that: a rest pattern silently absorbs every
+        // future field, making this the one arm where a newly-added bounded
+        // field could slip past the guard without a compile error.
         ClientMessage::StartTournamentRound {
             code,
             organizer_token,
+            request_id: _,
         } => validate_start_tournament_round_fields(StartTournamentRoundFields {
             code,
             organizer_token,
         }),
         ClientMessage::ReportMatchResult {
             code,
+            pairing_id: _,
             player_token,
             outcome,
-            ..
+            request_id: _,
         } => validate_report_match_result_fields(ReportMatchResultFields {
             code,
             player_token,
             outcome,
         }),
-        ClientMessage::DropFromTournament { code, player_token } => {
-            validate_drop_from_tournament_fields(DropFromTournamentFields { code, player_token })
-        }
+        ClientMessage::DropFromTournament {
+            code,
+            player_token,
+            request_id: _,
+        } => validate_drop_from_tournament_fields(DropFromTournamentFields { code, player_token }),
         ClientMessage::EndTournament {
             code,
             organizer_token,
+            request_id: _,
         } => validate_end_tournament_fields(EndTournamentFields {
             code,
             organizer_token,
+        }),
+        ClientMessage::RenewTournamentCredential {
+            code,
+            role: _,
+            token,
+            rotation_nonce,
+        } => validate_renew_tournament_credential_fields(RenewTournamentCredentialFields {
+            code,
+            token,
+            rotation_nonce,
         }),
         ClientMessage::CreateDraftWithSettings {
             display_name,
@@ -297,6 +354,14 @@ pub fn wire_rejection_message(msg: &ClientMessage, reason: String) -> ServerMess
                 rejection: ActionRejection::new(ActionRejectionCode::InvalidAction),
             }
         }
+        // Benign like `Interaction`'s arm — a preview carries the same
+        // free-form response an ordinary paste can oversize — and correlated
+        // like `PreviewManaPayment`'s, so the client's pending promise settles
+        // instead of hanging.
+        ClientMessage::PreviewInteraction { request } => ServerMessage::InteractionPreviewFailed {
+            request_id: request.request_id.clone(),
+            message: reason,
+        },
 
         // Every remaining variant keeps the operational-error behavior: a
         // bounds failure on these is a malformed frame, not a rejected game
@@ -306,6 +371,7 @@ pub fn wire_rejection_message(msg: &ClientMessage, reason: String) -> ServerMess
         | ClientMessage::JoinGame { .. }
         | ClientMessage::Reconnect { .. }
         | ClientMessage::AbandonGame
+        | ClientMessage::ExportAuthoritativeState
         | ClientMessage::SubscribeLobby
         | ClientMessage::UnsubscribeLobby
         | ClientMessage::CreateGameWithSettings { .. }
@@ -342,7 +408,8 @@ pub fn wire_rejection_message(msg: &ClientMessage, reason: String) -> ServerMess
         | ClientMessage::StartTournamentRound { .. }
         | ClientMessage::ReportMatchResult { .. }
         | ClientMessage::DropFromTournament { .. }
-        | ClientMessage::EndTournament { .. } => ServerMessage::error(reason),
+        | ClientMessage::EndTournament { .. }
+        | ClientMessage::RenewTournamentCredential { .. } => ServerMessage::error(reason),
     }
 }
 
@@ -425,9 +492,16 @@ pub fn guard_broker_projection_inbound(msg: &ClientMessage) -> Result<(), String
         // map into the broker, so anything unbounded here is an unbounded
         // clone — the same hazard `UpdateLobbyMetadata`'s arm above exists to
         // prevent.
-        ClientMessage::CreateTournament { name, .. } => {
-            validate_create_tournament_fields(CreateTournamentFields { name })
-        }
+        ClientMessage::CreateTournament {
+            name,
+            total_rounds,
+            plus_rounds,
+            ..
+        } => validate_create_tournament_fields(CreateTournamentFields {
+            name,
+            total_rounds: *total_rounds,
+            plus_rounds: *plus_rounds,
+        }),
         ClientMessage::JoinTournament {
             code,
             player_key,
@@ -438,38 +512,58 @@ pub fn guard_broker_projection_inbound(msg: &ClientMessage) -> Result<(), String
             display_name,
         }),
         ClientMessage::GetTournament { code } => validate_get_tournament_fields(code),
+        // `request_id: _` for the same reason as the dispatch guard above: the
+        // correlator carries no bound, and binding it explicitly here keeps the
+        // two guards reading identically.
         ClientMessage::StartTournamentRound {
             code,
             organizer_token,
+            request_id: _,
         } => validate_start_tournament_round_fields(StartTournamentRoundFields {
             code,
             organizer_token,
         }),
         ClientMessage::ReportMatchResult {
             code,
+            pairing_id: _,
             player_token,
             outcome,
-            ..
+            request_id: _,
         } => validate_report_match_result_fields(ReportMatchResultFields {
             code,
             player_token,
             outcome,
         }),
-        ClientMessage::DropFromTournament { code, player_token } => {
-            validate_drop_from_tournament_fields(DropFromTournamentFields { code, player_token })
-        }
+        ClientMessage::DropFromTournament {
+            code,
+            player_token,
+            request_id: _,
+        } => validate_drop_from_tournament_fields(DropFromTournamentFields { code, player_token }),
         ClientMessage::EndTournament {
             code,
             organizer_token,
+            request_id: _,
         } => validate_end_tournament_fields(EndTournamentFields {
             code,
             organizer_token,
+        }),
+        ClientMessage::RenewTournamentCredential {
+            code,
+            role: _,
+            token,
+            rotation_nonce,
+        } => validate_renew_tournament_credential_fields(RenewTournamentCredentialFields {
+            code,
+            token,
+            rotation_nonce,
         }),
         ClientMessage::CreateGame { .. }
         | ClientMessage::JoinGame { .. }
         | ClientMessage::Action { .. }
         | ClientMessage::Interaction { .. }
+        | ClientMessage::PreviewInteraction { .. }
         | ClientMessage::PreviewManaPayment { .. }
+        | ClientMessage::ExportAuthoritativeState
         | ClientMessage::Reconnect { .. }
         | ClientMessage::AbandonGame
         | ClientMessage::Concede
@@ -491,16 +585,52 @@ pub fn guard_broker_projection_inbound(msg: &ClientMessage) -> Result<(), String
     }
 }
 
+/// Wire bounds for an inbound `InteractionPreviewRequest`.
+///
+/// `InteractionPreviewRequest` differs from `InteractionSubmission` only by its
+/// correlation key, so the two shared members are charged through the same
+/// engine validator the submission path uses — the same cumulative budget, not
+/// a restatement of it — and the key is charged against the engine's own
+/// per-string ceiling. The rejection string is therefore byte-identical to the
+/// submission's at every layer.
+///
+/// Private: the preview route has no second caller. The handler deliberately
+/// re-guards nothing, because `preview_interaction` re-charges every member and
+/// answers its own `PayloadTooLarge` on the preview's own correlated channel —
+/// a third charge would buy a strictly worse frame.
+///
+/// ponytail: clones the two shared members to present them as a submission,
+/// because `bound_interaction_submission` takes a borrowed `InteractionSubmission`
+/// and no borrowed-view constructor exists. The clone is of an already-materialized
+/// frame and is dropped at the end of this function, so it never enters a
+/// long-lived structure. Upgrade path: a borrowed submission view in the engine.
+fn guard_interaction_preview_request_payload(
+    request: &InteractionPreviewRequest,
+) -> Result<(), String> {
+    if request.request_id.as_str().len() > MAX_INTERACTION_STRING_LEN {
+        return Err(format!(
+            "Engine error: {:?}",
+            engine::types::interaction::InteractionReasonCode::PayloadTooLarge
+        ));
+    }
+    guard_interaction_submission_payload(&InteractionSubmission {
+        interaction_id: request.interaction_id.clone(),
+        response: request.response.clone(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::game_action_payload_guard::MAX_ACTION_LIST_LEN;
+    use engine::game::interaction::MAX_INTERACTION_STRING_LEN;
     use engine::types::ability::{TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef};
     use engine::types::game_state::ProductionOverride;
     use engine::types::identifiers::ObjectIncarnationRef;
     use engine::types::interaction::{
-        InteractionChoiceId, InteractionId, InteractionResponse, InteractionSubmission,
-        MAX_INTERACTION_LIST_LEN,
+        AmountAssignment, InteractionChoiceId, InteractionId, InteractionResponse,
+        InteractionShortcutDecision, InteractionShortcutPin, InteractionSubmission,
+        PreviewRequestId, MAX_INTERACTION_LIST_LEN,
     };
     use engine::types::mana::{
         ManaRestriction, ManaSourcePenalty, ManaSourceSelection, ManaType, TapsForManaSelection,
@@ -513,6 +643,87 @@ mod tests {
         assert!(guard_client_message_before_dispatch(
             &ClientMessage::SubscribeLobby,
             ServerMode::Full
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn booster_pack_pool_guard_preserves_duplicates_and_rejects_oversize_or_bad_names() {
+        assert!(guard_booster_pack_pool(
+            &Some(vec![
+                "Cube Card".into(),
+                "Cube Card".into(),
+                "Undealt sentinel".into(),
+            ]),
+            false,
+        )
+        .is_ok());
+        assert!(guard_booster_pack_pool(
+            &Some(vec!["Card".into(); MAX_BOOSTER_PACK_POOL_ENTRIES + 1]),
+            false,
+        )
+        .unwrap_err()
+        .contains("booster_pack_pool"));
+        assert!(
+            guard_booster_pack_pool(&Some(vec!["bad\nname".into()]), false)
+                .unwrap_err()
+                .contains("booster_pack_pool")
+        );
+    }
+
+    /// A settings-create frame as the dispatch guard sees it: a two-seat duel
+    /// that passes every other bound, varying only `ranked` and the pool.
+    fn create_game_with_settings(
+        ranked: bool,
+        booster_pack_pool: Option<Vec<String>>,
+    ) -> ClientMessage {
+        ClientMessage::CreateGameWithSettings {
+            deck: crate::protocol::DeckData {
+                main_deck: vec!["Forest".to_string()],
+                ..Default::default()
+            },
+            display_name: "Alice".to_string(),
+            public: false,
+            password: None,
+            timer_seconds: None,
+            player_count: 2,
+            match_config: engine::types::match_config::MatchConfig::default(),
+            ai_seats: vec![],
+            format_config: None,
+            room_name: None,
+            host_peer_id: None,
+            draft_metadata: None,
+            start_when_full: true,
+            ranked,
+            booster_pack_pool,
+        }
+    }
+
+    /// A rated game must not let its creator choose every card a pack opener
+    /// can find, so any supplied pool, empty included, refuses a ranked room.
+    ///
+    /// REVERT-PROBE: drop the `ranked` refusal from `guard_booster_pack_pool`
+    /// and both ranked frames pass. The unranked and pool-less ranked frames are
+    /// the reach-guards: the refusal is the pool on a ranked room, not either
+    /// field alone.
+    #[test]
+    fn dispatch_guard_refuses_a_booster_pack_pool_on_a_ranked_game() {
+        for pool in [vec!["Cube Card".to_string()], Vec::new()] {
+            let err = guard_client_message_before_dispatch(
+                &create_game_with_settings(true, Some(pool.clone())),
+                ServerMode::Full,
+            )
+            .unwrap_err();
+            assert!(err.contains("booster_pack_pool"), "{pool:?}: {err}");
+            assert!(guard_client_message_before_dispatch(
+                &create_game_with_settings(false, Some(pool)),
+                ServerMode::Full,
+            )
+            .is_ok());
+        }
+        assert!(guard_client_message_before_dispatch(
+            &create_game_with_settings(true, None),
+            ServerMode::Full,
         )
         .is_ok());
     }
@@ -724,7 +935,7 @@ mod tests {
 
     // -- Tournament organizer ----------------------------------------------
 
-    use crate::protocol::{BracketShape, MatchArity, PodOutcome, ScoringPolicy};
+    use crate::protocol::{BracketShape, MatchArity, PodOutcome, ScoringPolicy, TournamentRole};
     use lobby_broker::validation::{
         MAX_DISPLAY_NAME_LEN, MAX_GAME_CODE_LEN, MAX_GAME_WINS_ENTRIES, MAX_ROOM_NAME_LEN,
         MAX_TOKEN_LEN,
@@ -744,9 +955,12 @@ mod tests {
                 ClientMessage::CreateTournament {
                     name: "n".repeat(MAX_ROOM_NAME_LEN + 1),
                     arity: MatchArity::HEAD_TO_HEAD,
-                    scoring: ScoringPolicy::default(),
+                    scoring: Some(ScoringPolicy::default()),
                     bracket: BracketShape::Swiss,
                     total_rounds: None,
+                    plus_rounds: None,
+                    format: None,
+                    match_type: None,
                 },
             ),
             (
@@ -768,6 +982,7 @@ mod tests {
                 ClientMessage::StartTournamentRound {
                     code: "TOUR01".into(),
                     organizer_token: long_token.clone(),
+                    request_id: None,
                 },
             ),
             (
@@ -777,6 +992,7 @@ mod tests {
                     pairing_id: 0,
                     player_token: long_token.clone(),
                     outcome: PodOutcome::Draw,
+                    request_id: None,
                 },
             ),
             (
@@ -784,13 +1000,38 @@ mod tests {
                 ClientMessage::DropFromTournament {
                     code: "TOUR01".into(),
                     player_token: long_token.clone(),
+                    request_id: None,
                 },
             ),
             (
                 "organizer_token",
                 ClientMessage::EndTournament {
                     code: "TOUR01".into(),
-                    organizer_token: long_token,
+                    organizer_token: long_token.clone(),
+                    request_id: None,
+                },
+            ),
+            // Lobby protocol 6's rotation frame. Both guards gained an arm for
+            // it, and an arm that returned `Ok(())` in one of them would be
+            // exhaustive and compile — which is precisely the divergence
+            // `both_inbound_guards_agree_on_every_tournament_variant` exists
+            // to rule out, so the new variant has to be in this table.
+            (
+                "token",
+                ClientMessage::RenewTournamentCredential {
+                    code: "TOUR01".into(),
+                    role: TournamentRole::Organizer,
+                    token: long_token,
+                    rotation_nonce: "n".into(),
+                },
+            ),
+            (
+                "code",
+                ClientMessage::RenewTournamentCredential {
+                    code: long_code,
+                    role: TournamentRole::Player,
+                    token: "tok".into(),
+                    rotation_nonce: "n".into(),
                 },
             ),
         ]
@@ -801,9 +1042,12 @@ mod tests {
             ClientMessage::CreateTournament {
                 name: "Friday Night".into(),
                 arity: MatchArity::HEAD_TO_HEAD,
-                scoring: ScoringPolicy::default(),
+                scoring: Some(ScoringPolicy::default()),
                 bracket: BracketShape::Swiss,
                 total_rounds: Some(3),
+                plus_rounds: None,
+                format: None,
+                match_type: None,
             },
             ClientMessage::JoinTournament {
                 code: "TOUR01".into(),
@@ -816,20 +1060,36 @@ mod tests {
             ClientMessage::StartTournamentRound {
                 code: "TOUR01".into(),
                 organizer_token: "tok".into(),
+                request_id: None,
             },
             ClientMessage::ReportMatchResult {
                 code: "TOUR01".into(),
                 pairing_id: 0,
                 player_token: "tok".into(),
                 outcome: PodOutcome::Draw,
+                request_id: None,
             },
             ClientMessage::DropFromTournament {
                 code: "TOUR01".into(),
                 player_token: "tok".into(),
+                request_id: None,
             },
             ClientMessage::EndTournament {
                 code: "TOUR01".into(),
                 organizer_token: "tok".into(),
+                request_id: None,
+            },
+            ClientMessage::RenewTournamentCredential {
+                code: "TOUR01".into(),
+                role: TournamentRole::Organizer,
+                token: "tok".into(),
+                rotation_nonce: "nonce".into(),
+            },
+            ClientMessage::RenewTournamentCredential {
+                code: "TOUR01".into(),
+                role: TournamentRole::Player,
+                token: "tok".into(),
+                rotation_nonce: String::new(),
             },
         ]
     }
@@ -895,6 +1155,7 @@ mod tests {
                 winner: "key-0".into(),
                 game_wins,
             },
+            request_id: None,
         };
 
         let err = guard_broker_projection_inbound(&msg).unwrap_err();
@@ -920,5 +1181,169 @@ mod tests {
                 other => panic!("a tournament frame must not answer as {other:?}"),
             }
         }
+    }
+
+    // ── Row 4: the payload ceiling on the preview path ────────────────────
+
+    fn preview_frame(request_id: &str, response: InteractionResponse) -> ClientMessage {
+        ClientMessage::PreviewInteraction {
+            request: engine::types::interaction::InteractionPreviewRequest {
+                request_id: PreviewRequestId(request_id.to_string()),
+                interaction_id: InteractionId("interaction-1".to_string()),
+                response,
+            },
+        }
+    }
+
+    /// Pins whose `amounts` are each individually under the list ceiling and
+    /// whose sum is not — the cumulative branch a naive per-field guard misses.
+    fn cumulative_shortcut(pin_count: u32) -> InteractionResponse {
+        let per_pin = MAX_INTERACTION_LIST_LEN / 2;
+        InteractionResponse::Shortcut {
+            decision: InteractionShortcutDecision::AcceptSuggested,
+            pins: (0..pin_count)
+                .map(|group| InteractionShortcutPin {
+                    group,
+                    choice_ids: vec![InteractionChoiceId("a".to_string())],
+                    amounts: vec![
+                        AmountAssignment {
+                            choice_id: InteractionChoiceId("a".to_string()),
+                            amount: 1,
+                        };
+                        per_pin
+                    ],
+                })
+                .collect(),
+        }
+    }
+
+    /// Row 4. Sited at the WIRE GUARD, not at the engine: the engine charges the
+    /// same triple independently before its `state.clone()`, so an engine-sited
+    /// assertion would still pass with this arm reverted to `Ok(())` — vacuous.
+    /// Replace the `PreviewInteraction` arm with `Ok(())` and the first
+    /// assertion below accepts an oversized frame.
+    #[test]
+    fn dispatch_guard_rejects_an_oversized_preview_before_handler_work() {
+        let three_pins = preview_frame("req-1", cumulative_shortcut(3));
+        // Reach guard on the fixture itself: every pin is individually legal,
+        // so the refusal below is attributable to the cumulative charge.
+        match &three_pins {
+            ClientMessage::PreviewInteraction { request } => {
+                let InteractionResponse::Shortcut { pins, .. } = &request.response else {
+                    panic!("fixture must carry a shortcut response");
+                };
+                assert!(pins.len() > 1, "the cumulative branch needs several pins");
+                for pin in pins {
+                    assert!(pin.amounts.len() <= MAX_INTERACTION_LIST_LEN);
+                    assert!(pin.choice_ids.len() <= MAX_INTERACTION_LIST_LEN);
+                }
+            }
+            other => panic!("wrong fixture: {other:?}"),
+        }
+
+        let err = guard_client_message_before_dispatch(&three_pins, ServerMode::Full)
+            .expect_err("the cumulative budget is charged at the wire");
+        assert!(err.contains("PayloadTooLarge"), "unexpected reason: {err}");
+
+        // Discriminating positive: ONE pin of the identical shape passes the
+        // bound, so the refusal above is the cumulative charge and not the pin
+        // shape.
+        assert_eq!(
+            guard_client_message_before_dispatch(
+                &preview_frame("req-1", cumulative_shortcut(1)),
+                ServerMode::Full
+            ),
+            Ok(())
+        );
+
+        // The second member this helper charges: the correlation key, against
+        // the engine's own per-string ceiling.
+        let long_key = "x".repeat(MAX_INTERACTION_STRING_LEN + 1);
+        let key_err = guard_client_message_before_dispatch(
+            &preview_frame(
+                &long_key,
+                InteractionResponse::Choose {
+                    choice_id: InteractionChoiceId("a".to_string()),
+                },
+            ),
+            ServerMode::Full,
+        )
+        .expect_err("an oversized request_id is refused");
+        assert!(key_err.contains("PayloadTooLarge"), "unexpected: {key_err}");
+
+        // The bound sits at the constant, not at "any long key".
+        assert_eq!(
+            guard_client_message_before_dispatch(
+                &preview_frame(
+                    &"x".repeat(MAX_INTERACTION_STRING_LEN),
+                    InteractionResponse::Choose {
+                        choice_id: InteractionChoiceId("a".to_string()),
+                    },
+                ),
+                ServerMode::Full
+            ),
+            Ok(())
+        );
+
+        // And the interaction_id half still reaches the shared engine validator.
+        let long_id = ClientMessage::PreviewInteraction {
+            request: engine::types::interaction::InteractionPreviewRequest {
+                request_id: PreviewRequestId("req-1".to_string()),
+                interaction_id: InteractionId("x".repeat(MAX_INTERACTION_STRING_LEN + 1)),
+                response: InteractionResponse::Choose {
+                    choice_id: InteractionChoiceId("a".to_string()),
+                },
+            },
+        };
+        assert!(guard_client_message_before_dispatch(&long_id, ServerMode::Full).is_err());
+    }
+
+    /// The refusal string is byte-identical to the submission's, because both
+    /// charge the same engine validator rather than restating its bounds.
+    #[test]
+    fn preview_and_submission_refuse_the_same_payload_identically() {
+        let response = cumulative_shortcut(3);
+        assert_eq!(
+            guard_client_message_before_dispatch(
+                &preview_frame("req-1", response.clone()),
+                ServerMode::Full
+            ),
+            guard_client_message_before_dispatch(
+                &interaction_frame(response.clone()),
+                ServerMode::Full
+            )
+        );
+        // Non-vacuity: both sides are `Err`, not both `Ok`.
+        assert!(guard_client_message_before_dispatch(
+            &interaction_frame(response),
+            ServerMode::Full
+        )
+        .is_err());
+    }
+
+    /// Row 5's wire-guard legs. The preview is classified exactly as
+    /// `Interaction` is at the projection boundary, and its rejection travels
+    /// on a CORRELATED channel where `Interaction`'s does not — an uncorrelated
+    /// answer would leave the client's pending promise hanging forever.
+    #[test]
+    fn preview_wire_rejection_is_benign_and_correlated() {
+        let frame = preview_frame("req-1", cumulative_shortcut(3));
+        let reason = guard_client_message_before_dispatch(&frame, ServerMode::Full).unwrap_err();
+
+        match wire_rejection_message(&frame, reason.clone()) {
+            ServerMessage::InteractionPreviewFailed {
+                request_id,
+                message,
+            } => {
+                assert_eq!(request_id, PreviewRequestId("req-1".to_string()));
+                assert_eq!(message, reason);
+            }
+            other => panic!("a preview rejection must not tear the session down: {other:?}"),
+        }
+
+        // Same projection policy as its sibling: accepted without bounding,
+        // safe only because `to_lobby_client_message` never clones it (the
+        // paired half lives in `phase-server`).
+        assert!(guard_broker_projection_inbound(&frame).is_ok());
     }
 }

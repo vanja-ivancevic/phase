@@ -1,4 +1,6 @@
+import { initializeLanCapabilities, isLanEndpoint } from "../services/lan";
 import type {
+  AbilityBlockEntry,
   EngineAdapter,
   EngineSnapshot,
   GameAction,
@@ -16,7 +18,11 @@ import type {
   SubmitResult,
   FormatConfig,
 } from "./types";
-import type { InteractionSubmission } from "./generated/interaction";
+import type {
+  InteractionPreview,
+  InteractionPreviewRequest,
+  InteractionSubmission,
+} from "./generated/interaction";
 import { AdapterError, AdapterErrorCode, EMPTY_LEGAL_ACTIONS, actionRejectionError, isActionRejection, nextSnapshotSeq } from "./types";
 import type { BracketDeckRequest, BracketEstimate } from "../types/bracketEstimate";
 import {
@@ -172,7 +178,7 @@ export interface NativeSocketAdapterOptions {
 /** Native server setup for one local P2P seat. The PeerJS connection remains
  * the guest-facing transport; these sockets never leave the desktop host. */
 export type NativePregameAdapterOptions =
-  | ({ kind: "host"; aiSeats: NativeAiSeat[]; playerCount: number; formatConfig?: FormatConfig; matchConfig?: MatchConfig } & NativeSocketAdapterOptions)
+  | ({ kind: "host"; aiSeats: NativeAiSeat[]; playerCount: number; formatConfig?: FormatConfig; matchConfig?: MatchConfig; boosterPackPool?: string[] | null } & NativeSocketAdapterOptions)
   | ({ kind: "guest" } & NativeSocketAdapterOptions)
   | ({ kind: "reconnect"; gameCode: string; playerId: PlayerId; playerToken: string; fullKey: FullSessionKey } & NativeSocketAdapterOptions);
 
@@ -203,6 +209,133 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 73 — `CastingVariantChoiceOption` gained required `face`, making a paused
+ *      Fuse split-card menu an exact `(variant, face)` tuple. This integrated
+ *      state also carries a resolution-owned modal choice's additional cost so
+ *      a paid graveyard cast cannot lose it across face election. Old snapshots
+ *      cannot safely bind either payload, so full-game peers must refuse skew.
+ * 72 — `ResolutionCastFacePolicy` replaces the legacy free-cast-window filter,
+ *      and `WaitingFor.CastOffer { kind: GraveyardPaidCast }` carries two additive
+ *      fields: additional_cost (Ogre Battlecaster's "{R}{R} in addition to its
+ *      other costs", CR 601.2b) and installed_triggers (the delayed triggers a
+ *      declined offer withdraws). Both are serde-defaulted, so a v71 peer
+ *      parses a v72 offer — and then pays the offered card at its printed
+ *      cost alone while the v72 host charges the addition. The offer also
+ *      opens for seven more printed cards (the paid "cast target … card from
+ *      your graveyard" class, CR 608.2g) that v71 granted a lingering
+ *      permission instead. Exact-match refuses the pairing. P2P moves in
+ *      lockstep (wire 54); lobby messages are unchanged. See PROTOCOL_VERSION
+ *      in crates/lobby-broker/src/protocol.rs for the full entry.
+ * 71 — DraftKind.Winston and DraftAction::SharedStackDecision are serialized
+ *      by draft WebSocket messages. A PARSE bump like 27 and 34, not a
+ *      capability bump like 24 — but a CONDITIONAL one: neither type carries
+ *      a serde fallback variant, so a v70 peer fails deserialization outright
+ *      on "Winston" or on the SharedStackDecision tag, and a v71 peer cannot
+ *      round-trip a frame a v70 peer would have to invent. The break runs in
+ *      BOTH directions, and for the types named so far only for a Winston
+ *      pod's frames.
+ *      DraftDelta::SharedStackDecisionApplied, the two shared-stack
+ *      DraftError variants (InvalidSharedStackConfiguration and
+ *      SharedStackDecisionRefused — a third, SharedStackRequiresHumanSeats,
+ *      existed while this entry was first written and was deleted when
+ *      shared-stack pods gained bot seats) and PickStatus.Waiting ride the
+ *      same condition.
+ *      TWO FIELDS DO NOT RIDE IT, and they are the exception to the sentence
+ *      above: SeatPublicView.drafted_card_count and
+ *      DraftPlayerView.distribution are REQUIRED, non-optional fields on
+ *      every kind's frames, so a v70 server's view fails to satisfy a v71
+ *      client's shape for Premier, Traditional, Sealed and CommanderDraft too
+ *      — not just Winston. That is what this version gate is for and it
+ *      already refuses the mismatch. drafted_card_count is a count and never
+ *      an identity, and is public in every kind (a pick-and-pass seat's total
+ *      follows from the pick number); distribution is a procedure fact
+ *      published for the same reason launch_capability is, and deliberately
+ *      NOT status-gated so a surface outliving the draft can still tell a pile
+ *      pod from a passing one.
+ *      DraftPlayerView.{shared_stack, play_first_chooser},
+ *      SpectatorDraftView.shared_stack and DraftSession.shared_stack are
+ *      additive and serde-optional, which is why their TypeScript mirrors are
+ *      declared optional — they are listed because 71 carries them, not
+ *      because they force it. play_first_chooser is ADVISORY: no engine path
+ *      enforces it, because game one's starting player still comes from
+ *      CR 103.1's contest. Lobby messages are unchanged: draftKind is a
+ *      length-bounded string. See PROTOCOL_VERSION in
+ *      crates/lobby-broker/src/protocol.rs for the full entry.
+ * 70 — OutsideGameChoiceSource.BoosterPack replaced set_code with a required
+ *      origin: PackOrigin ({ type: "Set", data } or { type: "Cube" }), so an
+ *      opened pack's OutsideGameChoice no longer decodes on a v69 peer and a
+ *      v69 frame renders no pack origin here. The exact handshake refuses the
+ *      pairing. P2P moves in lockstep; lobby messages are unchanged.
+ * 69 — GameEvent gained the tagged variant ExtraTurnCreated { player_id,
+ *      anchor }. Event-bearing full-server frames can now carry that tag, so
+ *      the exact handshake must refuse v68 peers that do not share the variant
+ *      contract. P2P moves in lockstep; lobby messages are unchanged.
+ * 68 — PendingManaAbility.chosen_tappers changed from Vec<ObjectId> to
+ *      Option<Vec<ObjectId>> (#8698), so an ANSWERED zero-tapper selection of
+ *      the CR 107.3a X-sentinel form (X=0) is distinguishable from a selection
+ *      stage nobody has answered. A PARSE bump like 67: the field carries no
+ *      serde default, so the pre-68 unanswered shape — which omitted the field
+ *      entirely — is a missing-field error rather than a silent decode. The
+ *      reverse skew is what made the bump mandatory: Some([]) serializes as
+ *      `chosen_tappers: []`, which a v67 build reads through its is_empty()
+ *      gate as *unanswered*, re-surfacing the same PayCost prompt forever.
+ * 67 — DerivedViews.dungeon_rooms entries gained required `card` and `rooms`
+ *      fields, carrying the dungeon card's Scryfall identity and the whole
+ *      room graph (each room's edges plus its position on the printed card).
+ *      A PARSE bump like 66, not a capability bump like 24: neither field is
+ *      serde-optional, so a v66 peer fails deserialization on any snapshot
+ *      where a player is venturing rather than degrading silently. The
+ *      reverse skew is equally hard — this client destructures `card`
+ *      unconditionally to resolve the card art, so a v66 host would throw in
+ *      render, not merely omit the map panel.
+ * 65 — DraftMatchStart now announces the exact Full-session identity for the
+ *      spawned match. Draft reconnect attaches the authenticated draft seat
+ *      to that Full-session lifetime, and Full follow-up frames carry the key
+ *      needed to reject stale-generation traffic. Lobby messages are unchanged.
+ * 61 — Effect.ChooseCounterKind gained domain and chooser (CR 608.2d): the
+ *      population a counter-kind choice draws from, and whether the game draws
+ *      one at random instead of prompting. Serde-additive, so an older payload
+ *      reads as the on-target/controller form; the other direction drops the
+ *      printed list and the random draw silently, which is the #7796 defect
+ *      itself. Abilities ride inside GameObject, so every GameState frame
+ *      carries the shape. The full handshake refuses stale peers. Lobby
+ *      messages are unchanged.
+ * 60 — DerivedViews.back_face_spell_costs publishes, for each card the viewer
+ *      may cast whose player chooses a spell face at cast time (a split card
+ *      such as a Room, a spell//spell MDFC — CR 709.3 + CR 712.11b), the live
+ *      cost of the OTHER face; spell_costs reports the live face only. The
+ *      cost badge renders both faces from this map. Serde-additive, but the
+ *      client renders the map directly, so an older server would silently
+ *      show a Room's single-face badge again. The full handshake refuses
+ *      stale peers. Lobby messages are unchanged.
+ * 59 — InteractionResponseSpec.shortcut.preview changed from a single optional
+ *      InteractionShortcutPreview to an Array<InteractionShortcutPreview>, one
+ *      element per offerable count, and each element gained an allocation list
+ *      stating the declaration's shape over that element's count. The retype is
+ *      the break; the added list is not — it is default and skip-if-empty and
+ *      parses in both directions. A PARSE bump like 23, 36 and 42, not a
+ *      capability bump like 24, and asymmetric: a v58 peer always emits the
+ *      preview key (null or an object) and neither deserializes into a list, so
+ *      v58 → v59 fails on every shortcut offer; v59 → v58 fails only when a
+ *      preview is actually carried, because an empty list omits the key and a
+ *      v58 peer reads that as absent. No shim ships.
+ *      MIN_SUPPORTED_SERVER_PROTOCOL below and MIN_SUPPORTED_PROTOCOL in
+ *      crates/server-core/src/protocol.rs are each equal to their own
+ *      PROTOCOL_VERSION, so the pairing is refused at the handshake — which
+ *      matters here because this client parses server frames with JSON.parse and
+ *      would otherwise read the new shape silently. See PROTOCOL_VERSION in
+ *      crates/lobby-broker/src/protocol.rs for the full entry.
+ * 58 — `DraftPlayerView::commanders_required` publishes the procedure-owned
+ *      commander designation count. The client renders designation controls
+ *      from this required field rather than inferring them from `DraftKind`.
+ * 57 — `GameAction::BeginResolveAll` gained `scope: ResolveAllScope` (`Own`
+ *      binds only the requester and resolves immediately; `Shared` opens the
+ *      table-wide consent protocol), and `PriorityPassingMode` gained
+ *      `FullControl`, which is now engine-authoritative rather than a
+ *      frontend-only toggle.
+ * 56 — Host-only authoritative-state export request/response variants. Native
+ *      P2P sends each player a redacted view, so the host must ask its local
+ *      server for the trusted engine envelope rather than export that view.
  * 55 — DerivedViews.room_half_identities publishes both halves of every
  *      battlefield Room in printed order, resolved through the COPIED halves
  *      for a permanent that copies a Room (CR 709.5b + CR 707.2). The unlock
@@ -383,12 +516,20 @@ export class NativeEngineVersionMismatchError extends Error {
  * 17 — Dedicated companion deck slot and typed companion-reveal choices.
  * 16 — Meld pair/attacking-entry choices after the mana-payment preview variants.
  * 15 — Mana-payment preview request/response variants.
+ * 75 — ResolutionCastCleanup, its delayed-trigger receipts, and each
+ *      receipt-eligible delayed-install origin carry the producer-issued paid
+ *      offer owner. Older peers cannot preserve cross-offer isolation through
+ *      a paused state handoff.
+ * 74 — ResolutionCastCleanup now carries exact delayed-trigger receipts for a
+ *      paused paid resolution cast. Older peers cannot preserve the receipt
+ *      authority through a state handoff, so this is an exact-match boundary.
+ *
  * 14 — PrecastCopyShortcut action and its two WaitingFor variants.
  * 13 — WaitingFor::MulliganBottomCards removed; mulligan bottoming folded
  *      into a MulliganDecisionPhase::BottomCards sub-phase on
  *      WaitingFor::MulliganDecision.
  */
-export const PROTOCOL_VERSION = 55;
+export const PROTOCOL_VERSION = 76;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.
@@ -411,13 +552,84 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * Wire version of the LOBBY message set, independent of PROTOCOL_VERSION.
  * Must match `LOBBY_PROTOCOL_VERSION` in `crates/lobby-broker/src/protocol.rs`.
  *
- * Bump ONLY when a lobby message variant changes shape. A full-game bump must
- * NOT move this number: no lobby variant carries GameState or GameAction, so
- * full-game churn cannot break lobby traffic. Sharing one integer between the
- * two surfaces is what took preview multiplayer down — PROTOCOL_VERSION moved
- * twice for GameState-only changes and the derived lobby window went disjoint
- * from the deployed broker's.
+ * Bump ONLY when a lobby message variant changes shape — OR when a lobby
+ * message's SEMANTICS change in a way this client must gate behavior on (see 9).
+ * A full-game bump must NOT move this number: no lobby variant carries GameState
+ * or GameAction, so full-game churn cannot break lobby traffic. Sharing one
+ * integer between the two surfaces is what took preview multiplayer down —
+ * PROTOCOL_VERSION moved twice for GameState-only changes and the derived lobby
+ * window went disjoint from the deployed broker's.
  *
+ * 9 — Recoverable credential rotation via idempotent-nonce replay.
+ *     RenewTournamentCredential gains an optional `rotation_nonce` field
+ *     (#[serde(default)]) — the "a lobby field is added" trigger;
+ *     TournamentCredentialRenewed is unchanged. A rotation mints ONLY from the
+ *     current secret (recording the superseded secret + that nonce); presenting
+ *     the superseded secret with the SAME nonce REPLAYS the already-committed
+ *     secret (minting nothing), so a lost renewal reply is recovered by retrying
+ *     the same (token, nonce) rather than by any overlap window — a superseded
+ *     secret never stays valid and never yields a fresh primary without the
+ *     initiator's nonce. This client gates on it: `maybeRenewNearExpiry`
+ *     (multiplayerStore) only rotates proactively — and only then relies on
+ *     same-nonce replay recovery — against a broker at or above
+ *     MIN_LOBBY_PROTOCOL_FOR_RECOVERABLE_ROTATION below. Additive, so
+ *     MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL stays at 2: every older broker still
+ *     parses every v9 frame (the nonce defaults away), and this client simply
+ *     does not proactively rotate against one.
+ * 8 — Tournament match structure. CreateTournament gains `match_type` (Bo1 /
+ *     Bo3), optional (`#[serde(default)]`); `None` resolves to the arity default
+ *     (Bo3 head-to-head, Bo1 for pods — single-game per MSTR), preserving pre-8
+ *     behaviour. TournamentSummary gains the resolved `match_type`, server →
+ *     client. This lets a 2-player event be Bo1 (e.g. single-game single
+ *     elimination). Purely ADDITIVE, so MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL
+ *     stays at 2 and no client-side floor is needed: a client's `match_type`
+ *     reaching a pre-8 broker deserializes away (the event runs the default
+ *     structure — a silent capability loss, not a parse error), and a pre-8
+ *     broker's summary omitting it is inert against a `JSON.parse` client.
+ * 7 — Tournament game-format label and an "automatic + N" round option. Two
+ *     fields added to CreateTournament, both optional (`#[serde(default)]`):
+ *     `format` (a GameFormat display label, mirroring the one a LobbyGame
+ *     listing already carries) and `plus_rounds` (add N to the auto-derived
+ *     round count — the "Swiss plus N" shape, mutually exclusive with
+ *     `total_rounds`). Separately, the DIFFERENT TournamentSummary message
+ *     gains a `format` echoed back resolved (server → client). Purely ADDITIVE
+ *     in BOTH directions, so MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL below stays at
+ *     2 and — unlike 6's scoring relaxation — NO client-side floor is needed:
+ *     a client sending `format`/`plus_rounds` to a pre-7 broker has them
+ *     ignored as unknown fields (a silent capability loss, not a parse error),
+ *     and a pre-7 broker's summary omitting `format` is inert against this
+ *     client, whose consumer is `JSON.parse`.
+ * 6 — Broker-owned tournament action legality, broker-owned default scoring,
+ *     and expiring/rotating tournament credentials. Two lobby variants added —
+ *     RenewTournamentCredential and TournamentCredentialRenewed — which alone
+ *     makes this bump mandatory. PairingView gains a required report_gate;
+ *     TournamentSummary gains a required open_actions and a required resolved
+ *     scoring; TournamentCreated and TournamentJoined each gain a required
+ *     expires_at_ms beside the token they already carried. All of those are
+ *     server → client, and this client ignores fields it does not name, so
+ *     MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL below deliberately stays at 2 — a
+ *     v2 broker still speaks everything this client already parses.
+ *     CreateTournament.scoring is RELAXED from required to optional, `None`
+ *     meaning "the broker applies its arity default". That direction is NOT
+ *     symmetric: a client that omits scoring against a pre-6 broker gets a
+ *     hard `missing field` parse error, not a degrade. It is gated on the
+ *     CLIENT side by MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING below — capability,
+ *     not parseability, exactly as 5 gated the ack — so a below-floor session
+ *     keeps sending an explicit policy instead of being evicted.
+ * 5 — Request-correlated settlement for the four GATED tournament actions.
+ *     Two LobbyServerMessage variants added — TournamentActionAck and
+ *     TournamentActionRejected — which is what makes this bump mandatory. Both
+ *     are requester-only point replies carrying the client-minted request_id,
+ *     so a caller can tell its own outcome from an ambient TournamentUpdate for
+ *     the same tournament. StartTournamentRound, ReportMatchResult,
+ *     DropFromTournament and EndTournament each gain one optional request_id.
+ *     Purely ADDITIVE in both directions — an omitted correlator deserializes
+ *     to None and a present one is ignored by a v4 broker — so
+ *     MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL below deliberately stays at 2.
+ *     Capability, not parseability, is what moves here: a pre-5 broker cannot
+ *     ANSWER a correlated action, which is what
+ *     MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK below exists to gate — separately,
+ *     and without evicting the session.
  * 4 — The tournament-organizer message set: seven LobbyClientMessage variants
  *     and five LobbyServerMessage variants. Purely ADDITIVE, so
  *     MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL below deliberately stays at 2 — no
@@ -439,7 +651,7 @@ export const LOBBY_MIN_SUPPORTED_SERVER_PROTOCOL = PROTOCOL_VERSION - 1;
  * 1 — Initial lobby-owned version, covering the lobby variant set unchanged
  *     since #1880.
  */
-export const LOBBY_PROTOCOL_VERSION = 4;
+export const LOBBY_PROTOCOL_VERSION = 9;
 
 /**
  * Lowest broker LOBBY_PROTOCOL_VERSION this client accepts.
@@ -452,6 +664,109 @@ export const LOBBY_PROTOCOL_VERSION = 4;
  * release used to strand every older desktop build.
  */
 export const MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL = 2;
+
+/**
+ * Lowest broker LOBBY_PROTOCOL_VERSION that can answer a gated tournament
+ * action with a `TournamentActionAck` / `TournamentActionRejected` frame.
+ *
+ * This is a FLOOR frozen at the version that introduced correlated tournament
+ * settlement, not a moving target. It must NOT be bumped when
+ * LOBBY_PROTOCOL_VERSION moves: a v6 or v7 broker still answers the ack, and
+ * raising this to match the current version would refuse every one of them and
+ * silently disable organizer actions against servers that work perfectly. For
+ * the same reason it must never be written as an expression over
+ * LOBBY_PROTOCOL_VERSION — `scripts/check-protocol-version.mjs` matches it only
+ * against a bare integer literal, so re-deriving it fails the cross-language
+ * gate rather than shipping that bug.
+ *
+ * Like {@link MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL} there is deliberately NO
+ * ceiling. It moves only if a future version REMOVES the ack, which would be a
+ * breaking change requiring its own floor decision.
+ */
+export const MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK = 5;
+
+/**
+ * Lowest broker LOBBY_PROTOCOL_VERSION that accepts a `CreateTournament` with
+ * `scoring` omitted and applies its own arity default.
+ *
+ * A FLOOR frozen at the version that introduced broker-owned default scoring,
+ * on exactly the terms {@link MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK} above is
+ * frozen — and it must NOT be bumped when LOBBY_PROTOCOL_VERSION moves: a v7
+ * or v8 broker still applies the default, and raising this to match the
+ * current version would push every one of them below the floor and make this
+ * client send an explicit policy forever.
+ *
+ * The gate it guards is sharper than the ack's, which is why the floor exists
+ * at all. Omitting `scoring` against a pre-6 broker is not a missing
+ * capability that degrades — it is a hard `missing field \`scoring\`` parse
+ * error on the broker side. Below this floor the client keeps sending an
+ * explicit policy; at or above it, it may omit one and read the resolved
+ * value back off `TournamentSummary.scoring`.
+ *
+ * Written as a bare integer literal and never as an expression over
+ * LOBBY_PROTOCOL_VERSION — `scripts/check-protocol-version.mjs` matches it
+ * only against a bare integer, so re-deriving it fails the cross-language gate
+ * instead of shipping the latent bug. Like the two floors above there is
+ * deliberately NO ceiling.
+ *
+ * Scope note (protocol v6, wire-contract-only): this floor is the frozen
+ * cross-language contract for the omit-`scoring` capability, and is enforced
+ * today only by `check-protocol-version.mjs`. It has no runtime send-path
+ * consumer yet — `tournamentClient.ts` still always sends an explicit
+ * `ScoringPolicy`, which is the conservative, always-correct direction. The
+ * version-gated omit-path this floor guards lands with the tournament
+ * client-rendering follow-up, alongside reading the resolved value back off
+ * `TournamentSummary.scoring`.
+ */
+export const MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING = 6;
+
+/**
+ * Lowest broker `LOBBY_PROTOCOL_VERSION` that honors a per-event `match_type`
+ * (Bo1 / Bo3) on `CreateTournament`.
+ *
+ * Below this, a broker discards `match_type` as an unknown field and applies the
+ * arity default (Bo3 head-to-head, Bo1 pods). That silent substitution is
+ * harmless when the request already matches the default, but it turns an
+ * explicit **Bo1 head-to-head** choice into a Bo3 event with no signal — so the
+ * send path refuses that one request (see `matchTypeNeedsCapability` /
+ * `createTournament`) rather than let an organizer receive a structure they did
+ * not pick.
+ *
+ * Unlike the two floors above, this is a CLIENT-side send-path floor with no
+ * shared Rust constant to mirror, so it is deliberately NOT registered in
+ * `scripts/check-protocol-version.mjs`. Frozen at 8 (the version that introduced
+ * `match_type`) and, like the others, written as a bare literal rather than
+ * derived from `LOBBY_PROTOCOL_VERSION`, so a future bump cannot silently drag
+ * it forward and start refusing v8 brokers.
+ */
+export const MIN_LOBBY_PROTOCOL_FOR_MATCH_TYPE = 8;
+
+/**
+ * Lowest broker `LOBBY_PROTOCOL_VERSION` whose credential rotation is
+ * RECOVERABLE — i.e. supports idempotent-nonce replay: it mints only from the
+ * current secret (recording the superseded secret + the client's nonce) and, on
+ * a retry presenting that superseded secret with the SAME nonce, REPLAYS the
+ * already-committed secret rather than minting again
+ * (`crates/lobby-broker/src/tournament.rs`, `renew`/`renew_kind`).
+ *
+ * This is the capability that makes proactive rotation SAFE. Against a broker at
+ * or above this floor, a renewal reply lost after the server commits is
+ * survivable: the client retries with the same (token, nonce) and the broker
+ * replays the committed secret. Against a broker below it there is no replay, so
+ * a retry with a superseded token would just be refused — hence
+ * `maybeRenewNearExpiry` (`stores/multiplayerStore`) does not proactively rotate
+ * at all below this floor, leaving the pre-rotation behavior (the credential
+ * simply lapses at its TTL) untouched rather than introducing a strand.
+ *
+ * A CLIENT-side behavioral floor with no shared Rust constant to mirror, so —
+ * like {@link MIN_LOBBY_PROTOCOL_FOR_MATCH_TYPE} — it is NOT value-pinned by an
+ * EXPECTED_* assertion in `scripts/check-protocol-version.mjs`, only listed in
+ * its authored-literals classifier. Frozen at 9 (the version that made rotation
+ * recoverable) and written as a bare literal, never derived from
+ * LOBBY_PROTOCOL_VERSION, so a future bump cannot silently drag it forward and
+ * start refusing v9 brokers that recover perfectly.
+ */
+export const MIN_LOBBY_PROTOCOL_FOR_RECOVERABLE_ROTATION = 9;
 
 /** Identity advertised by the server in its `ServerHello`. */
 export interface ServerInfo {
@@ -616,6 +931,16 @@ export class WebSocketAdapter implements EngineAdapter {
     number,
     { resolve: (sourceIds: ObjectId[]) => void; reject: (error: Error) => void }
   >();
+  private pendingAuthoritativeStateExport: {
+    resolve: (state: string) => void;
+    reject: (error: Error) => void;
+  } | null = null;
+  /** Keyed on the engine-minted `PreviewRequestId`, so this adapter mints no
+   *  counter of its own and the correlation key stays the caller's. */
+  private pendingInteractionPreviews = new Map<
+    string,
+    { resolve: (preview: InteractionPreview) => void; reject: (error: Error) => void }
+  >();
   private initResolve: (() => void) | null = null;
   private initReject: ((error: Error) => void) | null = null;
   /** Starting-player contest event captured from the initial GameStarted
@@ -774,50 +1099,60 @@ export class WebSocketAdapter implements EngineAdapter {
       this.initResolve = resolve;
       this.initReject = reject;
 
-      if (!this.isNativeSocket() && !isValidWebSocketUrl(this.serverUrl)) {
-        reject(new AdapterError("WS_ERROR", "Invalid WebSocket URL", false));
-        this.initResolve = null;
-        this.initReject = null;
-        return;
-      }
+      const initializeConnection = async () => {
+        if (!this.isNativeSocket() && isLanEndpoint(this.serverUrl)) {
+          await initializeLanCapabilities();
+          if (this.disposed) {
+            throw new AdapterError("WS_CLOSED", "Adapter disposed before initialization completed", true);
+          }
+        }
 
-      // A ws:// target from an HTTPS page is blocked by the browser before the
-      // handshake — surface why instead of letting it fail as "unreachable".
-      const blockReason = this.isNativeSocket()
-        ? null
-        : mixedContentBlockReason(this.serverUrl);
-      if (blockReason) {
-        reject(new AdapterError("WS_ERROR", blockReason, false));
-        this.initResolve = null;
-        this.initReject = null;
-        return;
-      }
+        if (!this.isNativeSocket() && !isValidWebSocketUrl(this.serverUrl)) {
+          reject(new AdapterError("WS_ERROR", "Invalid WebSocket URL", false));
+          this.initResolve = null;
+          this.initReject = null;
+          return;
+        }
 
-      this.seedNativeReconnectSession();
-      const setupFrame =
-        this.options.nativeAi
-          ? this.nativeAiSetupFrame(this.options.nativeAi)
-          : this.options.nativePregame
-            ? this.nativePregameSetupFrame(this.options.nativePregame)
-          : this.mode === "host"
-          ? { type: "CreateGame", data: { deck: this.deckData } }
-          : this.mode === "spectate"
-            ? { type: "SpectatorJoin", data: { game_code: this.joinGameCode! } }
-            : {
-                type: "JoinGameWithPassword",
-                data: {
-                  game_code: this.joinGameCode!,
-                  deck: this.deckData,
-                  display_name: this.displayName,
-                  password: this.joinPassword ?? null,
-                  reservation_token: this.reservationToken ?? null,
-                },
-              };
+        // A ws:// target from an HTTPS page is blocked by the browser before the
+        // handshake — surface why instead of letting it fail as "unreachable".
+        const blockReason = this.isNativeSocket()
+          ? null
+          : mixedContentBlockReason(this.serverUrl);
+        if (blockReason) {
+          reject(new AdapterError("WS_ERROR", blockReason, false));
+          this.initResolve = null;
+          this.initReject = null;
+          return;
+        }
 
-      this.attachSocket(setupFrame).catch(() => {
-        // `attachSocket` emits reject via initReject; swallow the
-        // rejection here so it doesn't surface as an unhandled promise.
-      });
+        this.seedNativeReconnectSession();
+        const setupFrame =
+          this.options.nativeAi
+            ? this.nativeAiSetupFrame(this.options.nativeAi)
+            : this.options.nativePregame
+              ? this.nativePregameSetupFrame(this.options.nativePregame)
+            : this.mode === "host"
+            ? { type: "CreateGame", data: { deck: this.deckData } }
+            : this.mode === "spectate"
+              ? { type: "SpectatorJoin", data: { game_code: this.joinGameCode! } }
+              : {
+                  type: "JoinGameWithPassword",
+                  data: {
+                    game_code: this.joinGameCode!,
+                    deck: this.deckData,
+                    display_name: this.displayName,
+                    password: this.joinPassword ?? null,
+                    reservation_token: this.reservationToken ?? null,
+                  },
+                };
+
+        this.attachSocket(setupFrame).catch(() => {
+          // `attachSocket` emits reject via initReject; swallow the
+          // rejection here so it doesn't surface as an unhandled promise.
+        });
+      };
+      void initializeConnection().catch((error: Error) => this.rejectInitialization(error));
     });
   }
 
@@ -940,7 +1275,27 @@ export class WebSocketAdapter implements EngineAdapter {
     this.startPing();
 
     socket.ws.onmessage = (event) => {
-      this.handleMessage(JSON.parse(event.data as string));
+      let message: unknown;
+      try {
+        message = JSON.parse(event.data as string);
+      } catch {
+        this.rejectAuthoritativeStateExport(
+          new AdapterError("WS_ERROR", "Server sent an invalid WebSocket frame.", false),
+        );
+        return;
+      }
+      if (
+        typeof message !== "object"
+        || message === null
+        || !("type" in message)
+        || typeof message.type !== "string"
+      ) {
+        this.rejectAuthoritativeStateExport(
+          new AdapterError("WS_ERROR", "Server sent an invalid WebSocket frame.", false),
+        );
+        return;
+      }
+      this.handleMessage(message as { type: string; data?: unknown });
     };
 
     socket.ws.onerror = () => {
@@ -957,12 +1312,9 @@ export class WebSocketAdapter implements EngineAdapter {
         clearInterval(this.pingInterval);
         this.pingInterval = null;
       }
-      if (this.sessionIdentityRejected) return;
-      // Clear the "host waiting for opponent" latch on socket close —
-      // otherwise a host who received GameCreated, disconnected before
-      // GameStarted, and then reconnected through a different path would
-      // fire `opponentJoined` spuriously on the replayed GameStarted.
-      this.hostWaitingForOpponent = false;
+      // Settled above the identity-rejection guard: a close that arrives
+      // while the latch is set must still settle the caller's promise, or
+      // the submission hangs forever holding the dispatch mutex.
       if (this.pendingReject) {
         this.emit({ type: "actionPendingChanged", pending: false });
         this.pendingReject(
@@ -971,8 +1323,24 @@ export class WebSocketAdapter implements EngineAdapter {
         this.pendingResolve = null;
         this.pendingReject = null;
       }
+      // Deliberately scoped to the submission slot. The seven reject helpers
+      // below still skip on the identity-rejected path; none of them holds the
+      // dispatch mutex, so none can freeze the board the way a parked
+      // submission does. Widening the hoist is a separate judgement.
+      if (this.sessionIdentityRejected) return;
+      // Clear the "host waiting for opponent" latch on socket close —
+      // otherwise a host who received GameCreated, disconnected before
+      // GameStarted, and then reconnected through a different path would
+      // fire `opponentJoined` spuriously on the replayed GameStarted.
+      this.hostWaitingForOpponent = false;
       this.rejectPendingManaPaymentPreviews(
         new AdapterError("WS_CLOSED", "Connection closed during mana-payment preview", true),
+      );
+      this.rejectAuthoritativeStateExport(
+        new AdapterError("WS_CLOSED", "Connection closed during authoritative-state export", true),
+      );
+      this.rejectPendingInteractionPreviews(
+        new AdapterError("WS_CLOSED", "Connection closed during interaction preview", true),
       );
       this.rejectPregameMutation(
         new AdapterError("WS_CLOSED", "Connection closed during seat mutation", true),
@@ -1070,6 +1438,60 @@ export class WebSocketAdapter implements EngineAdapter {
       if (!this.send({ type: "PreviewManaPayment", data: { request_id: requestId, action } })) {
         this.pendingManaPaymentPreviews.delete(requestId);
         reject(new AdapterError("WS_CLOSED", "Failed to send mana-payment preview", true));
+      }
+    });
+  }
+
+  /**
+   * Requests the server-owned trusted engine envelope. The server authorizes
+   * this separately from ordinary redacted state broadcasts.
+   */
+  async exportPersistenceState(): Promise<string> {
+    // An unredacted engine envelope must not cross a cleartext WebSocket. The
+    // native sidecar is a local trusted transport rather than a network socket.
+    if (
+      !this.serverUrl.startsWith("wss://")
+      && !this.serverUrl.startsWith("native-engine://")
+    ) {
+      throw new AdapterError(
+        "WS_ERROR",
+        "Authoritative-state export requires a secure connection",
+        false,
+      );
+    }
+    if (this.sessionIdentityRejected) {
+      throw new AdapterError("WS_ERROR", "Session identity rejected", false);
+    }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new AdapterError("WS_ERROR", "WebSocket not connected", false);
+    }
+    if (this.pendingAuthoritativeStateExport) {
+      throw new AdapterError("WS_ERROR", "Authoritative-state export already in progress", false);
+    }
+
+    return new Promise<string>((resolve, reject) => {
+      this.pendingAuthoritativeStateExport = { resolve, reject };
+      if (!this.send({ type: "ExportAuthoritativeState" })) {
+        this.pendingAuthoritativeStateExport = null;
+        reject(new AdapterError("WS_CLOSED", "Failed to request authoritative state", true));
+      }
+    });
+  }
+
+  async previewInteraction(
+    request: InteractionPreviewRequest,
+    _actor: PlayerId,
+  ): Promise<InteractionPreview> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      throw new AdapterError("WS_ERROR", "WebSocket not connected", false);
+    }
+
+    return new Promise<InteractionPreview>((resolve, reject) => {
+      this.pendingInteractionPreviews.set(request.requestId, { resolve, reject });
+      // `request` is forwarded VERBATIM — no field is read, reshaped or rebuilt.
+      if (!this.send({ type: "PreviewInteraction", data: { request } })) {
+        this.pendingInteractionPreviews.delete(request.requestId);
+        reject(new AdapterError("WS_CLOSED", "Failed to send interaction preview", true));
       }
     });
   }
@@ -1194,10 +1616,21 @@ export class WebSocketAdapter implements EngineAdapter {
     this.playerToken = null;
     this._gameCode = null;
     this.fullSessionKey = null;
-    this.pendingResolve = null;
-    this.pendingReject = null;
+    if (this.pendingReject) {
+      this.pendingReject(
+        new AdapterError("WS_CLOSED", "Adapter disposed during action", true),
+      );
+      this.pendingResolve = null;
+      this.pendingReject = null;
+    }
     this.rejectPendingManaPaymentPreviews(
       new AdapterError("WS_CLOSED", "Adapter disposed during mana-payment preview", true),
+    );
+    this.rejectAuthoritativeStateExport(
+      new AdapterError("WS_CLOSED", "Adapter disposed during authoritative-state export", true),
+    );
+    this.rejectPendingInteractionPreviews(
+      new AdapterError("WS_CLOSED", "Adapter disposed during interaction preview", true),
     );
     this.rejectPregameMutation(
       new AdapterError("WS_CLOSED", "Adapter disposed during seat mutation", true),
@@ -1315,6 +1748,9 @@ export class WebSocketAdapter implements EngineAdapter {
             deck: { type: "DeckList", data: seat.deck },
           })),
           format_config: options.formatConfig ?? null,
+          ...(options.boosterPackPool !== undefined
+            ? { booster_pack_pool: options.boosterPackPool }
+            : {}),
           start_when_full: false,
           ranked: false,
         },
@@ -1431,6 +1867,18 @@ export class WebSocketAdapter implements EngineAdapter {
       reject(error);
     }
     this.pendingManaPaymentPreviews.clear();
+  }
+
+  private rejectAuthoritativeStateExport(error: Error): void {
+    this.pendingAuthoritativeStateExport?.reject(error);
+    this.pendingAuthoritativeStateExport = null;
+  }
+
+  private rejectPendingInteractionPreviews(error: Error): void {
+    for (const { reject } of this.pendingInteractionPreviews.values()) {
+      reject(error);
+    }
+    this.pendingInteractionPreviews.clear();
   }
 
   /** Snapshot of the server's advertised identity, or null before ServerHello. */
@@ -1572,7 +2020,7 @@ export class WebSocketAdapter implements EngineAdapter {
       }
 
       case "GameStarted": {
-        const data = msg.data as { state_revision: number; state: GameState; your_player: PlayerId; opponent_name?: string; player_names?: string[]; legal_actions?: GameAction[]; auto_pass_recommended?: boolean; end_continuous_effect_offers?: LegalActionsResult["endContinuousEffectOffers"]; mana_payment_shortcut_actions?: GameAction[]; spell_costs?: Record<string, ManaCost>; legal_actions_by_object?: Record<string, GameAction[]>; viewer_interaction?: LegalActionsResult["viewerInteraction"]; derived?: GameState["derived"]; player_token?: string; full_key?: FullSessionKey; events?: GameEvent[]; rewind_targets?: RewindOption[] };
+        const data = msg.data as { state_revision: number; state: GameState; your_player: PlayerId; opponent_name?: string; player_names?: string[]; legal_actions?: GameAction[]; auto_pass_recommended?: boolean; end_continuous_effect_offers?: LegalActionsResult["endContinuousEffectOffers"]; mana_payment_shortcut_actions?: GameAction[]; spell_costs?: Record<string, ManaCost>; legal_actions_by_object?: Record<string, GameAction[]>; activation_block_reasons?: Record<string, AbilityBlockEntry[]>; viewer_interaction?: LegalActionsResult["viewerInteraction"]; derived?: GameState["derived"]; player_token?: string; full_key?: FullSessionKey; events?: GameEvent[]; rewind_targets?: RewindOption[] };
         const nativeReconnect = this.options.nativePregame?.kind === "reconnect"
           ? this.options.nativePregame
           : null;
@@ -1604,6 +2052,7 @@ export class WebSocketAdapter implements EngineAdapter {
             manaPaymentShortcutActions: data.mana_payment_shortcut_actions ?? [],
             spellCosts: data.spell_costs,
             legalActionsByObject: data.legal_actions_by_object,
+            activationBlockReasons: data.activation_block_reasons,
             viewerInteraction: data.viewer_interaction,
           },
         );
@@ -1685,7 +2134,8 @@ export class WebSocketAdapter implements EngineAdapter {
       }
 
       case "StateUpdate": {
-        const data = msg.data as { state_revision: number; state: GameState; events: GameEvent[]; legal_actions?: GameAction[]; auto_pass_recommended?: boolean; end_continuous_effect_offers?: LegalActionsResult["endContinuousEffectOffers"]; mana_payment_shortcut_actions?: GameAction[]; spell_costs?: Record<string, ManaCost>; legal_actions_by_object?: Record<string, GameAction[]>; viewer_interaction?: LegalActionsResult["viewerInteraction"]; log_entries?: GameLogEntry[]; derived?: GameState["derived"]; rewind_targets?: RewindOption[] };
+        const data = msg.data as { state_revision: number; state: GameState; events: GameEvent[]; legal_actions?: GameAction[]; auto_pass_recommended?: boolean; end_continuous_effect_offers?: LegalActionsResult["endContinuousEffectOffers"]; mana_payment_shortcut_actions?: GameAction[]; spell_costs?: Record<string, ManaCost>; legal_actions_by_object?: Record<string, GameAction[]>; activation_block_reasons?: Record<string, AbilityBlockEntry[]>; viewer_interaction?: LegalActionsResult["viewerInteraction"]; log_entries?: GameLogEntry[]; derived?: GameState["derived"]; rewind_targets?: RewindOption[]; full_key?: FullSessionKey };
+        if (!this.acceptFollowUpFullSessionKey(data.full_key)) break;
         // Attach the engine-authored derived views to the state snapshot so
         // components (e.g. CommanderDamage) can read them via gameState.derived
         // without a separate subscription path. See
@@ -1699,6 +2149,7 @@ export class WebSocketAdapter implements EngineAdapter {
             manaPaymentShortcutActions: data.mana_payment_shortcut_actions ?? [],
             spellCosts: data.spell_costs,
             legalActionsByObject: data.legal_actions_by_object,
+            activationBlockReasons: data.activation_block_reasons,
             viewerInteraction: data.viewer_interaction,
           },
         );
@@ -1808,6 +2259,74 @@ export class WebSocketAdapter implements EngineAdapter {
         break;
       }
 
+      case "AuthoritativeStateExport": {
+        const data = msg.data;
+        const pending = this.pendingAuthoritativeStateExport;
+        this.pendingAuthoritativeStateExport = null;
+        if (pending) {
+          if (
+            typeof data === "object"
+            && data !== null
+            && "state" in data
+            && typeof data.state === "string"
+          ) {
+            pending.resolve(data.state);
+          } else {
+            pending.reject(new AdapterError(
+              "WS_ERROR",
+              "Server sent an invalid authoritative-state export.",
+              false,
+            ));
+          }
+        }
+        break;
+      }
+
+      // `ServerMessage` carries no `rename_all`, so its own fields are
+      // snake_case on the wire while the engine DTO inside carries camelCase.
+      case "InteractionPreview": {
+        const data = msg.data as { preview: InteractionPreview };
+        const pending = this.pendingInteractionPreviews.get(data.preview.requestId);
+        if (pending) {
+          this.pendingInteractionPreviews.delete(data.preview.requestId);
+          pending.resolve(data.preview);
+        }
+        break;
+      }
+
+      case "AuthoritativeStateExportFailed": {
+        const data = msg.data;
+        const pending = this.pendingAuthoritativeStateExport;
+        this.pendingAuthoritativeStateExport = null;
+        pending?.reject(new AdapterError(
+          "WS_ERROR",
+          typeof data === "object"
+            && data !== null
+            && "message" in data
+            && typeof data.message === "string"
+            ? data.message
+            : "Authoritative-state export failed.",
+          false,
+        ));
+        break;
+      }
+
+      case "InteractionPreviewFailed": {
+        const data = msg.data as { request_id: string; message: string };
+        const pending = this.pendingInteractionPreviews.get(data.request_id);
+        if (pending) {
+          this.pendingInteractionPreviews.delete(data.request_id);
+          pending.reject(new AdapterError("WS_ERROR", data.message, false));
+        }
+        break;
+      }
+
+      default:
+        this.rejectAuthoritativeStateExport(
+          new AdapterError("WS_ERROR", "Server sent an unrecognized WebSocket frame.", false),
+        );
+        break;
+
       case "RequestRejected": {
         const data = msg.data as { reason?: unknown };
         this.emit({
@@ -1818,7 +2337,8 @@ export class WebSocketAdapter implements EngineAdapter {
       }
 
       case "OpponentDisconnected": {
-        const data = msg.data as { grace_seconds: number };
+        const data = msg.data as { grace_seconds: number; full_key?: FullSessionKey };
+        if (!this.acceptFollowUpFullSessionKey(data.full_key)) break;
         this.emit({
           type: "opponentDisconnected",
           graceSeconds: data.grace_seconds,
@@ -1827,6 +2347,8 @@ export class WebSocketAdapter implements EngineAdapter {
       }
 
       case "OpponentReconnected": {
+        const data = (msg.data ?? {}) as { full_key?: FullSessionKey };
+        if (!this.acceptFollowUpFullSessionKey(data.full_key)) break;
         this.emit({ type: "opponentReconnected" });
         break;
       }
@@ -2039,6 +2561,13 @@ export class WebSocketAdapter implements EngineAdapter {
     return true;
   }
 
+  /** Allows legacy follow-up frames only until the server establishes an exact Full identity. */
+  private acceptFollowUpFullSessionKey(key: FullSessionKey | undefined): boolean {
+    return !this.fullSessionKey && !key
+      ? true
+      : this.acceptFullSessionKey(key);
+  }
+
   /** Reject identity-bearing reconnect frames before they can update session state. */
   private acceptNativeReconnectIdentity(frame: {
     gameCode?: string;
@@ -2078,6 +2607,8 @@ export class WebSocketAdapter implements EngineAdapter {
       this.pingInterval = null;
     }
     this.rejectInitialization(error);
+    this.rejectAuthoritativeStateExport(error);
+    this.rejectPregameMutation(error);
     this.emit({ type: "error", message: error.message });
     this.ws?.close();
     return false;

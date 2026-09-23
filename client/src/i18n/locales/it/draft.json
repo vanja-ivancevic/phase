@@ -2,6 +2,7 @@
   "intro": {
     "quickTitle": "Quick Draft",
     "podTitle": "Pod Draft",
+    "winstonTitle": "Winston Draft",
     "commanderTitle": "Commander Draft",
     "subtitle": "Ecco come funziona",
     "startDrafting": "Inizia il draft",
@@ -21,7 +22,11 @@
       "minimumDeckCards_one": "{{count, number}} carta",
       "minimumDeckCards_few": "{{count, number}} carte",
       "minimumDeckCards_many": "{{count, number}} carte",
-      "minimumDeckCards_other": "{{count, number}} carte"
+      "minimumDeckCards_other": "{{count, number}} carte",
+      "pilesDealt_one": "{{count, number}} mucchio da una carta",
+      "pilesDealt_few": "{{count, number}} mucchi da una carta",
+      "pilesDealt_many": "{{count, number}} mucchi da una carta",
+      "pilesDealt_other": "{{count, number}} mucchi da una carta"
     },
     "packPassing_one": "Questo draft ha un solo round di buste, quindi la direzione di passaggio non cambia",
     "packPassing_few": "La direzione di passaggio cambia a ogni round",
@@ -38,6 +43,13 @@
       "step2": "Apri {{packs}}; ogni busta contiene {{cardsPerPack}} — scegli una carta e passa il resto",
       "step2Mixed": "Apri {{packs}} di dimensioni diverse, in quest'ordine: {{packSizes, list}} — scegli una carta e passa il resto",
       "step4": "Dopo il draft, costruisci un mazzo di almeno {{minimumDeckCards}} e gioca le partite del torneo"
+    },
+    "winston": {
+      "step2": "Le {{packs}} di ogni giocatore vengono aperte senza che nessuno le guardi e tutte le carte sono mescolate in un'unica pila coperta",
+      "step2Mixed": "Le {{packs}} di dimensioni diverse di ogni giocatore, in quest'ordine: {{packSizes, list}}, vengono aperte senza che nessuno le guardi e mescolate in un'unica pila coperta",
+      "step3": "{{piles}} vengono distribuiti dalla cima. Nel tuo turno, guarda il primo mucchio: prendilo, oppure rifiutalo e passa al successivo",
+      "step4": "Rifiutare mette la carta in cima alla pila sul mucchio che hai rifiutato. Rifiutali tutti e prendi invece la carta in cima alla pila, senza vederla",
+      "step5": "I turni si alternano finché non restano carte; poi costruisci un mazzo di almeno {{minimumDeckCards}} e gioca le partite del torneo"
     },
     "commander": {
       "step2": "Apri {{packs}}; ogni busta contiene {{cardsPerPack}} — scegli due carte e passa il resto",
@@ -79,6 +91,13 @@
     "label": "Timer di scelta",
     "seconds": "{{count}}s"
   },
+  "pickStatus": {
+    "Pending": "Sceglie",
+    "Picked": "Scelto",
+    "Waiting": "In attesa",
+    "TimedOut": "Tempo scaduto",
+    "NotDrafting": "Non in draft"
+  },
   "scoreBadge": {
     "label": "Punteggio: {{count}} vittorie"
   },
@@ -92,7 +111,11 @@
     "activePackCount_one": "{{count}} busta presso {{player}}",
     "activePackCount_few": "{{count}} buste presso {{player}}",
     "activePackCount_many": "{{count}} buste presso {{player}}",
-    "activePackCount_other": "{{count}} buste presso {{player}}"
+    "activePackCount_other": "{{count}} buste presso {{player}}",
+    "draftedCardCount_one": "{{count}} carta draftata da {{player}}",
+    "draftedCardCount_few": "{{count}} carte draftate da {{player}}",
+    "draftedCardCount_many": "{{count}} carte draftate da {{player}}",
+    "draftedCardCount_other": "{{count}} carte draftate da {{player}}"
   },
   "setSelector": {
     "botDifficulty": "Difficoltà bot",
@@ -256,7 +279,7 @@
     "compact": { "sideboardRegion": "Sideboard compatto" },
     "toolbar": { "label": "Disposizione del tabellone" },
     "layout": { "label": "Layout", "columns": "Colonne", "maxPerRow": "Massimo di colonne per riga", "decreaseMaxPerRow": "Riduci massimo di colonne per riga", "increaseMaxPerRow": "Aumenta massimo di colonne per riga" },
-    "sort": { "label": "Ordina tabellone", "group": "Raggruppa", "cmc": "Valore di mana", "color": "Colore", "rarity": "Rarità", "type": "Tipo" },
+    "sort": { "label": "Raggruppa per", "group": "Raggruppa", "cmc": "Valore di mana", "color": "Colore", "rarity": "Rarità", "type": "Tipo" },
     "rows": { "label": "Righe del tabellone", "one": "Una riga", "two": "Due righe" },
     "rowHeaders": { "creatures": "Creature", "nonCreatures": "Non creature" },
     "columns": { "label": "Colonne del tabellone", "add": "Aggiungi colonna", "removeFinal": "Rimuovi ultima colonna", "removeHeader": "Rimuovi colonna {{column}}" },
@@ -310,6 +333,7 @@
     "textBasedBuilder": "Costruttore testuale",
     "textBuilder": "Costruttore testo",
     "averageManaCost": "Costo medio di mana",
+    "deckStats": "Statistiche del mazzo",
     "manaColor": "Colore del mana",
     "countInCost": "Quantità nel costo",
     "type": "Tipo",
@@ -336,6 +360,8 @@
     "moreNeeded": "{{count}} altre necessarie",
     "commanderRequired": "Designa un comandante dalla tua riserva per inviare.",
     "commanderUnavailable": "La designazione del comandante non è disponibile al momento: non è stato possibile caricare il database delle carte.",
+    "compatibilityPending": "Verifica della compatibilità del mazzo...",
+    "compatibilityUnavailable": "La compatibilità del mazzo non è disponibile al momento: riprova prima di inviarlo.",
     "grantedFiller": "La tua riserva include anche fino a {{maximum}} × {{name}}, utilizzabile solo come comandante."
   },
   "landing": {
@@ -363,6 +389,10 @@
       "title": "Commander Draft",
       "description": "Drafta due carte alla volta in un pod, costruisci un mazzo Commander da 60 carte, poi gioca una partita multigiocatore."
     },
+    "winstonDraft": {
+      "title": "Winston Draft",
+      "description": "Due giocatori condividono una pila coperta divisa in tre mucchi: prendi un mucchio o rifiutalo, poi costruisci e gioca."
+    },
     "podInProgress": "Pod Draft in corso",
     "guestPodInProgress": "Pod partecipato pronto a riconnettersi",
     "podLabel": "Pod {{kind}}",
@@ -383,6 +413,12 @@
     "resumeMatch": "Riprendi partita",
     "viewResults": "Vedi risultati",
     "setIconAlt": "Icona {{code}}"
+  },
+  "offline": {
+    "unavailableTitle": "Il draft multigiocatore non è disponibile offline.",
+    "unavailableDescription": "Riconnettiti o disattiva la modalità offline per ospitare, unirti, avviare o guardare un draft multigiocatore.",
+    "startUnavailable": "Non puoi avviare un draft multigiocatore offline. Riconnettiti o disattiva la modalità offline per continuare.",
+    "watchUnavailable": "Non puoi guardare un draft multigiocatore offline. Riconnettiti o disattiva la modalità offline per continuare."
   },
   "podPhase": {
     "lobby": "Lobby",
@@ -418,6 +454,7 @@
     "exportUrl": "URL di esportazione CubeCobra",
     "exportUrlPlaceholder": "Incolla un URL di esportazione raw, o incolla la lista qui sotto",
     "loadUrl": "Carica URL",
+    "offlineUrlUnavailable": "Il caricamento di liste cube da URL non è disponibile offline.",
     "deckAddables": "Carte aggiungibili al mazzo",
     "addablesStandardBasics": "Base standard",
     "addablesBasicsPlusCustom": "Base più personalizzate",
@@ -505,6 +542,8 @@
     "kindSealedDesc": "Apri sei buste direttamente nel pool di ogni giocatore, poi costruisci un mazzo da torneo al meglio di una.",
     "kindCommanderDraft": "Commander",
     "kindCommanderDraftDesc": "Ogni giocatore drafta due carte alla volta e costruisce un mazzo Commander da 60 carte, poi il pod gioca una partita multigiocatore.",
+    "kindWinston": "Winston",
+    "kindWinstonDesc": "Da due a quattro giocatori draftano una pila condivisa coperta tramite tre mucchi: nel tuo turno guarda un mucchio e prendilo, oppure rifiutalo e aggiungici una carta.",
     "tournamentFormat": "Formato torneo",
     "tournamentSwiss": "Svizzero",
     "tournamentSwissDesc": "Tutti continuano a giocare per tre round, anche dopo una sconfitta.",
@@ -574,6 +613,12 @@
   "podComplete": {
     "title": "Draft completato",
     "launchCommanderGame": "Avvia partita Commander",
+    "launchLocalCommanderGame": "Avvia partita Commander locale",
+    "waitingForPlayers": "In attesa che i giocatori si uniscano…",
+    "cancelCommanderLaunch": "Annulla avvio",
+    "joinCommanderGame": "Unisciti alla partita Commander",
+    "joiningCommanderGame": "Accesso in corso: in attesa degli altri giocatori…",
+    "seatCeiling": "Questo tavolo ha {{seats}} giocatori; una partita Commander peer-to-peer ne supporta al massimo {{max}}. Giocherai questa partita in locale contro il motore, con tutti i mazzi draftati.",
     "returnToMenu": "Torna al menu"
   },
   "podError": {
@@ -581,6 +626,51 @@
     "hostLeft": "L'host ha abbandonato il draft",
     "connection": "Errore di connessione",
     "retry": "Prova a riconnetterti"
+  },
+  "winston": {
+    "heading": "Winston Draft",
+    "yourTurn": "Tocca a te — mucchio {{index}}",
+    "otherSeatTurn": "{{name}} sta decidendo",
+    "seatFallback": "Posto {{index}}",
+    "turnHint": "Prendi il mucchio oppure rifiutalo. Rifiutandolo vi si aggiunge una carta dalla pila principale e passi al mucchio successivo; se rifiuti l'ultimo, peschi la prima carta della pila principale.",
+    "mainStackRemaining_one": "{{count, number}} carta coperta nella pila principale",
+    "mainStackRemaining_few": "{{count, number}} carte coperte nella pila principale",
+    "mainStackRemaining_many": "{{count, number}} carte coperte nella pila principale",
+    "mainStackRemaining_other": "{{count, number}} carte coperte nella pila principale",
+    "cardsLeft_one": "{{count, number}} carta rimasta nel draft",
+    "cardsLeft_few": "{{count, number}} carte rimaste nel draft",
+    "cardsLeft_many": "{{count, number}} carte rimaste nel draft",
+    "cardsLeft_other": "{{count, number}} carte rimaste nel draft",
+    "stackShare": "Quota delle carte rimaste nel draft ancora coperte nella pila principale",
+    "pileLabel": "Mucchio {{index}}",
+    "pileTotal_one": "{{count, number}} carta",
+    "pileTotal_few": "{{count, number}} carte",
+    "pileTotal_many": "{{count, number}} carte",
+    "pileTotal_other": "{{count, number}} carte",
+    "pileFaceDown": "Coperto",
+    "deciding": "Decisione su questo mucchio",
+    "hiddenPiles": "I mucchi restano coperti finché non tocca a te.",
+    "take": "Prendi",
+    "takeAria": "Prendi il mucchio {{index}}",
+    "decline": "Rifiuta",
+    "declineAria": "Rifiuta il mucchio {{index}}",
+    "refusal": {
+      "PileNotActive": "Non stai decidendo su questo mucchio.",
+      "PileEmpty": "Questo mucchio è vuoto, non c'è nulla da prendere.",
+      "NoGuaranteedCard": "Rifiutare non può più garantirti una carta in questo turno, quindi prendere questo mucchio è la tua unica mossa legale."
+    },
+    "refusalUnpublished": "Il draft non ha pubblicato alcun verdetto per questa decisione.",
+    "playFirstChooser": "{{name}} sceglie chi gioca per primo nelle partite dopo il draft.",
+    "scale": "Scala dei mucchi",
+    "scaleDecrease": "Riduci la scala dei mucchi",
+    "scaleReset": "Reimposta la scala dei mucchi",
+    "scaleIncrease": "Aumenta la scala dei mucchi",
+    "faceDownStack_one": "{{count, number}} carta coperta",
+    "faceDownStack_few": "{{count, number}} carte coperte",
+    "faceDownStack_many": "{{count, number}} carte coperte",
+    "faceDownStack_other": "{{count, number}} carte coperte",
+    "forcedDraw": "Hai rifiutato ogni mucchio, quindi hai pescato {{name}} dalla cima della pila principale.",
+    "forcedDrawLabel": "Pescata dalla pila principale"
   },
   "lobby": {
     "title": "Lobby del pod di draft",

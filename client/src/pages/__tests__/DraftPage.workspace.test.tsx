@@ -9,9 +9,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { DraftCardInstance, DraftPlayerView } from "../../adapter/draft-adapter";
 import { DRAFT_WORKSPACE_PREFERENCES_KEY } from "../../constants/storage";
+import { createDefaultDraftWorkspacePreferences } from "../../components/draft/workspace/workspacePreferences";
 import type { LocalDeckBuilderController } from "../../components/draft/LimitedDeckBuilder";
 import type { PackDisplayController, PackDisplayPresentation } from "../../components/draft/PackDisplay";
 import { projectWorkspaceLandCounts } from "../../components/draft/workspace/workspaceProjection";
+import { ShellProvider } from "../../components/chrome/ShellContext";
 
 interface DraftIntroCapture {
   mode: string;
@@ -63,14 +65,17 @@ const persistence = vi.hoisted(() => ({
 const captured = vi.hoisted(() => ({
   local: null as LocalDeckBuilderController | null,
   preview: null as { mode?: string; hoverDelayMs?: number } | null,
-  menuShell: null as { layout?: string; contentWidthClass?: string; compactTopPadding?: boolean } | null,
+  menuShell: null as { layout?: string; contentWidthClass?: string; compactTopPadding?: boolean; fillEmbeddedHeight?: boolean } | null,
   pack: null as PackDisplayController | null,
   presentation: null as PackDisplayPresentation | null,
   phoneToolbarPinned: null as boolean | null,
   shellMode: null as string | null,
+  showProgress: null as boolean | null,
   steps: null as { phase?: string; compact?: boolean; arrowSeparators?: boolean } | null,
   intro: null as DraftIntroCapture | null,
 }));
+
+const arrivingPreferences = vi.hoisted(() => vi.fn());
 
 vi.mock("@wasm/draft", () => wasm);
 vi.mock("../../services/quickDraftPersistence", () => persistence);
@@ -85,9 +90,12 @@ vi.mock("../../hooks/useCardImage", () => ({ useCardImage: () => ({ src: null, i
 vi.mock("../../components/chrome/ScreenChrome", () => ({ ScreenChrome: () => null }));
 vi.mock("../../components/chrome/ShellContext", async (importOriginal) => ({
   ...await importOriginal<typeof import("../../components/chrome/ShellContext")>(),
-  useDraftShellChrome: (mode: string) => { captured.shellMode = mode; },
+  useDraftShellChrome: (mode: string, _phoneAction?: unknown, _progressVariant?: string, showProgress?: boolean) => {
+    captured.shellMode = mode;
+    captured.showProgress = showProgress ?? true;
+  },
 }));
-vi.mock("../../components/menu/MenuShell", () => ({ MenuShell: (props: { children: ReactNode; layout?: string; contentWidthClass?: string; compactTopPadding?: boolean }) => {
+vi.mock("../../components/menu/MenuShell", () => ({ MenuShell: (props: { children: ReactNode; layout?: string; contentWidthClass?: string; compactTopPadding?: boolean; fillEmbeddedHeight?: boolean }) => {
   captured.menuShell = props;
   return <>{props.children}</>;
 } }));
@@ -128,6 +136,23 @@ vi.mock("../../components/draft/DraftIntro", () => ({
     return <button type="button" onClick={props.onContinue}>Continue</button>;
   },
 }));
+// Spied on the module the page imports it from. `setArrivingCardBoardPreferences`
+// lives in `workspacePreferences` rather than in either store, because both
+// draft stores read the published value. Everything else in the module is the
+// real implementation, including the `loadDraftWorkspacePreferences` /
+// `saveDraftWorkspacePreferences` pair these tests already exercise.
+vi.mock("../../components/draft/workspace/workspacePreferences", async (importOriginal) => {
+  const actual = await importOriginal<
+    typeof import("../../components/draft/workspace/workspacePreferences")
+  >();
+  // FORWARDS to the real setter rather than swallowing the call. The stores read
+  // the published value back through `getArrivingCardBoardPreferences` in this
+  // same module, so a bare `vi.fn()` would sever the page-to-store seam and any
+  // later placement assertion here would silently measure the module's seeded
+  // default instead of what the page published.
+  arrivingPreferences.mockImplementation(actual.setArrivingCardBoardPreferences);
+  return { ...actual, setArrivingCardBoardPreferences: arrivingPreferences };
+});
 
 import { useDraftStore } from "../../stores/draftStore";
 import { usePreferencesStore } from "../../stores/preferencesStore";
@@ -142,7 +167,7 @@ function card(instanceId: string, name = instanceId): DraftCardInstance {
 
 function view(overrides: Partial<DraftPlayerView> = {}): DraftPlayerView {
   return {
-    status: "Drafting", kind: "Quick", launch_capability: "None", pool: [], current_pack: [], draft_effects: [],
+    status: "Drafting", kind: "Quick", launch_capability: "None", commanders_required: 0, pool: [], current_pack: [], draft_effects: [],
     pool_groups: {
       color_groups: [], type_groups: [], cmc_groups: [], rarity_groups: [],
       type_filter_options: [], color_filter_options: [],
@@ -168,6 +193,7 @@ describe("DraftPage local deckbuilding wiring", () => {
     captured.presentation = null;
     captured.phoneToolbarPinned = null;
     captured.shellMode = null;
+    captured.showProgress = null;
     captured.steps = null;
     captured.intro = null;
     usePreferencesStore.setState({ draftCardPreviewMode: "none", draftDoubleClickConfirmPick: true });
@@ -272,6 +298,7 @@ describe("DraftPage local deckbuilding wiring", () => {
     expect(captured.menuShell).toMatchObject({ compactTopPadding: true });
     expect(captured.phoneToolbarPinned).toBe(true);
     expect(captured.shellMode).toBe("phone-drafting");
+    expect(captured.showProgress).toBe(false);
     expect(captured.steps).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Show Deck workspace" }));
     expect(captured.phoneToolbarPinned).toBe(false);
@@ -304,10 +331,34 @@ describe("DraftPage local deckbuilding wiring", () => {
     const { container } = render(<MemoryRouter><DraftPage /></MemoryRouter>);
 
     expect(captured.shellMode).toBe("phone-deckbuilding");
+    expect(captured.showProgress).toBe(false);
     expect(captured.steps).toBeNull();
     expect(container.querySelector("[data-draft-steps-spacing]")).not.toBeInTheDocument();
     expect(captured.menuShell).toMatchObject({ compactTopPadding: true });
     expect(screen.getByTestId("limited-deck-builder")).toBeInTheDocument();
+  });
+
+  it("forwards embedded fill only for responsive workspace phases", async () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, writable: true, value: 768 });
+    Object.defineProperty(window, "innerHeight", { configurable: true, writable: true, value: 1024 });
+    wasm.start_quick_draft.mockReturnValue(view({ current_pack: [card("c1")] }));
+    await act(async () => useDraftStore.getState().startDraft("pool", "TST", "Test", 2));
+
+    const { rerender } = render(
+      <ShellProvider value>
+        <MemoryRouter><DraftPage /></MemoryRouter>
+      </ShellProvider>,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    expect(captured.menuShell).toMatchObject({ fillEmbeddedHeight: true });
+
+    act(() => { useDraftStore.setState({ phase: "deckbuilding" }); });
+    rerender(
+      <ShellProvider value>
+        <MemoryRouter><DraftPage /></MemoryRouter>
+      </ShellProvider>,
+    );
+    expect(captured.menuShell).toMatchObject({ fillEmbeddedHeight: true });
   });
 
   it.each([
@@ -346,6 +397,50 @@ describe("DraftPage local deckbuilding wiring", () => {
       .toMatchObject({ zone: "deck", column: 3, row: 0 });
   });
 
+  it("publishes_the_stored_board_columns_on_mount", () => {
+    // The arriving-card placement in `draftStore.installWorkspace` reads the
+    // published value, and a `kind: "state"` install can land before the page
+    // has changed anything — a resumed draft, a fresh Sealed pool. Without this
+    // publication those cards lay out against the module's seeded default
+    // rather than the columns this player actually chose.
+    localStorage.setItem(DRAFT_WORKSPACE_PREFERENCES_KEY, JSON.stringify({
+      ...createDefaultDraftWorkspacePreferences(),
+      deck: { sort: "color", columnCount: 5, rows: "one", showHeaders: true },
+    }));
+    arrivingPreferences.mockClear();
+
+    render(<MemoryRouter><DraftPage /></MemoryRouter>);
+
+    expect(arrivingPreferences).toHaveBeenCalledWith(
+      expect.objectContaining({ sort: "color", columnCount: 5 }),
+    );
+  });
+
+  it("publishes_board_columns_during_the_preference_change_not_after_a_commit", async () => {
+    // The solo twin of `DraftPodPage.winston.test.tsx`'s "publishes board
+    // columns during the preference change, not after a commit". Deliberately
+    // NOT wrapped in `act`: were the publication moved into an effect, nothing
+    // would have flushed it by the time this assertion runs.
+    localStorage.setItem(DRAFT_WORKSPACE_PREFERENCES_KEY, JSON.stringify({
+      ...createDefaultDraftWorkspacePreferences(),
+      deck: { sort: "rarity", columnCount: 4, rows: "one", showHeaders: true },
+    }));
+    wasm.start_quick_draft.mockReturnValue(view({ current_pack: [card("c1")] }));
+    await act(async () => useDraftStore.getState().startDraft("pool", "TST", "Test", 2));
+    render(<MemoryRouter><DraftPage /></MemoryRouter>);
+    fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    arrivingPreferences.mockClear();
+
+    // `setPackScale` routes through `handleWorkspacePreferencesChange`, the one
+    // path that publishes, spreading the rest of the preferences unchanged.
+    captured.presentation!.setPackScale(1.2);
+
+    expect(arrivingPreferences).toHaveBeenCalledTimes(1);
+    expect(arrivingPreferences).toHaveBeenCalledWith({
+      sort: "rarity", columnCount: 4, rows: "one", showHeaders: true,
+    });
+  });
+
   it("uses_the_frozen_full_width_shell_fragment", () => {
     render(<MemoryRouter><DraftPage /></MemoryRouter>);
     expect(captured.menuShell).toMatchObject({ layout: "stacked", contentWidthClass: "max-w-none" });
@@ -360,6 +455,7 @@ describe("DraftPage local deckbuilding wiring", () => {
             (phoneLayout && (phase === "drafting" || phase === "deckbuilding"))
             || tabletDeckbuilding
           }
+          fillEmbeddedHeight={fillEmbeddedHeight}
         >`);
   });
 

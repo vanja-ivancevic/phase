@@ -1,4 +1,22 @@
 {
+  "lan": {
+    "title": "Réseau local",
+    "guidance": "Saisissez une adresse de serveur pour rejoindre manuellement. Les pages HTTPS nécessitent un serveur wss:// sécurisé ; utilisez l’application de bureau pour les adresses ws:// locales.",
+    "unavailable": "L’hébergement et la recherche LAN nécessitent une application de bureau à jour.",
+    "checking": "Vérification de la prise en charge LAN…",
+    "start": "Démarrer l’hébergement LAN",
+    "stop": "Arrêter l’hébergement LAN",
+    "scan": "Rechercher des serveurs LAN",
+    "pending": "Opération en cours…",
+    "running": "L’hébergement LAN est actif. Partagez une adresse avec les joueurs de votre réseau.",
+    "empty": "Aucun serveur LAN trouvé. Vérifiez que l’hôte est actif sur le même réseau, puis réessayez.",
+    "add": "Ajouter le serveur",
+    "copy": "Copier l’adresse",
+    "copied": "Adresse copiée",
+    "error": "Échec de l’opération LAN. {{detail}}",
+    "added": "Serveur ajouté. Utilisez un serveur dédié lorsque sa connexion est compatible et prête.",
+    "originUnavailable": "L’hébergement LAN n’est pas disponible pour cette version ou origine de l’application."
+  },
   "concedeDialog": {
     "title": "Concéder la partie ?",
     "game": {
@@ -85,7 +103,8 @@
     "firstMessageInvalid": "L’hôte a refusé la connexion avant la configuration. Actualisez les deux fenêtres puis réessayez.",
     "versionRequired": "Cet hôte nécessite le protocole de connexion v{{version}}. Actualisez les deux fenêtres puis réessayez.",
     "versionMismatch": "Les protocoles de connexion ne correspondent pas : votre client a envoyé v{{guestVersion}}, mais l’hôte utilise v{{hostVersion}}. Actualisez les deux fenêtres.",
-    "malformedAuthority": "L’hôte a refusé une autorisation de connexion non valide. Rejoignez avec un nouveau code de salon."
+    "malformedAuthority": "L’hôte a refusé une autorisation de connexion non valide. Rejoignez avec un nouveau code de salon.",
+    "frameUndecodable": "L’hôte a envoyé un message que ce client n’a pas pu lire. Actualisez les deux fenêtres puis réessayez."
   },
   "serverOfflinePrompt": {
     "title": "Matchmaking injoignable",
@@ -113,18 +132,28 @@
     "draftBadge": "Draft {{setCode}}",
     "p2pBadgeTitle": "Partie pair-à-pair (l'hôte exécute le moteur)",
     "sandboxBadgeTitle": "Cette partie autorise les actions de débogage. À utiliser pour des tests — pas pour un match compétitif.",
+    "hintSlow": "LENT",
+    "hintSlowTitle": "Ce serveur répond lentement aux joueurs ces derniers temps.",
+    "hintUnreliable": "PEU FIABLE",
+    "hintUnreliableTitle": "Les joueurs ont souvent échoué à se connecter à ce serveur récemment.",
     "rankedBadgeTitle": "Salon classé",
     "rankedBadge": "CLASSÉ",
     "anonymous": "Anonyme",
     "by": "par {{name}}",
     "passwordProtected": "Protégé par mot de passe",
-    "join": "Rejoindre"
+    "join": "Rejoindre",
+    "originTitle": "Référencée par {{name}} {{kind}}",
+    "kindFull": "(serveur de jeu)",
+    "kindLobbyOnly": "(courtier de salon)"
+  },
+  "connectionMode": {
+    "label": "Connexion",
+    "server": "Serveur officiel",
+    "p2p": "P2P"
   },
   "serverPicker": {
     "title": "Serveur",
-    "subtitle": "Choisissez une région, ou connectez-vous à une instance auto-hébergée.",
-    "noneLabel": "Aucun (P2P uniquement)",
-    "directCodes": "codes directs",
+    "subtitle": "Choisissez où vous hébergez, et quels salons vous parcourez.",
     "official": "Officiel",
     "selfHosted": "Auto-hébergé",
     "customUrlPlaceholder": "wss://votre-serveur.exemple/ws",
@@ -133,7 +162,23 @@
     "urlError": "L'URL doit commencer par ws:// ou wss://",
     "connected": "Connecté",
     "connectionFailed": "Échec de la connexion",
-    "testing": "Test en cours…"
+    "testing": "Test en cours…",
+    "hostingServer": "Serveur d'hébergement",
+    "hostingServerHelp": "Où les parties que vous hébergez sont créées et enregistrées.",
+    "sources": "Sources de salon",
+    "sourcesHelp": "Les tables ouvertes de toutes les sources ci-dessous sont fusionnées en une seule liste.",
+    "addSource": "Ajouter une source",
+    "remove": "Retirer",
+    "useForHosting": "Utiliser pour héberger",
+    "sourceStatusConnecting": "Connexion…",
+    "sourceStatusDegraded": "Injoignable",
+    "sourceDuplicate": "Ce serveur est déjà une source de salon.",
+    "sourceCapReached": "Jusqu'à {{max}} sources peuvent être ajoutées.",
+    "directoryOrigin": "Annuaire",
+    "sourceScore": "Score {{score}}",
+    "enable": "Activer",
+    "disable": "Désactiver",
+    "incompatibleVersion": "Incompatible — version du serveur {{version}}"
   },
   "lobbyDraftRooms": {
     "noRooms": "Aucune salle de draft disponible",
@@ -154,10 +199,7 @@
     "createDraft": "Créer le draft"
   },
   "lobbyView": {
-    "directConnection": "Connexion directe",
     "onlineLobby": "Salon en ligne",
-    "pickServerTitle": "Choisissez un serveur pour utiliser le mode salon en ligne",
-    "pickServer": "Choisir un serveur",
     "online": "{{count}} en ligne",
     "format": "Format",
     "allFormats": "Tous les formats",
@@ -169,26 +211,25 @@
     "noFormatGames": "Aucune partie {{format}} pour le moment.",
     "noOpenGames": "Aucune partie ouverte pour le moment.",
     "showAllFormats": "Afficher tous les formats",
-    "p2pNotice": "Serveur dédié indisponible. Vous pouvez toujours héberger ou rejoindre directement avec un code de salle à 5 caractères.",
-    "joinByCode": "Rejoindre par code",
     "joinATable": "Rejoindre une table",
-    "p2pCodePlaceholder": "Saisissez un code P2P à 5 caractères",
     "serverCodePlaceholder": "Saisissez un code ou CODE@IP:PORT",
     "join": "Rejoindre",
     "host": "Héberger",
-    "hostP2PDescription": "Créez une salle directe pour un adversaire.",
     "hostServerDescription": "Ouvrez une salle et attendez des joueurs.",
     "hostDraft": "Héberger un draft",
     "hostGame": "Héberger une partie",
-    "hostP2PGame": "Héberger une partie P2P",
     "passwordRequired": "Mot de passe requis",
     "passwordPlaceholder": "Saisissez le mot de passe",
-    "watch": "Watch"
+    "watch": "Watch",
+    "sourcesDegraded": "Certaines sources de salon sont injoignables",
+    "invalidJoinServer": "L'adresse de serveur de ce code n'est pas valide."
   },
   "hostSetup": {
+    "dedicatedUnavailable": "Aucun serveur dédié n’est disponible pour le moment. Vous pouvez héberger une partie en P2P.",
     "hostDirectMatch": "Héberger un match direct",
     "hostMatch": "Héberger un match",
-    "p2pNotice": "Le serveur dédié est indisponible, donc cette salle utilisera une connexion directe.",
+    "p2pNotice": "Mode pair-à-pair. Cette salle connecte les joueurs directement au lieu de tourner sur un serveur.",
+    "p2pSeatCap": "Les tables P2P accueillent au plus {{max}} joueurs, le nombre de places est donc plafonné.",
     "roomName": "Nom de la salle",
     "optional": "(facultatif)",
     "roomNamePlaceholder": "ex. Commander du vendredi soir",
@@ -213,6 +254,10 @@
     "startWhenFull": "Démarrer une fois complet",
     "ranked": "Classé",
     "listInLobby": "Répertorier dans le salon",
+    "hostServer": "Héberger sur",
+    "hostServerHelp": "Quel serveur exécute cette partie. Vos réglages de navigation et de code direct ne changent pas.",
+    "hostServerScore": "{{name}} — santé {{score}}",
+    "hostServerUnscored": "{{name}} — pas encore évalué",
     "sandboxMode": "Mode bac à sable — autoriser les actions de débogage",
     "sandboxModeHelp": "L'hôte peut manipuler directement l'état de la partie (déplacer des cartes, modifier les points de vie, modifier les marqueurs) et accorder la permission de débogage à d'autres joueurs. À utiliser pour des tests ou du jeu bac à sable — pas pour des matchs compétitifs. Ce paramètre ne peut pas être modifié une fois la partie lancée.",
     "setPassword": "Définir un mot de passe",
@@ -253,6 +298,8 @@
     "descriptionDraftLobby": "En attente que des joueurs rejoignent le pod de draft.",
     "descriptionDeckSelectFormat": "Choisissez un deck pour {{format}}.",
     "descriptionDeckSelect": "Choisissez le deck que vous voulez amener en ligne.",
+    "offlineUnavailableTitle": "Le multijoueur n’est pas disponible hors ligne.",
+    "offlineUnavailableDescription": "Reconnectez-vous ou désactivez le mode hors ligne pour héberger ou rejoindre une partie multijoueur.",
     "eyebrow": "Multijoueur",
     "activeDeck": "Deck actif",
     "edit": "Modifier",
@@ -260,7 +307,8 @@
     "noDeckWarning": "Aucun deck sélectionné — vous devrez en choisir un avant d'héberger.",
     "pickDeck": "Choisir un deck",
     "anonymous": "Anonyme",
-    "joining": "Connexion"
+    "joining": "Connexion",
+    "joinNeedsServer": "Choisissez un serveur avant de rejoindre une partie."
   },
   "draftLobbyPanel": {
     "draftPod": "Pod de draft",

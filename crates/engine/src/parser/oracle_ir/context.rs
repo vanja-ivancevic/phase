@@ -13,7 +13,10 @@ use crate::types::zones::Zone;
 /// Parser-only lookahead for token body clauses split across adjacent sentences.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TokenPtFollowup {
-    PowerToughness { power: PtValue, toughness: PtValue },
+    PowerToughness {
+        power: PtValue,
+        toughness: PtValue,
+    },
     /// The next sentence grants a token characteristic-defining ability which
     /// supplies its power/toughness. The definitions themselves are absorbed
     /// by the sequence continuation; this marker only lets the creature token
@@ -39,6 +42,108 @@ pub(crate) enum TriggerConditionScope {
     /// A delayed trigger condition created from a resolving effect chain
     /// (set by `try_parse_whenever_this_turn`).
     Delayed,
+}
+
+/// CR 105.4: whether THIS parse can supply the `Effect::Choose(Color)` that a
+/// printed "of the color of your choice" object-filter qualifier needs.
+///
+/// CONTAINMENT, stated honestly: `ChainBound` is WRITTEN at exactly one
+/// struct-literal line (the effect-chain chunk context in
+/// `oracle_effect/mod.rs`), but `ParseContext` derives `Clone`, so the value is
+/// INHERITED by every context cloned from that one. A clone-derived context
+/// whose result is merged back with `*ctx = ..` propagates its
+/// `pending_printed_color_choice` correctly; a throwaway clone DISCARDS it,
+/// which would stamp `FilterProp::IsChosenColor` with no injected chooser — a
+/// fail-closed, match-NOTHING filter with no `Effect::Unimplemented` and
+/// therefore no coverage signal.
+///
+/// RULE, both halves — the same two hazards `pending_damage_multi_target`
+/// documents below:
+///   1. A clone-derived `ParseContext` that is NOT merged back with `*ctx = ..`
+///      must reset this field to `Unbound` at construction. Use
+///      [`ParseContext::clone_throwaway`] rather than `.clone()` at those sites —
+///      it is the named, greppable spelling of this half of the rule, and the
+///      plain `.clone()` that remains is then a positive signal that the site
+///      really does merge back.
+///   2. A speculative sub-parse that runs against the REAL `&mut ctx` and can
+///      abandon its result must clear `pending_printed_color_choice` on the
+///      abandonment path — otherwise the surviving context carries a pending
+///      choice for a clause that was never emitted, and the chain gets a
+///      spurious colour prompt with no `IsChosenColor` anywhere. The
+///      alternative, and the shape already used elsewhere in this file's
+///      neighbourhood, is to run against a clone and commit with
+///      `*ctx = tentative_ctx` only on success.
+///
+///      AUDIT, so the next reader inherits it rather than re-deriving it: one
+///      site structurally matches this half — `parse_leading_subject_application`
+///      (`oracle_effect/subject.rs`), which is called with the real `chunk_ctx`
+///      and can abandon its result. It is UNREACHABLE for this hazard: it
+///      extracts the SUBJECT phrase, and the printed qualifier is only ever
+///      consumed off an object filter in predicate position (no card in the pool
+///      prints "of the color of your choice" in subject position). Left unedited
+///      deliberately; revisit if a subject-position printed qualifier ever
+///      appears. No other site runs a speculative sub-parse against the real
+///      `&mut ctx` while this gate is `ChainBound`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ChosenColorQualifierScope {
+    /// Default, and the value every `ParseContext::default()` carries — which
+    /// is every `parse_type_phrase_folding` call site, by construction of the wrapper
+    /// in `oracle_target.rs`. The printed form must NOT be consumed here.
+    #[default]
+    Unbound,
+    /// An effect-chain chunk parse. This is the SINGLE context that both opens
+    /// this channel and reads `pending_printed_color_choice` back
+    /// (`oracle_effect/mod.rs`: the chunk-ctx literal and the chunk loop's
+    /// `.push()` sites), so "consumed" and "supplied" are one decision made in
+    /// one place. Phrased by role rather than by count so it cannot go stale
+    /// when the loop grows another emit arm.
+    ChainBound,
+}
+
+/// Parser-only provenance: the enclosing trigger body is resolving a PROVEN
+/// zone-change event, and the pair it pins.
+///
+// CR 603.10 + CR 400.7 + CR 122.2: a trigger-body past-tense predicate ("… if
+// it had a death counter on it") reads the zone-change event object's
+// last-known information, because CR 122.2 makes the counters cease to exist
+// the moment the object changes zones. Only a trigger head whose shape PROVES
+// the pair (today: the dies head, battlefield → graveyard) may establish it.
+//
+/// SAFE BY CONTRACT, NOT BY `Clone`. Ordinary `Clone` PRESERVES this value,
+/// because `ParseContext` has an established clone-and-commit idiom: a
+/// speculative parse clones the context, and on success writes it back with
+/// `*ctx = <derived>` (`try_parse_radiance_color_fanout_damage`'s
+/// `tentative_ctx`, the `body_ctx`/`candidate_ctx` token paths). A `Clone` that
+/// silently dropped state would make every one of those commits erase the
+/// enclosing trigger's authority — the same defect
+/// [`ParseContext::clone_throwaway`] was written to avoid for
+/// `ChosenColorQualifierScope`.
+///
+/// Entering an INDEPENDENT body is therefore spelled by NAME, never implied by
+/// a clone: [`ParseContext::clone_for_independent_body`] for a body that is kept
+/// (a CR 603.12 reflexive trigger, a CR 603.1 nested printed trigger line), and
+/// [`ParseContext::clone_throwaway`] for a sub-parse whose context is discarded
+/// (a speculative probe, a branch alternative). Both reset this field; a plain
+/// `.clone()` continues the same body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TriggerZoneChangeProvenance(Option<(Zone, Zone)>);
+
+impl TriggerZoneChangeProvenance {
+    /// No enclosing zone-change authority.
+    pub(crate) fn none() -> Self {
+        Self(None)
+    }
+
+    /// The enclosing trigger head PROVED this origin → destination pair.
+    pub(crate) fn established(origin: Zone, destination: Zone) -> Self {
+        Self(Some((origin, destination)))
+    }
+
+    /// The proven `(origin, destination)` pair, or `None` when this parse has no
+    /// enclosing zone-change authority.
+    pub(crate) fn as_pair(&self) -> Option<(Zone, Zone)> {
+        self.0
+    }
 }
 
 /// Unified parsing context — threaded through all parser branches for
@@ -115,6 +220,20 @@ pub(crate) struct ParseContext {
     /// "choose one of them at random. You may cast IT" — "it" is the chosen card,
     /// not the pool).
     pub plural_object_pronoun_ref: Option<TargetFilter>,
+    /// CR 608.2k: Antecedent for a singular DEMONSTRATIVE ("that creature" /
+    /// "that permanent" / "that card" / "that token") in the current trigger
+    /// body. Deliberately separate from — and narrower than —
+    /// `object_pronoun_ref`, on the same principle that separates
+    /// `plural_object_pronoun_ref` from it: which references may capture a given
+    /// antecedent is a property of the surface grammar, not of the antecedent.
+    ///
+    /// Set only for the damage-RECIPIENT provenance (a demonstrative names an
+    /// object the condition acted upon), by
+    /// `oracle_trigger::trigger_demonstrative_object_ref_for_condition`. The
+    /// spell-cast provenance is excluded: "exile THAT CARD ... instead of putting
+    /// it into your graveyard as it resolves" is a replacement clause whose
+    /// demonstrative belongs to its own grammar.
+    pub demonstrative_object_ref: Option<TargetFilter>,
     /// Accumulated diagnostics for the current card parse (Phase 52, D-07).
     /// Replaces thread-local oracle_warnings accumulator.
     pub diagnostics: Vec<OracleDiagnostic>,
@@ -187,6 +306,17 @@ pub(crate) struct ParseContext {
     /// printed abilities (CR 607.2d). Mirrors `chosen_player_count` as a
     /// parse-time accumulator (not serialized).
     pub pending_choice_type: Option<crate::types::ability::ChoiceType>,
+    /// CR 105.4: gate for the printed chosen-colour object-filter qualifier.
+    /// See `ChosenColorQualifierScope`, including its clone-inheritance rule.
+    pub chosen_color_qualifier: ChosenColorQualifierScope,
+    /// CR 105.4 + CR 608.2c: this chunk's type-phrase parse consumed a printed
+    /// "of the color of your choice" qualifier, so the chunk's clause must be
+    /// wrapped in an injected `Effect::Choose(Color)`. Carries the `ChoiceType`
+    /// the injector needs rather than a yes/no. Lifted into
+    /// `ClauseIr.printed_color_choice` by the chain chunk loop. Set and consumed
+    /// within a single chunk parse; never serialized. A speculative sub-parse that
+    /// discards its cloned context also discards this — see the scope enum's rule.
+    pub pending_printed_color_choice: Option<crate::types::ability::ChoiceType>,
     /// CR 115.1 + CR 701.9b: Target selection mode for the most recent target
     /// phrase parsed via `parse_target_with_ctx`. The chunk loop in
     /// `parse_effect_chain_ir` snapshots this into the produced `ClauseIr` and
@@ -307,6 +437,28 @@ pub(crate) struct ParseContext {
     /// alongside `parent_target_is_chosen` in the chunk loop; `None` on every
     /// standalone and non-chosen parse.
     pub chain_prior_chosen_target: Option<TargetFilter>,
+    /// CR 601.2c + CR 608.2c: the object-target FILTER declared by the nearest
+    /// EARLIER clause of this same effect chain — the antecedent a later
+    /// clause's demonstrative anaphor ("that token", "that artifact") can name.
+    /// Sibling of [`Self::chain_prior_chosen_target`] and of
+    /// [`Self::declared_target_slots`], but single-valued and not restricted to
+    /// `Effect::TargetOnly`: Hazel of the Rootbloom's antecedent is the copy
+    /// source of a `CopyTokenOf`, Thieving Skydiver's the subject of a
+    /// `GainControl`.
+    ///
+    /// LIFECYCLE — leak-proof by construction, not by a set/clear window:
+    /// `parse_effect_chain_ir` `take()`s the caller's value before its chunk
+    /// loop and restores it immediately after; inside the loop the field is
+    /// REASSIGNED UNCONDITIONALLY as the first statement of every iteration, as
+    /// a pure function of `builder.clauses()`. There is therefore no window for
+    /// an early `continue` to escape (the loop body contains no statement-level
+    /// `return`), no stale value can reach the next chunk, and a nested
+    /// `parse_effect_chain_ir` sees `None` from its chunk loop onward; its
+    /// pre-loop special-case IR builders still observe the caller's value
+    /// (measured at zero corpus cards — no divergent-noun demonstrative is
+    /// lowered through them). `None` on the first chunk of every chain and on
+    /// every standalone parse. Never serialized.
+    pub chain_declared_object_target: Option<TargetFilter>,
     /// CR 608.2c + CR 400.7: Source zone of the tracked set that a downstream
     /// "put those cards / put them onto the battlefield" anaphor (a
     /// `TargetFilter::TrackedSet`) must scan. Set by a producer clause that
@@ -389,6 +541,16 @@ pub(crate) struct ParseContext {
     /// lingering path. Mirrors `chain_has_prior_exile_producer`.
     // CR 608.2g + CR 701.20e
     pub chain_prior_self_library_peek: bool,
+    /// CR 603.10 + CR 400.7 + CR 122.2: the enclosing trigger body's PROVEN
+    /// zone-change event pair, when this parse continues that body. Consumed by
+    /// the trigger-body past-tense counter grammar in
+    /// `oracle_effect::conditions::strip_counter_conditional`, which may only
+    /// emit an `AbilityCondition::ZoneChangeObjectMatchesFilter` while the pair
+    /// is present. Ordinary `Clone` PRESERVES it (the clone-and-commit idiom
+    /// depends on that); entering an independent body is spelled by name via
+    /// [`Self::clone_for_independent_body`] or [`Self::clone_throwaway`]. See
+    /// [`TriggerZoneChangeProvenance`].
+    pub trigger_zone_change: TriggerZoneChangeProvenance,
 }
 
 impl ParseContext {
@@ -413,6 +575,49 @@ impl ParseContext {
             return;
         }
         self.diagnostics.push(d);
+    }
+
+    /// CR 105.4: clone this context for a sub-parse whose CONTEXT is DISCARDED —
+    /// the parsed value is kept, but `*ctx = <derived>` never runs.
+    ///
+    /// This is the runnable half of `ChosenColorQualifierScope`'s rule 1. A plain
+    /// `.clone()` inherits `ChainBound`, so a throwaway derived context can stamp
+    /// `FilterProp::IsChosenColor` on a filter it keeps while dropping the
+    /// `pending_printed_color_choice` that would have injected the matching
+    /// `Effect::Choose(Color)` — a fail-closed, match-NOTHING filter with no
+    /// `Effect::Unimplemented` and therefore no coverage signal.
+    ///
+    /// Deliberately NOT a `Clone` impl: a `Clone` that silently drops state is a
+    /// worse defect than the one it fixes, and the merge-back sites
+    /// (`*ctx = tentative_ctx`, `*ctx = body_ctx`, `*ctx = candidate_ctx`,
+    /// `*ctx = fanout_ctx`) genuinely need the inheriting `.clone()`. The two
+    /// spellings are the two intents, and `clone_throwaway` is greppable.
+    pub fn clone_throwaway(&self) -> Self {
+        Self {
+            chosen_color_qualifier: ChosenColorQualifierScope::Unbound,
+            // CR 603.7 + CR 603.12: a discarded sub-parse still KEEPS its parsed
+            // value, so a probe or branch alternative must not be able to emit a
+            // `ZoneChangeObjectMatchesFilter` on authority it does not own. The
+            // context is independent for the same reason it is throwaway.
+            trigger_zone_change: TriggerZoneChangeProvenance::none(),
+            ..self.clone()
+        }
+    }
+
+    /// CR 603.1 + CR 603.7 + CR 603.12: clone this context for an INDEPENDENT
+    /// trigger body whose context IS kept — a reflexive "when you do" body, a
+    /// nested printed trigger line inside a modal block, an anchor mode that
+    /// spawns its own triggered ability.
+    ///
+    /// Such a body establishes its own event authority, so the enclosing
+    /// trigger's proven zone-change pair would be unrelated to it. This is the
+    /// named counterpart to a plain `.clone()`, which continues the SAME body
+    /// and therefore keeps that authority (see [`TriggerZoneChangeProvenance`]).
+    pub fn clone_for_independent_body(&self) -> Self {
+        Self {
+            trigger_zone_change: TriggerZoneChangeProvenance::none(),
+            ..self.clone()
+        }
     }
 
     /// Execute `f` with a temporary relative-player scope, restoring the prior
@@ -466,5 +671,68 @@ mod tests {
         });
 
         assert_eq!(ctx.diagnostics.len(), 2);
+    }
+
+    /// CR 603.10: a fresh context carries no zone-change authority.
+    #[test]
+    fn trigger_zone_change_provenance_defaults_to_empty() {
+        assert_eq!(ParseContext::default().trigger_zone_change.as_pair(), None);
+        assert_eq!(TriggerZoneChangeProvenance::none().as_pair(), None);
+    }
+
+    /// The clone-and-commit idiom (`*ctx = <derived>`) depends on ordinary
+    /// `Clone` PRESERVING state, so a successful speculative parse inside the
+    /// same trigger body must not erase the enclosing event's authority.
+    #[test]
+    fn trigger_zone_change_provenance_survives_ordinary_clone() {
+        let ctx = ParseContext {
+            trigger_zone_change: TriggerZoneChangeProvenance::established(
+                Zone::Battlefield,
+                Zone::Graveyard,
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ctx.clone().trigger_zone_change.as_pair(),
+            Some((Zone::Battlefield, Zone::Graveyard)),
+            "a same-body speculative parse that commits must retain provenance"
+        );
+        assert_eq!(
+            ctx.trigger_zone_change.as_pair(),
+            Some((Zone::Battlefield, Zone::Graveyard)),
+            "cloning must not disturb the source context"
+        );
+    }
+
+    /// CR 603.7 + CR 603.12 + CR 603.1: entering an INDEPENDENT body is spelled
+    /// by name, and both named operations refuse to inherit the outer event.
+    #[test]
+    fn trigger_zone_change_provenance_resets_for_independent_bodies() {
+        let ctx = ParseContext {
+            trigger_zone_change: TriggerZoneChangeProvenance::established(
+                Zone::Battlefield,
+                Zone::Graveyard,
+            ),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            ctx.clone_for_independent_body()
+                .trigger_zone_change
+                .as_pair(),
+            None,
+            "a reflexive / nested-trigger body establishes its own authority"
+        );
+        assert_eq!(
+            ctx.clone_throwaway().trigger_zone_change.as_pair(),
+            None,
+            "a discarded sub-parse keeps its value, so it must not borrow authority"
+        );
+        assert_eq!(
+            ctx.trigger_zone_change.as_pair(),
+            Some((Zone::Battlefield, Zone::Graveyard)),
+            "neither named operation may disturb the source context"
+        );
     }
 }

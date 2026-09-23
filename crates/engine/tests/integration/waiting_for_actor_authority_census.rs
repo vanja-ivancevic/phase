@@ -745,12 +745,32 @@ fn every_waiting_for_arm_declares_its_acting_authority() {
     // 132 -> 133 is adjudicated: `ResolutionOptionalPaymentChoice` names one
     // payer and is explicitly classified by `WaitingFor::acting_authority` as
     // `ActingAuthority::One(player)`.
-    // 133 -> 135 is adjudicated: `MeldPairChoice` and `MeldAttackTargetChoice`
-    // each name their acting player and are already classified by the shared
-    // `ActingAuthority::One(player)` arm above.
-    if declared.len() != 135 {
+    // 133 -> 135 is adjudicated: Ripple's two-decision model (CR 702.60a /
+    // 608.2d) added `RippleRevealChoice` (the optional "you may reveal") and
+    // `RippleBottomOrder` (the "in any order" bottom placement). Both name one
+    // acting `player` and are classified by `WaitingFor::acting_authority` as
+    // `ActingAuthority::One(player)` — neither is actorless.
+    // 135 -> 136 is adjudicated: the CR 706.6 die-roll ignore model (Barbarian
+    // Class, Pixie Guide, Wyll) added `DieKeepChoice`. It names one acting
+    // `player` — CR 706.6's second sentence gives the tie choice to the player
+    // instructed to ignore, i.e. the roller — and is classified by
+    // `WaitingFor::acting_authority` as `ActingAuthority::One(player)`. Not
+    // actorless: the prompt cannot advance without that player's
+    // `GameAction::SelectDieRolls`.
+    // 136 -> 137 is adjudicated: CR 601.2f's caster-elected cost-reduction
+    // ordering added `OrderCostReductions`. It names one acting `player` —
+    // CR 601.2f gives the choice to "the player" determining the total cost,
+    // i.e. the caster — and is classified by `WaitingFor::acting_authority` as
+    // `ActingAuthority::One(player)`. Not actorless: the prompt cannot advance
+    // without that caster's `GameAction::OrderCostReductions` (or a
+    // `GameAction::CancelCast`).
+    // 137 -> 139 is adjudicated: RepeatPaidLibraryLookPayment and
+    // ReorderLibraryChoice each name the one player who must answer the
+    // life-payment or library-order prompt. Both already take the
+    // ActingAuthority::One(player) arm; neither is actorless or simultaneous.
+    if declared.len() != 139 {
         failures.push(format!(
-            "PIN declared.len()={} != 135.\n\
+            "PIN declared.len()={} != 139.\n\
              \n\
              Adding a `WaitingFor` variant IS the counted event this gate exists to make loud. \
              Repair it by ADJUDICATING, not by bumping the number:\n\

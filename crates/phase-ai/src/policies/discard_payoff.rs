@@ -214,12 +214,14 @@ fn candidate_discards_controller(ctx: &PolicyContext<'_>) -> bool {
         | GameAction::SelectCards { .. }
         | GameAction::ChooseRemoveCounterCostDistribution { .. }
         | GameAction::SelectCoinFlips { .. }
+        | GameAction::SelectDieRolls { .. }
         | GameAction::ChooseOutsideGameCards { .. }
         | GameAction::SelectTargets { .. }
         | GameAction::ChooseTarget { .. }
         | GameAction::ChooseReplacement { .. }
         | GameAction::ChooseEntryController { .. }
         | GameAction::OrderTriggers { .. }
+        | GameAction::OrderCostReductions { .. }
         | GameAction::CancelCast
         | GameAction::Equip { .. }
         | GameAction::CrewVehicle { .. }

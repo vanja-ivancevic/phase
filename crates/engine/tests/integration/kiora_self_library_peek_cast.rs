@@ -162,25 +162,16 @@ fn parsed_zone_play_permission_duration(
             } => Some(duration.clone()),
             _ => None,
         };
-        duration.or_else(|| {
-            definition
-                .sub_ability
-                .as_deref()
-                .and_then(in_definition)
-        })
+        duration.or_else(|| definition.sub_ability.as_deref().and_then(in_definition))
     }
 
-    parsed
-        .abilities
-        .iter()
-        .find_map(in_definition)
-        .or_else(|| {
-            parsed
-                .triggers
-                .iter()
-                .filter_map(|trigger| trigger.execute.as_deref())
-                .find_map(in_definition)
-        })
+    parsed.abilities.iter().find_map(in_definition).or_else(|| {
+        parsed
+            .triggers
+            .iter()
+            .filter_map(|trigger| trigger.execute.as_deref())
+            .find_map(in_definition)
+    })
 }
 
 fn has_self_library_peek(definition: &AbilityDefinition) -> bool {

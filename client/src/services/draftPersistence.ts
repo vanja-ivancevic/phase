@@ -12,6 +12,7 @@
 
 import { createStore, del, get, set } from "idb-keyval";
 
+import { DRAFT_KINDS } from "../adapter/draft-adapter";
 import type { DraftKind, DraftStatus, PoolInput } from "../adapter/draft-adapter";
 import {
   isPlainRecord,
@@ -146,6 +147,20 @@ export interface ActiveDraftGuestMeta {
   hostPeerId: string;
   timestamp: number;
 }
+
+/** Stable identity of a guest recovery locator read from local storage. */
+export interface ActiveDraftGuestMetaCapture {
+  roomCode: string;
+  displayName: string;
+  hostPeerId: string;
+  timestamp: number;
+}
+
+/** Non-mutating classification for guest recovery callers. */
+export type ActiveDraftGuestLoadResult =
+  | { type: "absent" }
+  | { type: "invalid"; capture: ActiveDraftGuestMetaCapture | null }
+  | { type: "present"; meta: ActiveDraftGuestMeta; capture: ActiveDraftGuestMetaCapture };
 
 export type ActiveDraftPodPhase =
   | "lobby"
@@ -322,19 +337,56 @@ export function saveActiveDraftGuest(meta: Omit<ActiveDraftGuestMeta, "timestamp
   }));
 }
 
-export function loadActiveDraftGuest(): ActiveDraftGuestMeta | null {
+function activeDraftGuestCapture(value: unknown): ActiveDraftGuestMetaCapture | null {
+  if (!isActiveDraftGuestMeta(value)) return null;
+  return {
+    roomCode: value.roomCode,
+    displayName: value.displayName,
+    hostPeerId: value.hostPeerId,
+    timestamp: value.timestamp,
+  };
+}
+
+/** Inspects the guest recovery locator without removing malformed or expired data. */
+export function inspectActiveDraftGuest(): ActiveDraftGuestLoadResult {
   try {
     const raw = localStorage.getItem(ACTIVE_DRAFT_GUEST_KEY);
-    if (!raw) return null;
+    if (!raw) return { type: "absent" };
     const value: unknown = JSON.parse(raw);
-    if (!isActiveDraftGuestMeta(value) || Date.now() - value.timestamp > GUEST_SESSION_TTL_MS) {
-      clearActiveDraftGuest();
-      return null;
+    if (!isActiveDraftGuestMeta(value)) return { type: "invalid", capture: null };
+    const capture = activeDraftGuestCapture(value);
+    if (!capture || Date.now() - capture.timestamp > GUEST_SESSION_TTL_MS) {
+      return { type: "invalid", capture };
     }
-    return value;
+    return { type: "present", meta: value, capture };
   } catch {
-    clearActiveDraftGuest();
-    return null;
+    return { type: "invalid", capture: null };
+  }
+}
+
+export function loadActiveDraftGuest(): ActiveDraftGuestMeta | null {
+  const active = inspectActiveDraftGuest();
+  if (active.type === "present") return active.meta;
+  if (active.type === "invalid") clearActiveDraftGuest();
+  return null;
+}
+
+/** Clears guest metadata only when it still matches a previously inspected locator. */
+export function clearActiveDraftGuestIfCurrent(capture: ActiveDraftGuestMetaCapture): void {
+  try {
+    const raw = localStorage.getItem(ACTIVE_DRAFT_GUEST_KEY);
+    if (!raw) return;
+    const currentCapture = activeDraftGuestCapture(JSON.parse(raw));
+    if (
+      currentCapture?.roomCode === capture.roomCode
+      && currentCapture.displayName === capture.displayName
+      && currentCapture.hostPeerId === capture.hostPeerId
+      && currentCapture.timestamp === capture.timestamp
+    ) {
+      clearActiveDraftGuest();
+    }
+  } catch {
+    // A malformed replacement is not evidence that this caller owns it.
   }
 }
 
@@ -396,7 +448,7 @@ function isActiveDraftPodMeta(value: unknown): value is ActiveDraftPodMeta {
   return (
     typeof value.id === "string" && value.id.length > 0 &&
     isCanonicalRoomCode(value.roomCode) &&
-    (value.kind === "Premier" || value.kind === "Traditional" || value.kind === "Sealed" || value.kind === "CommanderDraft") &&
+    isDraftKind(value.kind) &&
     isPositiveInteger(value.podSize) &&
     typeof value.hostDisplayName === "string" &&
     (value.tournamentFormat === "Swiss" || value.tournamentFormat === "SingleElimination") &&
@@ -456,8 +508,30 @@ function isPersistedDraftHostSession(value: unknown): value is PersistedDraftHos
   );
 }
 
+/**
+ * The kinds a persisted pod may carry, DERIVED from `DRAFT_KINDS` rather than
+ * restated beside it.
+ *
+ * `"Quick"` is excluded because a Quick draft is single-player against bots and
+ * is never persisted as a P2P host session; that exclusion is expressed once,
+ * here, as a filter over the authority.
+ */
+const PERSISTABLE_DRAFT_KINDS: readonly Exclude<DraftKind, "Quick">[] = DRAFT_KINDS.filter(
+  (kind): kind is Exclude<DraftKind, "Quick"> => kind !== "Quick",
+);
+
+/**
+ * IndexedDB is untrusted, so the kind is validated rather than asserted.
+ *
+ * Folds `PERSISTABLE_DRAFT_KINDS` instead of enumerating the kinds inline:
+ * TypeScript never checks a type-guard BODY against the union in its
+ * `value is …` clause, so a hand-written chain here would keep compiling —
+ * and keep refusing — after `DRAFT_KINDS` grew. The symptom is silent: a
+ * persisted host session of the new kind is classified corrupt and discarded
+ * on resume, with no error raised anywhere.
+ */
 function isDraftKind(value: unknown): value is Exclude<DraftKind, "Quick"> {
-  return value === "Premier" || value === "Traditional" || value === "Sealed" || value === "CommanderDraft";
+  return PERSISTABLE_DRAFT_KINDS.some((kind) => kind === value);
 }
 
 function isPoolInput(value: unknown): value is PoolInput {

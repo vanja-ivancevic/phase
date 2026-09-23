@@ -1,19 +1,27 @@
 {
+  "playerLatency": {"host":"Host","waiting":"Warten","value":"{{ms}} ms","description":"Hin- und Rücklaufzeit zum Host. Eine fehlende Antwort trennt das Spiel nicht."},
   "abilityBlock": {
     "badge": "Blockiert",
     "cantBeActivated": "Diese Fähigkeit kann nicht aktiviert werden",
     "cantActivateDuring": "Kann derzeit nicht aktiviert werden",
-    "prohibited": "Das Aktivieren dieser Fähigkeit ist verboten"
+    "prohibited": "Das Aktivieren dieser Fähigkeit ist verboten",
+    "costNotPayableNow": "Du kannst diese Kosten gerade nicht bezahlen"
   },
-  "manaSourceSelection": { "title": "Manaquelle wählen", "description": "Diese Manafähigkeit erfordert das Opfern einer bleibenden Karte.", "sacrifice": "Opfern", "back": "Zurück zur Manabezahlung", "unknownSource": "Manaquelle" },
+  "manaSourceSelection": {
+    "title": "Manaquelle wählen",
+    "description": "Diese Manafähigkeit erfordert das Opfern einer bleibenden Karte.",
+    "sacrifice": "Opfern",
+    "back": "Zurück zur Manabezahlung",
+    "unknownSource": "Manaquelle"
+  },
   "comboShortcut": {
     "declareTitle": "Loop Shortcut",
     "declareSubtitle": "You control a loop with a determined outcome. Take the shortcut to resolve it.",
     "respondTitle": "Loop Shortcut Proposed",
-    "respondSubtitle": "An opponent proposes taking a loop shortcut. Accept it, or break out to keep playing manually.",
+    "respondSubtitle": "An opponent proposes taking a loop shortcut. Accept it, or name the place where the sequence stops.",
     "confirm": "Take the shortcut",
     "accept": "Accept",
-    "shorten": "Break out",
+    "shorten": "Shorten it",
     "decline": "Decline the shortcut",
     "untilLethal": "Repeat until the game ends.",
     "fixedCount_one": "Repeat at most once.",
@@ -21,10 +29,27 @@
     "convokeInfo_one": "Auto-taps up to 1 creature for convoke each iteration.",
     "convokeInfo_other": "Auto-taps up to {{count}} creatures for convoke each iteration.",
     "countAria": "Number of iterations",
+    "countDecreaseAria": "Anzahl der Wiederholungen verringern",
+    "countIncreaseAria": "Anzahl der Wiederholungen erhöhen",
     "previewTitle_one": "Repeating once produces:",
     "previewTitle_other": "Repeating {{count}} times produces:",
     "previewEntry": "{{amount}} {{resource}}",
     "previewEntryPlayer": "{{amount}} {{resource}} — {{player}}",
+    "allocationTitle": "Verteile die Wiederholungen auf die Ziele:",
+    "allocationAria": "Wiederholungen für {{subject}}",
+    "allocationDecreaseAria": "Wiederholungen für {{subject}} verringern",
+    "allocationIncreaseAria": "Wiederholungen für {{subject}} erhöhen",
+    "allocationSum": "{{allocated}} von {{total}} Wiederholungen verteilt.",
+    "evenSplit": "Auf die gleichmäßige Verteilung zurücksetzen",
+    "customDistribution": "Eigene Verteilung — die Engine hat für diese Aufteilung keine Vorschau berechnet.",
+    "announceTitle": "Wähle das Ziel, das jede Wiederholung ansagt:",
+    "announce": "Ansagen",
+    "announceAria": "{{subject}} ansagen",
+    "mayTitle": "Optionale Fähigkeit {{group}} — diese Wahl in jeder Iteration wiederholen?",
+    "mayTake": "Nutzen",
+    "mayDecline": "Ablehnen",
+    "mayTakeAria": "Optionale Fähigkeit {{group}} nutzen",
+    "mayDeclineAria": "Optionale Fähigkeit {{group}} ablehnen",
     "winKind": {
       "LethalDamage": "This loop deals lethal damage.",
       "PoisonLoss": "This loop gives lethal poison counters.",
@@ -32,6 +57,13 @@
       "ImmediateWin": "This loop wins the game.",
       "ExtraTurns": "This loop takes infinite extra turns.",
       "Advantage": "This loop generates unbounded advantage."
+    },
+    "respondDeclaredTitle": "Vorgeschlagene Deklaration:",
+    "respondAllocationEntry": "{{subject}} — ×{{repetitions}}",
+    "respondOrderEntry": "{{position}}. {{subject}}",
+    "respondDecision": {
+      "take": "{{subject}} — in jeder Iteration genutzt",
+      "decline": "{{subject}} — in jeder Iteration abgelehnt"
     }
   },
   "precastShortcut": {
@@ -46,9 +78,23 @@
   },
   "restoredAutomation": {
     "dismiss": "Schließen",
-    "noop": {"title": "Gespeichertes Spiel geladen", "summary_one": "Keine Stapelautomatisierung zum Fortsetzen erforderlich.", "summary_other": "Keine Stapelautomatisierung zum Fortsetzen erforderlich."},
-    "progressed": {"title": "Stapelautomatisierung fortgesetzt", "summary_one": "Die Engine hat {{count}} automatisierte Auflösung abgeschlossen.", "summary_other": "Die Engine hat {{count}} automatisierte Auflösungen abgeschlossen.", "omitted_one": "{{count}} Zwischenereignis wurde ausgelassen.", "omitted_other": "{{count}} Zwischenereignisse wurden ausgelassen."},
-    "zeroResolutionRepair": {"title": "Stapelautomatisierung repariert", "summary_one": "Die gespeicherte Automatisierung wurde vor der Fortsetzung sicher repariert.", "summary_other": "Die gespeicherte Automatisierung wurde vor der Fortsetzung sicher repariert."}
+    "noop": {
+      "title": "Gespeichertes Spiel geladen",
+      "summary_one": "Keine Stapelautomatisierung zum Fortsetzen erforderlich.",
+      "summary_other": "Keine Stapelautomatisierung zum Fortsetzen erforderlich."
+    },
+    "progressed": {
+      "title": "Stapelautomatisierung fortgesetzt",
+      "summary_one": "Die Engine hat {{count}} automatisierte Auflösung abgeschlossen.",
+      "summary_other": "Die Engine hat {{count}} automatisierte Auflösungen abgeschlossen.",
+      "omitted_one": "{{count}} Zwischenereignis wurde ausgelassen.",
+      "omitted_other": "{{count}} Zwischenereignisse wurden ausgelassen."
+    },
+    "zeroResolutionRepair": {
+      "title": "Stapelautomatisierung repariert",
+      "summary_one": "Die gespeicherte Automatisierung wurde vor der Fortsetzung sicher repariert.",
+      "summary_other": "Die gespeicherte Automatisierung wurde vor der Fortsetzung sicher repariert."
+    }
   },
   "resolveAllConsent": {
     "eyebrow": "Alles auflösen",
@@ -59,6 +105,7 @@
   },
   "debugCreate": {
     "copies": "Kopien",
+    "asToken": "Als Spielstein erstellen",
     "tokenPower": "Power",
     "tokenToughness": "Toughness",
     "tokenPowerPlaceholder": "Power",
@@ -265,8 +312,10 @@
     "underAttack_one": "Von {{count}} Kreatur angegriffen",
     "underAttack_other": "Von {{count}} Kreaturen angegriffen",
     "target": "Ziel",
+    "token": "Spielstein",
+    "tokenTooltip": "Spielstein-Kopie einer echten Karte",
     "copy": "Kopie",
-    "copyTooltip": "Spielstein-Kopie einer echten Karte",
+    "copyTooltip": "Nicht-Spielstein-Permanent, das eine andere Karte kopiert",
     "cantBeBlocked": "Kann nicht geblockt werden",
     "ringBearer": "Ring",
     "ringBearerTooltip": "Ringträger",
@@ -466,6 +515,8 @@
     "enduringStoryTooltip": "Bleibende Geschichte — erhalten, wenn du eine Storied bleibende Karte und drei oder mehr Artefakte, legendäre bleibende Karten und/oder Sagen kontrollierst; bleibt für den Rest der Partie bestehen",
     "dungeonAriaLabel": "Wagt sich in {{name}} vor, {{roomName}}, Raum {{room}} von {{total}}",
     "dungeonRoomTooltip": "{{roomName}} — Raum {{room}} von {{total}}",
+    "dungeonMapLoading": "Verlieskarte wird geladen…",
+    "dungeonMapUnavailable": "Bild der Verlieskarte nicht verfügbar",
     "dungeonTooltip": "Wagt sich in {{name}} vor",
     "poisonAriaLabel_one": "{{count}} Giftmarke",
     "poisonAriaLabel_other": "{{count}} Giftmarken",
@@ -513,6 +564,8 @@
     "unboundedConditionalYouTooltip": "Unbegrenzt: {{resource}} (∞) — Auflösung steht aus; dies kann unbegrenzt bleiben, und andernfalls nennst du die Anzahl",
     "unboundedMixedTooltip": "Unbegrenzt: {{resource}} (∞) — ein Teil dieser Gruppe hat eine ausstehende Auflösung; ein Teil bleibt unbegrenzt",
     "unboundedConditionalGlyph": "∞→?",
+    "boundedLoopGlyph": "≤{{bound}}×",
+    "boundedLoopTooltip": "{{resource}} aus einer erkannten Schleife, mit höchstens {{bound}} Wiederholungen",
     "unboundedManaPoolMarker": "Unbegrenztes Mana (∞)",
     "unboundedMana": "Mana",
     "unboundedLife": "Leben",
@@ -917,6 +970,7 @@
     "genericEvent": "Ereignis: {{type}}",
     "searchPlaceholder": "Search log…",
     "allTurns": "All turns",
+    "turnFilterLabel": "Nach Zug filtern",
     "turnChip": "T{{turn}}",
     "entryCount": "{{count}} entries",
     "copy": "Copy",
@@ -1730,6 +1784,12 @@
     "untapSubset": {
       "title": "Choose permanents to untap",
       "subtitle": "Untap up to {{count}} of these permanents."
+    },
+    "rippleBottom": {
+      "title": "Order the rest on the bottom",
+      "subtitle_one": "Put {{count}} revealed card on the bottom of your library",
+      "subtitle_other": "Put {{count}} revealed cards on the bottom of your library, in any order",
+      "hint": "Drag to reorder · position 1 ends up on top of this pile"
     }
   },
   "specializeColor": {
@@ -1942,10 +2002,15 @@
     "subtitleCascade": "Kaskade hat {{name}} ins Exil geschickt (Manawert unter {{sourceMv}}). Wirke es, ohne seine Manakosten zu bezahlen, oder lehne ab und mische alle {{total}} ins Exil geschickten Karten unter deine Bibliothek.",
     "subtitleDiscover": "Entdecken hat {{name}} ins Exil geschickt. Wirke es, ohne seine Manakosten zu bezahlen, oder nimm es auf deine Hand und mische die anderen {{missCount}} ins Exil geschickten Karten unter deine Bibliothek.",
     "subtitleRipple": "Ripple hat {{name}} aufgedeckt. Wirke es, ohne seine Manakosten zu bezahlen, oder lehne ab und lege alle {{total}} aufgedeckten Karten in zufälliger Reihenfolge unter deine Bibliothek.",
-    "subtitleGraveyardPaid": "Wirke {{name}} aus einem Friedhof, indem du seine Manakosten bezahlst — Mana jeder Art darf ausgegeben werden. Oder lehne ab und lass es im Friedhof.",
+    "subtitleGraveyardPaid": "Wirke {{name}} aus einem Friedhof, indem du seine Manakosten{{extra}} bezahlst{{concession}}. Oder lehne ab und lass es im Friedhof.",
     "castNamed": "{{name}} wirken",
     "castSuffix": "(ohne seine Manakosten zu bezahlen)",
-    "castPaidSuffix": "(bezahle seine Manakosten — Mana jeder Art darf ausgegeben werden)",
+    "castPaidSuffix": "(bezahle seine Manakosten{{extra}}{{concession}})",
+    "paidExtraFragment": " plus {{extra}}",
+    "paidAnyTypeSubtitleFragment": " — Mana jeder Art darf ausgegeben werden",
+    "paidAnyColorSubtitleFragment": " — Mana jeder Farbe darf ausgegeben werden",
+    "paidAnyTypeSuffixFragment": " — Mana jeder Art darf ausgegeben werden",
+    "paidAnyColorSuffixFragment": " — Mana jeder Farbe darf ausgegeben werden",
     "putIntoHand": "Auf die Hand nehmen",
     "decline": "Ablehnen",
     "discoverDeclineSuffix": "(den Rest unter die Bibliothek legen)",
@@ -2057,6 +2122,7 @@
     "exportClientSnapshot": "Client-Snapshot exportieren",
     "exported": "Exportiert",
     "exportFailed": "Export fehlgeschlagen",
+    "exportRequested": "Export unbestätigt",
     "copyDiagnostic": "Diagnose kopieren",
     "copied": "Kopiert!",
     "reportOnGithub": "Auf GitHub melden",
@@ -2160,7 +2226,7 @@
     "yes": "Ja",
     "no": "Nein",
     "dontAskAgain": "Dieses Spiel nicht mehr fragen",
-    "dontAskAgainForSameCard": "Auf jede Kopie dieser Karte anwenden"
+    "dontAskAgainForSameCard": "Diese Entscheidung für jede Kopie dieser Karte in diesem Spiel verwenden"
   },
   "resolutionOptionalPayment": {
     "title": "Optionale Zahlung wählen",
@@ -2227,8 +2293,21 @@
   "replacement": {
     "eyebrow": "Auflösungsreihenfolge",
     "title": "Ersatzeffekte",
-    "subtitle": "Wähle, welcher Ersatzeffekt zuerst angewendet wird.",
-    "candidateFallback": "Ersatzeffekt {{number}}"
+    "orderSubtitle": "Diese Effekte ändern alle, wie dieses Ereignis abläuft. Ziehe, um die Reihenfolge festzulegen — der zuletzt angewendete Effekt ist der wirksame (CR 616.1).",
+    "appliedFirst": "Zuerst angewendet (wird überschrieben)",
+    "appliedLast": "Zuletzt angewendet — dieser gilt",
+    "resultLabel": "Ergebnis: {{outcome}}",
+    "confirmOrder": "Reihenfolge bestätigen",
+    "dragHint": "Zum Umsortieren ziehen oder die Pfeile benutzen.",
+    "chooseSubtitle": "Wähle, welcher Ersatzeffekt angewendet wird.",
+    "candidateFallback": "Ersatzeffekt {{number}}",
+    "orderSubtitleComposing": "Diese Effekte ändern alle, wie dieses Ereignis geschieht. Ziehe, um die Reihenfolge festzulegen — jeder wird angewendet, die Reihenfolge ändert das Ergebnis (CR 616.1).",
+    "appliedEarlier": "Früher angewendet",
+    "appliedLater": "Später angewendet",
+    "composesNote": "Jeder Effekt wird angewendet — die Reihenfolge ändert ihre Kombination.",
+    "moveUpNamed": "{{name}} nach vorne verschieben",
+    "moveDownNamed": "{{name}} nach hinten verschieben",
+    "positionAnnounce": "Position {{position}} von {{total}}"
   },
   "retargetChoice": {
     "title": "Ziel ändern",
@@ -2281,6 +2360,24 @@
     "moveDown": "Nach unten verschieben",
     "triggerFallback": "Trigger {{number}}"
   },
+  "costReductionOrder": {
+    "eyebrow": "Reihenfolge der Kostenreduzierungen",
+    "title": "Ordne deine Kostenreduzierungen",
+    "subtitle": "Je nach Reihenfolge, in der du diese Reduzierungen anwendest, werden andere Gesamtkosten festgelegt (CR 601.2f). Das oberste dieser Liste wird zuerst angewendet.",
+    "appliedFirst": "Wird zuerst angewendet",
+    "appliedLast": "Wird zuletzt angewendet",
+    "lockedCost": "Festgelegte Gesamtkosten",
+    "lockedCostUnknown": "Entspricht einer der Summen unten",
+    "outcomesHeading": "Mögliche Gesamtkosten",
+    "reachColoredOnly": "Reduziert nur farbiges Mana",
+    "reachSpills": "Kann generisches Mana reduzieren",
+    "multiplier": "×{{count}}",
+    "confirmOrder": "Reihenfolge bestätigen",
+    "cancelCast": "Zaubern abbrechen",
+    "moveUp": "Nach oben verschieben",
+    "moveDown": "Nach unten verschieben",
+    "reductionFallback": "Reduzierung {{number}}"
+  },
   "unhandledWaitingFor": {
     "title": "Aktion erforderlich, aber UI fehlt",
     "body": "Das Spiel wartet auf eine Aktion von dir, aber diese Version von phase.rs hat dafür noch keine UI. Dies ist ein Fehler — bitte melde ihn, damit wir ihn beheben können. Nutze die Schaltfläche unten, um das Spiel zu verlassen.",
@@ -2307,7 +2404,17 @@
   },
   "outsideGame": {
     "fromExile": "Aus dem Exil",
-    "fromSideboard": "Aus dem Sideboard"
+    "fromSideboard": "Aus dem Sideboard",
+    "fromBoosterPack": "Aus einem {{setCode}}-Booster",
+    "fromCubeBoosterPack": "Aus einem Cube-Booster"
+  },
+  "boosterPack": {
+    "title": "{{setCode}}-Booster",
+    "cubeTitle": "Cube-Booster",
+    "subtitleExact_one": "Wähle {{count}} Karte zum Behalten – der Rest wird aus dem Spiel entfernt",
+    "subtitleExact_other": "Wähle {{count}} Karten zum Behalten – der Rest wird aus dem Spiel entfernt",
+    "subtitleUpTo_one": "Wähle bis zu {{count}} Karte zum Behalten – der Rest wird aus dem Spiel entfernt",
+    "subtitleUpTo_other": "Wähle bis zu {{count}} Karten zum Behalten – der Rest wird aus dem Spiel entfernt"
   },
   "phaseName": {
     "Untap": "Enttappen",
@@ -2341,6 +2448,18 @@
     },
     "buttons": {
       "keep": "Keep this"
+    }
+  },
+  "dieRoll": {
+    "ignore": {
+      "title": "Ignore a Roll",
+      "subtitle_one": "Choose which of the tied lowest rolls to ignore.",
+      "subtitle_other": "Choose {{count}} of the tied lowest rolls to ignore."
+    },
+    "buttons": {
+      "ignore": "Ignore this",
+      "ignoring": "Ignoring",
+      "keep": "Kept"
     }
   },
   "spectator": {
@@ -2427,6 +2546,7 @@
       "mulligan": "mulligan decision",
       "discarding": "discarding",
       "orderingTriggers": "ordering triggers",
+      "orderingCostReductions": "ordering cost reductions",
       "respondingToStack": "responding to the stack",
       "priorityCombat": "combat",
       "priorityMain": "main phase",
@@ -2442,11 +2562,21 @@
       "mulligan": "Mulligan",
       "discarding": "Discarding",
       "orderingTriggers": "Ordering triggers",
+      "orderingCostReductions": "Ordering cost reductions",
       "respondingToStack": "Responding",
       "priorityCombat": "Combat",
       "priorityMain": "Main phase",
       "priority": "Priority",
       "thinking": "Thinking"
     }
+  },
+  "rippleReveal": {
+    "eyebrow": "Ripple",
+    "title": "Reveal the top of your library?",
+    "subtitle_one": "You may reveal the top {{count}} card. Same-named cards can be cast free; the rest go to the bottom.",
+    "subtitle_other": "You may reveal the top {{count}} cards. Same-named cards can be cast free; the rest go to the bottom.",
+    "reveal_one": "Reveal {{count}} card",
+    "reveal_other": "Reveal {{count}} cards",
+    "decline": "Don't reveal"
   }
 }

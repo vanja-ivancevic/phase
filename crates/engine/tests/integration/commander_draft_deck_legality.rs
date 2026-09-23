@@ -23,7 +23,7 @@ use engine::game::{
 };
 use engine::types::card::CardFace;
 use engine::types::card_type::{CardType, CoreType, Supertype};
-use engine::types::format::{FormatConfig, GameFormat};
+use engine::types::format::{FormatConfig, GameFormat, SelectedFormat};
 use engine::types::keywords::{Keyword, PartnerType};
 use engine::types::mana::ManaColor;
 
@@ -111,7 +111,7 @@ fn request(main_deck: Vec<String>, commander: Vec<String>) -> DeckCompatibilityR
     DeckCompatibilityRequest {
         main_deck,
         commander,
-        selected_format: Some(GameFormat::CommanderDraft),
+        selected_format: Some(SelectedFormat::Tag(GameFormat::CommanderDraft)),
         ..DeckCompatibilityRequest::default()
     }
 }
@@ -163,9 +163,10 @@ fn commander_draft_deck_allows_duplicates_but_enforces_color_identity() {
         !compatible,
         "a card outside the commander's colour identity must be rejected"
     );
-    assert!(
-        reasons.iter().any(|r| r.contains("color identity")),
-        "expected a colour-identity reason, got {reasons:?}"
+    assert_eq!(
+        reasons,
+        vec!["Cards outside commander's color identity: Off Color Card"],
+        "the engine must retain the exact named colour-identity reason"
     );
 }
 
@@ -209,12 +210,13 @@ fn commander_draft_enforces_a_minimum_deck_size_and_no_maximum() {
 #[test]
 fn commander_draft_suppresses_the_singleton_rule() {
     let db = test_db();
-    let main = deck(100, 4);
+    let draft_main = deck(60, 4);
+    let constructed_main = deck(100, 4);
 
     for summary_only in [false, true] {
         let draft = DeckCompatibilityRequest {
             summary_only,
-            ..request(main.clone(), vec![COMMANDER.to_string()])
+            ..request(draft_main.clone(), vec![COMMANDER.to_string()])
         };
         let (compatible, reasons) = verdict(&db, &draft);
         assert!(
@@ -227,9 +229,9 @@ fn commander_draft_suppresses_the_singleton_rule() {
         );
 
         let constructed = DeckCompatibilityRequest {
-            selected_format: Some(GameFormat::Commander),
+            selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
             summary_only,
-            ..request(main.clone(), vec![COMMANDER.to_string()])
+            ..request(constructed_main.clone(), vec![COMMANDER.to_string()])
         };
         let (_, reasons) = verdict(&db, &constructed);
         assert!(
@@ -257,7 +259,7 @@ fn commander_draft_consults_no_constructed_legality_table() {
     );
 
     let constructed = DeckCompatibilityRequest {
-        selected_format: Some(GameFormat::Commander),
+        selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
         ..request(main, vec![COMMANDER.to_string()])
     };
     let (compatible, _) = verdict(&db, &constructed);
@@ -345,7 +347,7 @@ fn constructed_commander_keeps_its_own_axes() {
     // CR 903.5a: exactly 100, so a 60-card deck is rejected — the same deck
     // Commander Draft accepts above.
     let sixty = DeckCompatibilityRequest {
-        selected_format: Some(GameFormat::Commander),
+        selected_format: Some(SelectedFormat::Tag(GameFormat::Commander)),
         ..request(deck(60, 0), vec![COMMANDER.to_string()])
     };
     let (compatible, reasons) = verdict(&db, &sixty);

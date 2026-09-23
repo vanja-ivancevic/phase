@@ -31,6 +31,7 @@ import {
   loadDraftWorkspacePreferences,
   repairDraftWorkspacePackScale,
   saveDraftWorkspacePreferences,
+  setArrivingCardBoardPreferences,
   type DraftWorkspacePreferences,
   type ResponsiveDraftLayout,
 } from "../components/draft/workspace/workspacePreferences";
@@ -38,7 +39,7 @@ import { DraftProgress } from "../components/draft/DraftProgress";
 import { LimitedDeckBuilder } from "../components/draft/LimitedDeckBuilder";
 import { SealedPackOpening } from "../components/draft/SealedPackOpening";
 import { ScreenChrome } from "../components/chrome/ScreenChrome";
-import { useDraftShellChrome } from "../components/chrome/ShellContext";
+import { useDraftShellChrome, useInShell } from "../components/chrome/ShellContext";
 import { menuButtonClass } from "../components/menu/buttonStyles";
 import { MenuShell } from "../components/menu/MenuShell";
 import { runLimits } from "../services/quickDraftPersistence";
@@ -381,6 +382,8 @@ export function DraftPage() {
   const responsiveDrafting = phase === "drafting" && responsiveLayout !== "desktop";
   const phoneDeckbuilding = phase === "deckbuilding" && phoneLayout;
   const tabletDeckbuilding = phase === "deckbuilding" && tabletLayout;
+  const fillEmbeddedHeight = useInShell()
+    && (responsiveDrafting || phoneDeckbuilding || tabletDeckbuilding);
   const compactSteps = responsiveDrafting || phoneDeckbuilding || tabletDeckbuilding;
   useDraftShellChrome(
     phoneLayout && phase === "drafting"
@@ -392,6 +395,9 @@ export function DraftPage() {
         : responsiveDrafting
           ? "tablet-drafting"
         : "default",
+      undefined,
+      "quick",
+      !phoneLayout,
   );
 
   useEffect(() => {
@@ -486,6 +492,25 @@ export function DraftPage() {
     if (useDraftStore.getState().pickInteractionLocked) return;
     setWorkspacePreferences(next);
     saveDraftWorkspacePreferences(next);
+    // SYNCHRONOUSLY, not from an effect. An effect runs after commit, and an
+    // install landing in that window would place its arriving cards against the
+    // PREVIOUS columns. A pick is not the case to worry about here — the guard
+    // above returns while `pickInteractionLocked` is set, which
+    // `draftStore.performPick` sets before its first await — but a `kind:
+    // "state"` install takes no such lock, so `resumeDraft` finishing in that
+    // window would lay out the whole restored pool against stale columns.
+    // The drafting screen's `handlePreferencesChange` in `DraftPodPage` — one of
+    // three same-named handlers there, and the only one that publishes —
+    // publishes synchronously for the same reason, against its own unguarded
+    // `viewUpdated` broadcasts.
+    //
+    // This is the only path that changes `deck`; `setPackScale` below spreads
+    // `workspacePreferences` and touches one numeric field.
+    setArrivingCardBoardPreferences(next.deck);
+  }, []);
+  // Mount only. The change path publishes for itself, above.
+  useEffect(() => {
+    setArrivingCardBoardPreferences(loadDraftWorkspacePreferences().deck);
   }, []);
 
   const handleDrop = useCallback((request: DraftDropRequest) => {
@@ -515,6 +540,8 @@ export function DraftPage() {
 
   const dragController = useDraftWorkspaceDrag({
     enabled: phase === "drafting" && introDismissed && !pickInteractionLocked,
+    workspaceProjectionEnabled: responsiveLayout === "desktop",
+    retainLastValidWorkspaceTarget: true,
     readPickInteraction,
     subscribePickInteraction,
     onDrop: handleDrop,
@@ -593,7 +620,7 @@ export function DraftPage() {
   }), [handleWorkspacePreferencesChange, workspacePreferences]);
 
   return (
-    <div className={`menu-scene relative flex flex-col overflow-hidden ${phoneLayout && phase === "drafting" && introDismissed ? "h-dvh min-h-0 overscroll-none" : tabletLayout && phase === "drafting" && introDismissed ? "h-full min-h-0" : "min-h-screen"}`}>
+    <div className={`menu-scene relative flex flex-col overflow-hidden ${fillEmbeddedHeight ? "h-full min-h-0 flex-1" : phoneLayout && phase === "drafting" && introDismissed ? "h-dvh min-h-0 overscroll-none" : tabletLayout && phase === "drafting" && introDismissed ? "h-full min-h-0" : "min-h-screen"}`}>
       <ScreenChrome onBack={() => navigate("/draft")} />
       {phase === "drafting" && introDismissed && (
         <HoverCardPreview
@@ -613,8 +640,9 @@ export function DraftPage() {
             (phoneLayout && (phase === "drafting" || phase === "deckbuilding"))
             || tabletDeckbuilding
           }
+          fillEmbeddedHeight={fillEmbeddedHeight}
         >
-        <div className="flex w-full flex-col">
+        <div className={`flex w-full flex-col ${fillEmbeddedHeight ? "h-full min-h-0 flex-1" : ""}`}>
         {resumeLoading ? (
           <div className="flex items-center justify-center py-24">
             <div className="h-8 w-8 animate-spin rounded-full border-2 border-gray-500 border-t-white" />

@@ -519,6 +519,7 @@ impl EventObjectSnapshot {
             | TargetFilter::TriggeringSpellController
             | TargetFilter::TriggeringSpellOwner
             | TargetFilter::TriggeringSourceController
+            | TargetFilter::EventTargetController
             | TargetFilter::ParentTargetController
             | TargetFilter::ParentTargetOwner
             | TargetFilter::PostReplacementSourceController
@@ -664,7 +665,7 @@ impl EventObjectSnapshot {
 
             // ---- embedded per-turn history ----
             FilterProp::WasDealtDamageThisTurn
-            | FilterProp::DealtDamageThisTurn
+            | FilterProp::DealtDamageThisTurn { .. }
             | FilterProp::EnteredThisTurn
             | FilterProp::AttackedThisTurn { .. }
             | FilterProp::BlockedThisTurn
@@ -730,6 +731,7 @@ impl EventObjectSnapshot {
             | FilterProp::SameNameAsExiledBySource
             | FilterProp::AttachedToSource
             | FilterProp::AttachedToRecipient
+            | FilterProp::AttachedToPlayer { .. }
             | FilterProp::Unpaired
             | FilterProp::OtherThanTriggerObject
             | FilterProp::MostPrevalentCreatureTypeIn { .. }
@@ -751,6 +753,36 @@ impl EventObjectSnapshot {
     }
 }
 
+/// A life total reported alongside the change that produced it, for display.
+///
+/// Its `PartialEq` is deliberately always true, which is what makes it safe to carry
+/// inside a [`GameEvent`]. The event can be retained as resolution context, and a life
+/// total moves every iteration of a drain loop. A derived `PartialEq` would therefore make
+/// two otherwise-equivalent cycle points differ by this display reading alone. Being
+/// equality-transparent, the reading cannot perturb any comparison of game state, present
+/// or future, while the change itself (`amount`) stays fully compared.
+///
+/// `None` means no total was reported: an event from a peer or a recording older than this
+/// field, where a consumer falls back to the accompanying state snapshot.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct LifeTotalReading(pub Option<i32>);
+
+impl LifeTotalReading {
+    /// Whether no total was reported, so serialization can leave the key out entirely.
+    pub fn is_unreported(&self) -> bool {
+        self.0.is_none()
+    }
+}
+
+impl PartialEq for LifeTotalReading {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for LifeTotalReading {}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum GameEvent {
@@ -766,6 +798,13 @@ pub enum GameEvent {
     TurnStarted {
         player_id: PlayerId,
         turn_number: u32,
+    },
+    /// CR 500.7: One extra turn was created after the turn identified by
+    /// `anchor`; `player_id` is the beneficiary. CR 805.8: In a shared-team-turn
+    /// game, both ids are the corresponding shared-turn representatives.
+    ExtraTurnCreated {
+        player_id: PlayerId,
+        anchor: PlayerId,
     },
     PhaseChanged {
         phase: Phase,
@@ -871,6 +910,13 @@ pub enum GameEvent {
     LifeChanged {
         player_id: PlayerId,
         amount: i32,
+        /// CR 119.1 + CR 119.3: the player's own life total once this change has
+        /// been applied. Emitted so a presentation layer animating a run of life
+        /// changes can show each intermediate total without re-deriving it by
+        /// summing `amount`s — summing cannot reproduce the real sequence once a
+        /// replacement effect alters an amount mid-run.
+        #[serde(default, skip_serializing_if = "LifeTotalReading::is_unreported")]
+        new_total: LifeTotalReading,
     },
     ManaAdded {
         player_id: PlayerId,
@@ -918,6 +964,23 @@ pub enum GameEvent {
         player_id: PlayerId,
         source_id: ObjectId,
         color: ManaType,
+    },
+    /// Mana burn: a player lost life for mana unspent when one of CR 500.1's
+    /// five phases ended. Pre-M10 only — the current rules have no such rule
+    /// (glossary "Mana Burn (Obsolete)": "Older versions of the rules stated
+    /// that unspent mana caused a player to lose life"), so this is emitted
+    /// only for a custom format declaring `LegacyRuleSet.mana_burn`.
+    ///
+    /// Distinct from the Yurlok-class life loss a card's static ability
+    /// causes at the same seam: that is a card doing something, this is the
+    /// format's rules being older. A log that conflated them would tell a
+    /// player the wrong reason they are at 14 life.
+    ManaBurn {
+        player_id: PlayerId,
+        /// The number of mana units that emptied — a count, so `u32` like
+        /// `apply_empty_mana_pool_decisions` returns. Under mana burn the
+        /// emptied count IS the life lost, which is why no second tally exists.
+        amount: u32,
     },
     /// CR 614.1a + CR 703.4q: A `Transform(_)` step-end mana handler (Horizon
     /// Stone, Kruphix, Omnath, Ozai) recolored a unit in place during the
@@ -1246,6 +1309,10 @@ pub enum GameEvent {
         /// Per-attacker targets — parallel to attacker_ids, same length and order.
         #[serde(default)]
         attacks: Vec<(ObjectId, crate::game::combat::AttackTarget)>,
+        /// CR 508.1a + CR 603.4: declaration-time characteristics for the
+        /// exact attackers in this event, used by event-scoped trigger checks.
+        #[serde(default)]
+        declaration_records: Vec<crate::types::game_state::AttackDeclarationRecord>,
     },
     BlockersDeclared {
         assignments: Vec<(ObjectId, ObjectId)>,
@@ -1615,9 +1682,16 @@ pub enum GameEvent {
         kind: StickerKind,
     },
     /// CR 701.52: The active player rolled to visit their Attractions.
+    ///
+    /// CR 701.52a specifies ONE roll-to-visit turn-based action, so this event
+    /// is emitted ONCE per action even when a CR 706.6 count-raising replacement
+    /// (Barbarian Class, Pixie Guide, Wyll) leaves more than one surviving die.
+    /// `rolls` therefore carries every SURVIVING result, in roll order — an
+    /// ignored roll never happened (CR 706.6) and never appears here. Visiting
+    /// is still decided per result (`AttractionVisited`, one per visit).
     AttractionsRolledToVisit {
         player_id: PlayerId,
-        roll: u8,
+        rolls: Vec<u8>,
     },
     /// CR 701.52a + CR 702.159a: A specific Attraction was visited this roll.
     AttractionVisited {
@@ -1682,10 +1756,14 @@ pub enum GameEvent {
         is_mana_ability: bool,
     },
 
-    /// CR 702.110: A creature exploited another creature (sacrificed via exploit ETB).
+    /// CR 702.110b + CR 603.10a + CR 400.7: A creature exploited another
+    /// creature. `exploiter` identifies the actor, while `record` preserves the
+    /// sacrificed victim's exact pre-departure characteristics for later
+    /// trigger matching after the victim has become a new object.
     CreatureExploited {
         exploiter: ObjectId,
         sacrificed: ObjectId,
+        record: Box<ZoneChangeRecord>,
     },
     /// CR 122.1: A player's energy counter total changed.
     EnergyChanged {
@@ -1815,6 +1893,22 @@ mod tests {
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "TurnStarted");
         assert_eq!(json["data"]["turn_number"], 1);
+    }
+
+    #[test]
+    fn extra_turn_created_serializes_with_normalized_record_identity() {
+        let event = GameEvent::ExtraTurnCreated {
+            player_id: PlayerId(2),
+            anchor: PlayerId(5),
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"], "ExtraTurnCreated");
+        assert_eq!(json["data"]["player_id"], 2);
+        assert_eq!(json["data"]["anchor"], 5);
+
+        let round_tripped: GameEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, event);
     }
 
     #[test]

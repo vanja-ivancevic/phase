@@ -94,7 +94,7 @@ pub enum AlternativeCastDecision {
     Normal,
     /// Pay the keyword-granted alternative cost. Resolution applies the
     /// keyword's post-payment effects (Overload's target→each text change per
-    /// CR 702.96b-c, Evoke's ETB-sacrifice trigger per CR 702.74b, Bestow's
+    /// CR 702.96b-c, Evoke's ETB-sacrifice trigger per CR 702.74a, Bestow's
     /// Aura transformation per CR 702.103b, Warp's exile-at-end-step rider).
     Alternative,
 }
@@ -130,6 +130,12 @@ pub enum OutsideGameSelection {
     Sideboard { sideboard_index: usize },
     /// CR 406.3: A face-up exile object the player owns.
     FaceUpExile { object_id: ObjectId },
+    /// CR 400.11b: A card in the booster pack this effect just opened,
+    /// identified by its slot in the opened pack. The pack's cards are not in
+    /// any zone and have no `ObjectId` until one is taken, so the slot index is
+    /// the only stable identity — and it keeps two identically named cards in
+    /// the same pack distinguishable.
+    BoosterPack { pack_slot: usize },
 }
 
 #[derive(
@@ -307,6 +313,15 @@ pub enum GameAction {
     SelectCoinFlips {
         keep_indices: Vec<usize>,
     },
+    /// CR 706.6: Die-roll ignore choice — indices into `results` the roller
+    /// IGNORES (the rest survive). Note the inversion from
+    /// [`GameAction::SelectCoinFlips`], which names the flips KEPT: CR 705.1
+    /// instructs the player to keep one, while CR 706.6 instructs them to ignore
+    /// the lowest. Length must equal `ignore_count`, and every index must be one
+    /// the engine offered in `ignorable_indices`.
+    SelectDieRolls {
+        ignore_indices: Vec<usize>,
+    },
     /// CR 400.11 + CR 406.3: Player commits one or more selections from the
     /// offered outside-game pool. Each selection is a discriminated source —
     /// a sideboard slot (wishboard) or a face-up exile object (Karn / Coax).
@@ -333,6 +348,20 @@ pub enum GameAction {
     /// that controller's group on the stack — resolves last, CR 405.3 LIFO).
     OrderTriggers {
         order: Vec<usize>,
+    },
+    /// CR 601.2b + CR 601.2f: Caster submits their cost-determination election.
+    /// `order` is a permutation of indices into the
+    /// `WaitingFor::OrderCostReductions.reductions` vec the caster was prompted
+    /// with; index 0 = applied first ("If multiple cost reductions apply, the
+    /// player may apply them in any order"). `hybrid_announcement` is the
+    /// announced nonhybrid equivalent for each entry of that prompt's
+    /// `hybrid_symbols` vec, in the same order ("the player announces the
+    /// nonhybrid equivalent cost they intend to pay"), or empty to announce
+    /// nothing and leave every hybrid symbol in the locked cost.
+    OrderCostReductions {
+        order: Vec<usize>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hybrid_announcement: Vec<crate::types::mana::ManaCostShard>,
     },
     CancelCast,
     Equip {
@@ -704,7 +733,7 @@ pub enum GameAction {
     ChooseLegend {
         keep: ObjectId,
     },
-    /// CR 310.11 + CR 704.5w + CR 704.5x: Choose which player becomes the
+    /// CR 310.11 + CR 704.5x: Choose which player becomes the
     /// battle's new protector when the SBA pauses with a `BattleProtectorChoice`.
     ChooseBattleProtector {
         protector: PlayerId,
@@ -925,8 +954,7 @@ pub enum GameAction {
     /// The CURRENT FRONTEND always sends `null` (`LoopShortcutModal`, pinned by that modal's T2
     /// test) — that is a client-side policy, NOT this action's contract. Engine-side per-iteration
     /// pin CAPTURE is what remains outstanding, as part of the "Shortcut-system rules-correctness
-    /// completion" follow-up in `.deferred-backlog.md` (see
-    /// `analysis::loop_check::ShortcutResponse`'s deficiency note).
+    /// completion" follow-up in `.deferred-backlog.md`.
     DeclareShortcut {
         count: crate::analysis::decision_template::IterationCount,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -968,11 +996,16 @@ pub enum GameAction {
         source_name: String,
         cost: crate::types::mana::ManaCost,
     },
-    /// Begins the table-consent protocol for the forthcoming Resolve All batch.
-    /// Phase 1 only records unanimous consent; it deliberately does not drive
-    /// priority or resolve the batch.
+    /// Begins a Resolve All batch. `scope` selects whether this binds only the
+    /// requester (`Own` — the player-facing button, resolves immediately) or
+    /// opens the table-wide consent protocol (`Shared` — engine stack
+    /// compression). See [`ResolveAllScope`].
     BeginResolveAll {
         max_resolutions: u32,
+        /// `#[serde(default)]` migrates payloads written before the scope
+        /// existed to `Own`, the weaker of the two authorities.
+        #[serde(default)]
+        scope: ResolveAllScope,
     },
     /// Answers the currently queued Resolve All consent prompt. `epoch` makes
     /// delayed transport submissions fail closed rather than answering a newer
@@ -996,6 +1029,33 @@ pub enum GameAction {
 pub enum ResolveAllConsentDecision {
     Grant,
     Decline,
+}
+
+/// CR 117.3d + CR 117.4: which priority representatives a Resolve All request
+/// binds.
+///
+/// `Own` is the player-facing shortcut: a pre-commitment to pass the
+/// REQUESTER'S OWN priority windows while the current stack cohort drains. One
+/// player can never decide another's passes, so it asks nobody and cannot be
+/// blocked by a seat that declines or (an AI seat) never answers. Every other
+/// seat keeps its ordinary windows and its non-representative meaningful-action
+/// protection in `stack_resolution_session_priority_decision`, so CR 117.4 still
+/// requires their real passes before anything resolves.
+///
+/// `Shared` is the table-wide compression proposal: it asks every representative
+/// for consent, and a unanimous grant makes them all representatives of one
+/// session. That is strictly stronger than `Own` — a representative's windows
+/// are passed WITHOUT the meaningful-action check — which is exactly what lets
+/// the engine collapse a stack whose other players could still have acted. It
+/// is opt-in for that reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
+#[serde(tag = "type", content = "data")]
+pub enum ResolveAllScope {
+    /// Bind only the requester. The default so a payload written before this
+    /// field existed cannot silently acquire table-wide authority.
+    #[default]
+    Own,
+    Shared,
 }
 
 /// CR 117.3d: The mutation a `GameAction::SetPriorityYield` performs on the
@@ -1067,6 +1127,17 @@ fn default_debug_create_count() -> u32 {
     1
 }
 
+/// Whether a sandbox Create Card request materializes a printed card object or
+/// a token with that card's printed characteristics.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub enum DebugCardCreationKind {
+    #[default]
+    Card,
+    Token,
+}
+
 /// Direct game-state manipulation actions for debugging, testing, and remediation.
 /// Bypasses `WaitingFor` validation — fires from any game state without disrupting
 /// the current prompt. Gated on `GameState::debug_mode`.
@@ -1115,6 +1186,11 @@ pub enum DebugAction {
         /// characteristics.
         #[serde(default)]
         nonlegendary: bool,
+        /// A token retains the card's printed copiable characteristics and
+        /// artwork while obeying token zone behavior once it leaves the
+        /// battlefield.
+        #[serde(default)]
+        creation_kind: DebugCardCreationKind,
     },
     /// Remove an object from the game entirely.
     RemoveObject { object_id: ObjectId },
@@ -1433,6 +1509,7 @@ impl DebugAction {
                 attach_to,
                 run_etb,
                 nonlegendary,
+                creation_kind,
             } => {
                 let attach_suffix = match attach_to {
                     Some(AttachTarget::Object(id)) => format!(" attached to {}", obj(*id)),
@@ -1443,8 +1520,12 @@ impl DebugAction {
                 };
                 let etb_suffix = if *run_etb { "" } else { " (no ETB)" };
                 let nonlegendary_suffix = if *nonlegendary { " (nonlegendary)" } else { "" };
+                let token_suffix = match creation_kind {
+                    DebugCardCreationKind::Card => "",
+                    DebugCardCreationKind::Token => " (token)",
+                };
                 format!(
-                    "CreateCard ({} ×{} for {} in {:?}{}{}{})",
+                    "CreateCard ({} ×{} for {} in {:?}{}{}{}{})",
                     card_name,
                     count,
                     player_label(*owner),
@@ -1452,6 +1533,7 @@ impl DebugAction {
                     attach_suffix,
                     etb_suffix,
                     nonlegendary_suffix,
+                    token_suffix,
                 )
             }
             DebugAction::RemoveObject { object_id } => {
@@ -1775,6 +1857,29 @@ impl GameAction {
         )
     }
 
+    /// Whether this action names the submitting seat itself rather than a
+    /// decision slot the engine is waiting on.
+    ///
+    /// CR 723.5b: the controller of another player can't make choices or
+    /// decisions for that player that aren't called for by the rules or by any
+    /// objects. A UI preference mutates the submitter's own slot and a debug
+    /// capability grant authorizes the submitting connection — neither is such
+    /// a choice, so controlling a player must not redirect either one.
+    ///
+    /// Not `game::interaction::action_preserves_interaction`, whose
+    /// near-identical list answers a different question: this one decides
+    /// whether an action may skip the seat check, that one whether an action
+    /// leaves an open interaction standing. The two lists may diverge.
+    pub fn is_submitter_scoped(&self) -> bool {
+        self.is_actor_scoped_preference()
+            || matches!(
+                self,
+                GameAction::Debug(_)
+                    | GameAction::GrantDebugPermission { .. }
+                    | GameAction::RevokeDebugPermission { .. }
+            )
+    }
+
     /// Issue #4878: allocation-free total order over `GameAction`, used for
     /// deterministic AI candidate / legal-action sorting. Orders by the
     /// `GameActionKind` discriminant first, then by payload fields, so equal
@@ -1838,9 +1943,11 @@ impl GameAction {
             | Self::SpendPoolMana { .. }
             | Self::UnspendPoolMana { .. }
             | Self::SelectCoinFlips { .. }
+            | Self::SelectDieRolls { .. }
             | Self::ChooseReplacement { .. }
             | Self::ChooseEntryController { .. }
             | Self::OrderTriggers { .. }
+            | Self::OrderCostReductions { .. }
             | Self::CancelCast
             | Self::SubmitSideboard { .. }
             | Self::ChoosePlayDraw { .. }
@@ -2173,12 +2280,14 @@ impl GameAction {
             | GameAction::SelectCards { .. }
             | GameAction::ChooseRemoveCounterCostDistribution { .. }
             | GameAction::SelectCoinFlips { .. }
+            | GameAction::SelectDieRolls { .. }
             | GameAction::ChooseOutsideGameCards { .. }
             | GameAction::SelectTargets { .. }
             | GameAction::ChooseTarget { .. }
             | GameAction::ChooseReplacement { .. }
             | GameAction::ChooseEntryController { .. }
             | GameAction::OrderTriggers { .. }
+            | GameAction::OrderCostReductions { .. }
             | GameAction::CancelCast
             | GameAction::BackToManaPayment
             | GameAction::SubmitSideboard { .. }

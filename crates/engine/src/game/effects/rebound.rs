@@ -51,6 +51,8 @@ pub fn arm_rebound(
             duration: Some(Duration::UntilEndOfTurn),
             driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
             mana_spend_permission: None,
+            additional_cost: None,
+            cast_cost_modifier: None,
         },
         vec![TargetRef::Object(exiled_id)],
         exiled_id,
@@ -65,6 +67,10 @@ pub fn arm_rebound(
             phase: Phase::Upkeep,
             player: controller,
             gate: crate::types::ability::TurnGate::None,
+            // Already-concrete `player` (constructed directly, never passed
+            // through the placeholder-resolving `resolve()` path), so
+            // `binding` is unread here; `Controller` is the accurate label.
+            binding: crate::types::ability::DelayedTriggerPlayerBinding::Controller,
         },
         ability: Box::new(inner),
         // CR 603.7d: controller of the delayed trigger is the player who
@@ -199,6 +205,8 @@ mod tests {
                 duration: Some(Duration::UntilEndOfTurn),
                 driver: crate::types::ability::CastFromZoneDriver::LingeringPermission,
                 mana_spend_permission: None,
+                additional_cost: None,
+                cast_cost_modifier: None,
             },
             vec![TargetRef::Object(exiled)],
             exiled,

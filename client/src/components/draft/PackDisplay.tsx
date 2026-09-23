@@ -35,6 +35,11 @@ export interface PackDropAdmission {
   readonly interactionGeneration: number;
 }
 
+export interface PackDragPreviewImage {
+  readonly src: string | null;
+  readonly alt: string;
+}
+
 interface PackDropSourceCommon {
   readonly authorityId: string;
   /** The rendered pack card which originated this drag, distinct from effect authority. */
@@ -44,6 +49,7 @@ interface PackDropSourceCommon {
   readonly interactionGeneration: number;
   readonly previewWidth: number;
   readonly previewHeight: number;
+  readonly previewImages: readonly PackDragPreviewImage[];
   readonly onAdmission: (admission: PackDropAdmission) => void;
   readonly onSettled: (result: PackDropSettlement) => void;
 }
@@ -140,14 +146,21 @@ interface PackDisplayProps {
 
 type CardVisualState = "leaving" | "submitting" | "waiting" | "failure-restored" | "selected" | "default";
 
+interface DraftStep {
+  readonly packNumber: number;
+  readonly pickNumber: number;
+}
+
 interface RetainedCard {
   readonly card: DraftCardInstance;
+  readonly imageSrc: string | null;
   readonly sourceIndex: number;
   readonly requestOrder: number;
   readonly width: number;
   readonly height: number;
   readonly token: string;
   readonly generation: number;
+  readonly step: DraftStep;
 }
 
 interface CardVisualRecord {
@@ -162,15 +175,58 @@ interface ScheduledVisual {
 }
 
 const DOUBLE_TAP_DELAY_MS = 350;
+const TOUCH_PICK_COMPATIBILITY_WINDOW_MS = 500;
 const TOUCH_TAP_MOVE_THRESHOLD_PX = 10;
+const POINTER_SELECTION_CLICK_TIMEOUT_MS = 500;
+
+interface PendingPointerSelection {
+  readonly pointerId: number;
+  readonly pointerType: string;
+  readonly expiresAt: number;
+}
+
+interface TouchPickSuppression {
+  readonly sourceInstanceId: string;
+  readonly step: DraftStep;
+  readonly interactionGeneration: number;
+  readonly expiresAt: number;
+}
+
+const draftStep = (view: DraftPlayerView): DraftStep => ({
+  packNumber: view.current_pack_number,
+  pickNumber: view.pick_number,
+});
+
+const sameDraftStep = (left: DraftStep, right: DraftStep) => (
+  left.packNumber === right.packNumber && left.pickNumber === right.pickNumber
+);
 
 const cardInfo = (card: DraftCardInstance): CardHoverInfo => ({
   name: card.name,
   sourcePrinting: { setCode: card.set_code, collectorNumber: card.collector_number },
 });
 
+function RetainedPackCard({ entry, fallbackWidth }: { entry: RetainedCard; fallbackWidth: number }) {
+  const width = entry.width || fallbackWidth;
+  return (
+    <motion.div
+      data-instance-id={entry.card.instance_id}
+      data-visual-state="leaving"
+      initial={false}
+      style={{ width, height: entry.height || undefined, flexBasis: width, aspectRatio: "488 / 680" }}
+      className="shrink-0 overflow-hidden rounded-md ring-1 ring-amber-300/50"
+    >
+      {entry.imageSrc === null ? (
+        <span aria-hidden="true" className="block h-full w-full bg-neutral-900" />
+      ) : (
+        <img src={entry.imageSrc} alt={entry.card.name} draggable={false} className="h-full w-full object-contain" />
+      )}
+    </motion.div>
+  );
+}
+
 function PackCard({
-  card, state, width, locked, local, doubleTapPickEnabled, doubleClickPickEnabled, allowTouchPackDrag, desktopLayout, onSelect, onDestination, onDoubleClickPick, onHover, makeDropSource,
+  card, state, width, locked, local, doubleTapPickEnabled, doubleClickPickEnabled, allowTouchPackDrag, desktopLayout, onSelect, onDestination, onDoubleClickPick, onConsumeTouchPickCompatibility, onHover, onImageSource, makeDropSource,
 }: {
   card: DraftCardInstance;
   state: CardVisualState;
@@ -183,8 +239,10 @@ function PackCard({
   desktopLayout: boolean;
   onSelect(): void;
   onDestination(destination: DraftPickDestination): void;
-  onDoubleClickPick(): void;
+  onDoubleClickPick(inputKind: "touch" | "mouse"): void;
+  onConsumeTouchPickCompatibility(kind: "touch-pointer" | "click" | "double-click", detail?: number): boolean;
   onHover(info: CardHoverInfo | null): void;
+  onImageSource(instanceId: string, image: PackDragPreviewImage): void;
   makeDropSource(): PackDropSource | null;
 }) {
   const { t } = useTranslation("draft");
@@ -192,24 +250,48 @@ function PackCard({
     card.name,
     { setCode: card.set_code, collectorNumber: card.collector_number },
   );
-  const [loadedSrc, setLoadedSrc] = useState<string | null>(null);
   const touchStart = useRef<{ x: number; y: number } | null>(null);
   const touchMoved = useRef(false);
   const lastTouchTapAt = useRef<number | null>(null);
   const ignoreCompatibilityClickUntil = useRef(0);
-  const imageLoaded = src !== null && loadedSrc === src;
+  const pendingPointerSelection = useRef<PendingPointerSelection | null>(null);
+  const releasedPointerId = useRef<number | null>(null);
   const longPress = useLongPress(() => onHover(cardInfo(card)), { delay: 500 });
+
+  useEffect(() => {
+    onImageSource(card.instance_id, { src, alt: displayName });
+  }, [card.instance_id, displayName, onImageSource, src]);
+
+  useEffect(() => {
+    if (locked) pendingPointerSelection.current = null;
+  }, [locked]);
+
+  const consumePointerSelectionClick = (event: ReactMouseEvent<HTMLElement>) => {
+    const pending = pendingPointerSelection.current;
+    if (pending === null || event.detail === 0) return false;
+    if (Date.now() > pending.expiresAt) {
+      pendingPointerSelection.current = null;
+      return false;
+    }
+    const pointerEvent = event.nativeEvent as MouseEvent & { pointerId?: number; pointerType?: string };
+    if (
+      (pointerEvent.pointerId !== undefined && pointerEvent.pointerId !== pending.pointerId)
+      || (pointerEvent.pointerType !== undefined && pointerEvent.pointerType !== pending.pointerType)
+    ) return false;
+    return true;
+  };
 
   return (
     <motion.div
       data-instance-id={card.instance_id}
       data-visual-state={state}
-      className={`relative shrink-0 select-none overflow-visible rounded-md caret-transparent ring-1 ${state === "selected" ? "transition-transform" : "transition-all"} duration-150 ${locked ? "" : `cursor-pointer ${desktopLayout ? "hover:scale-[1.08]" : ""}`} ${state === "selected" ? "z-10 ring-2 ring-[rgb(3,139,6)] shadow-[0_0_7px_3px_rgb(3,139,6)] motion-safe:animate-[draft-pack-selected-glow_4.8s_ease-in-out_infinite]" : state === "failure-restored" ? "ring-red-300" : "ring-white/15 hover:ring-white/20"} ${state === "submitting" || state === "waiting" ? "opacity-55 grayscale" : ""}`}
+      className={`relative shrink-0 select-none overflow-visible rounded-md caret-transparent ring-1 ${state === "selected" ? "transition-transform" : "transition-all"} duration-150 ${locked ? "" : `cursor-pointer ${desktopLayout ? "hover:scale-[1.05]" : ""}`} ${state === "selected" ? "z-10 ring-2 ring-arcane shadow-[0_0_7px_3px_#38bdf8]" : state === "failure-restored" ? "ring-red-300" : "ring-white/15 hover:ring-white/20"} ${state === "submitting" || state === "waiting" ? "opacity-55 grayscale" : ""}`}
       style={{ width, flexBasis: width, aspectRatio: "488 / 680" }}
       onMouseEnter={() => onHover(cardInfo(card))}
       onMouseLeave={() => onHover(null)}
       onPointerDown={(event) => {
         if (event.pointerType === "touch") {
+          if (onConsumeTouchPickCompatibility("touch-pointer")) return;
           if (!locked) {
             touchStart.current = { x: event.clientX, y: event.clientY };
             touchMoved.current = false;
@@ -218,6 +300,23 @@ function PackCard({
             if (source !== null) local?.dragController.handlePointerDown(event, source, true);
           }
         } else {
+          const existingPendingSelection = pendingPointerSelection.current;
+          const samePendingPointer = existingPendingSelection !== null
+            && Date.now() <= existingPendingSelection.expiresAt
+            && existingPendingSelection.pointerId === event.pointerId
+            && existingPendingSelection.pointerType === event.pointerType;
+          if (!samePendingPointer) pendingPointerSelection.current = null;
+          releasedPointerId.current = null;
+          if (desktopLayout && !locked && state !== "selected" && event.isPrimary && event.button === 0) {
+            onSelect();
+            pendingPointerSelection.current = {
+              pointerId: event.pointerId,
+              pointerType: event.pointerType,
+              expiresAt: Date.now() + POINTER_SELECTION_CLICK_TIMEOUT_MS,
+            };
+          } else {
+            pendingPointerSelection.current = null;
+          }
           const source = makeDropSource();
           if (source !== null) local?.dragController.handlePointerDown(event, source);
         }
@@ -227,6 +326,7 @@ function PackCard({
           local?.dragController.handlePointerMove(event);
           return;
         }
+        if (onConsumeTouchPickCompatibility("touch-pointer")) return;
         const start = touchStart.current;
         if (start !== null) {
           const deltaX = event.clientX - start.x;
@@ -241,6 +341,12 @@ function PackCard({
       onPointerUp={(event) => {
         if (event.pointerType !== "touch") {
           local?.dragController.handlePointerUp(event);
+          releasedPointerId.current = event.pointerId;
+          return;
+        }
+        if (onConsumeTouchPickCompatibility("touch-pointer")) {
+          touchStart.current = null;
+          touchMoved.current = false;
           return;
         }
         const longPressFired = longPress.firedRef.current;
@@ -257,7 +363,7 @@ function PackCard({
           && now - lastTouchTapAt.current <= DOUBLE_TAP_DELAY_MS
         ) {
           lastTouchTapAt.current = null;
-          onDoubleClickPick();
+          onDoubleClickPick("touch");
           return;
         }
         lastTouchTapAt.current = now;
@@ -265,28 +371,54 @@ function PackCard({
       }}
       onPointerCancel={(event) => {
         if (event.pointerType === "touch") {
+          if (onConsumeTouchPickCompatibility("touch-pointer")) {
+            touchStart.current = null;
+            touchMoved.current = false;
+            return;
+          }
           touchStart.current = null;
           touchMoved.current = false;
           if (allowTouchPackDrag) local?.dragController.handlePointerCancel(event);
           longPress.handlers.onPointerCancel(event);
         } else {
+          if (pendingPointerSelection.current?.pointerId === event.pointerId) pendingPointerSelection.current = null;
           local?.dragController.handlePointerCancel(event);
         }
       }}
-      onLostPointerCapture={(event) => local?.dragController.handleLostPointerCapture(event)}
+      onLostPointerCapture={(event) => {
+        if (event.pointerType === "touch" && onConsumeTouchPickCompatibility("touch-pointer")) return;
+        if (
+          pendingPointerSelection.current?.pointerId === event.pointerId
+          && releasedPointerId.current !== event.pointerId
+        ) pendingPointerSelection.current = null;
+        local?.dragController.handleLostPointerCapture(event);
+      }}
       onContextMenu={longPress.handlers.onContextMenu}
+      onClick={(event) => {
+        // The desktop drag controller captures the pointer on this shell. A
+        // browser may consequently target its trailing click here instead of
+        // the nested activation button; accept only that retargeted case.
+        if (locked || !desktopLayout || event.target !== event.currentTarget) return;
+        if (onConsumeTouchPickCompatibility("click", event.detail)) return;
+        if (consumePointerSelectionClick(event)) return;
+        if (!longPress.firedRef.current && !local?.dragController.consumeCompatibilityActivation(compatibilityActivation(event, "click", card.instance_id))) onSelect();
+      }}
       onDoubleClick={(event) => {
         const target = event.target as HTMLElement;
         if (target !== event.currentTarget && target.closest("[data-pack-card-activation]") === null) return;
-        if (!local?.dragController.consumeCompatibilityActivation(compatibilityActivation(event, "double-click", card.instance_id)) && doubleClickPickEnabled) onDoubleClickPick();
+        if (onConsumeTouchPickCompatibility("double-click", event.detail)) return;
+        if (!local?.dragController.consumeCompatibilityActivation(compatibilityActivation(event, "double-click", card.instance_id)) && doubleClickPickEnabled) onDoubleClickPick("mouse");
       }}
     >
       <button
         type="button"
         data-pack-card-activation
+        aria-pressed={state === "selected"}
         disabled={locked}
         onClick={(event) => {
-          if (Date.now() < ignoreCompatibilityClickUntil.current) return;
+          if (onConsumeTouchPickCompatibility("click", event.detail)) return;
+          if (consumePointerSelectionClick(event)) return;
+          if (event.detail !== 0 && Date.now() < ignoreCompatibilityClickUntil.current) return;
           if (!longPress.firedRef.current && !local?.dragController.consumeCompatibilityActivation(compatibilityActivation(event, "click", card.instance_id))) onSelect();
         }}
         className="block h-full w-full overflow-hidden rounded-md disabled:cursor-not-allowed"
@@ -299,9 +431,8 @@ function PackCard({
             alt={displayName}
             draggable={false}
             className="h-full w-full object-contain"
-            onLoad={() => setLoadedSrc(src)}
             onError={() => {
-              setLoadedSrc(null);
+              onImageSource(card.instance_id, { src: null, alt: displayName });
               advanceFailedSource?.(src);
             }}
           />
@@ -320,11 +451,6 @@ function PackCard({
         >
           ↺
         </button>
-      )}
-      {!imageLoaded && (
-        <div className="absolute inset-x-1 bottom-1 flex items-center gap-1 rounded bg-black/80 p-1">
-          <span className="min-w-0 flex-1 truncate px-1 text-[10px] text-white/85">{card.name}</span>
-        </div>
       )}
       {local !== null && (
         <>
@@ -352,11 +478,15 @@ export function PackDisplay({
   const [states, setStates] = useState<Readonly<Record<string, CardVisualRecord>>>({});
   const [retained, setRetained] = useState<readonly RetainedCard[]>([]);
   const statesRef = useRef<Readonly<Record<string, CardVisualRecord>>>({});
+  const imageSourcesRef = useRef(new Map<string, PackDragPreviewImage>());
   const viewRef = useRef(controller.view);
+  const previousStepRef = useRef<DraftStep | null>(null);
   const requestOrder = useRef(0);
   const timers = useRef(new Map<string, ScheduledVisual>());
   const packSequenceRef = useRef<HTMLDivElement>(null);
   const responsiveScaleInitialized = useRef(false);
+  const touchPickSuppressionRef = useRef<TouchPickSuppression | null>(null);
+  const touchPickSuppressionTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const setPackScaleRef = useRef(presentation.setPackScale);
   const localGeneration = controller.kind === "local-workspace" ? controller.interactionGeneration : 0;
   const generationRef = useRef(localGeneration);
@@ -383,9 +513,19 @@ export function PackDisplay({
       timers.current.set(key, { handle, instanceId });
     }
   };
+  const clearTouchPickSuppression = (record?: TouchPickSuppression) => {
+    if (record !== undefined && touchPickSuppressionRef.current !== record) return;
+    touchPickSuppressionRef.current = null;
+    if (touchPickSuppressionTimerRef.current !== null) {
+      clearTimeout(touchPickSuppressionTimerRef.current);
+      touchPickSuppressionTimerRef.current = null;
+    }
+  };
   useEffect(() => () => {
     for (const entry of timers.current.values()) clearTimeout(entry.handle);
     timers.current.clear();
+    touchPickSuppressionRef.current = null;
+    if (touchPickSuppressionTimerRef.current !== null) clearTimeout(touchPickSuppressionTimerRef.current);
   }, []);
 
   const view = controller.view;
@@ -395,8 +535,9 @@ export function PackDisplay({
   const draftEffects = view?.draft_effects ?? [];
   const local = controller.kind === "local-workspace" ? controller : null;
   const isOrderedSelection = view?.pick_selection_mode === "Ordered";
+  const currentStep = view === null ? null : draftStep(view);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const live = new Set(controller.view?.current_pack?.map((card) => card.instance_id) ?? []);
     setRetained((current) => {
       const reappeared = current.filter((entry) => live.has(entry.card.instance_id));
@@ -407,12 +548,24 @@ export function PackDisplay({
   useEffect(() => {
     if (generationRef.current === localGeneration) return;
     generationRef.current = localGeneration;
+    clearTouchPickSuppression();
     for (const entry of timers.current.values()) clearTimeout(entry.handle);
     timers.current.clear();
     statesRef.current = {};
     setStates({});
     setRetained([]);
   }, [localGeneration]);
+  useEffect(() => {
+    const previousStep = previousStepRef.current;
+    const currentStep = viewRef.current === null ? null : draftStep(viewRef.current);
+    previousStepRef.current = currentStep;
+    if (previousStep === null || currentStep === null || sameDraftStep(previousStep, currentStep)) return;
+    setRetained((current) => {
+      const stale = current.filter((entry) => !sameDraftStep(entry.step, currentStep));
+      cancelTimersFor(stale.map((entry) => entry.card.instance_id));
+      return current.filter((entry) => sameDraftStep(entry.step, currentStep));
+    });
+  }, [view?.current_pack_number, view?.pick_number]);
   useEffect(() => {
     if (pack.length === 1 && selectedCard === null && !locked) controller.selectCard(pack[0].instance_id);
   }, [controller, locked, pack, selectedCard]);
@@ -457,7 +610,13 @@ export function PackDisplay({
   }, [view?.current_pack_number, view?.pick_number]);
 
   if (!view) return null;
-  if (pack.length === 0 && retained.length === 0) return <div className="flex justify-center py-12 text-white/40">{t("pack.waitingNext")}</div>;
+  const currentPackIds = new Set(pack.map((card) => card.instance_id));
+  const visibleRetained = retained.filter((entry) => (
+    entry.generation === localGeneration
+    && sameDraftStep(entry.step, currentStep!)
+    && !currentPackIds.has(entry.card.instance_id)
+  ));
+  if (pack.length === 0 && visibleRetained.length === 0) return <div className="flex justify-center py-12 text-white/40">{t("pack.waitingNext")}</div>;
 
   const updateStates = (update: (current: Readonly<Record<string, CardVisualRecord>>) => Readonly<Record<string, CardVisualRecord>>) => {
     const next = update(statesRef.current);
@@ -487,7 +646,7 @@ export function PackDisplay({
     }
     return next;
   });
-  const settle = (token: string, generation: number, cards: readonly DraftCardInstance[], indices: readonly number[], sizes: readonly { width: number; height: number }[], result: PackDropSettlement) => {
+  const settle = (token: string, generation: number, step: DraftStep, cards: readonly DraftCardInstance[], indices: readonly number[], sizes: readonly { width: number; height: number }[], result: PackDropSettlement) => {
     const ids = cards.map((card) => card.instance_id);
     if (!requestIsCurrent(ids, token, generation)) return;
     if (result.kind !== "outcome") {
@@ -496,10 +655,16 @@ export function PackDisplay({
     }
     switch (result.outcome.status) {
       case "acknowledged": {
+        const currentStep = viewRef.current === null ? null : draftStep(viewRef.current);
+        if (currentStep === null || !sameDraftStep(step, currentStep)) {
+          setCardStates(ids, token, generation, null);
+          break;
+        }
         const live = new Set(viewRef.current?.current_pack?.map((card) => card.instance_id) ?? []);
         const departed = cards.flatMap((card, index): RetainedCard[] => live.has(card.instance_id) ? [] : [{
-          card, sourceIndex: indices[index], requestOrder: requestOrder.current,
-          width: sizes[index]?.width ?? 0, height: sizes[index]?.height ?? 0, token, generation,
+          card, imageSrc: imageSourcesRef.current.get(card.instance_id)?.src ?? null,
+          sourceIndex: indices[index], requestOrder: requestOrder.current,
+          width: sizes[index]?.width ?? 0, height: sizes[index]?.height ?? 0, token, generation, step,
         }]);
         setCardStates(ids, token, generation, null);
         if (departed.length > 0) {
@@ -523,6 +688,37 @@ export function PackDisplay({
     return card === undefined ? [] : [card];
   });
   const requiredCount = activeEffect === null ? Math.max(1, view.required_pick_count) : 2;
+  const armTouchPickSuppression = (
+    sourceInstanceId: string,
+    step: DraftStep,
+    interactionGeneration: number,
+  ) => {
+    clearTouchPickSuppression();
+    const record: TouchPickSuppression = {
+      sourceInstanceId,
+      step,
+      interactionGeneration,
+      expiresAt: Date.now() + TOUCH_PICK_COMPATIBILITY_WINDOW_MS,
+    };
+    touchPickSuppressionRef.current = record;
+    touchPickSuppressionTimerRef.current = setTimeout(
+      () => clearTouchPickSuppression(record),
+      TOUCH_PICK_COMPATIBILITY_WINDOW_MS,
+    );
+    return record;
+  };
+  const consumeTouchPickCompatibilityActivation = (
+    kind: "touch-pointer" | "click" | "double-click",
+    detail = 1,
+  ) => {
+    const record = touchPickSuppressionRef.current;
+    if (record === null || (kind !== "touch-pointer" && detail === 0)) return false;
+    if (record.interactionGeneration !== localGeneration || Date.now() >= record.expiresAt) {
+      clearTouchPickSuppression(record);
+      return false;
+    }
+    return true;
+  };
   const chosenCards = (fallback: DraftCardInstance): readonly DraftCardInstance[] => {
     if (activeEffect === null && requiredCount === 1) return [fallback];
     return selectedCards.length === requiredCount && selectedCards.some((card) => card.instance_id === fallback.instance_id)
@@ -534,6 +730,7 @@ export function PackDisplay({
     const token = crypto.randomUUID();
     requestOrder.current += 1;
     const generation = local.interactionGeneration;
+    const step = draftStep(view);
     const ids = cards.map((card) => card.instance_id);
     const indices = cards.map((card) => pack.indexOf(card));
     beginRequest(ids, token, generation);
@@ -542,7 +739,23 @@ export function PackDisplay({
       : ids.length === 1
         ? await local.pickCard(ids[0], destination)
         : await local.pickCardStep(ids, destination);
-    settle(token, generation, cards, indices, cards.map(() => ({ width: 0, height: 0 })), { kind: "outcome", outcome });
+    settle(token, generation, step, cards, indices, cards.map(() => ({ width: 0, height: 0 })), { kind: "outcome", outcome });
+  };
+  const submitDoublePick = async (card: DraftCardInstance, inputKind: "touch" | "mouse") => {
+    if (activeEffect !== null || requiredCount !== 1) {
+      await request(chosenCards(card), "deck");
+      return;
+    }
+    if (local === null) return;
+    const suppression = inputKind === "touch"
+      ? armTouchPickSuppression(card.instance_id, draftStep(view), local.interactionGeneration)
+      : null;
+    try {
+      const outcome = await local.confirmPick("deck");
+      if (outcome.status === "rejected" && suppression !== null) clearTouchPickSuppression(suppression);
+    } catch {
+      if (suppression !== null) clearTouchPickSuppression(suppression);
+    }
   };
   const select = (id: string) => {
     if (locked) return;
@@ -596,7 +809,7 @@ export function PackDisplay({
     && selectedCards.length === requiredCount;
   const slots = [
     ...pack.map((card, sourceIndex) => ({ kind: "live" as const, card, sourceIndex, requestOrder: -1 })),
-    ...retained.map((entry) => ({ kind: "retained" as const, ...entry })),
+    ...visibleRetained.map((entry) => ({ kind: "retained" as const, ...entry })),
   ].sort((left, right) => left.sourceIndex - right.sourceIndex || left.requestOrder - right.requestOrder);
 
   const mobileLayout = responsiveLayout === "phone-portrait" || responsiveLayout === "phone-landscape";
@@ -628,7 +841,7 @@ export function PackDisplay({
       )}
       <div
         data-pack-toolbar
-        className={`flex min-w-0 shrink-0 flex-nowrap items-center gap-3 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden ${phoneToolbarPinned ? "sticky top-0 z-20 bg-slate-950 py-1" : ""}`}
+        className={`flex min-w-0 shrink-0 flex-nowrap items-center gap-3 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden ${phoneToolbarPinned ? "sticky top-0 z-20 bg-slate-950 py-1" : "min-h-9"}`}
       >
         <div data-pack-status-controls className="flex shrink-0 items-center gap-2">
           <span className="text-sm text-fg">
@@ -659,17 +872,17 @@ export function PackDisplay({
         {mobileLayout || responsiveLayout === "tablet-landscape" ? (
           <div data-pack-scale-controls className="ml-auto flex shrink-0 items-center gap-1.5">
             <button type="button" disabled={locked} aria-label={t("pack.scaleDecrease")} onClick={() => presentation.setPackScale(repairDraftWorkspacePackScale(presentation.packScale - 0.1))} className={menuButtonClass({ tone: "neutral", size: "icon", disabled: locked })}>−</button>
-            <label className="flex items-center">
+            <label className="flex min-w-0 items-center">
               <span className="sr-only">{t("pack.scale")}</span>
-              <input type="range" min={DRAFT_WORKSPACE_PACK_SCALE_MIN} max={DRAFT_WORKSPACE_PACK_SCALE_MAX} step={DRAFT_WORKSPACE_PACK_SCALE_STEP} value={presentation.packScale} disabled={locked} onChange={(event) => presentation.setPackScale(Number(event.target.value))} aria-label={t("pack.scale")} />
+              <input type="range" min={DRAFT_WORKSPACE_PACK_SCALE_MIN} max={DRAFT_WORKSPACE_PACK_SCALE_MAX} step={DRAFT_WORKSPACE_PACK_SCALE_STEP} value={presentation.packScale} disabled={locked} onChange={(event) => presentation.setPackScale(Number(event.target.value))} aria-label={t("pack.scale")} className="min-w-0 w-[6.5rem] max-w-full" />
             </label>
             <button type="button" disabled={locked} aria-label={t("pack.scaleIncrease")} onClick={() => presentation.setPackScale(repairDraftWorkspacePackScale(presentation.packScale + 0.1))} className={menuButtonClass({ tone: "neutral", size: "icon", disabled: locked })}>+</button>
           </div>
         ) : (
           <div data-pack-scale-controls className="ml-auto flex shrink-0 items-center gap-2">
-            <label className="flex items-center gap-2 text-xs text-white/70">
+            <label className={`flex items-center gap-2 text-xs text-white/70 ${responsiveLayout === "desktop" ? "" : "min-w-0"}`}>
               {t("pack.scale")}
-              <input type="range" min={DRAFT_WORKSPACE_PACK_SCALE_MIN} max={DRAFT_WORKSPACE_PACK_SCALE_MAX} step={DRAFT_WORKSPACE_PACK_SCALE_STEP} value={presentation.packScale} disabled={locked} onChange={(event) => presentation.setPackScale(Number(event.target.value))} aria-label={t("pack.scale")} />
+              <input type="range" min={DRAFT_WORKSPACE_PACK_SCALE_MIN} max={DRAFT_WORKSPACE_PACK_SCALE_MAX} step={DRAFT_WORKSPACE_PACK_SCALE_STEP} value={presentation.packScale} disabled={locked} onChange={(event) => presentation.setPackScale(Number(event.target.value))} aria-label={t("pack.scale")} className={responsiveLayout === "desktop" ? undefined : "min-w-0 w-[6.5rem] max-w-full"} />
             </label>
             <button type="button" disabled={locked} aria-label={t("pack.scaleDecrease")} onClick={() => presentation.setPackScale(repairDraftWorkspacePackScale(presentation.packScale - 0.1))} className={menuButtonClass({ tone: "neutral", size: "icon", disabled: locked })}>−</button>
             <button type="button" disabled={locked} aria-label={t("pack.scaleReset")} onClick={() => presentation.setPackScale(DRAFT_WORKSPACE_PACK_SCALE_DEFAULT)} className={menuButtonClass({ tone: "neutral", size: "icon", disabled: locked })}>
@@ -702,17 +915,16 @@ export function PackDisplay({
       >
         <AnimatePresence initial={false}>
           {slots.map((slot) => {
-            if (slot.kind === "retained") return (
-              <motion.div key={`retained:${slot.token}:${slot.card.instance_id}`} data-instance-id={slot.card.instance_id} data-visual-state="leaving" initial={false} style={{ width: slot.width || width, height: slot.height || undefined, flexBasis: slot.width || width, aspectRatio: "488 / 680" }} className="shrink-0 rounded-md ring-1 ring-amber-300/50">
-                <span className="flex h-full items-center justify-center text-xs text-white/60">{slot.card.name}</span>
-              </motion.div>
-            );
+            if (slot.kind === "retained") return <RetainedPackCard key={`retained:${slot.token}:${slot.card.instance_id}`} entry={slot} fallbackWidth={width} />;
             const card = slot.card;
             const selected = selectedCard === card.instance_id || additionalCards.includes(card.instance_id);
             const waiting = local?.pendingIntent?.kind !== "auto-pick" && local?.pendingIntent?.instanceIds.includes(card.instance_id);
+            const visualRecord = states[card.instance_id];
             const state = waiting
               ? "waiting"
-              : states[card.instance_id]?.state ?? (selected ? "selected" : "default");
+              : visualRecord?.generation === localGeneration
+                ? visualRecord.state
+                : selected ? "selected" : "default";
             return <PackCard
               key={card.instance_id}
               card={card}
@@ -726,11 +938,10 @@ export function PackDisplay({
               desktopLayout={responsiveLayout === "desktop"}
               onSelect={() => select(card.instance_id)}
               onDestination={(destination) => void request(chosenCards(card), destination)}
-              onDoubleClickPick={() => {
-                if (activeEffect === null && requiredCount === 1) void local?.confirmPick("deck");
-                else void request(chosenCards(card), "deck");
-              }}
+              onDoubleClickPick={(inputKind) => void submitDoublePick(card, inputKind)}
+              onConsumeTouchPickCompatibility={consumeTouchPickCompatibilityActivation}
               onHover={onCardHover}
+              onImageSource={(instanceId, image) => imageSourcesRef.current.set(instanceId, image)}
               makeDropSource={() => {
                 if (local === null || locked) return null;
                 const cards = chosenCards(card);
@@ -739,6 +950,7 @@ export function PackDisplay({
                 const ids = cards.map((candidate) => candidate.instance_id);
                 const indices = cards.map((candidate) => pack.indexOf(candidate));
                 const generation = local.interactionGeneration;
+                const step = draftStep(view);
                 let admission: PackDropAdmission | null = null;
                 return {
                   kind: cards.length === 2 ? "draft-effect" : "pick",
@@ -750,6 +962,10 @@ export function PackDisplay({
                   interactionGeneration: generation,
                   previewWidth: width,
                   previewHeight: width * 680 / 488,
+                  previewImages: cards.map((candidate) => imageSourcesRef.current.get(candidate.instance_id) ?? {
+                    src: null,
+                    alt: candidate.name,
+                  }),
                   onAdmission: (nextAdmission) => {
                     admission = nextAdmission;
                     requestOrder.current += 1;
@@ -757,7 +973,7 @@ export function PackDisplay({
                   },
                   onSettled: (result) => {
                     if (admission === null) return;
-                    settle(admission.requestToken, admission.interactionGeneration, cards, indices, cards.map(() => ({ width, height: width * 680 / 488 })), result);
+                    settle(admission.requestToken, admission.interactionGeneration, step, cards, indices, cards.map(() => ({ width, height: width * 680 / 488 })), result);
                   },
                 } as PackDropSource;
               }}

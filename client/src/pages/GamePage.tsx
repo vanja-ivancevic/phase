@@ -84,6 +84,7 @@ import { CardDataMissingModal } from "../components/modal/CardDataMissingModal.t
 import { UnhandledWaitingForModal } from "../components/modal/UnhandledWaitingForModal.tsx";
 import { AdventureCastModal } from "../components/modal/AdventureCastModal.tsx";
 import { CascadeChoiceModal } from "../components/modal/CascadeChoiceModal.tsx";
+import { RippleRevealChoiceModal } from "../components/modal/RippleRevealChoiceModal.tsx";
 import { FreeCastWindowModal } from "../components/modal/FreeCastWindowModal.tsx";
 import { ModalFaceModal } from "../components/modal/ModalFaceModal.tsx";
 import { AlternativeCostModal } from "../components/modal/AlternativeCostModal.tsx";
@@ -106,6 +107,7 @@ import {
 import { ReplacementModal } from "../components/modal/ReplacementModal.tsx";
 import { ResolveAllConsentModal } from "../components/modal/ResolveAllConsentModal.tsx";
 import { TriggerOrderModal } from "../components/modal/TriggerOrderModal.tsx";
+import { CostReductionOrderModal } from "../components/modal/CostReductionOrderModal.tsx";
 import { PeekTab } from "../components/modal/DialogShell.tsx";
 import { PeekRestoreTab } from "../components/modal/DialogHost.tsx";
 import { useModalPeek } from "../components/modal/useModalPeek.ts";
@@ -176,12 +178,16 @@ import { SpectatorChrome } from "../components/spectator/SpectatorChrome.tsx";
 import { useSpectatorMode } from "../hooks/useSpectatorMode.ts";
 import { GameProvider } from "../providers/GameProvider.tsx";
 import { useCanActForWaitingState, usePerspectivePlayerId, usePlayerId } from "../hooks/usePlayerId.ts";
+import { ABILITY_BLOCK_REASON_KEY } from "../viewmodel/abilityBlockReason.ts";
 import {
   abilityChoiceLabel,
+  abilityLabel,
   formatAbilityCost,
   loyaltyBadge,
+  stripCostPrefix,
   stripLoyaltyCostPrefix,
 } from "../viewmodel/costLabel.ts";
+import { renderDescription } from "../utils/description.ts";
 import { LoyaltyBadge } from "../components/ui/LoyaltyBadge.tsx";
 import {
   getCastableZoneViewerTarget,
@@ -274,6 +280,11 @@ export function GamePage() {
   const roomNameParam = searchParams.get("roomName");
   const sourceParam = searchParams.get("source") ?? undefined;
   const draftIdParam = searchParams.get("draftId") ?? undefined;
+  // The lobby authority this join/spectate was launched from. Produced by
+  // our own navigation from a canonical `LobbySource.url`; a hand-edited
+  // value surfaces through the adapter's existing handshake error path, the
+  // same way a hand-edited `code` does.
+  const serverParam = searchParams.get("server") ?? undefined;
   const playerCount = playersParam ? Number(playersParam) : undefined;
   const activeGameMeta = useMemo(
     () => (gameId ? loadActiveGame() : null),
@@ -552,11 +563,14 @@ export function GamePage() {
             deckRejected: true,
             reason: event.reason,
             joinCode,
+            // Carry the origin back: the retry must re-join the same server,
+            // not whichever one this client hosts on.
+            server: serverParam,
           },
         });
         break;
     }
-  }, [gameId, navigate, joinCode, isOnlineMode, t]);
+  }, [gameId, navigate, joinCode, serverParam, isOnlineMode, t]);
 
   const handleP2PEvent = useCallback((event: P2PAdapterEvent) => {
     switch (event.type) {
@@ -762,6 +776,7 @@ export function GamePage() {
       roomName={roomNameParam ?? undefined}
       source={sourceParam}
       draftId={draftIdParam}
+      serverUrl={serverParam}
       onWsEvent={mode === "ai" || mode === "online" || mode === "spectate" ? handleWsEvent : undefined}
       onP2PEvent={
         mode === "p2p-host" || mode === "p2p-join" ? handleP2PEvent : undefined
@@ -1004,6 +1019,7 @@ function GamePageContent({
   );
   const debugPanelOpen = useUiStore((s) => s.debugPanelOpen);
   const debugClickModeButtonVisible = useUiStore((s) => s.debugClickModeButtonVisible);
+  const logPanelOpen = useUiStore((s) => s.logPanelOpen);
   const toggleDebugClickModeButtonVisible = useUiStore(
     (s) => s.toggleDebugClickModeButtonVisible,
   );
@@ -1361,6 +1377,7 @@ function GamePageContent({
   const gamePageStyle = {
     "--game-top-overlay-offset": `${topOverlayOffsetPx}px`,
     "--game-split-safe-top": "0px",
+    "--game-left-rail-offset": "0px",
     // Where the targeting prompt starts, which is the only part of its
     // placement this page can state: the split layout puts seat panes at the
     // very top of the board, so the prompt clears them. How TALL the block is
@@ -1455,9 +1472,12 @@ function GamePageContent({
 
   return (
     <div
-      ref={containerRef}
-      className={`game-no-select relative h-[100dvh] w-full overflow-hidden bg-gray-950${showDebugBounds ? " debug-bounds" : ""}`}
-      style={gamePageStyle}
+      className={`game-no-select flex h-[100dvh] w-full flex-col bg-gray-950 lg:flex-row${showDebugBounds ? " debug-bounds" : ""}`}
+    >
+      <div
+        ref={containerRef}
+        className="relative min-h-0 min-w-0 flex-1 overflow-hidden contain-paint"
+        style={gamePageStyle}
       onContextMenu={(e) => {
         e.preventDefault();
         const target = e.target as HTMLElement | null;
@@ -1594,16 +1614,16 @@ function GamePageContent({
             band would drag the hand vertically. Instead we give the row a
             CONSTANT height equal to the DEFAULT band and pin it to the track's
             bottom (`self-end`, the viewport edge, which never moves). The height
-            mirrors the resolver's default track exactly — `min(18%, 150px)` of
-            the grid's CONTENT box (`100dvh` minus the top-overlay padding) — but
+            uses the shared `--game-player-row-height` contract (also consumed by
+            board-choice controls) to mirror the resolver's default track. It is
             computed in viewport units so it ignores the LIVE (resized) track,
-            which a plain `18%` on a grid item would track instead. The hand thus
-            keeps its default resting position and stays put on resize; a grown
-            band opens empty space ABOVE the row (trading with the battlefield)
-            rather than shoving the hand up. */}
+            which a plain percentage on a grid item would track instead. The hand
+            thus keeps its default resting position and stays put on resize; a
+            grown band opens empty space ABOVE the row (trading with the
+            battlefield) rather than shoving the hand up. */}
         <div
           className="relative min-w-0 self-end overflow-visible"
-          style={{ height: "min(calc(0.18 * (100dvh - var(--game-top-overlay-offset, 0px))), 150px)" }}
+          style={{ height: "var(--game-player-row-height)" }}
           data-flex-zone="player-row"
         >
           <div className="flex items-end justify-center" data-flex-zone="playerHandRow">
@@ -1611,17 +1631,18 @@ function GamePageContent({
                 PlayerHand's own fan (see ZoneFanCard), so the row is just the hand.
                 The `playerHandRow` flex-zone hook drives the mobile hand-lift
                 transform in index.css. */}
-            <PlayerHand />
+            <PlayerHand interactionDisabled={boardChoiceLayerActive} />
           </div>
           <DraggableWidget
             target={{ kind: "widget", key: "playerPiles" }}
             flexZone="playerPiles"
             scaleKey="playerPiles"
             className="pointer-events-none absolute left-0 top-0 bottom-0 z-10 flex w-fit flex-col items-start justify-end gap-0.5 p-1 lg:gap-1 lg:p-3 [&>*]:pointer-events-auto [&>div>*]:pointer-events-auto"
-            // Anchor box-scale to the bottom-left dock corner.
+            // Anchor box-scale to the bottom-left dock corner. No left-rail
+            // offset here: this pile is absolutely positioned inside the board
+            // grid, whose padding already accounts for a left-docked log panel.
             style={{
               ...playerZoneRailStyle,
-              left: "var(--game-left-rail-offset, 0px)",
               transformOrigin: "bottom left",
             }}
           >
@@ -1719,8 +1740,7 @@ function GamePageContent({
         </div>
       </DraggableWidget>
 
-      <GameLogPanel />
-      <MobileHandDrawer />
+      <MobileHandDrawer interactionDisabled={boardChoiceLayerActive} />
       <FlexEditOverlay />
 
       {/* Game menu — top-left hamburger */}
@@ -1730,6 +1750,8 @@ function GamePageContent({
         isOnlineMode={isOnlineMode}
         showAiHand={showAiHand}
         onToggleAiHand={() => setShowAiHand((v) => !v)}
+        logPanelOpen={logPanelOpen}
+        onToggleGameLog={() => useUiStore.getState().toggleLogPanel()}
         multiplayerBoardLayout={
           seatCount > 2 && !untapForcedSplit ? resolvedMultiplayerBoardLayout : undefined
         }
@@ -1971,10 +1993,6 @@ function GamePageContent({
       <AttackRequirementBadges />
       <BlockerConstraintBadges />
 
-      {/* Card preview overlay. Owns its own inspect-state subscriptions so a
-          hover doesn't re-render GamePageContent (and the whole battlefield). */}
-      <GameCardPreview />
-
       {/* WaitingFor-driven prompt overlays (only for human player).
           Wrapped in DialogHost so any active dialog can be peeked away to
           reveal the battlefield underneath; peek state resets on every
@@ -1999,6 +2017,8 @@ function GamePageContent({
         {canActForWaitingState && <ResolveAllConsentModal playerId={playerId} />}
         {waitingFor?.type === "OrderTriggers" &&
           canActForWaitingState && <TriggerOrderModal />}
+        {waitingFor?.type === "OrderCostReductions" &&
+          canActForWaitingState && <CostReductionOrderModal />}
         <BattleProtectorModal />
         <MeldChoiceModal />
         <AssistChoosePlayerModal />
@@ -2022,6 +2042,7 @@ function GamePageContent({
         <LifeRedistributionModal />
         <AdventureCastModal />
         <CascadeChoiceModal />
+        <RippleRevealChoiceModal />
         <SpellbookDraftModal />
         <FreeCastWindowModal />
         <ModalFaceModal />
@@ -2319,6 +2340,11 @@ function GamePageContent({
         onExit={handleUnhandledExit}
         exitLabel={isOnlineMode ? t("gamePage.actions.concedeGame") : t("gamePage.actions.returnToMenuLower")}
       />
+      </div>
+      <GameLogPanel />
+      {/* This is a peer of the board and log columns: a preview opened from a
+          log card must not be clipped by the paint-contained board column. */}
+      <GameCardPreview />
     </div>
   );
 }
@@ -2983,6 +3009,24 @@ function GameOverScreen({
     navigate("/draft/quick?resume=1");
   };
 
+  /**
+   * There are TWO "back to pod" affordances in a `draft-match` game — this
+   * game-over button and the in-game menu's "Back to draft"
+   * (`GameMenu.tsx`) — and a third exit through Concede
+   * (`useConcedeHandler`). All three ask the same question, so all three ask
+   * `endCommanderSession`, which owns the answer and the reasoning: a pairwise
+   * pod match must survive being left, a Commander launch must not.
+   *
+   * `finally`, not `then` — a teardown that rejects must not strand the player
+   * on the game-over screen.
+   */
+  const handleBackToPod = () => {
+    void useMultiplayerDraftStore
+      .getState()
+      .endCommanderSession()
+      .finally(() => navigate("/draft-pod"));
+  };
+
   return (
     <div
       className="fixed inset-0 z-50 flex flex-col items-center justify-center px-4"
@@ -3072,7 +3116,7 @@ function GameOverScreen({
             ) : isDraftPodMatch ? (
               <button
                 disabled={!resultRecorded}
-                onClick={() => navigate("/draft-pod")}
+                onClick={handleBackToPod}
                 className={gameButtonClass({
                   tone: isVictory ? "amber" : "slate",
                   size: "lg",
@@ -3273,6 +3317,16 @@ function AbilityChoiceModal() {
     (s) => s.gameState?.derived?.room_half_identities,
   );
   const viewerInteraction = useGameStore((s) => s.viewerInteraction);
+  // CR 118.3: the engine-authored "can't pay this cost right now" read-out.
+  // Read from the store slice (not from `uiStore.pendingAbilityChoice`) so the
+  // rows stay live against the current state rather than latched to whatever
+  // was true when the choice was queued.
+  // `?? {}` is load-bearing, not defensive noise: a store SNAPSHOT that predates
+  // this slice (a restored session, or any consumer holding an older store
+  // shape) yields `undefined`, and subscripting it would crash the whole game
+  // page for a display-only feature. Mirrors `legalResultState`'s own
+  // `result.activationBlockReasons ?? {}` default.
+  const activationBlockReasons = useGameStore((s) => s.activationBlockReasons) ?? {};
 
   if (!pending || !obj) return null;
 
@@ -3312,7 +3366,8 @@ function AbilityChoiceModal() {
       subtitle={subtitle}
       previewCardName={obj.name}
       previewCardTypes={obj.card_types}
-      options={pending.actions.map((action, i) => {
+      options={[
+        ...pending.actions.map((action, i) => {
         let { label, description } = abilityChoiceLabel(
           action,
           obj,
@@ -3340,16 +3395,62 @@ function AbilityChoiceModal() {
             // badge already expresses its cost, so keeping the effect in the
             // secondary description would visually detach it from that badge.
             label: description ?? stripLoyaltyCostPrefix(label),
-            labelTone: "secondary",
+            // `as const`: a spread element no longer receives `ChoiceOption[]`
+            // as its contextual type, so this would otherwise widen to `string`.
+            labelTone: "secondary" as const,
             icon: (
               <LoyaltyBadge amount={badge.amount} kind="cost" />
             ),
           };
         }
         return { id: String(i), label, description };
-      })}
+        }),
+        // CR 118.3: display-only rows for abilities the engine is withholding
+        // solely because the cost is unpayable right now. Appended AFTER the
+        // action rows so the positional `id = String(i)` <-> `pending.actions[Number(id)]`
+        // contract above is preserved byte-for-byte.
+        //
+        // No de-duplication against the offered rows is needed: the engine's
+        // read-out and its offered set are produced by the SAME
+        // `activation_verdict` core, so an ability is in exactly one of them.
+        ...(activationBlockReasons[String(pending.objectId)] ?? []).map((entry) => {
+          // CR 201.5: `~` is the engine's self-reference token; bind it to the
+          // host object, the idiom both shipped consumers use. A runtime-granted
+          // index has no printed description, so the row falls back to the
+          // reason alone (matching `PermanentCard`'s badge).
+          const ability = entry.ability_index < obj.abilities.length
+            ? obj.abilities[entry.ability_index]
+            : undefined;
+          const reason = t(ABILITY_BLOCK_REASON_KEY[entry.type]);
+          // Same label/description split the OFFERED rows above get from
+          // `abilityChoiceLabel` (`costLabel.ts`: `abilityLabel` for the label,
+          // `stripCostPrefix` for the description). A blocked `{3}` and an
+          // offered `{3}` therefore render identically in the same list and
+          // differ only by the disabled styling — which is the comparison the
+          // reported defect is about, since the card face shows both. Reusing
+          // the shipped helpers rather than re-deriving the split here keeps the
+          // two row kinds from drifting apart. `RichLabel` inside `ChoiceModal`
+          // renders `{3}` as a real mana pip, so no cost plumbing is needed.
+          const effect = ability?.description
+            ? renderDescription(stripCostPrefix(ability.description), obj.name)
+            : undefined;
+          return {
+            id: `blocked:${entry.ability_index}`,
+            label: ability ? renderDescription(abilityLabel(ability), obj.name) : reason,
+            description: effect ? `${effect} — ${reason}` : ability ? reason : undefined,
+            disabled: true,
+          };
+        }),
+      ]}
       onChoose={(id) => {
-        dispatch(pending.actions[Number(id)]);
+        // CR 118.3: blocked rows are display-only and carry a non-numeric id.
+        // Without this guard `Number("blocked:0")` is `NaN`, so
+        // `pending.actions[NaN]` is `undefined` and a malformed dispatch
+        // reaches the engine.
+        if (id.startsWith("blocked:")) return;
+        const action = pending.actions[Number(id)];
+        if (!action) return;
+        dispatch(action);
         setPending(null);
       }}
       onClose={() => setPending(null)}

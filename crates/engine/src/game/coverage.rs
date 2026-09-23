@@ -13,21 +13,24 @@ use crate::parser::oracle::{
     is_commander_permission_sentence, is_deck_construction_copy_limit_sentence,
     is_draft_matters_sentence,
 };
-use crate::parser::oracle_ir::diagnostic::OracleDiagnostic;
+use crate::parser::oracle_casting::parse_casting_restriction_line;
+use crate::parser::oracle_ir::diagnostic::{ClauseGap, OracleDiagnostic};
 use crate::parser::oracle_util::normalize_card_name_refs;
 use crate::types::ability::{
-    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction,
-    AdditionalCost, AggregateFunction, AttackScope, AttackSubject, CardTypeSetSource, ChoiceType,
-    CoinFlipResult, CommanderOwnership, Comparator, ContinuousModification, ControllerRef,
-    CountScope, CounterSourceRider, DelayedTriggerCondition, DieRollModifier, DoublePTMode,
-    Duration, EachDamageRecipient, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
-    ForEachCategoryAction, GameRestriction, LibraryPosition, ManaProduction, ObjectProperty,
-    ObjectScope, ParsedCondition, PerpetualModification, PlayerFilter, PlayerRelation, PlayerScope,
-    PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef, ReplacementCondition,
-    ReplacementDefinition, ReplacementMode, SeatDirection, SharedQuality, SharedQualityRelation,
-    SpeedDelta, SpellCastingOption, SpellCastingOptionKind, SpellStackToGraveyardReplacement,
-    StackAbilityKind, StaticCondition, StaticDefinition, TapStateChange, TargetFilter,
-    TriggerDefinition, TypeFilter, TypedFilter, VoteSubject, ZoneRef,
+    AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityUseTally,
+    ActivationRestriction, AdditionalCost, AggregateFunction, AttackScope, AttackSubject,
+    CardTypeSetSource, ChoiceType, CoinFlipResult, CommanderOwnership, Comparator,
+    ContinuousModification, ControllerRef, CountScope, CounterKindChooser, CounterKindDomain,
+    CounterSourceRider, DelayedTriggerCondition, DieRollModifier, DoublePTMode, Duration,
+    EachDamageRecipient, Effect, EffectOutcomeSignal, EffectScope, FilterProp,
+    ForEachCategoryAction, GameRestriction, LibraryPosition, ManaProduction,
+    MassLibraryShuffleMode, ObjectProperty, ObjectScope, ObjectSelectionCardinality,
+    ObjectSelectionEligibility, ParsedCondition, PerpetualModification, PlayerFilter,
+    PlayerRelation, PlayerScope, PtStat, PtValue, PtValueScope, QuantityExpr, QuantityRef,
+    ReplacementCondition, ReplacementDefinition, ReplacementMode, SeatDirection, SharedQuality,
+    SharedQualityRelation, SpeedDelta, SpellCastingOption, SpellCastingOptionKind,
+    SpellStackToGraveyardReplacement, StackAbilityKind, StaticCondition, StaticDefinition,
+    TapStateChange, TargetFilter, TriggerDefinition, TypeFilter, TypedFilter, VoteSubject, ZoneRef,
 };
 use crate::types::card::CardFace;
 use crate::types::card_type::CoreType;
@@ -36,7 +39,7 @@ use crate::types::keywords::Keyword;
 use crate::types::mana::{ManaColor, ManaCost, ManaCostShard};
 use crate::types::phase::Phase;
 use crate::types::replacements::ReplacementEvent;
-use crate::types::statics::{CostModifyMode, StaticMode};
+use crate::types::statics::{CostModifyMode, CostReductionReach, StaticMode};
 use crate::types::triggers::TriggerMode;
 use crate::types::zones::{EtbTapState, Zone};
 use nom::branch::alt;
@@ -46,6 +49,7 @@ use nom::combinator::{all_consuming, opt, value};
 use nom::Parser;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ops::ControlFlow;
 
 const TOKEN_FIDELITY_PARTIAL_MISSING_ABILITIES_LABEL: &str =
     "TokenFidelity:PartialMissingAbilities";
@@ -164,7 +168,7 @@ pub(crate) fn is_data_carrying_static(mode: &StaticMode) -> bool {
             // CR 509.1b: BlockRestriction carries the allowed-attacker filter.
             | StaticMode::BlockRestriction { .. }
             // CR 301.5 + CR 303.4 + CR 701.3a: AttachmentRestriction carries the
-            // `TargetFilter` of legal hosts (Strata Scythe, Konda's Banner).
+            // `TargetFilter` of legal hosts (O-Naginata, Konda's Banner).
             // Enforced via active static definitions in effects/attach.rs::attachment_illegality.
             | StaticMode::AttachmentRestriction { .. }
             // CR 602.5 + CR 603.2a: CantBeActivated carries `who` + `source_filter`.
@@ -183,6 +187,11 @@ pub(crate) fn is_data_carrying_static(mode: &StaticMode) -> bool {
             | StaticMode::ControlPlayersDuringOwnLibrarySearch { .. }
             // CR 603.2 + CR 609.3: CantCauseSacrificeOrExile carries `cause`.
             | StaticMode::CantCauseSacrificeOrExile { .. }
+            // CR 701.9a + CR 701.21a: CantCauseForcedAction carries `cause` +
+            // `actions`. Runtime enforcement is in
+            // game/static_abilities.rs::forced_action_muzzled, consulted from
+            // effects/sacrifice.rs and effects/discard.rs.
+            | StaticMode::CantCauseForcedAction { .. }
             // CR 603.2g: SuppressTriggers carries `source_filter` + `events`.
             | StaticMode::SuppressTriggers { .. }
             // CR 603.2d: DoubleTriggers carries the `TriggerCause` predicate.
@@ -319,8 +328,63 @@ pub struct GapDetail {
     pub source_text: Option<String>,
 }
 
+/// Internal, canonical coverage gap. The public JSON remains the historical
+/// `GapDetail` shape; this type makes every coverage consumer derive its
+/// result from the same merged view of analysis gaps, parse-tree gaps, and
+/// parser warnings.
+#[derive(Debug, Clone)]
+struct CoverageGap {
+    handler: String,
+    source_text: Option<String>,
+}
+
+fn merge_coverage_gaps(
+    analysis_handlers: &[String],
+    parse_tree_gaps: Vec<GapDetail>,
+    warnings: &[OracleDiagnostic],
+) -> Vec<CoverageGap> {
+    let mut by_handler: BTreeMap<String, Option<String>> = BTreeMap::new();
+    for handler in analysis_handlers {
+        by_handler.entry(handler.clone()).or_insert(None);
+    }
+    for gap in parse_tree_gaps {
+        let entry = by_handler.entry(gap.handler).or_insert(None);
+        if entry.is_none() {
+            *entry = gap.source_text;
+        }
+    }
+    for warning in warnings {
+        if let Some(handler) = parse_warning_gap_label(warning) {
+            let entry = by_handler.entry(handler).or_insert(None);
+            if entry.is_none() {
+                *entry = Some(warning.to_string());
+            }
+        }
+    }
+    by_handler
+        .into_iter()
+        .map(|(handler, source_text)| CoverageGap {
+            handler,
+            source_text,
+        })
+        .collect()
+}
+
+fn public_gap_details(gaps: &[CoverageGap]) -> Vec<GapDetail> {
+    gaps.iter()
+        .map(|gap| GapDetail {
+            handler: gap.handler.clone(),
+            source_text: gap.source_text.clone(),
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CardCoverageResult {
+    /// Internal provenance for associating duplicate printed names with their
+    /// authoritative database face. Coverage JSON remains byte-compatible.
+    #[serde(skip)]
+    pub card_face_key: Option<String>,
     pub card_name: String,
     pub set_code: String,
     pub supported: bool,
@@ -598,13 +662,16 @@ fn fmt_target(filter: &TargetFilter) -> String {
         TargetFilter::CostPaidObject => "cost-paid object".into(),
         // CR 701.47c: matches `ObjectScope::AmassedArmy`'s description string.
         TargetFilter::AmassedArmy => "amassed Army".into(),
-        TargetFilter::ChosenCard => "last chosen card".into(),
+        TargetFilter::ChosenCard => "the chosen object".into(),
         TargetFilter::TriggeringSpellController => "triggering spell's controller".into(),
         TargetFilter::TriggeringSpellOwner => "triggering spell's owner".into(),
         TargetFilter::TriggeringSourceController => "triggering source's controller".into(),
         TargetFilter::TriggeringPlayer => "triggering player".into(),
         TargetFilter::TriggeringSource => "triggering source".into(),
         TargetFilter::EventTarget => "object targeted by the triggering event".into(),
+        TargetFilter::EventTargetController => {
+            "controller of the object targeted by the triggering event".into()
+        }
         TargetFilter::DefendingPlayer => "defending player".into(),
         TargetFilter::ParentTarget => "parent target".into(),
         TargetFilter::ParentTargetSlot { index } => format!("parent target slot {index}"),
@@ -790,6 +857,9 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             FilterProp::EquippedBy => parts.push("equipped by self".into()),
             FilterProp::AttachedToSource => parts.push("attached to self".into()),
             FilterProp::AttachedToRecipient => parts.push("attached to it".into()),
+            FilterProp::AttachedToPlayer { player } => {
+                parts.push(format!("attached to {}", fmt_controller(player)))
+            }
             FilterProp::Unpaired => parts.push("unpaired".into()),
             FilterProp::HasAttachment {
                 kind,
@@ -900,6 +970,7 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                     ControllerRef::TargetPlayer => "target player's",
                     ControllerRef::TargetOpponent => "target opponent's",
                     ControllerRef::ParentTargetController => "parent target's",
+                    ControllerRef::EventTargetController => "the damaged object's controller's",
                     ControllerRef::ParentTargetOwner => "parent target owner's",
                     ControllerRef::DefendingPlayer => "defending player's",
                     ControllerRef::SourceChosenPlayer => "the chosen player's",
@@ -979,12 +1050,28 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 };
                 parts.push(format!("{prefix} {name}{suffix}"));
             }
-            // Both damage-role filters share this human coverage label (the AST
-            // variant carries the source-vs-recipient distinction); keeping the
-            // passive label unchanged avoids a cosmetic coverage-diff on every
-            // existing "was dealt damage this turn" card.
-            FilterProp::WasDealtDamageThisTurn | FilterProp::DealtDamageThisTurn => {
-                parts.push("dealt damage this turn".into())
+            // The passive filter keeps the bare label (the AST variant carries
+            // the source-vs-recipient distinction), so every existing "was dealt
+            // damage this turn" card produces no cosmetic coverage-diff. The
+            // active-voice arm below reports the label only when unrestricted,
+            // for the same reason.
+            FilterProp::WasDealtDamageThisTurn => parts.push("dealt damage this turn".into()),
+            // CR 120.2a + CR 120.1: the active-voice filter reports its damage
+            // class and recipient so a restricted clause is distinguishable from
+            // the bare one in coverage output. The unrestricted form keeps the
+            // shared label, so existing cards produce no coverage diff.
+            FilterProp::DealtDamageThisTurn { kind, recipient } => {
+                let class = match kind {
+                    crate::types::ability::DamageKindFilter::Any => "damage",
+                    crate::types::ability::DamageKindFilter::CombatOnly => "combat damage",
+                    crate::types::ability::DamageKindFilter::NoncombatOnly => "noncombat damage",
+                };
+                parts.push(match recipient {
+                    None => format!("dealt {class} this turn"),
+                    Some(player) => {
+                        format!("dealt {class} to {} this turn", fmt_player_filter(player))
+                    }
+                })
             }
             FilterProp::EnteredThisTurn => parts.push("entered this turn".into()),
             FilterProp::ControlledContinuouslySinceTurnBegan => {
@@ -1074,6 +1161,9 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
                 ControllerRef::TargetPlayer => "target player",
                 ControllerRef::TargetOpponent => "target opponent",
                 ControllerRef::ParentTargetController => "parent target's controller",
+                ControllerRef::EventTargetController => {
+                    "controller of the object the triggering event targeted"
+                }
                 ControllerRef::ParentTargetOwner => "parent target's owner",
                 ControllerRef::DefendingPlayer => "defending player",
                 ControllerRef::SourceChosenPlayer => "the chosen player",
@@ -1151,6 +1241,9 @@ fn fmt_controller(ctrl: &ControllerRef) -> String {
         ControllerRef::TargetPlayer => "target player controls",
         ControllerRef::TargetOpponent => "target opponent controls",
         ControllerRef::ParentTargetController => "parent target's controller controls",
+        ControllerRef::EventTargetController => {
+            "the controller of the object the triggering event targeted controls"
+        }
         ControllerRef::ParentTargetOwner => "parent target's owner controls",
         ControllerRef::DefendingPlayer => "defending player controls",
         ControllerRef::SourceChosenPlayer => "the chosen player controls",
@@ -1391,6 +1484,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card",
                 ObjectScope::AmassedArmy => "amassed Army",
                 ObjectScope::BatchSource => "batch source",
+                ObjectScope::ChainRootTarget => "chain-root target",
             };
             match counter_type {
                 Some(ct) => format!("{} counters on {scope_str}", ct.as_str()),
@@ -1423,6 +1517,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's power".into(),
             ObjectScope::AmassedArmy => "amassed Army's power".into(),
             ObjectScope::BatchSource => "batch source's power".into(),
+            ObjectScope::ChainRootTarget => "chain-root target's power".into(),
         },
         QuantityRef::BasePower { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -1437,6 +1532,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's base power".into(),
             ObjectScope::AmassedArmy => "amassed Army's base power".into(),
             ObjectScope::BatchSource => "batch source's base power".into(),
+            ObjectScope::ChainRootTarget => "chain-root target's base power".into(),
         },
         QuantityRef::Toughness { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -1451,6 +1547,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's toughness".into(),
             ObjectScope::AmassedArmy => "amassed Army's toughness".into(),
             ObjectScope::BatchSource => "batch source's toughness".into(),
+            ObjectScope::ChainRootTarget => "chain-root target's toughness".into(),
         },
         QuantityRef::ObjectManaValue { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -1465,6 +1562,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's mana value".into(),
             ObjectScope::AmassedArmy => "amassed Army's mana value".into(),
             ObjectScope::BatchSource => "batch source's mana value".into(),
+            ObjectScope::ChainRootTarget => "chain-root target's mana value".into(),
         },
         QuantityRef::TargetObjectManaValue { .. } => "target object's mana value".into(),
         QuantityRef::ObjectColorCount { scope } => match scope {
@@ -1480,6 +1578,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card's colors".into(),
             ObjectScope::AmassedArmy => "amassed Army's colors".into(),
             ObjectScope::BatchSource => "batch source's colors".into(),
+            ObjectScope::ChainRootTarget => "chain-root target's colors".into(),
         },
         QuantityRef::ObjectTypelineComponentCount { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -1496,6 +1595,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             }
             ObjectScope::AmassedArmy => "typeline components on amassed Army".into(),
             ObjectScope::BatchSource => "typeline components on batch source".into(),
+            ObjectScope::ChainRootTarget => "typeline components on chain-root target".into(),
         },
         QuantityRef::ObjectNameWordCount { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -1510,6 +1610,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
             ObjectScope::OwnedLinkedExileCard => "words in owned linked-exiled card's name".into(),
             ObjectScope::AmassedArmy => "words in amassed Army's name".into(),
             ObjectScope::BatchSource => "words in batch source's name".into(),
+            ObjectScope::ChainRootTarget => "words in chain-root target's name".into(),
         },
         QuantityRef::ManaSymbolsInManaCost { scope, color } => {
             let scope_str = match scope {
@@ -1523,6 +1624,7 @@ fn fmt_quantity_ref(qty: &QuantityRef) -> String {
                 ObjectScope::OwnedLinkedExileCard => "owned linked-exiled card",
                 ObjectScope::AmassedArmy => "amassed Army",
                 ObjectScope::BatchSource => "batch source",
+                ObjectScope::ChainRootTarget => "chain-root target",
             };
             match color {
                 Some(c) => format!("{c:?} mana symbols in {scope_str}'s mana cost"),
@@ -2184,8 +2286,8 @@ fn fmt_choice_type(ct: &ChoiceType) -> String {
         }
         ChoiceType::OddOrEven => "odd or even",
         ChoiceType::BasicLandType => "basic land type",
-        ChoiceType::CardType { excluded } => {
-            if excluded.is_empty() {
+        ChoiceType::CardType { options } => {
+            if options.is_empty() {
                 "card type"
             } else {
                 "restricted card type"
@@ -2231,9 +2333,14 @@ fn fmt_delayed_condition(cond: &DelayedTriggerCondition) -> String {
         DelayedTriggerCondition::AtNextPhase { phase } => {
             format!("at next {}", fmt_phase(phase))
         }
-        DelayedTriggerCondition::AtNextPhaseForPlayer { phase, .. } => {
-            format!("at your next {}", fmt_phase(phase))
-        }
+        DelayedTriggerCondition::AtNextPhaseForPlayer { phase, binding, .. } => match binding {
+            crate::types::ability::DelayedTriggerPlayerBinding::Controller => {
+                format!("at your next {}", fmt_phase(phase))
+            }
+            crate::types::ability::DelayedTriggerPlayerBinding::ParentTargetOwner => {
+                format!("at that player's next {}", fmt_phase(phase))
+            }
+        },
         DelayedTriggerCondition::WhenLeavesPlay { .. } => "when leaves play".into(),
         DelayedTriggerCondition::WhenDies { .. } => "when dies".into(),
         DelayedTriggerCondition::WhenLeavesPlayFiltered { filter } => {
@@ -2389,6 +2496,9 @@ fn fmt_characteristic_population(source: &CardTypeSetSource) -> String {
             Some(cause) => {
                 use crate::types::ability::ThisWayCause;
                 let verb = match cause {
+                    ThisWayCause::OwnerLibraryShuffleSubject => {
+                        "designated for an owner-library shuffle"
+                    }
                     ThisWayCause::Discarded => "discarded",
                     ThisWayCause::Exiled => "exiled",
                     ThisWayCause::Milled => "milled",
@@ -2521,6 +2631,17 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             d.push(("filter".into(), fmt_target(filter)));
             d.push(("count".into(), fmt_quantity(count)));
             d.push(("destination".into(), format!("{destination:?}")));
+        }
+        Effect::OpenBoosterPack {
+            filter,
+            count,
+            destination,
+            reveal,
+        } => {
+            d.push(("filter".into(), fmt_target(filter)));
+            d.push(("count".into(), fmt_quantity(count)));
+            d.push(("destination".into(), format!("{destination:?}")));
+            d.push(("reveal".into(), reveal.to_string()));
         }
         Effect::Draw { count, target } => {
             if !matches!(count, QuantityExpr::Fixed { value: 1 }) {
@@ -3025,6 +3146,7 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             enter_with_counters,
             face_down_profile,
             library_position,
+            library_shuffle,
             random_order,
         } => {
             if let Some(o) = origin {
@@ -3055,6 +3177,9 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             }
             if let Some(lp) = library_position {
                 d.push(("library_position".into(), format!("{lp:?}")));
+            }
+            if matches!(library_shuffle, MassLibraryShuffleMode::TerminalShuffle) {
+                d.push(("library_shuffle".into(), format!("{library_shuffle:?}")));
             }
             if *random_order {
                 d.push(("random_order".into(), "true".into()));
@@ -3602,6 +3727,8 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             filter,
             min,
             max,
+            cardinality,
+            eligibility,
         } => {
             d.push(("chooser".into(), fmt_target(chooser)));
             d.push(("filter".into(), fmt_target(filter)));
@@ -3610,9 +3737,64 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
                 "max".into(),
                 max.map_or_else(|| "any".to_string(), |m| m.to_string()),
             ));
+            if let Some(ObjectSelectionCardinality::Exactly { count }) = cardinality {
+                d.push(("cardinality".into(), format!("exactly {count}")));
+            }
+            if let Some(ObjectSelectionEligibility::RemovableCounter { counter_type }) = eligibility
+            {
+                d.push((
+                    "eligibility".into(),
+                    counter_type.as_ref().map_or_else(
+                        || "removable counter".to_string(),
+                        |counter_type| format!("removable {} counter", counter_type.as_str()),
+                    ),
+                ));
+            }
         }
-        Effect::ChooseCounterKind { target } => {
+        Effect::ChooseCounterKind {
+            target,
+            domain,
+            chooser,
+        } => {
             d.push(("target".into(), fmt_target(target)));
+            // Both axes belong in the signature: the parse-diff report is what
+            // tells a reviewer which cards a parser change moved, and a domain
+            // or chooser that flipped without the target moving would otherwise
+            // be invisible there.
+            match domain {
+                CounterKindDomain::OnTarget => {
+                    d.push(("kinds".into(), "on target".into()));
+                }
+                CounterKindDomain::Printed {
+                    kinds,
+                    excluding_kinds_on_target,
+                } => {
+                    d.push((
+                        "kinds".into(),
+                        format!(
+                            "printed {}{}",
+                            kinds
+                                .iter()
+                                .map(|kind| kind.as_str().into_owned())
+                                .collect::<Vec<_>>()
+                                .join("/"),
+                            if *excluding_kinds_on_target {
+                                ", excluding kinds on target"
+                            } else {
+                                ""
+                            }
+                        ),
+                    ));
+                }
+            }
+            d.push((
+                "chooser".into(),
+                match chooser {
+                    CounterKindChooser::Controller => "controller",
+                    CounterKindChooser::Random => "at random",
+                }
+                .into(),
+            ));
         }
         Effect::PutChosenCounter {
             target,
@@ -3756,9 +3938,14 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             d.push(("target".into(), fmt_target(target)));
             d.push(("chooser".into(), fmt_target(chooser)));
         }
-        Effect::Amass { subtype, count } => {
+        Effect::Amass {
+            subtype,
+            count,
+            player,
+        } => {
             d.push(("subtype".into(), subtype.clone()));
             d.push(("count".into(), fmt_quantity(count)));
+            d.push(("player".into(), fmt_target(player)));
         }
         Effect::Monstrosity { count } => {
             d.push(("counters".into(), fmt_quantity(count)));
@@ -3789,8 +3976,11 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             ));
             d.push(("target".into(), fmt_target(target)));
         }
-        Effect::ExtraTurn { target } => {
+        Effect::ExtraTurn { target, count } => {
             d.push(("player".into(), fmt_target(target)));
+            if !matches!(count, QuantityExpr::Fixed { value: 1 }) {
+                d.push(("count".into(), fmt_quantity(count)));
+            }
         }
         Effect::GrantExtraLoyaltyActivations { amount, target } => {
             d.push(("amount".into(), fmt_quantity(amount)));
@@ -4308,6 +4498,7 @@ fn fmt_ability_condition(cond: &AbilityCondition) -> String {
             format!("target has {} (instead)", keyword_label(keyword))
         }
         AbilityCondition::HasObjectTarget => "has an object target".into(),
+        AbilityCondition::AllDeclaredTargetsLegal => "all declared targets still legal".into(),
         AbilityCondition::TargetMatchesFilter { filter, .. } => {
             format!("target is {}", fmt_target(filter))
         }
@@ -4371,8 +4562,19 @@ fn fmt_ability_condition(cond: &AbilityCondition) -> String {
         }
         AbilityCondition::DayNightIsNeither => "neither day nor night".into(),
         AbilityCondition::DayNightIs { state } => format!("it is {state:?}"),
-        AbilityCondition::NthResolutionThisTurn { n } => {
-            format!("{n} resolution this turn")
+        AbilityCondition::AbilityUseCountThisTurn {
+            tally,
+            comparator,
+            n,
+        } => {
+            let verb = match tally {
+                AbilityUseTally::Resolved => "resolved",
+                AbilityUseTally::Activated => "activated",
+            };
+            format!(
+                "this ability {verb} {} {n} times this turn",
+                fmt_comparator(comparator)
+            )
         }
         AbilityCondition::SourceLacksKeyword { keyword } => {
             format!("source lacks {}", keyword_label(keyword))
@@ -5121,64 +5323,50 @@ pub fn build_parse_details(
 
     // Activated/spell abilities
     for def in face.abilities.iter() {
-        items.push(build_ability_item(def));
+        items.push(build_ability_item(
+            def,
+            trigger_registry,
+            static_registry,
+            TokenStaticTraversal::Include,
+        ));
     }
 
     // Triggers
     for trig in &face.triggers {
-        items.push(build_trigger_item(trig, trigger_registry));
+        items.push(build_trigger_item(
+            trig,
+            trigger_registry,
+            static_registry,
+            TokenStaticTraversal::Include,
+        ));
     }
 
     // Static abilities
     for stat in &face.static_abilities {
-        let mode_supported =
-            static_registry.contains_key(&stat.mode) || is_data_carrying_static(&stat.mode);
-        let mut children = Vec::new();
-        for modif in &stat.modifications {
-            match modif {
-                ContinuousModification::GrantTrigger { trigger } => {
-                    children.push(build_trigger_item(trigger, trigger_registry));
-                }
-                ContinuousModification::GrantAbility { definition } => {
-                    children.push(build_ability_item(definition));
-                }
-                ContinuousModification::GrantReplacement { replacement } => {
-                    if let Some(execute) = &replacement.execute {
-                        children.push(build_ability_item(execute));
-                    }
-                }
-                _ => {}
-            }
-        }
-        items.push(ParsedItem {
-            category: ParseCategory::Static,
-            label: format!("{}", stat.mode),
-            source_text: stat.description.clone(),
-            supported: mode_supported,
-            details: static_details(stat),
-            children,
-        });
+        items.push(build_static_item(
+            stat,
+            trigger_registry,
+            static_registry,
+            TokenStaticTraversal::Include,
+        ));
     }
 
     // Replacement effects
     for repl in &face.replacements {
         let mut children = Vec::new();
         let mut execute_supported = true;
-        if let Some(execute) = &repl.execute {
-            let item = build_ability_item(execute);
-            execute_supported = item.is_fully_supported();
-            children.push(item);
-        }
-        if let ReplacementMode::Optional {
-            decline: Some(decline),
-        } = &repl.mode
-        {
-            let item = build_ability_item(decline);
+        visit_replacement_ability_payloads(repl, |token_static_traversal, payload| {
+            let item = build_ability_item(
+                payload,
+                trigger_registry,
+                static_registry,
+                token_static_traversal,
+            );
             if !item.is_fully_supported() {
                 execute_supported = false;
             }
             children.push(item);
-        }
+        });
         items.push(ParsedItem {
             category: ParseCategory::Replacement,
             label: format!("{}", repl.event),
@@ -5239,7 +5427,7 @@ pub fn build_parse_details(
     // pitch cost, Snapcaster-style flash, "without paying its mana cost", etc.).
     // Each `SpellCastingOption` corresponds to its own Oracle line, so it must
     // emit exactly one `ParsedItem` to keep `count_effective_parsed_items` in
-    // parity with `count_effective_oracle_lines`. Without this, pitch spells
+    // parity with `effective_oracle_lines`. Without this, pitch spells
     // (Force of Will, Force of Negation, Misdirection, …) are falsely flagged
     // by the silent-drop audit.
     for option in &face.casting_options {
@@ -5255,6 +5443,8 @@ pub fn build_parse_details(
 fn build_trigger_item(
     trig: &TriggerDefinition,
     trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
 ) -> ParsedItem {
     // CR 603.8: StateCondition triggers use the priority pipeline, not the
     // event-based trigger registry — they are supported.
@@ -5263,7 +5453,12 @@ fn build_trigger_item(
             || matches!(&trig.mode, TriggerMode::StateCondition));
     let mut children = Vec::new();
     if let Some(execute) = &trig.execute {
-        children.push(build_ability_item(execute));
+        children.push(build_ability_item(
+            execute,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        ));
     }
     ParsedItem {
         category: ParseCategory::Trigger,
@@ -5277,7 +5472,66 @@ fn build_trigger_item(
 
 /// Build a `ParsedItem` for a single `AbilityDefinition`, recursing into
 /// sub-abilities and modal abilities.
-fn build_ability_item(def: &AbilityDefinition) -> ParsedItem {
+#[derive(Copy, Clone)]
+enum TokenStaticTraversal {
+    /// Normal abilities and executable payloads expose token-carried statics.
+    Include,
+    /// Replacement declines retain their historical coverage boundary.
+    Exclude,
+}
+
+impl TokenStaticTraversal {
+    fn includes(self) -> bool {
+        matches!(self, Self::Include)
+    }
+}
+
+/// Visit every executable body owned by a replacement definition. A replacement
+/// decline intentionally retains the token-static exclusion boundary, so all
+/// coverage consumers use the same traversal semantics.
+fn visit_replacement_ability_payloads(
+    replacement: &ReplacementDefinition,
+    mut visit: impl FnMut(TokenStaticTraversal, &AbilityDefinition),
+) {
+    if let Some(execute) = &replacement.execute {
+        visit(TokenStaticTraversal::Include, execute);
+    }
+    match &replacement.mode {
+        ReplacementMode::Optional {
+            decline: Some(decline),
+        }
+        | ReplacementMode::MayCost {
+            decline: Some(decline),
+            ..
+        } => visit(TokenStaticTraversal::Exclude, decline),
+        ReplacementMode::Mandatory
+        | ReplacementMode::Optional { decline: None }
+        | ReplacementMode::MayCost { decline: None, .. } => {}
+    }
+}
+
+/// Visit executable payloads carried by an effect-owned replacement.
+///
+/// `AddTargetReplacement` registers the inner replacement for a later event,
+/// but its `execute` and decline bodies remain part of the parsed card's
+/// coverage surface. Delegate to the replacement visitor so its mode-specific
+/// token-static traversal stays identical to top-level and granted
+/// replacements.
+fn visit_effect_replacement_ability_payloads(
+    effect: &Effect,
+    visit: impl FnMut(TokenStaticTraversal, &AbilityDefinition),
+) {
+    if let Effect::AddTargetReplacement { replacement, .. } = effect {
+        visit_replacement_ability_payloads(replacement, visit);
+    }
+}
+
+fn build_ability_item(
+    def: &AbilityDefinition,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+) -> ParsedItem {
     let label = match &*def.effect {
         Effect::Unimplemented { name, .. } => name.clone(),
         Effect::GenericEffect {
@@ -5316,21 +5570,58 @@ fn build_ability_item(def: &AbilityDefinition) -> ParsedItem {
 
     // Sub-ability chain
     if let Some(sub) = &def.sub_ability {
-        children.push(build_ability_item(sub));
+        children.push(build_ability_item(
+            sub,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        ));
     }
 
     // Else-ability chain (CR 608.2c: "Otherwise" branches)
     if let Some(else_ab) = &def.else_ability {
-        children.push(build_ability_item(else_ab));
+        children.push(build_ability_item(
+            else_ab,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        ));
     }
 
     // Modal abilities
     for mode_ability in &def.mode_abilities {
-        children.push(build_ability_item(mode_ability));
+        children.push(build_ability_item(
+            mode_ability,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        ));
     }
 
+    append_effect_static_carrier_items(
+        &def.effect,
+        trigger_registry,
+        static_registry,
+        token_static_traversal,
+        &mut children,
+    );
+
+    visit_effect_replacement_ability_payloads(&def.effect, |payload_traversal, payload| {
+        children.push(build_ability_item(
+            payload,
+            trigger_registry,
+            static_registry,
+            payload_traversal,
+        ));
+    });
+
     visit_direct_effect_ability_payloads(&def.effect, |_, payload| {
-        children.push(build_ability_item(payload));
+        children.push(build_ability_item(
+            payload,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        ));
     });
 
     ParsedItem {
@@ -5343,15 +5634,166 @@ fn build_ability_item(def: &AbilityDefinition) -> ParsedItem {
     }
 }
 
-/// Build `ParsedItem` nodes for ability costs, only emitting items for
-/// composite or unimplemented costs (simple costs are not interesting).
-fn build_cost_item(cost: &AbilityCost, items: &mut Vec<ParsedItem>) {
-    match cost {
-        AbilityCost::Composite { costs } => {
-            for nested in costs {
-                build_cost_item(nested, items);
+/// Build a `ParsedItem` for a single `StaticDefinition`, including executable
+/// children granted by the static. This is shared by printed static abilities
+/// and static abilities carried by token-creation effects.
+fn build_static_item(
+    stat: &StaticDefinition,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+) -> ParsedItem {
+    let mode_supported =
+        static_registry.contains_key(&stat.mode) || is_data_carrying_static(&stat.mode);
+    let mut children = Vec::new();
+    for modification in &stat.modifications {
+        append_modification_payload_items(
+            modification,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            &mut children,
+        );
+    }
+    ParsedItem {
+        category: ParseCategory::Static,
+        label: format!("{}", stat.mode),
+        source_text: stat.description.clone(),
+        supported: mode_supported,
+        details: static_details(stat),
+        children,
+    }
+}
+
+fn append_modification_payload_items(
+    modification: &ContinuousModification,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+    children: &mut Vec<ParsedItem>,
+) {
+    match modification {
+        ContinuousModification::GrantTrigger { trigger } => children.push(build_trigger_item(
+            trigger,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        )),
+        ContinuousModification::GrantAbility { definition } => children.push(build_ability_item(
+            definition,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        )),
+        ContinuousModification::GrantReplacement { replacement } => {
+            visit_replacement_ability_payloads(replacement, |payload_traversal, payload| {
+                children.push(build_ability_item(
+                    payload,
+                    trigger_registry,
+                    static_registry,
+                    payload_traversal,
+                ));
+            });
+        }
+        // `build_static_item` uses StaticDefinition's existing granted-static
+        // walker recursively, rather than flattening its definition here.
+        ContinuousModification::GrantStaticAbility { definition } => {
+            children.push(build_static_item(
+                definition,
+                trigger_registry,
+                static_registry,
+                token_static_traversal,
+            ))
+        }
+        _ => {}
+    }
+}
+
+/// Append parse-tree children carried by an effect rather than by its ordinary
+/// ability-chain fields. Keeping these carriers in one facade prevents the
+/// coverage tree from losing semantics that the runtime preserves on a token,
+/// emblem, or counter rider.
+fn append_effect_static_carrier_items(
+    effect: &Effect,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+    children: &mut Vec<ParsedItem>,
+) {
+    match effect {
+        Effect::GenericEffect {
+            static_abilities, ..
+        } => {
+            for stat in static_abilities {
+                children.push(build_static_item(
+                    stat,
+                    trigger_registry,
+                    static_registry,
+                    token_static_traversal,
+                ));
             }
         }
+        Effect::Token {
+            static_abilities, ..
+        } if token_static_traversal.includes() => {
+            for stat in static_abilities {
+                children.push(build_static_item(
+                    stat,
+                    trigger_registry,
+                    static_registry,
+                    token_static_traversal,
+                ));
+            }
+        }
+        Effect::Counter {
+            source_rider: Some(CounterSourceRider::LosesAbilities { static_def, .. }),
+            ..
+        } => children.push(build_static_item(
+            static_def,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        )),
+        Effect::CreateEmblem { statics, triggers } => {
+            for stat in statics {
+                children.push(build_static_item(
+                    stat,
+                    trigger_registry,
+                    static_registry,
+                    token_static_traversal,
+                ));
+            }
+            for trigger in triggers {
+                children.push(build_trigger_item(
+                    trigger,
+                    trigger_registry,
+                    static_registry,
+                    token_static_traversal,
+                ));
+            }
+        }
+        _ => {}
+    }
+    visit_effect_modification_carriers(effect, |modification| {
+        append_modification_payload_items(
+            modification,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            children,
+        );
+    });
+}
+
+/// Build `ParsedItem` nodes for ability costs, emitting an unsupported item
+/// for every unpayable leaf in the tree.
+///
+/// Traversal delegates to [`AbilityCost::for_each_cost_node`], the single
+/// cost-tree shape authority, so this collector, the gap collector below, and
+/// `AbilityCost::contains_unimplemented` all see the same subtrees — including
+/// `OneOf`/`PerCounter` nesting and an `EffectCost`'s embedded effect.
+fn build_cost_item(cost: &AbilityCost, items: &mut Vec<ParsedItem>) {
+    cost.for_each_cost_node(&mut |node| match node {
         AbilityCost::Unimplemented { description } => {
             items.push(ParsedItem {
                 category: ParseCategory::Cost,
@@ -5362,8 +5804,20 @@ fn build_cost_item(cost: &AbilityCost, items: &mut Vec<ParsedItem>) {
                 children: vec![],
             });
         }
+        AbilityCost::EffectCost { effect, .. } => {
+            if let Effect::Unimplemented { name, description } = effect.as_ref() {
+                items.push(ParsedItem {
+                    category: ParseCategory::Cost,
+                    label: name.clone(),
+                    source_text: description.clone().or_else(|| Some(name.clone())),
+                    supported: false,
+                    details: vec![],
+                    children: vec![],
+                });
+            }
+        }
         _ => {}
-    }
+    });
 }
 
 /// Return the source line for a parsed per-target casting-cost surcharge.
@@ -5389,24 +5843,16 @@ fn strive_cost_source_text(oracle_text: &Option<String>) -> Option<String> {
 /// Return the Oracle sentence represented by card-level casting metadata.
 ///
 /// `CastingRestriction` is stored outside an ability definition, so unlike a
-/// spell effect it cannot retain its source description directly. The parser
-/// accepts the direct sentence and ability-word-prefixed form; use that same
-/// narrow surface shape for coverage provenance.
+/// spell effect it cannot retain its source description directly. Only attach
+/// a printed line when the restriction grammar consumes the whole line; a
+/// supported prefix must not hide an unparsed second sentence.
 fn casting_restriction_source_text(oracle_text: &Option<String>) -> Option<String> {
     oracle_text.as_deref().and_then(|text| {
         text.lines().map(str::trim).find_map(|line| {
-            let lower = line.to_ascii_lowercase();
-            (lower.starts_with("cast this spell only ")
-                || lower.starts_with("you can't cast ")
-                || lower.starts_with("you cannot cast ")
-                || lower.starts_with("you can\u{2019}t cast ")
-                || lower.starts_with("you can't spend mana to cast ")
-                || lower.starts_with("you can\u{2019}t spend mana to cast ")
-                || lower.contains(" — cast this spell only ")
-                || lower.contains(" — you can't cast ")
-                || lower.contains(" — you cannot cast ")
-                || lower.contains(" — you can\u{2019}t cast "))
-            .then(|| line.to_string())
+            let complete_restriction = parse_casting_restriction_line(line).is_some()
+                || crate::parser::oracle_casting::extract_spend_only_on_x_prefix(line)
+                    .is_some_and(|(rest, _)| rest.is_empty() || rest == ".");
+            complete_restriction.then(|| line.to_string())
         })
     })
 }
@@ -5415,7 +5861,7 @@ fn casting_restriction_source_text(oracle_text: &Option<String>) -> Option<Strin
 ///
 /// An additional cost ("As an additional cost to cast this spell, ...") is its
 /// own Oracle line, so it must emit exactly one `ParsedItem` to keep
-/// `count_effective_parsed_items` in parity with `count_effective_oracle_lines`.
+/// `count_effective_parsed_items` in parity with `effective_oracle_lines`.
 /// Without this, cards with a concrete additional cost plus one spell effect
 /// (e.g. Vicious Rivalry, Fix What's Broken) are falsely flagged by the
 /// silent-drop audit: the Oracle line is counted but no parse item is emitted
@@ -5477,23 +5923,22 @@ fn build_additional_cost_items(additional_cost: &AdditionalCost, items: &mut Vec
 }
 
 /// Returns true if any leaf `AbilityCost` in the tree is `Unimplemented`.
+///
+/// Delegates to [`AbilityCost::contains_unimplemented`], the single
+/// containment authority over the cost tree. That method is a strict superset
+/// of the two former coverage-private `Composite`-only copies: it also
+/// recurses `OneOf` and `PerCounter`.
 fn additional_cost_has_unimplemented(additional_cost: &AdditionalCost) -> bool {
     match additional_cost {
         AdditionalCost::Optional { cost, .. } | AdditionalCost::Required(cost) => {
-            ability_cost_has_unimplemented(cost)
+            cost.contains_unimplemented()
         }
-        AdditionalCost::Kicker { costs, .. } => costs.iter().any(ability_cost_has_unimplemented),
+        AdditionalCost::Kicker { costs, .. } => {
+            costs.iter().any(AbilityCost::contains_unimplemented)
+        }
         AdditionalCost::Choice(first, second) => {
-            ability_cost_has_unimplemented(first) || ability_cost_has_unimplemented(second)
+            first.contains_unimplemented() || second.contains_unimplemented()
         }
-    }
-}
-
-fn ability_cost_has_unimplemented(cost: &AbilityCost) -> bool {
-    match cost {
-        AbilityCost::Unimplemented { .. } => true,
-        AbilityCost::Composite { costs } => costs.iter().any(ability_cost_has_unimplemented),
-        _ => false,
     }
 }
 
@@ -5501,7 +5946,7 @@ fn ability_cost_has_unimplemented(cost: &AbilityCost) -> bool {
 /// "without paying its mana cost", "as though it had flash", Adventure half).
 ///
 /// Each casting option corresponds to its own Oracle line; this keeps
-/// `count_effective_parsed_items` aligned with `count_effective_oracle_lines`
+/// `count_effective_parsed_items` aligned with `effective_oracle_lines`
 /// so pitch spells (Force of Will, Force of Negation, Misdirection, …) are
 /// not falsely flagged by the silent-drop audit. The item is unsupported only
 /// when the option carries an `Unimplemented` cost component.
@@ -5515,7 +5960,7 @@ fn build_casting_option_item(option: &SpellCastingOption, items: &mut Vec<Parsed
     let supported = option
         .cost
         .as_ref()
-        .is_none_or(|c| !ability_cost_has_unimplemented(c));
+        .is_none_or(|c| !c.contains_unimplemented());
     items.push(ParsedItem {
         category: ParseCategory::Cost,
         label: format!("CastingOption:{kind_label}"),
@@ -5616,10 +6061,18 @@ pub fn parse_warning_pattern(
         OracleDiagnostic::SwallowedClause {
             detector,
             description,
+            gap,
             ..
         } => {
-            let excerpt = oracle_text
-                .and_then(|text| swallowed_clause_excerpt(detector, text))
+            // Prefer the engine's own typed verdict. The phrase the axis authority rejected
+            // is parens-stripped, it is bounded by the grammar's own clause bounds, and it is
+            // not subject to `description`'s 140-byte truncation. The excerpt and the
+            // whole-description fallbacks are unchanged, and a `gap: None` warning takes
+            // exactly the path it takes today.
+            let excerpt = gap
+                .as_ref()
+                .map(ClauseGap::phrase)
+                .or_else(|| oracle_text.and_then(|text| swallowed_clause_excerpt(detector, text)))
                 .unwrap_or(description.as_str());
             (
                 warning.category_name().to_string(),
@@ -5746,32 +6199,6 @@ fn extract_gap_details(items: &[ParsedItem]) -> Vec<GapDetail> {
     let mut details = Vec::new();
     extract_gap_details_inner(items, &mut seen, &mut details);
     details
-}
-
-/// Add every coverage-predicate failure which was not already represented by
-/// the parse tree or a parser warning. `missing` is deduplicated by every
-/// checker, but the existing details may already contain the same handler.
-fn append_missing_gap_details(missing: &[String], details: &mut Vec<GapDetail>) {
-    let mut seen: std::collections::HashSet<String> = details
-        .iter()
-        .map(|detail| detail.handler.clone())
-        .collect();
-    // A swallowed-clause / target-fallback parse gap often also reduces the
-    // parse-tree line count. The resulting SilentDrop label is useful when it
-    // is the only evidence, but is redundant when the parser already named the
-    // semantic gap; keep the per-card distance-to-supported metric causal.
-    let has_existing_parse_gap = !seen.is_empty();
-    for handler in missing {
-        if has_existing_parse_gap && handler.starts_with("SilentDrop:") {
-            continue;
-        }
-        if seen.insert(handler.clone()) {
-            details.push(GapDetail {
-                handler: handler.clone(),
-                source_text: None,
-            });
-        }
-    }
 }
 
 fn extract_gap_details_inner(
@@ -6176,13 +6603,25 @@ pub fn analyze_coverage(card_db: &CardDatabase) -> CoverageSummary {
         let parse_details = build_parse_details(face, &trigger_registry, &static_registry);
 
         // Check abilities
-        check_abilities(&face.abilities, &mut missing);
+        check_abilities(
+            &face.abilities,
+            &trigger_registry,
+            &static_registry,
+            TokenStaticTraversal::Include,
+            &mut missing,
+        );
 
         // Check additional cost
         check_additional_cost(&face.additional_cost, &mut missing);
 
         // Check triggers
-        check_triggers(&face.triggers, &trigger_registry, &mut missing);
+        check_triggers(
+            &face.triggers,
+            &trigger_registry,
+            &static_registry,
+            TokenStaticTraversal::Include,
+            &mut missing,
+        );
 
         // Check keywords
         check_keywords(&face.keywords, &mut missing);
@@ -6192,11 +6631,17 @@ pub fn analyze_coverage(card_db: &CardDatabase) -> CoverageSummary {
             &face.static_abilities,
             &trigger_registry,
             &static_registry,
+            TokenStaticTraversal::Include,
             &mut missing,
         );
 
         // Check replacements
-        check_replacements(&face.replacements, &mut missing);
+        check_replacements(
+            &face.replacements,
+            &trigger_registry,
+            &static_registry,
+            &mut missing,
+        );
 
         // Validate subtype references in AddSubtype modifications against
         // the printed-corpus lexicon. Catches parser misfires where English
@@ -6209,17 +6654,26 @@ pub fn analyze_coverage(card_db: &CardDatabase) -> CoverageSummary {
 
         // Flag cards where the parser consumed Oracle text without producing
         // a corresponding parse item. Uses the parse tree computed above.
-        check_silent_drops(&face.oracle_text, &parse_details, &mut missing);
+        check_silent_drops(&face.oracle_text, &face.name, &parse_details, &mut missing);
 
-        let supported_before_parse_warnings = missing.is_empty();
+        // The public result, summary counters, and warning rollup all derive
+        // from this one canonical gap set. `missing` captures analysis-only
+        // findings (for example resolver features), while the tree contributes
+        // the most specific Oracle source text for representable failures.
+        let gaps_before_parse_warnings =
+            merge_coverage_gaps(&missing, extract_gap_details(&parse_details), &[]);
+        let supported_before_parse_warnings = gaps_before_parse_warnings.is_empty();
+        let gaps = merge_coverage_gaps(
+            &missing,
+            extract_gap_details(&parse_details),
+            &face.parse_warnings,
+        );
+        let supported = gaps.is_empty();
+        let gap_details = public_gap_details(&gaps);
+        let gap_count = gap_details.len();
 
-        // Check parse warnings
-        check_parse_warnings(&face.parse_warnings, &mut missing);
-
-        let supported = missing.is_empty();
-
-        for m in &missing {
-            *freq.entry(m.clone()).or_default() += 1;
+        for gap in &gaps {
+            *freq.entry(gap.handler.clone()).or_default() += 1;
         }
 
         let legal_formats: Vec<&'static str> = LegalityFormat::ALL
@@ -6247,23 +6701,6 @@ pub fn analyze_coverage(card_db: &CardDatabase) -> CoverageSummary {
             }
         }
 
-        let mut gap_details = extract_gap_details(&parse_details);
-        // Append parse-warning gaps so they appear in per-card gap reporting.
-        for warning in &face.parse_warnings {
-            if let Some(handler) = parse_warning_gap_label(warning) {
-                gap_details.push(GapDetail {
-                    handler,
-                    source_text: Some(warning.to_string()),
-                });
-            }
-        }
-        // `missing` is the authoritative support predicate. Some checks (for
-        // example SilentDrop and resolver-feature auditing) have no unsupported
-        // parse-tree node to extract, so surface their labels here as well.
-        // Otherwise a card can truthfully be `supported: false` while reporting
-        // `gap_count: 0`, making the deck-priority tally impossible to trust.
-        append_missing_gap_details(&missing, &mut gap_details);
-        let gap_count = gap_details.len();
         for warning in &face.parse_warnings {
             let (category, pattern) = parse_warning_pattern(warning, face.oracle_text.as_deref());
             parse_warning_patterns
@@ -6283,6 +6720,7 @@ pub fn analyze_coverage(card_db: &CardDatabase) -> CoverageSummary {
             .unwrap_or_default();
 
         cards.push(CardCoverageResult {
+            card_face_key: Some(key.to_owned()),
             card_name: face.name.clone(),
             set_code: String::new(),
             supported,
@@ -6586,7 +7024,7 @@ pub fn card_face_has_unimplemented_parts(face: &CardFace) -> bool {
         || face
             .additional_cost
             .as_ref()
-            .is_some_and(additional_cost_has_unimplemented_parts)
+            .is_some_and(additional_cost_has_unimplemented)
         || face.triggers.iter().any(trigger_has_unimplemented_parts)
         || face
             .replacements
@@ -6599,6 +7037,19 @@ pub fn card_face_has_unimplemented_parts(face: &CardFace) -> bool {
 }
 
 fn static_has_unimplemented_parts(def: &StaticDefinition) -> bool {
+    let mut has_unimplemented_parts = false;
+    let _ = def.walk_self_and_granted(&mut |static_def| {
+        has_unimplemented_parts |= static_definition_has_unimplemented_parts(static_def);
+        if has_unimplemented_parts {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    });
+    has_unimplemented_parts
+}
+
+fn static_definition_has_unimplemented_parts(def: &StaticDefinition) -> bool {
     // Coverage-tooling detail (not a game rule): recurse through And/Or/Not —
     // a parser fallback that wraps an unparsed `unless` clause as
     // `Not(Unrecognized)` is a top-level `Not`, not a top-level `Unrecognized`,
@@ -6607,22 +7058,35 @@ fn static_has_unimplemented_parts(def: &StaticDefinition) -> bool {
     def.condition
         .as_ref()
         .is_some_and(StaticCondition::contains_unrecognized)
-        || def
-            .modifications
-            .iter()
-            .any(|modification| match modification {
-                ContinuousModification::GrantAbility { definition } => {
-                    ability_definition_has_unimplemented_parts(definition)
-                }
-                ContinuousModification::GrantTrigger { trigger } => {
-                    trigger_has_unimplemented_parts(trigger)
-                }
-                ContinuousModification::GrantReplacement { replacement } => replacement
-                    .execute
-                    .as_deref()
-                    .is_some_and(ability_definition_has_unimplemented_parts),
-                _ => false,
-            })
+        || def.modifications.iter().any(|modification| {
+            modification_has_unimplemented_parts(modification, TokenStaticTraversal::Include)
+        })
+}
+
+fn modification_has_unimplemented_parts(
+    modification: &ContinuousModification,
+    token_static_traversal: TokenStaticTraversal,
+) -> bool {
+    match modification {
+        ContinuousModification::GrantAbility { definition } => {
+            ability_definition_has_unimplemented_parts(definition, token_static_traversal)
+        }
+        ContinuousModification::GrantTrigger { trigger } => {
+            trigger_has_unimplemented_parts(trigger)
+        }
+        ContinuousModification::GrantReplacement { replacement } => {
+            let mut has_unimplemented_parts = false;
+            visit_replacement_ability_payloads(replacement, |payload_traversal, payload| {
+                has_unimplemented_parts |=
+                    ability_definition_has_unimplemented_parts(payload, payload_traversal);
+            });
+            has_unimplemented_parts
+        }
+        ContinuousModification::GrantStaticAbility { definition } => {
+            static_has_unimplemented_parts(definition)
+        }
+        _ => false,
+    }
 }
 
 /// Returns the list of unsupported handler labels for a card face (e.g.
@@ -6633,16 +7097,34 @@ pub fn card_face_gaps(face: &CardFace) -> Vec<String> {
     let static_registry = build_static_registry();
     let mut missing = Vec::new();
     check_keywords(&face.keywords, &mut missing);
-    check_abilities(&face.abilities, &mut missing);
-    check_triggers(&face.triggers, &trigger_registry, &mut missing);
+    check_abilities(
+        &face.abilities,
+        &trigger_registry,
+        &static_registry,
+        TokenStaticTraversal::Include,
+        &mut missing,
+    );
+    check_triggers(
+        &face.triggers,
+        &trigger_registry,
+        &static_registry,
+        TokenStaticTraversal::Include,
+        &mut missing,
+    );
     check_statics(
         &face.static_abilities,
         &trigger_registry,
         &static_registry,
+        TokenStaticTraversal::Include,
         &mut missing,
     );
     check_additional_cost(&face.additional_cost, &mut missing);
-    check_replacements(&face.replacements, &mut missing);
+    check_replacements(
+        &face.replacements,
+        &trigger_registry,
+        &static_registry,
+        &mut missing,
+    );
     missing
 }
 
@@ -6654,19 +7136,39 @@ pub fn build_parse_details_for_face(face: &CardFace) -> Vec<ParsedItem> {
     build_parse_details(face, &trigger_registry, &static_registry)
 }
 
-fn check_abilities(abilities: &[AbilityDefinition], missing: &mut Vec<String>) {
+fn check_abilities(
+    abilities: &[AbilityDefinition],
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+    missing: &mut Vec<String>,
+) {
     for def in abilities {
-        collect_ability_missing_parts(def, missing);
+        collect_ability_missing_parts(
+            def,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        );
     }
 }
 
 fn check_triggers(
     triggers: &[TriggerDefinition],
     trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
     missing: &mut Vec<String>,
 ) {
     for def in triggers {
-        check_trigger(def, trigger_registry, missing);
+        check_trigger(
+            def,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        );
     }
 }
 
@@ -6690,55 +7192,136 @@ fn check_statics(
     statics: &[StaticDefinition],
     trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
     static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
     missing: &mut Vec<String>,
 ) {
     for def in statics {
-        if !static_registry.contains_key(&def.mode) && !is_data_carrying_static(&def.mode) {
-            let label = format!("Static:{}", def.mode);
+        check_static_tree(
+            def,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        );
+    }
+}
+
+fn check_static_tree(
+    root: &StaticDefinition,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+    missing: &mut Vec<String>,
+) {
+    let _ = root.walk_self_and_granted(&mut |def| {
+        check_static_definition(
+            def,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        );
+        ControlFlow::Continue(())
+    });
+}
+
+fn check_static_definition(
+    def: &StaticDefinition,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+    missing: &mut Vec<String>,
+) {
+    if !static_registry.contains_key(&def.mode) && !is_data_carrying_static(&def.mode) {
+        let label = format!("Static:{}", def.mode);
+        if !missing.contains(&label) {
+            missing.push(label);
+        }
+    }
+    // Flag unrecognized conditions — these represent parser gaps where
+    // the condition text wasn't decomposed into typed building blocks.
+    // Recurse through And/Or/Not (`contains_unrecognized`/`unrecognized_texts`)
+    // so a nested `Not(Unrecognized)` fallback (e.g. an unbindable
+    // recipient-scoped `unless` gate) is labeled instead of silently
+    // passing as supported.
+    if let Some(condition) = &def.condition {
+        for text in condition.unrecognized_texts() {
+            let label = format!("Static:Unrecognized({})", truncate_label(text, 60));
             if !missing.contains(&label) {
                 missing.push(label);
             }
         }
-        // Flag unrecognized conditions — these represent parser gaps where
-        // the condition text wasn't decomposed into typed building blocks.
-        // Recurse through And/Or/Not (`contains_unrecognized`/`unrecognized_texts`)
-        // so a nested `Not(Unrecognized)` fallback (e.g. an unbindable
-        // recipient-scoped `unless` gate) is labeled instead of silently
-        // passing as supported.
-        if let Some(condition) = &def.condition {
-            for text in condition.unrecognized_texts() {
-                let label = format!("Static:Unrecognized({})", truncate_label(text, 60));
-                if !missing.contains(&label) {
-                    missing.push(label);
-                }
-            }
+    }
+    for modification in &def.modifications {
+        collect_modification_missing_parts(
+            modification,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        );
+    }
+}
+
+fn collect_modification_missing_parts(
+    modification: &ContinuousModification,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+    missing: &mut Vec<String>,
+) {
+    match modification {
+        ContinuousModification::GrantAbility { definition } => collect_ability_missing_parts(
+            definition,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        ),
+        ContinuousModification::GrantTrigger { trigger } => check_trigger(
+            trigger,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        ),
+        ContinuousModification::GrantReplacement { replacement } => {
+            visit_replacement_ability_payloads(replacement, |payload_traversal, payload| {
+                collect_ability_missing_parts(
+                    payload,
+                    trigger_registry,
+                    static_registry,
+                    payload_traversal,
+                    missing,
+                );
+            });
         }
-        for modification in &def.modifications {
-            match modification {
-                ContinuousModification::GrantAbility { definition } => {
-                    collect_ability_missing_parts(definition, missing);
-                }
-                ContinuousModification::GrantTrigger { trigger } => {
-                    check_trigger(trigger, trigger_registry, missing);
-                }
-                ContinuousModification::GrantReplacement { replacement } => {
-                    if let Some(execute) = &replacement.execute {
-                        collect_ability_missing_parts(execute, missing);
-                    }
-                }
-                _ => {}
-            }
-        }
+        ContinuousModification::GrantStaticAbility { definition } => check_static_tree(
+            definition,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        ),
+        _ => {}
     }
 }
 
 fn check_trigger(
     trigger: &TriggerDefinition,
     trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
     missing: &mut Vec<String>,
 ) {
     if let Some(execute) = &trigger.execute {
-        collect_ability_missing_parts(execute, missing);
+        collect_ability_missing_parts(
+            execute,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        );
     }
     // CR 603.8: StateCondition triggers are handled by the priority pipeline
     // (check_state_triggers), not the event-based trigger registry. They are supported.
@@ -6761,18 +7344,22 @@ fn truncate_label(text: &str, max: usize) -> &str {
     }
 }
 
-fn check_replacements(replacements: &[ReplacementDefinition], missing: &mut Vec<String>) {
+fn check_replacements(
+    replacements: &[ReplacementDefinition],
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    missing: &mut Vec<String>,
+) {
     for def in replacements {
-        if let Some(execute) = &def.execute {
-            collect_ability_missing_parts(execute, missing);
-        }
-
-        if let ReplacementMode::Optional {
-            decline: Some(decline),
-        } = &def.mode
-        {
-            collect_ability_missing_parts(decline, missing);
-        }
+        visit_replacement_ability_payloads(def, |token_static_traversal, payload| {
+            collect_ability_missing_parts(
+                payload,
+                trigger_registry,
+                static_registry,
+                token_static_traversal,
+                missing,
+            );
+        });
 
         if let Some(ReplacementCondition::Unrecognized { ref text }) = def.condition {
             let label = format!("Replacement:Unrecognized({})", truncate_label(text, 60));
@@ -6807,28 +7394,20 @@ fn collect_valid_subtypes(card_db: &CardDatabase) -> HashSet<String> {
 /// modification so callers can inspect or validate the payload.
 fn visit_face_modifications(face: &CardFace, visit: &mut impl FnMut(&ContinuousModification)) {
     for ability in face.abilities.iter() {
-        visit_ability_modifications(ability, visit);
+        visit_ability_modifications(ability, TokenStaticTraversal::Include, visit);
     }
     for stat in &face.static_abilities {
-        for m in &stat.modifications {
-            visit(m);
-        }
+        visit_static_modifications(stat, visit);
     }
     for trigger in &face.triggers {
         if let Some(execute) = &trigger.execute {
-            visit_ability_modifications(execute, visit);
+            visit_ability_modifications(execute, TokenStaticTraversal::Include, visit);
         }
     }
     for replacement in &face.replacements {
-        if let Some(execute) = &replacement.execute {
-            visit_ability_modifications(execute, visit);
-        }
-        if let ReplacementMode::Optional {
-            decline: Some(decline),
-        } = &replacement.mode
-        {
-            visit_ability_modifications(decline, visit);
-        }
+        visit_replacement_ability_payloads(replacement, |token_static_traversal, payload| {
+            visit_ability_modifications(payload, token_static_traversal, visit);
+        });
     }
 }
 
@@ -7034,6 +7613,8 @@ fn visit_direct_effect_ability_payloads<'a>(
         | Effect::FlipPermanent { .. }
         | Effect::SearchLibrary { .. }
         | Effect::SearchOutsideGame { .. }
+        // CR 400.11b: carries no nested ability definition.
+        | Effect::OpenBoosterPack { .. }
         | Effect::RevealHand { .. }
         | Effect::RevealFromHand {
             on_decline: None, ..
@@ -7173,35 +7754,129 @@ fn visit_direct_effect_ability_payloads<'a>(
 }
 
 /// Recursively visit modifications inside an ability's effect graph.
-/// Descends into `GenericEffect.static_abilities` (the typical carrier of
-/// continuous modifications emitted from animations), sub-abilities, and
-/// modal branches. Non-`GenericEffect` effects don't carry modifications.
+/// Descends into static carriers, direct effect modification carriers,
+/// sub-abilities, and modal branches.
 fn visit_ability_modifications(
     def: &AbilityDefinition,
+    token_static_traversal: TokenStaticTraversal,
     visit: &mut impl FnMut(&ContinuousModification),
 ) {
-    if let Effect::GenericEffect {
-        static_abilities, ..
-    } = &*def.effect
-    {
-        for stat in static_abilities {
-            for m in &stat.modifications {
-                visit(m);
-            }
-        }
-    }
+    visit_effect_static_carrier_modifications(&def.effect, token_static_traversal, visit);
+    visit_effect_modification_carriers(&def.effect, |modification| {
+        visit_modification_and_granted_static_modifications(modification, visit);
+    });
     if let Some(sub) = &def.sub_ability {
-        visit_ability_modifications(sub, visit);
+        visit_ability_modifications(sub, token_static_traversal, visit);
     }
     if let Some(else_ab) = &def.else_ability {
-        visit_ability_modifications(else_ab, visit);
+        visit_ability_modifications(else_ab, token_static_traversal, visit);
     }
     for mode_ability in &def.mode_abilities {
-        visit_ability_modifications(mode_ability, visit);
+        visit_ability_modifications(mode_ability, token_static_traversal, visit);
     }
-    visit_direct_effect_ability_payloads(&def.effect, |_, payload| {
-        visit_ability_modifications(payload, visit);
+    visit_effect_replacement_ability_payloads(&def.effect, |payload_traversal, payload| {
+        visit_ability_modifications(payload, payload_traversal, visit);
     });
+    visit_direct_effect_ability_payloads(&def.effect, |_, payload| {
+        visit_ability_modifications(payload, token_static_traversal, visit);
+    });
+}
+
+/// Visit a direct modification and, for a static grant, its nested static
+/// definitions through the canonical static walker.
+fn visit_modification_and_granted_static_modifications(
+    modification: &ContinuousModification,
+    visit: &mut impl FnMut(&ContinuousModification),
+) {
+    visit(modification);
+    if let ContinuousModification::GrantStaticAbility { definition } = modification {
+        visit_static_modifications(definition, visit);
+    }
+}
+
+/// Visit modifications stored directly on an effect rather than in a
+/// `StaticDefinition`. Keep every `Vec<ContinuousModification>` carrier here
+/// so projection, support, gap, feature, and lexicon coverage cannot each
+/// accidentally omit a distinct effect shape.
+fn visit_effect_modification_carriers(
+    effect: &Effect,
+    mut visit: impl FnMut(&ContinuousModification),
+) {
+    let mut visit_all = |modifications: &[ContinuousModification]| {
+        for modification in modifications {
+            visit(modification);
+        }
+    };
+    match effect {
+        Effect::CopySpell {
+            additional_modifications,
+            ..
+        }
+        | Effect::CopyTokenOf {
+            additional_modifications,
+            ..
+        }
+        | Effect::BecomeCopy {
+            additional_modifications,
+            ..
+        } => visit_all(additional_modifications),
+        Effect::ReturnAsAura { grants, .. } => visit_all(grants),
+        Effect::AddPendingEntersModifications { modifications } => visit_all(modifications),
+        Effect::EachPlayerCopyChosen {
+            copy_modifications, ..
+        } => visit_all(copy_modifications),
+        _ => {}
+    }
+}
+
+fn visit_static_modifications(
+    root: &StaticDefinition,
+    visit: &mut impl FnMut(&ContinuousModification),
+) {
+    let _ = root.walk_self_and_granted(&mut |stat| {
+        for modification in &stat.modifications {
+            visit(modification);
+        }
+        ControlFlow::Continue(())
+    });
+}
+
+fn visit_effect_static_carrier_modifications(
+    effect: &Effect,
+    token_static_traversal: TokenStaticTraversal,
+    visit: &mut impl FnMut(&ContinuousModification),
+) {
+    match effect {
+        Effect::GenericEffect {
+            static_abilities, ..
+        } => {
+            for stat in static_abilities {
+                visit_static_modifications(stat, visit);
+            }
+        }
+        Effect::Token {
+            static_abilities, ..
+        } if token_static_traversal.includes() => {
+            for stat in static_abilities {
+                visit_static_modifications(stat, visit);
+            }
+        }
+        Effect::Counter {
+            source_rider: Some(CounterSourceRider::LosesAbilities { static_def, .. }),
+            ..
+        } => visit_static_modifications(static_def, visit),
+        Effect::CreateEmblem { statics, triggers } => {
+            for stat in statics {
+                visit_static_modifications(stat, visit);
+            }
+            for trigger in triggers {
+                if let Some(execute) = &trigger.execute {
+                    visit_ability_modifications(execute, token_static_traversal, visit);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Validate every `AddSubtype` modification on the face against the lexicon
@@ -7242,6 +7917,7 @@ fn check_subtype_lexicon(face: &CardFace, valid: &HashSet<String>, missing: &mut
 /// parser accepted text but produced no runtime behavior for it.
 fn check_silent_drops(
     oracle_text: &Option<String>,
+    card_name: &str,
     parse_details: &[ParsedItem],
     missing: &mut Vec<String>,
 ) {
@@ -7249,15 +7925,118 @@ fn check_silent_drops(
         return;
     };
 
-    let effective_oracle = count_effective_oracle_lines(oracle_text);
-    let effective_parsed = count_effective_parsed_items(parse_details);
+    let lines = effective_oracle_lines(oracle_text);
+    let (dropped, _) = dropped_oracle_lines(&lines, card_name, parse_details);
 
-    if effective_oracle > effective_parsed {
-        let label = format!("SilentDrop:{}_of_{}", effective_parsed, effective_oracle);
+    if dropped > 0 {
+        let label = format!("SilentDrop:{}_of_{}", lines.len() - dropped, lines.len());
         if !missing.contains(&label) {
             missing.push(label);
         }
     }
+}
+
+/// How many effective Oracle lines the parse tree demonstrably fails to represent,
+/// together with the uncovered lines that number was derived from.
+///
+/// Returning both keeps the count and the lines the audit blames on ONE call:
+/// recomputing them at the audit site repeated the whole normalization pass and
+/// left two call sites free to drift apart — the same failure this check exists
+/// to catch.
+///
+/// Two independent measures must agree before a printed line is called dropped:
+///
+/// * **Cardinality** — effective lines minus parse roots. A single root can
+///   legitimately cover several printed lines: a `sub_ability` chain ("Scry 1." +
+///   "Draw a card." on Opt), an ability-word branch ("Morbid — That creature gets
+///   -13/-13 … instead" on Tragic Slip), a die-roll outcome table. So this measure
+///   over-reports on its own and is kept only as a ceiling.
+/// * **Text evidence** — a printed line matched by no `source_text` anywhere in the
+///   tree, beyond what the tree's `source_text`-less items can account for.
+///
+/// Taking the minimum means a flag always carries evidence that a specific printed
+/// line went unrepresented, and can never fire on cardinality alone. It also makes
+/// the check monotone: because the ceiling *is* the historical rule, this can only
+/// ever withdraw a flag, never raise a new one.
+fn dropped_oracle_lines<'a>(
+    lines: &'a [String],
+    card_name: &str,
+    parse_details: &[ParsedItem],
+) -> (usize, Vec<&'a str>) {
+    let cardinality = lines
+        .len()
+        .saturating_sub(count_effective_parsed_items(parse_details));
+    if cardinality == 0 {
+        return (0, Vec::new());
+    }
+
+    // Only reached for cards the cardinality ceiling already suspects, so the
+    // normalization inside stays off the hot path for the rest of the corpus.
+    let uncovered = uncovered_oracle_lines(lines, card_name, parse_details);
+
+    // A top-level item carrying no `source_text` — a bare keyword, an
+    // `AdditionalCost`, a `SpellCastingOption` — represents a printed line the
+    // parser never attached text to, so each can stand in for one uncovered
+    // line. Without this the check would flag every card with a keyword line.
+    let anonymous = count_anonymous_parse_items(parse_details);
+
+    let dropped = cardinality.min(uncovered.len().saturating_sub(anonymous));
+    (dropped, uncovered)
+}
+
+/// The effective Oracle lines with no representation anywhere in the parse tree.
+///
+/// Shared by [`dropped_oracle_lines`] and the `missing_lines` of
+/// [`audit_silent_drops`], so the count and the lines it blames come from one
+/// filtered line set and one matcher. Deriving them separately let the audit name
+/// a line the count had already excluded and never held responsible — a casting
+/// restriction, a deck-construction sentence, a draft-procedure line.
+///
+/// Matching is `~`-normalized on both sides via [`normalize_for_matching`]: a
+/// parse item's `source_text` renders self-references as `~` while the printed
+/// line spells the card's name ("Shower of Coals deals 2 damage…" against
+/// "~ deals 2 damage…"), and raw containment misses every such pair.
+fn uncovered_oracle_lines<'a>(
+    lines: &'a [String],
+    card_name: &str,
+    parse_details: &[ParsedItem],
+) -> Vec<&'a str> {
+    let card_name_lower = card_name.to_lowercase();
+    let mut source_texts = Vec::new();
+    collect_source_texts(parse_details, &mut source_texts);
+    let sources: Vec<String> = source_texts
+        .iter()
+        .map(|src| normalize_for_matching(&src.to_lowercase(), &card_name_lower))
+        .collect();
+
+    lines
+        .iter()
+        .filter(|line| {
+            let norm = normalize_for_matching(&line.to_lowercase(), &card_name_lower);
+            !sources
+                .iter()
+                .any(|src| src.contains(&norm) || norm.contains(src.as_str()))
+        })
+        .map(String::as_str)
+        .collect()
+}
+
+/// Count TOP-LEVEL parse items that carry no `source_text`.
+///
+/// Deliberately not recursive, matching the granularity
+/// [`count_effective_parsed_items`] uses for the cardinality ceiling. A top-level
+/// anonymous item is anonymous *by design* — keywords, `AdditionalCost` and
+/// `SpellCastingOption` items never carry printed text — and stands for a real
+/// printed line. A descendant that merely happens to lack `source_text` (an
+/// undescribed `sub_ability` link, a modal branch, a nested static) is detail for
+/// a line its parent already covers; counting it would let an unrelated nested
+/// node absorb the offset owed to a by-design item and so mask a genuinely
+/// dropped line elsewhere on the card.
+fn count_anonymous_parse_items(items: &[ParsedItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| item.source_text.is_none() && counts_as_oracle_line(item))
+        .count()
 }
 
 /// Flag cards whose parsed features aren't handled by any runtime resolver.
@@ -7283,35 +8062,10 @@ fn check_resolver_features(face: &CardFace, missing: &mut Vec<String>) {
     }
 }
 
-/// Parse warnings indicate Oracle text the parser accepted but did not faithfully
-/// represent, so the card has silently incorrect behavior at runtime:
-///
-/// - `TargetFallback` — degraded targeting (`TargetFilter::Any` instead of a
-///   specific filter).
-/// - `SwallowedClause` — a load-bearing clause (condition, duration, optional,
-///   activation limit, dynamic quantity, replacement, APNAP ordering) was
-///   dropped from the AST while the surrounding ability still parsed. The
-///   swallow-check detectors fire only when the marker phrase is present AND
-///   the AST has no representation for it, so a fired warning is an unrepresented
-///   clause, not detector noise. Folding these into the supported predicate
-///   stops coverage from marking such cards green (umbrella issue #2243; per
-///   detector: #2229–#2241).
-/// - `CascadeLoss` — a cascade slot was populated but did not land on the final
-///   ability definition, so the parsed card is missing load-bearing behavior.
-///
+/// Returns the canonical coverage gap label for diagnostics that prove a
+/// semantically load-bearing clause was not represented in the parsed AST.
 /// `IgnoredRemainder` stays informational because it can be parser-internal
 /// trivia rather than a demonstrated missing semantic clause.
-fn check_parse_warnings(warnings: &[OracleDiagnostic], missing: &mut Vec<String>) {
-    for warning in warnings {
-        let Some(label) = parse_warning_gap_label(warning) else {
-            continue;
-        };
-        if !missing.contains(&label) {
-            missing.push(label);
-        }
-    }
-}
-
 fn parse_warning_gap_label(warning: &OracleDiagnostic) -> Option<String> {
     match warning {
         OracleDiagnostic::TargetFallback { context, .. } => {
@@ -7330,82 +8084,105 @@ fn parse_warning_gap_label(warning: &OracleDiagnostic) -> Option<String> {
 }
 
 fn ability_definitions_have_unimplemented_parts(abilities: &[AbilityDefinition]) -> bool {
-    abilities
-        .iter()
-        .any(ability_definition_has_unimplemented_parts)
+    abilities.iter().any(|ability| {
+        ability_definition_has_unimplemented_parts(ability, TokenStaticTraversal::Include)
+    })
 }
 
 fn trigger_has_unimplemented_parts(trigger: &TriggerDefinition) -> bool {
-    trigger
-        .execute
-        .as_ref()
-        .is_some_and(|execute| ability_definition_has_unimplemented_parts(execute))
+    trigger.execute.as_ref().is_some_and(|execute| {
+        ability_definition_has_unimplemented_parts(execute, TokenStaticTraversal::Include)
+    })
 }
 
 fn replacement_has_unimplemented_parts(replacement: &ReplacementDefinition) -> bool {
-    replacement
-        .execute
-        .as_ref()
-        .is_some_and(|execute| ability_definition_has_unimplemented_parts(execute))
-        || matches!(
-            &replacement.mode,
-            ReplacementMode::Optional {
-                decline: Some(decline),
-            } if ability_definition_has_unimplemented_parts(decline)
-        )
+    let mut has_unimplemented_parts = false;
+    visit_replacement_ability_payloads(replacement, |token_static_traversal, payload| {
+        has_unimplemented_parts |=
+            ability_definition_has_unimplemented_parts(payload, token_static_traversal);
+    });
+    has_unimplemented_parts
 }
 
-fn ability_definition_has_unimplemented_parts(def: &AbilityDefinition) -> bool {
+fn ability_definition_has_unimplemented_parts(
+    def: &AbilityDefinition,
+    token_static_traversal: TokenStaticTraversal,
+) -> bool {
     matches!(*def.effect, Effect::Unimplemented { .. })
         || def
             .cost
             .as_ref()
-            .is_some_and(ability_cost_has_unimplemented_parts)
-        || def
-            .sub_ability
-            .as_ref()
-            .is_some_and(|sub| ability_definition_has_unimplemented_parts(sub))
-        || def
-            .else_ability
-            .as_ref()
-            .is_some_and(|else_ability| ability_definition_has_unimplemented_parts(else_ability))
+            .is_some_and(|c| c.contains_unimplemented())
+        || def.sub_ability.as_ref().is_some_and(|sub| {
+            ability_definition_has_unimplemented_parts(sub, token_static_traversal)
+        })
+        || def.else_ability.as_ref().is_some_and(|else_ability| {
+            ability_definition_has_unimplemented_parts(else_ability, token_static_traversal)
+        })
         || def
             .mode_abilities
             .iter()
-            .any(ability_definition_has_unimplemented_parts)
+            .any(|mode| ability_definition_has_unimplemented_parts(mode, token_static_traversal))
+        || effect_static_carriers_have_unimplemented_parts(&def.effect, token_static_traversal)
+        || {
+            let mut has_unimplemented_parts = false;
+            visit_effect_replacement_ability_payloads(&def.effect, |payload_traversal, payload| {
+                has_unimplemented_parts |=
+                    ability_definition_has_unimplemented_parts(payload, payload_traversal);
+            });
+            has_unimplemented_parts
+        }
         || {
             let mut has_unimplemented_parts = false;
             visit_direct_effect_ability_payloads(&def.effect, |_, payload| {
-                has_unimplemented_parts |= ability_definition_has_unimplemented_parts(payload);
+                has_unimplemented_parts |=
+                    ability_definition_has_unimplemented_parts(payload, token_static_traversal);
             });
             has_unimplemented_parts
         }
 }
 
-fn additional_cost_has_unimplemented_parts(additional_cost: &AdditionalCost) -> bool {
-    match additional_cost {
-        AdditionalCost::Optional { cost, .. } | AdditionalCost::Required(cost) => {
-            ability_cost_has_unimplemented_parts(cost)
+fn effect_static_carriers_have_unimplemented_parts(
+    effect: &Effect,
+    token_static_traversal: TokenStaticTraversal,
+) -> bool {
+    let statics_have_unimplemented_parts = match effect {
+        Effect::GenericEffect {
+            static_abilities, ..
+        } => static_abilities.iter().any(static_has_unimplemented_parts),
+        Effect::Token {
+            static_abilities, ..
+        } => {
+            token_static_traversal.includes()
+                && static_abilities.iter().any(static_has_unimplemented_parts)
         }
-        AdditionalCost::Kicker { costs, .. } => {
-            costs.iter().any(ability_cost_has_unimplemented_parts)
+        Effect::Counter {
+            source_rider: Some(CounterSourceRider::LosesAbilities { static_def, .. }),
+            ..
+        } => static_has_unimplemented_parts(static_def),
+        Effect::CreateEmblem { statics, triggers } => {
+            statics.iter().any(static_has_unimplemented_parts)
+                || triggers.iter().any(trigger_has_unimplemented_parts)
         }
-        AdditionalCost::Choice(first, second) => {
-            ability_cost_has_unimplemented_parts(first)
-                || ability_cost_has_unimplemented_parts(second)
-        }
-    }
-}
-
-fn ability_cost_has_unimplemented_parts(cost: &AbilityCost) -> bool {
-    match cost {
-        AbilityCost::Composite { costs } => costs.iter().any(ability_cost_has_unimplemented_parts),
-        AbilityCost::Unimplemented { .. } => true,
         _ => false,
+    };
+    statics_have_unimplemented_parts || {
+        let mut has_unimplemented_parts = false;
+        visit_effect_modification_carriers(effect, |modification| {
+            has_unimplemented_parts |=
+                modification_has_unimplemented_parts(modification, token_static_traversal);
+        });
+        has_unimplemented_parts
     }
 }
 
-fn collect_ability_missing_parts(def: &AbilityDefinition, missing: &mut Vec<String>) {
+fn collect_ability_missing_parts(
+    def: &AbilityDefinition,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+    missing: &mut Vec<String>,
+) {
     if let Effect::Unimplemented { name, .. } = &*def.effect {
         let label = format!("Effect:{name}");
         if !missing.contains(&label) {
@@ -7418,19 +8195,126 @@ fn collect_ability_missing_parts(def: &AbilityDefinition, missing: &mut Vec<Stri
     }
 
     if let Some(sub_ability) = &def.sub_ability {
-        collect_ability_missing_parts(sub_ability, missing);
+        collect_ability_missing_parts(
+            sub_ability,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        );
     }
 
     if let Some(else_ability) = &def.else_ability {
-        collect_ability_missing_parts(else_ability, missing);
+        collect_ability_missing_parts(
+            else_ability,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        );
     }
 
     for mode_ability in &def.mode_abilities {
-        collect_ability_missing_parts(mode_ability, missing);
+        collect_ability_missing_parts(
+            mode_ability,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        );
     }
 
+    collect_effect_static_carrier_missing_parts(
+        &def.effect,
+        trigger_registry,
+        static_registry,
+        token_static_traversal,
+        missing,
+    );
+
+    visit_effect_replacement_ability_payloads(&def.effect, |payload_traversal, payload| {
+        collect_ability_missing_parts(
+            payload,
+            trigger_registry,
+            static_registry,
+            payload_traversal,
+            missing,
+        );
+    });
+
     visit_direct_effect_ability_payloads(&def.effect, |_, payload| {
-        collect_ability_missing_parts(payload, missing);
+        collect_ability_missing_parts(
+            payload,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        );
+    });
+}
+
+fn collect_effect_static_carrier_missing_parts(
+    effect: &Effect,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+    missing: &mut Vec<String>,
+) {
+    match effect {
+        Effect::GenericEffect {
+            static_abilities, ..
+        } => check_statics(
+            static_abilities,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        ),
+        Effect::Token {
+            static_abilities, ..
+        } if token_static_traversal.includes() => check_statics(
+            static_abilities,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        ),
+        Effect::Counter {
+            source_rider: Some(CounterSourceRider::LosesAbilities { static_def, .. }),
+            ..
+        } => check_static_tree(
+            static_def,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        ),
+        Effect::CreateEmblem { statics, triggers } => {
+            check_statics(
+                statics,
+                trigger_registry,
+                static_registry,
+                token_static_traversal,
+                missing,
+            );
+            check_triggers(
+                triggers,
+                trigger_registry,
+                static_registry,
+                token_static_traversal,
+                missing,
+            );
+        }
+        _ => {}
+    }
+    visit_effect_modification_carriers(effect, |modification| {
+        collect_modification_missing_parts(
+            modification,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+            missing,
+        );
     });
 }
 
@@ -7460,10 +8344,18 @@ fn collect_additional_cost_missing_parts(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SilentDropResult {
     pub card_name: String,
+    /// Effective printed lines the parse tree is expected to represent.
     pub oracle_lines: usize,
+    /// Of those, how many the tree does represent — `oracle_lines - delta`, and
+    /// the numerator of the card's `SilentDrop:{n}_of_{m}` label. Not a count of
+    /// parse roots: one root can represent several printed lines.
     pub parsed_items: usize,
+    /// Printed lines with no representation anywhere in the parse tree.
     pub delta: usize,
-    /// Oracle lines with no corresponding parse item (best-effort match).
+    /// The uncovered lines themselves, from the same filtered set and matcher
+    /// that produced `delta`. `delta` of them are unexplained once the
+    /// `source_text`-less top-level items have been offset, so this may be the
+    /// longer list — but every entry is a real candidate for the flag.
     pub missing_lines: Vec<String>,
 }
 
@@ -7485,16 +8377,17 @@ pub fn audit_silent_drops(summary: &CoverageSummary) -> Vec<SilentDropResult> {
             _ => continue,
         };
 
-        let effective_oracle = count_effective_oracle_lines(oracle_text);
-        let effective_parsed = count_effective_parsed_items(&card.parse_details);
+        let lines = effective_oracle_lines(oracle_text);
+        let (dropped, uncovered) =
+            dropped_oracle_lines(&lines, &card.card_name, &card.parse_details);
 
-        if effective_oracle > effective_parsed {
-            let missing_lines = find_missing_lines(oracle_text, &card.parse_details);
+        if dropped > 0 {
+            let missing_lines = uncovered.into_iter().map(str::to_string).collect();
             results.push(SilentDropResult {
                 card_name: card.card_name.clone(),
-                oracle_lines: effective_oracle,
-                parsed_items: effective_parsed,
-                delta: effective_oracle - effective_parsed,
+                oracle_lines: lines.len(),
+                parsed_items: lines.len() - dropped,
+                delta: dropped,
                 missing_lines,
             });
         }
@@ -7503,16 +8396,17 @@ pub fn audit_silent_drops(summary: &CoverageSummary) -> Vec<SilentDropResult> {
     results
 }
 
-/// Count effective Oracle text lines, accounting for modal/choose headers
-/// that cover their following bullet points as a single unit.
-fn count_effective_oracle_lines(oracle_text: &str) -> usize {
+/// The printed Oracle lines a card's parse tree is expected to represent, with
+/// reminder text stripped and modal bullets folded into their header. Typed
+/// card-face metadata is counted because it emits its own parse-tree root.
+fn effective_oracle_lines(oracle_text: &str) -> Vec<String> {
     let lines: Vec<&str> = oracle_text
         .split('\n')
         .map(|l| l.trim())
         .filter(|l| !l.is_empty())
         .collect();
 
-    let mut count = 0;
+    let mut effective = Vec::new();
     let mut in_modal = false;
 
     for line in &lines {
@@ -7543,7 +8437,7 @@ fn count_effective_oracle_lines(oracle_text: &str) -> usize {
         // Handles standalone headers, triggered modals ("when enters, choose one —"),
         // activated modals ("{cost}: choose one —"), and period-terminated ("choose three.")
         if is_modal_header_line(&lower) {
-            count += 1;
+            effective.push(stripped.to_string());
             in_modal = true;
             continue;
         }
@@ -7559,10 +8453,21 @@ fn count_effective_oracle_lines(oracle_text: &str) -> usize {
             in_modal = false;
         }
 
-        count += 1;
+        // CR 706.2 (rolling a die) / CR 701.51: an outcome row ("1—9 | Draw a
+        // card.", "20 | …", a level band) is the resolution table of the line
+        // above it, and the parser emits every row as a child of that one
+        // ability. Fold rows into their header exactly as modal bullets fold
+        // into their `choose` header, so a fully parsed roll is not counted as
+        // N+1 lines against 1 root. The `!effective.is_empty()` guard keeps a
+        // row that opens a card (no header to belong to) countable.
+        if !effective.is_empty() && (is_attraction_line(&lower) || is_level_effect_line(&lower)) {
+            continue;
+        }
+
+        effective.push(stripped.to_string());
     }
 
-    count
+    effective
 }
 
 /// Check if a line contains a modal header pattern: "choose one", "choose two", etc.
@@ -7729,51 +8634,29 @@ fn strip_parenthesized_reminder(line: &str) -> String {
     result
 }
 
-/// Count effective parsed items, recursively counting children for
-/// modal/choose nodes (which represent multiple Oracle lines as one node).
+/// Count parse-tree roots that represent independent Oracle lines.
+///
+/// Children record semantics nested inside the same printed ability: a trigger
+/// execute body, an otherwise branch, a token-carried static, or a granted
+/// ability. They must not increase this count, or a supported nested detail
+/// could mask a different Oracle line that the parser silently dropped.
+///
+/// The converse also holds — a child can carry its own printed line (a
+/// `sub_ability` chain, an ability-word branch) — so this count is only the
+/// ceiling in [`dropped_oracle_lines`], never a verdict on its own.
 fn count_effective_parsed_items(items: &[ParsedItem]) -> usize {
-    let mut count = 0;
-    for item in items {
-        if item.children.is_empty() {
-            count += 1;
-        } else {
-            // A modal/choose parent + its children count as 1 + children
-            // (the header is the parent, each bullet is a child)
-            count += 1 + item.children.len();
-        }
-    }
-    count
+    items
+        .iter()
+        .filter(|item| counts_as_oracle_line(item))
+        .count()
 }
 
-/// Find Oracle text lines that have no corresponding parsed item by
-/// matching against source_text fields in the parse tree.
-fn find_missing_lines(oracle_text: &str, parse_details: &[ParsedItem]) -> Vec<String> {
-    let mut source_texts: Vec<String> = Vec::new();
-    collect_source_texts(parse_details, &mut source_texts);
-
-    let source_lower: Vec<String> = source_texts.iter().map(|s| s.to_lowercase()).collect();
-
-    oracle_text
-        .split('\n')
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .filter(|line| {
-            let lower = line.to_lowercase();
-            let stripped = strip_parenthesized_reminder(&lower);
-            let stripped = stripped.trim();
-            if stripped.is_empty() {
-                return false;
-            }
-            if is_commander_permission_sentence(stripped) {
-                return false;
-            }
-            // A line is "missing" if no source_text contains it or is contained by it
-            !source_lower
-                .iter()
-                .any(|src| src.contains(stripped) || stripped.contains(src.as_str()))
-        })
-        .map(|l| l.to_string())
-        .collect()
+// Card-face metadata is projected into the coverage tree, but an unmatched
+// metadata field is not evidence that any printed line was parsed.
+fn counts_as_oracle_line(item: &ParsedItem) -> bool {
+    !(item.category == ParseCategory::Cost
+        && matches!(item.label.as_str(), "Strive" | "CastingRestriction")
+        && item.source_text.is_none())
 }
 
 /// Recursively collect all source_text values from the parse tree.
@@ -7786,21 +8669,29 @@ fn collect_source_texts(items: &[ParsedItem], out: &mut Vec<String>) {
     }
 }
 
+/// Collect the coverage gaps for an ability cost tree. Traversal delegates to
+/// [`AbilityCost::for_each_cost_node`], the single cost-tree shape authority,
+/// so the gap set cannot miss a subtree the containment predicate sees
+/// (`OneOf`/`PerCounter` nesting, and an `EffectCost` whose embedded effect is
+/// `Unimplemented`).
 fn collect_ability_cost_missing_parts(cost: &AbilityCost, missing: &mut Vec<String>) {
-    match cost {
-        AbilityCost::Composite { costs } => {
-            for nested_cost in costs {
-                collect_ability_cost_missing_parts(nested_cost, missing);
-            }
-        }
+    cost.for_each_cost_node(&mut |node| match node {
         AbilityCost::Unimplemented { description } => {
             let label = format!("Cost:{description}");
             if !missing.contains(&label) {
                 missing.push(label);
             }
         }
+        AbilityCost::EffectCost { effect, .. } => {
+            if let Effect::Unimplemented { name, .. } = effect.as_ref() {
+                let label = format!("Cost:{name}");
+                if !missing.contains(&label) {
+                    missing.push(label);
+                }
+            }
+        }
         _ => {}
-    }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -7943,7 +8834,12 @@ fn is_card_supported(
 ) -> bool {
     // Check abilities
     for def in face.abilities.iter() {
-        if !is_ability_supported(def) {
+        if !is_ability_supported(
+            def,
+            trigger_registry,
+            static_registry,
+            TokenStaticTraversal::Include,
+        ) {
             return false;
         }
     }
@@ -7955,23 +8851,40 @@ fn is_card_supported(
             return false;
         }
         if let Some(execute) = &trig.execute {
-            if !is_ability_supported(execute) {
+            if !is_ability_supported(
+                execute,
+                trigger_registry,
+                static_registry,
+                TokenStaticTraversal::Include,
+            ) {
                 return false;
             }
         }
     }
     // Check statics
     for stat in &face.static_abilities {
-        if !is_static_supported(stat, trigger_registry, static_registry) {
+        if !is_static_supported(
+            stat,
+            trigger_registry,
+            static_registry,
+            TokenStaticTraversal::Include,
+        ) {
             return false;
         }
     }
     // Check replacements
     for repl in &face.replacements {
-        if let Some(execute) = &repl.execute {
-            if !is_ability_supported(execute) {
-                return false;
-            }
+        let mut replacement_supported = true;
+        visit_replacement_ability_payloads(repl, |token_static_traversal, payload| {
+            replacement_supported &= is_ability_supported(
+                payload,
+                trigger_registry,
+                static_registry,
+                token_static_traversal,
+            );
+        });
+        if !replacement_supported {
+            return false;
         }
     }
     // Check keywords
@@ -7987,33 +8900,92 @@ fn is_static_supported(
     stat: &StaticDefinition,
     trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
     static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+) -> bool {
+    let mut supported = true;
+    let _ = stat.walk_self_and_granted(&mut |static_def| {
+        supported = is_static_definition_supported(
+            static_def,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        );
+        if supported {
+            ControlFlow::Continue(())
+        } else {
+            ControlFlow::Break(())
+        }
+    });
+    supported
+}
+
+fn is_static_definition_supported(
+    stat: &StaticDefinition,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
 ) -> bool {
     (static_registry.contains_key(&stat.mode) || is_data_carrying_static(&stat.mode))
         && !stat
             .condition
             .as_ref()
             .is_some_and(StaticCondition::contains_unrecognized)
-        && stat
-            .modifications
-            .iter()
-            .all(|modification| match modification {
-                ContinuousModification::GrantAbility { definition } => {
-                    is_ability_supported(definition)
-                }
-                ContinuousModification::GrantTrigger { trigger } => {
-                    is_trigger_supported(trigger, trigger_registry)
-                }
-                ContinuousModification::GrantReplacement { replacement } => replacement
-                    .execute
-                    .as_deref()
-                    .is_none_or(is_ability_supported),
-                _ => true,
-            })
+        && stat.modifications.iter().all(|modification| {
+            modification_is_supported(
+                modification,
+                trigger_registry,
+                static_registry,
+                token_static_traversal,
+            )
+        })
+}
+
+fn modification_is_supported(
+    modification: &ContinuousModification,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+) -> bool {
+    match modification {
+        ContinuousModification::GrantAbility { definition } => is_ability_supported(
+            definition,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        ),
+        ContinuousModification::GrantTrigger { trigger } => is_trigger_supported(
+            trigger,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        ),
+        ContinuousModification::GrantReplacement { replacement } => {
+            let mut supported = true;
+            visit_replacement_ability_payloads(replacement, |payload_traversal, payload| {
+                supported &= is_ability_supported(
+                    payload,
+                    trigger_registry,
+                    static_registry,
+                    payload_traversal,
+                );
+            });
+            supported
+        }
+        ContinuousModification::GrantStaticAbility { definition } => is_static_supported(
+            definition,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        ),
+        _ => true,
+    }
 }
 
 fn is_trigger_supported(
     trigger: &TriggerDefinition,
     trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
 ) -> bool {
     if matches!(&trigger.mode, TriggerMode::Unknown(_))
         || (!trigger_registry.contains_key(&trigger.mode)
@@ -8021,37 +8993,140 @@ fn is_trigger_supported(
     {
         return false;
     }
-    trigger.execute.as_deref().is_none_or(is_ability_supported)
+    trigger.execute.as_deref().is_none_or(|execute| {
+        is_ability_supported(
+            execute,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        )
+    })
 }
 
 /// Check if an ability definition tree has any Unimplemented effects.
-fn is_ability_supported(def: &AbilityDefinition) -> bool {
+fn is_ability_supported(
+    def: &AbilityDefinition,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+) -> bool {
     if matches!(&*def.effect, Effect::Unimplemented { .. }) {
         return false;
     }
     if let Some(sub) = &def.sub_ability {
-        if !is_ability_supported(sub) {
+        if !is_ability_supported(
+            sub,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        ) {
             return false;
         }
     }
     if let Some(else_ab) = &def.else_ability {
-        if !is_ability_supported(else_ab) {
+        if !is_ability_supported(
+            else_ab,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        ) {
             return false;
         }
     }
     for mode_ab in &def.mode_abilities {
-        if !is_ability_supported(mode_ab) {
+        if !is_ability_supported(
+            mode_ab,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        ) {
             return false;
         }
     }
+    if !effect_static_carriers_are_supported(
+        &def.effect,
+        trigger_registry,
+        static_registry,
+        token_static_traversal,
+    ) {
+        return false;
+    }
     let mut supported = true;
+    visit_effect_replacement_ability_payloads(&def.effect, |payload_traversal, payload| {
+        supported &= is_ability_supported(
+            payload,
+            trigger_registry,
+            static_registry,
+            payload_traversal,
+        );
+    });
     visit_direct_effect_ability_payloads(&def.effect, |_, payload| {
-        supported &= is_ability_supported(payload);
+        supported &= is_ability_supported(
+            payload,
+            trigger_registry,
+            static_registry,
+            token_static_traversal,
+        );
     });
     if !supported {
         return false;
     }
     true
+}
+
+fn effect_static_carriers_are_supported(
+    effect: &Effect,
+    trigger_registry: &HashMap<TriggerMode, crate::game::triggers::TriggerMatcher>,
+    static_registry: &HashMap<StaticMode, StaticAbilityHandler>,
+    token_static_traversal: TokenStaticTraversal,
+) -> bool {
+    let statics_supported = |statics: &[StaticDefinition]| {
+        statics.iter().all(|stat| {
+            is_static_supported(
+                stat,
+                trigger_registry,
+                static_registry,
+                token_static_traversal,
+            )
+        })
+    };
+
+    let static_carriers_supported = match effect {
+        Effect::GenericEffect {
+            static_abilities, ..
+        } => statics_supported(static_abilities),
+        Effect::Token {
+            static_abilities, ..
+        } => !token_static_traversal.includes() || statics_supported(static_abilities),
+        Effect::Counter {
+            source_rider: Some(CounterSourceRider::LosesAbilities { static_def, .. }),
+            ..
+        } => statics_supported(std::slice::from_ref(static_def.as_ref())),
+        Effect::CreateEmblem { statics, triggers } => {
+            statics_supported(statics)
+                && triggers.iter().all(|trigger| {
+                    is_trigger_supported(
+                        trigger,
+                        trigger_registry,
+                        static_registry,
+                        token_static_traversal,
+                    )
+                })
+        }
+        _ => true,
+    };
+    static_carriers_supported && {
+        let mut supported = true;
+        visit_effect_modification_carriers(effect, |modification| {
+            supported &= modification_is_supported(
+                modification,
+                trigger_registry,
+                static_registry,
+                token_static_traversal,
+            );
+        });
+        supported
+    }
 }
 
 /// Whether the resolver currently handles a given parsed feature.
@@ -8132,24 +9207,16 @@ fn extract_card_features(face: &CardFace, features: &mut HashMap<String, Feature
         extract_ability_features(def, features);
     }
     for trig in &face.triggers {
-        if let Some(execute) = &trig.execute {
-            extract_ability_features(execute, features);
-        }
-        // Trigger-level condition (intervening-if)
-        if trig.condition.is_some() {
-            emit_structural(features, StructuralFeature::TriggerCondition);
-        }
+        extract_trigger_features(trig, features, TokenStaticTraversal::Include);
     }
     for repl in &face.replacements {
-        if let Some(execute) = &repl.execute {
-            extract_ability_features(execute, features);
-        }
+        visit_replacement_ability_payloads(repl, |token_static_traversal, payload| {
+            extract_ability_features_with_token_statics(payload, features, token_static_traversal);
+        });
     }
-    // Static abilities with conditions
+    // Static abilities and all definitions they grant.
     for stat in &face.static_abilities {
-        if let Some(ref cond) = stat.condition {
-            extract_static_condition_features(cond, features);
-        }
+        extract_static_features(stat, features, TokenStaticTraversal::Include);
     }
     if face.additional_cost.is_some() {
         emit_structural(features, StructuralFeature::AdditionalCost);
@@ -8209,6 +9276,14 @@ fn extract_ability_features(
     def: &AbilityDefinition,
     features: &mut HashMap<String, FeatureSupport>,
 ) {
+    extract_ability_features_with_token_statics(def, features, TokenStaticTraversal::Include);
+}
+
+fn extract_ability_features_with_token_statics(
+    def: &AbilityDefinition,
+    features: &mut HashMap<String, FeatureSupport>,
+    token_static_traversal: TokenStaticTraversal,
+) {
     // Condition
     if let Some(ref cond) = def.condition {
         emit_structural(features, StructuralFeature::Condition);
@@ -8220,7 +9295,7 @@ fn extract_ability_features(
     // Else ability
     if let Some(ref else_ab) = def.else_ability {
         emit_structural(features, StructuralFeature::ElseAbility);
-        extract_ability_features(else_ab, features);
+        extract_ability_features_with_token_statics(else_ab, features, token_static_traversal);
     }
 
     // Repeat-for
@@ -8275,13 +9350,113 @@ fn extract_ability_features(
 
     // Recurse into sub-abilities
     if let Some(ref sub) = def.sub_ability {
-        extract_ability_features(sub, features);
+        extract_ability_features_with_token_statics(sub, features, token_static_traversal);
     }
     for mode_ab in &def.mode_abilities {
-        extract_ability_features(mode_ab, features);
+        extract_ability_features_with_token_statics(mode_ab, features, token_static_traversal);
     }
+    extract_effect_static_carrier_features(&def.effect, features, token_static_traversal);
+    visit_effect_replacement_ability_payloads(&def.effect, |payload_traversal, payload| {
+        extract_ability_features_with_token_statics(payload, features, payload_traversal);
+    });
     visit_direct_effect_ability_payloads(&def.effect, |_, payload| {
-        extract_ability_features(payload, features);
+        extract_ability_features_with_token_statics(payload, features, token_static_traversal);
+    });
+}
+
+fn extract_static_features(
+    root: &StaticDefinition,
+    features: &mut HashMap<String, FeatureSupport>,
+    token_static_traversal: TokenStaticTraversal,
+) {
+    let _ = root.walk_self_and_granted(&mut |stat| {
+        if let Some(condition) = &stat.condition {
+            extract_static_condition_features(condition, features);
+        }
+        for modification in &stat.modifications {
+            extract_modification_features(modification, features, token_static_traversal);
+        }
+        ControlFlow::Continue(())
+    });
+}
+
+fn extract_modification_features(
+    modification: &ContinuousModification,
+    features: &mut HashMap<String, FeatureSupport>,
+    token_static_traversal: TokenStaticTraversal,
+) {
+    match modification {
+        ContinuousModification::GrantAbility { definition } => {
+            extract_ability_features_with_token_statics(
+                definition,
+                features,
+                token_static_traversal,
+            );
+        }
+        ContinuousModification::GrantTrigger { trigger } => {
+            extract_trigger_features(trigger, features, token_static_traversal);
+        }
+        ContinuousModification::GrantReplacement { replacement } => {
+            visit_replacement_ability_payloads(replacement, |payload_traversal, payload| {
+                extract_ability_features_with_token_statics(payload, features, payload_traversal);
+            });
+        }
+        ContinuousModification::GrantStaticAbility { definition } => {
+            extract_static_features(definition, features, token_static_traversal);
+        }
+        _ => {}
+    }
+}
+
+fn extract_trigger_features(
+    trigger: &TriggerDefinition,
+    features: &mut HashMap<String, FeatureSupport>,
+    token_static_traversal: TokenStaticTraversal,
+) {
+    if let Some(execute) = &trigger.execute {
+        extract_ability_features_with_token_statics(execute, features, token_static_traversal);
+    }
+    if trigger.condition.is_some() {
+        emit_structural(features, StructuralFeature::TriggerCondition);
+    }
+}
+
+fn extract_effect_static_carrier_features(
+    effect: &Effect,
+    features: &mut HashMap<String, FeatureSupport>,
+    token_static_traversal: TokenStaticTraversal,
+) {
+    match effect {
+        Effect::GenericEffect {
+            static_abilities, ..
+        } => {
+            for stat in static_abilities {
+                extract_static_features(stat, features, token_static_traversal);
+            }
+        }
+        Effect::Token {
+            static_abilities, ..
+        } if token_static_traversal.includes() => {
+            for stat in static_abilities {
+                extract_static_features(stat, features, token_static_traversal);
+            }
+        }
+        Effect::Counter {
+            source_rider: Some(CounterSourceRider::LosesAbilities { static_def, .. }),
+            ..
+        } => extract_static_features(static_def, features, token_static_traversal),
+        Effect::CreateEmblem { statics, triggers } => {
+            for stat in statics {
+                extract_static_features(stat, features, token_static_traversal);
+            }
+            for trigger in triggers {
+                extract_trigger_features(trigger, features, token_static_traversal);
+            }
+        }
+        _ => {}
+    }
+    visit_effect_modification_carriers(effect, |modification| {
+        extract_modification_features(modification, features, token_static_traversal);
     });
 }
 
@@ -8449,6 +9624,7 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
         // CR 601.2c + CR 115.1: object-target presence guard — resolved by
         // `evaluate_condition` (effects/mod.rs) against the ability's declared targets.
         AbilityCondition::HasObjectTarget => ("HasObjectTarget", Handled),
+        AbilityCondition::AllDeclaredTargetsLegal => ("AllDeclaredTargetsLegal", Handled),
         AbilityCondition::TargetMatchesFilter { .. } => ("TargetMatchesFilter", Handled),
         AbilityCondition::TriggeringSpellTargetsFilter { .. } => {
             ("TriggeringSpellTargetsFilter", Handled)
@@ -8482,7 +9658,7 @@ fn condition_feature(cond: &AbilityCondition) -> (&'static str, FeatureSupport) 
         // CR 731.1: Day/night designation check — handled by evaluate_condition.
         AbilityCondition::DayNightIs { .. } => ("DayNightIs", Handled),
         // CR 603.4: Per-ability per-turn resolution counter — handled by evaluate_condition.
-        AbilityCondition::NthResolutionThisTurn { .. } => ("NthResolutionThisTurn", Handled),
+        AbilityCondition::AbilityUseCountThisTurn { .. } => ("AbilityUseCountThisTurn", Handled),
         AbilityCondition::CostPaidObjectMatchesFilter { .. } => {
             ("CostPaidObjectMatchesFilter", Handled)
         }
@@ -8533,6 +9709,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardPower", Unhandled),
             ObjectScope::AmassedArmy => ("AmassedArmyPower", Handled),
             ObjectScope::BatchSource => ("BatchSourcePower", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetPower", Unhandled),
         },
         QuantityRef::BasePower { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -8547,6 +9727,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardBasePower", Unhandled),
             ObjectScope::AmassedArmy => ("AmassedArmyBasePower", Handled),
             ObjectScope::BatchSource => ("BatchSourceBasePower", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetBasePower", Unhandled),
         },
         QuantityRef::Toughness { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -8561,6 +9745,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardToughness", Unhandled),
             ObjectScope::AmassedArmy => ("AmassedArmyToughness", Handled),
             ObjectScope::BatchSource => ("BatchSourceToughness", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetToughness", Unhandled),
         },
         QuantityRef::ObjectManaValue { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -8575,6 +9763,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardManaValue", Handled),
             ObjectScope::AmassedArmy => ("AmassedArmyManaValue", Handled),
             ObjectScope::BatchSource => ("BatchSourceManaValue", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetManaValue", Unhandled),
         },
         QuantityRef::TargetObjectManaValue { .. } => ("TargetObjectManaValue", Handled),
         QuantityRef::ObjectColorCount { scope } => match scope {
@@ -8593,6 +9785,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardColorCount", Handled),
             ObjectScope::AmassedArmy => ("AmassedArmyObjectColorCount", Handled),
             ObjectScope::BatchSource => ("BatchSourceObjectColorCount", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetObjectColorCount", Unhandled),
         },
         QuantityRef::ObjectNameWordCount { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -8607,6 +9803,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             ObjectScope::OwnedLinkedExileCard => ("OwnedLinkedExileCardNameWordCount", Handled),
             ObjectScope::AmassedArmy => ("AmassedArmyObjectNameWordCount", Handled),
             ObjectScope::BatchSource => ("BatchSourceObjectNameWordCount", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetObjectNameWordCount", Unhandled),
         },
         QuantityRef::ObjectTypelineComponentCount { scope } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -8623,6 +9823,12 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             }
             ObjectScope::AmassedArmy => ("AmassedArmyObjectTypelineComponentCount", Handled),
             ObjectScope::BatchSource => ("BatchSourceObjectTypelineComponentCount", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => {
+                ("ChainRootTargetObjectTypelineComponentCount", Unhandled)
+            }
         },
         QuantityRef::ManaSymbolsInManaCost { scope, .. } => match scope {
             ObjectScope::Source | ObjectScope::Anaphoric | ObjectScope::Demonstrative => {
@@ -8639,6 +9845,10 @@ fn quantity_ref_feature(qref: &QuantityRef) -> (&'static str, FeatureSupport) {
             }
             ObjectScope::AmassedArmy => ("AmassedArmyManaSymbolsInManaCost", Handled),
             ObjectScope::BatchSource => ("BatchSourceManaSymbolsInManaCost", Handled),
+            // Fail-closed `=> 0` in `game/quantity.rs`: no card reads a
+            // chain-root target's characteristics yet (CR 601.2c referent is
+            // wired for `CountersOn` only).
+            ObjectScope::ChainRootTarget => ("ChainRootTargetManaSymbolsInManaCost", Unhandled),
         },
         QuantityRef::SelfManaValue => ("SelfManaValue", Handled),
         QuantityRef::PropertyAggregate(_) => ("PropertyAggregate", Handled),
@@ -8848,6 +10058,15 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         // source's live attacker record, then evaluated against the defending
         // player's battlefield. This is a combat-relative condition, not an
         // unsupported parser placeholder.
+        // CR 506.2 + CR 508.1c + CR 508.5: resolved at runtime by
+        // `layers::evaluate_condition_with_context`'s `DefendingPlayerControls` arm from
+        // `ConditionContext` — the attack target under validation during
+        // declare-attackers (before CR 508.1k records the attacker), else the recorded
+        // `AttackerInfo` for the RECIPIENT attacking creature (so a remote carrier such
+        // as Tanglewalker resolves per affected attacker rather than per carrier).
+        // Creature-level queries that cannot bind the anchor defer to
+        // `combat::attacker_can_attack_target` rather than guess. The board census is
+        // `filter::player_controls_matching` (CR 109.2 + CR 108.4).
         StaticCondition::DefendingPlayerControls { .. } => ("DefendingPlayerControls", Handled),
         StaticCondition::SourceAttackingAlone => ("SourceAttackingAlone", Unhandled),
         // CR 508.1k / 509.1g / 509.1h: runtime-evaluated against the live combat
@@ -8881,8 +10100,8 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::OpponentPoisonAtLeast { .. } => ("OpponentPoisonAtLeast", Unhandled),
         StaticCondition::UnlessPay { .. } => ("UnlessPay", Handled),
         // CR 903.3d: the RUNTIME does evaluate this static
-        // (`layers::evaluate_static_condition`, layers.rs:1875, delegating both
-        // ownership arms to the single `game::commander` authority), so the
+        // (the `ControlsCommander` arm of `layers::evaluate_condition_with_context`,
+        // delegating both ownership arms to the single `game::commander` authority), so the
         // `Unhandled` tag below understates the resolver.
         //
         // It stays `Unhandled` DELIBERATELY, and must not be flipped as a rider on
@@ -8910,7 +10129,7 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
         StaticCondition::SourceIsMonstrous => ("SourceIsMonstrous", Handled),
         // SourceIsHarnessed resolved by layers::evaluate_condition (the ∞ gate).
         StaticCondition::SourceIsHarnessed => ("SourceIsHarnessed", Handled),
-        // SourceAttachedToCreature resolved by layers::evaluate_condition (layers.rs:1078)
+        // SourceAttachedToCreature resolved by `layers::evaluate_condition`
         StaticCondition::SourceAttachedToCreature => ("SourceAttachedToCreature", Handled),
         // SourceMatchesFilter resolved by layers::evaluate_condition (layers.rs:1104)
         StaticCondition::SourceMatchesFilter { .. } => ("SourceMatchesFilter", Handled),
@@ -8938,7 +10157,14 @@ fn static_condition_feature(cond: &StaticCondition) -> (&'static str, FeatureSup
 /// Walk an ability definition tree, visiting all nested `AbilityDefinition`s including
 /// those embedded in compound effects (`FlipCoin`, `RollDie`, `GrantAbility`, etc.).
 /// Returns `true` if the predicate returns `true` for any node in the tree.
-fn ability_tree_any(def: &AbilityDefinition, pred: &impl Fn(&AbilityDefinition) -> bool) -> bool {
+///
+/// `pub(crate)`: also the single-authority walker `PerpetualGrantModification::try_from`
+/// (`types/ability.rs`) reuses to reject a `GrantAbility` whose nested tree contains
+/// `Effect::Unimplemented` -- never reimplement tree-walking at that call site.
+pub(crate) fn ability_tree_any(
+    def: &AbilityDefinition,
+    pred: &impl Fn(&AbilityDefinition) -> bool,
+) -> bool {
     if pred(def) {
         return true;
     }
@@ -9966,7 +11192,11 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 || after_ability_word.is_some_and(|aw| aw.starts_with(&kw_name))
         }) || is_keyword_line(&lower)
             || after_ability_word.is_some_and(is_keyword_line);
-        let covered_by_x_mana_payment = lower.starts_with("spend only ")
+        let covered_by_x_mana_payment =
+            crate::parser::oracle_casting::parse_x_mana_payment_restriction(
+                lower.trim_end_matches('.'),
+            )
+            .is_some()
             // Consume Spirit / Drain Life attach the rider to the spell;
             // Crypt Rats / Crimson Hellkite attach it to an activation. Keep
             // both typed homes visible to the audit, while refusing to green
@@ -9990,7 +11220,12 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 // Hogaak, Arisen Necropolis (issue #1095): "You can't spend mana
                 // to cast this spell" is parsed to CastingRestriction::CantSpendMana.
                 || lower.starts_with("you can't spend mana to cast ")
-                || lower.starts_with("you can\u{2019}t spend mana to cast ")))
+                || lower.starts_with("you can\u{2019}t spend mana to cast ")
+                // CR 601.2b / CR 601.2h: "Spend only [colors] mana on X" is parsed to
+                // CastingRestriction::SpendOnlyOnX { colors }.
+                || (face.casting_restrictions.iter().any(|r| {
+                    matches!(r, crate::types::ability::CastingRestriction::SpendOnlyOnX { .. })
+                }) && crate::parser::oracle_casting::extract_spend_only_on_x_prefix(line).is_some())))
             || covered_by_x_mana_payment;
         // Casting option lines ("You may pay X rather than pay...", "If you control a
         // commander, you may cast this spell without paying its mana cost", etc.)
@@ -10080,9 +11315,19 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
             // CR 601.2f: ReduceCost / RaiseCost / MinimumCost coverage markers,
             // discriminated by the `mode` axis. Trinisphere's "would cost less than"
             // distinguishes Minimum from Reduce ("less to cast") and Raise ("more").
-            StaticMode::ModifyCost { mode, .. } => match mode {
+            StaticMode::ModifyCost { mode, reach, .. } => match mode {
+                // CR 118.7b/c/d: a reduction line that PRINTS "this effect
+                // reduces only the amount of [colored] mana you pay" is only
+                // covered when the emitted reducer actually carries that reach.
+                // Without this arm a parser that silently drops the rider still
+                // reports the card supported while playing it wrong — which is
+                // exactly how Morophon shipped reducing generic mana (#8432).
                 CostModifyMode::Reduce => {
-                    effective_lower.contains("cost") && effective_lower.contains("less")
+                    effective_lower.contains("cost")
+                        && effective_lower.contains("less")
+                        && (!crate::parser::oracle_cost::line_reduces_colored_mana_only(
+                            &effective_lower,
+                        ) || matches!(reach, CostReductionReach::ColoredManaOnly))
                 }
                 CostModifyMode::Raise => {
                     effective_lower.contains("cost") && effective_lower.contains("more")
@@ -10168,6 +11413,7 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 color,
                 life_cost,
                 mana_reduction,
+                reach,
             } => {
                 let color_word = mana_color_word(*color);
                 let color_symbol = mana_color_symbol(*color);
@@ -10176,7 +11422,16 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 )) && effective_lower.contains(&format!("pay {life_cost} life"));
                 let reduction_line = effective_lower
                     .contains(&format!("those spells cost {color_symbol} less to cast"));
-                (life_line || reduction_line) && mana_cost_is_single_color(mana_reduction, *color)
+                // CR 118.7b/c/d: mirror the `ModifyCost` arm above — a Defiler
+                // line that PRINTS the colored-only rider is only covered when
+                // the emitted reducer carries that reach. Gated on the rider
+                // being present so a split/abbreviated line that never prints it
+                // still passes on the CR 118.7b default.
+                (life_line || reduction_line)
+                    && mana_cost_is_single_color(mana_reduction, *color)
+                    && (!crate::parser::oracle_cost::line_reduces_colored_mana_only(
+                        &effective_lower,
+                    ) || matches!(reach, CostReductionReach::ColoredManaOnly))
             }
             StaticMode::CantBeBlocked => effective_lower.contains("can't be blocked"),
             StaticMode::CantBeBlockedExceptBy { .. } => {
@@ -10993,8 +12248,6 @@ fn line_has_condition_text(lower: &str) -> Option<&'static str> {
             // typically on triggers that the auditor already checks. The ability description
             // uses the keyword name, not a standalone condition. Mark as structural.
             || (lower.starts_with("coven") && lower.contains("if "))
-            // --- Activation/resolution count conditions ---
-            || lower.contains("this ability has been activated")
             // --- Zone-referential conditions (structural, not board-state) ---
             // "if this card is suspended" / "if this card is in your graveyard"
             || lower.contains("is suspended")
@@ -12277,7 +13530,7 @@ mod tests {
         let details = |zone: Option<Zone>| -> Vec<(String, String)> {
             let mut def = AbilityDefinition::new(AbilityKind::Activated, graveyard_self_return());
             def.activation_zone = zone;
-            build_ability_item(&def).details
+            build_test_ability_item(&def).details
         };
 
         // (1) `None` — the CR 113.6 battlefield default. No zone key emitted.
@@ -12391,6 +13644,60 @@ mod tests {
         );
     }
 
+    /// Exact cardinality and counter-removal eligibility are semantic parser
+    /// axes. Defaults deliberately render nothing, preserving existing
+    /// signatures, while non-default selections remain distinguishable.
+    #[test]
+    fn object_selection_cardinality_and_eligibility_reach_parse_details() {
+        let selection = |cardinality, eligibility| Effect::ChooseObjectsIntoTrackedSet {
+            chooser: TargetFilter::Controller,
+            filter: TargetFilter::Typed(TypedFilter::creature()),
+            min: 0,
+            max: None,
+            cardinality,
+            eligibility,
+        };
+        let default = effect_details(&selection(None, None));
+        assert!(
+            !default
+                .iter()
+                .any(|(key, _)| key == "cardinality" || key == "eligibility"),
+            "the legacy selection shape must not gain signature keys"
+        );
+
+        let exact = effect_details(&selection(
+            Some(ObjectSelectionCardinality::Exactly { count: 2 }),
+            None,
+        ));
+        assert!(
+            exact
+                .iter()
+                .any(|(key, value)| key == "cardinality" && value == "exactly 2"),
+            "an exact selection cardinality must be visible to parse coverage: {exact:?}"
+        );
+        assert_ne!(
+            default, exact,
+            "exact and legacy selections must not collapse"
+        );
+
+        let removable = effect_details(&selection(
+            Some(ObjectSelectionCardinality::Exactly { count: 2 }),
+            Some(ObjectSelectionEligibility::RemovableCounter {
+                counter_type: Some(CounterType::Plus1Plus1),
+            }),
+        ));
+        assert!(
+            removable
+                .iter()
+                .any(|(key, value)| { key == "eligibility" && value == "removable P1P1 counter" }),
+            "counter-removal eligibility must be visible to parse coverage: {removable:?}"
+        );
+        assert_ne!(
+            exact, removable,
+            "counter-eligible and unconstrained exact selections must not collapse"
+        );
+    }
+
     /// Matrix row 19 — `parse_details` renders each DECLARED mana role under its
     /// OWN key. Under the old role-blind rendering, Carpet of Flowers (count
     /// source) and Belbe (recipient) produced indistinguishable `target:` keys
@@ -12471,6 +13778,8 @@ mod tests {
 
     use super::*;
     use crate::database::legality::{legalities_to_export_map, LegalityStatus};
+    use crate::database::mtgjson::{AtomicCard, AtomicIdentifiers};
+    use crate::database::synthesis::build_oracle_face;
     use crate::parser::oracle_ir::diagnostic::{CascadeSlot, OracleDiagnostic};
     use crate::types::ability::{
         AbilityCondition, AbilityKind, Comparator, ContinuousModification, ControllerRef,
@@ -12569,6 +13878,46 @@ mod tests {
                 .iter()
                 .any(|k| k == "enters_attacking"),
             "a plain (non-attacking) ChangeZone must not add the row",
+        );
+    }
+
+    /// The parser-owned terminal shuffle changes the library action from
+    /// per-object randomization to one chained shuffle. It must therefore reach
+    /// coverage signatures, while the default remains absent to avoid churn.
+    #[test]
+    fn change_zone_all_signature_exposes_terminal_shuffle() {
+        let details = |library_shuffle| {
+            effect_details(&Effect::ChangeZoneAll {
+                origin: Some(Zone::Graveyard),
+                destination: Zone::Library,
+                target: TargetFilter::Controller,
+                enters_under: None,
+                enter_tapped: EtbTapState::Unspecified,
+                enters_attacking: false,
+                enter_with_counters: vec![],
+                face_down_profile: None,
+                library_position: None,
+                library_shuffle,
+                random_order: false,
+            })
+        };
+
+        let per_object = details(MassLibraryShuffleMode::PerObject);
+        assert!(
+            !per_object.iter().any(|(key, _)| key == "library_shuffle"),
+            "the default mode must not churn legacy coverage signatures"
+        );
+
+        let terminal = details(MassLibraryShuffleMode::TerminalShuffle);
+        assert!(
+            terminal
+                .iter()
+                .any(|(key, value)| { key == "library_shuffle" && value == "TerminalShuffle" }),
+            "the parser-emitted terminal shuffle must be visible to coverage"
+        );
+        assert_ne!(
+            per_object, terminal,
+            "per-object and terminal library shuffles must not collapse in coverage"
         );
     }
 
@@ -12824,7 +14173,7 @@ mod tests {
                 flipper: TargetFilter::Controller,
             },
         );
-        let item = build_ability_item(&def);
+        let item = build_test_ability_item(&def);
         assert!(
             item.children
                 .iter()
@@ -13180,10 +14529,10 @@ mod tests {
         let warnings = vec![OracleDiagnostic::swallowed_clause(
             "APNAP",
             "Repeat the following process for each opponent in turn order.",
+            None,
         )];
-        let mut missing = Vec::new();
-        check_parse_warnings(&warnings, &mut missing);
-        assert_eq!(missing, vec!["Swallow:APNAP"]);
+        let gaps = merge_coverage_gaps(&[], vec![], &warnings);
+        assert_eq!(gaps[0].handler, "Swallow:APNAP");
     }
 
     #[test]
@@ -13192,11 +14541,11 @@ mod tests {
             crate::parser::oracle_ir::diagnostic::OracleDiagnostic::swallowed_clause(
                 "Condition_If",
                 "If foo, draw a card.",
+                None,
             ),
         ];
-        let mut missing = Vec::new();
-        check_parse_warnings(&warnings, &mut missing);
-        assert_eq!(missing, vec!["Swallow:Condition_If"]);
+        let gaps = merge_coverage_gaps(&[], vec![], &warnings);
+        assert_eq!(gaps[0].handler, "Swallow:Condition_If");
     }
 
     #[test]
@@ -13208,9 +14557,8 @@ mod tests {
                 line_index: 0,
             },
         ];
-        let mut missing = Vec::new();
-        check_parse_warnings(&warnings, &mut missing);
-        assert_eq!(missing, vec!["ParseWarning:cascade-loss:Condition"]);
+        let gaps = merge_coverage_gaps(&[], vec![], &warnings);
+        assert_eq!(gaps[0].handler, "ParseWarning:cascade-loss:Condition");
     }
 
     #[test]
@@ -13222,9 +14570,8 @@ mod tests {
                 line_index: 0,
             },
         ];
-        let mut missing = Vec::new();
-        check_parse_warnings(&warnings, &mut missing);
-        assert!(missing.is_empty());
+        let gaps = merge_coverage_gaps(&[], vec![], &warnings);
+        assert!(gaps.is_empty());
     }
 
     /// CR 903.3d: the Lieutenant STATIC's `Unhandled` coverage tag is a
@@ -13232,7 +14579,7 @@ mod tests {
     /// cannot be smuggled in as a rider on an unrelated change.
     ///
     /// The runtime DOES evaluate `StaticCondition::ControlsCommander`
-    /// (`layers::evaluate_static_condition`, layers.rs:1875), so on the
+    /// (the `ControlsCommander` arm of `layers::evaluate_condition_with_context`), so on the
     /// resolver axis alone the tag understates the engine. But the tag is also
     /// the only thing keeping two demonstrably misparsed Lieutenant cards out
     /// of the supported set, so it must stay until those misparses register as
@@ -13411,35 +14758,109 @@ mod tests {
         assert!(missing.is_empty());
     }
 
+    /// The warning pattern prefers the engine's typed phrase, and falls back
+    /// to the sentence excerpt when there is none.
+    ///
+    /// The two halves are given the SAME `oracle_text` and the SAME detector, so `gap` is
+    /// the only variable, and each half is pinned to its own literal. Those two literals
+    /// differ, which is what stops either half from passing on a constant. The `None` half's
+    /// expected string is the excerpt path's output, i.e. exactly what this warning produced
+    /// before this field existed.
+    #[test]
+    fn swallowed_clause_pattern_prefers_the_gap_phrase_and_falls_back_without_one() {
+        const ORACLE: &str = "Whenever Aggressive Detective attacks, if all your commanders \
+have been revealed, Aggressive Detective deals 2 damage to each opponent.";
+        const DESCRIPTION: &str =
+            "Whenever Aggressive Detective attacks, if all your commanders have been revealed";
+
+        let with_gap = OracleDiagnostic::SwallowedClause {
+            detector: "Condition_If".to_string(),
+            description: DESCRIPTION.to_string(),
+            line_index: 0,
+            unit_span: None,
+            items: Vec::new(),
+            gap: Some(ClauseGap::Condition {
+                guard: "all your commanders have been revealed".to_string(),
+            }),
+        };
+        let without_gap = OracleDiagnostic::swallowed_clause("Condition_If", DESCRIPTION, None);
+
+        let preferred = parse_warning_pattern(&with_gap, Some(ORACLE));
+        let fallback = parse_warning_pattern(&without_gap, Some(ORACLE));
+
+        // The phrase the axis authority rejected, normalized, wins the chain head.
+        assert_eq!(
+            preferred,
+            (
+                "swallowed-clause".to_string(),
+                "Condition_If: all your commanders have been revealed".to_string()
+            )
+        );
+
+        // With no gap the excerpt path is untouched: the marker's whole sentence.
+        assert_eq!(
+            fallback,
+            (
+                "swallowed-clause".to_string(),
+                "Condition_If: if all your commanders have been revealed, aggressive detective \
+                 deals N damage to each opponent"
+                    .to_string()
+            )
+        );
+    }
+
+    /// A non-phrase detector's pattern is byte-identical to the value the phase-base
+    /// export records for it. The expected string is taken from that export's warning
+    /// patterns, an artifact, not from this code.
+    #[test]
+    fn non_phrase_detector_pattern_is_unchanged() {
+        const ORACLE: &str =
+            "Needle Drop deals 1 damage to any target that was dealt damage this turn.\nDraw a card.";
+        let warning = OracleDiagnostic::swallowed_clause("Duration_ThisTurn", ORACLE, None);
+
+        assert_eq!(
+            parse_warning_pattern(&warning, Some(ORACLE)),
+            (
+                "swallowed-clause".to_string(),
+                "Duration_ThisTurn: this turn".to_string()
+            )
+        );
+    }
+
     /// A fired `SwallowedClause` diagnostic must demote the card from
     /// "supported" via a `Swallow:{detector}` gap label (issue #2230 / #2243).
     /// The label format is a contract: parser tests in `oracle.rs` grep for
     /// exactly `"Swallow:{detector}"`, so this locks it.
     #[test]
-    fn check_parse_warnings_flags_swallowed_clause() {
+    fn merge_coverage_gaps_flags_swallowed_clause() {
         let warnings = vec![OracleDiagnostic::swallowed_clause(
             "Condition_If",
             "if you control a creature, …",
+            None,
         )];
-        let mut missing = Vec::new();
-        check_parse_warnings(&warnings, &mut missing);
-        assert_eq!(missing, vec!["Swallow:Condition_If".to_string()]);
+        let gaps = merge_coverage_gaps(&[], vec![], &warnings);
+        assert_eq!(gaps[0].handler, "Swallow:Condition_If");
     }
 
     /// Multiple swallowed clauses sharing a detector collapse to one gap label,
     /// matching the dedupe semantics of the existing `ParseWarning:*` arms.
     #[test]
-    fn check_parse_warnings_dedupes_same_detector() {
+    fn merge_coverage_gaps_dedupes_same_detector() {
         let warnings = vec![
             OracleDiagnostic::swallowed_clause(
                 "DynamicQty",
                 "equal to the number of charge counters",
+                None,
             ),
-            OracleDiagnostic::swallowed_clause("DynamicQty", "equal to that card's mana value"),
+            OracleDiagnostic::swallowed_clause(
+                "DynamicQty",
+                "equal to that card's mana value",
+                None,
+            ),
         ];
-        let mut missing = Vec::new();
-        check_parse_warnings(&warnings, &mut missing);
-        assert_eq!(missing, vec!["Swallow:DynamicQty".to_string()]);
+        let gaps = merge_coverage_gaps(&[], vec![], &warnings);
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].handler, "Swallow:DynamicQty");
     }
 
     /// CR 608.2d: A swallowed `Optional_YouMay` clause must demote the card
@@ -13447,28 +14868,27 @@ mod tests {
     /// the regression contract for issue #2277 — dropped `you may` optional
     /// sub-effects must not be counted as supported.
     #[test]
-    fn check_parse_warnings_flags_optional_you_may() {
+    fn merge_coverage_gaps_flags_optional_you_may() {
         let warnings = vec![OracleDiagnostic::swallowed_clause(
             "Optional_YouMay",
             "you may reveal that card and put it into your hand",
+            None,
         )];
-        let mut missing = Vec::new();
-        check_parse_warnings(&warnings, &mut missing);
-        assert_eq!(missing, vec!["Swallow:Optional_YouMay".to_string()]);
+        let gaps = merge_coverage_gaps(&[], vec![], &warnings);
+        assert_eq!(gaps[0].handler, "Swallow:Optional_YouMay");
     }
 
     /// `CascadeLoss` means a cascade slot was parsed but did not land on the
     /// final ability definition, so it must demote coverage.
     #[test]
-    fn check_parse_warnings_flags_cascade_loss() {
+    fn merge_coverage_gaps_flags_cascade_loss() {
         let warnings = vec![OracleDiagnostic::CascadeLoss {
             slot: CascadeSlot::Condition,
             effect_name: "DrawCards".into(),
             line_index: 0,
         }];
-        let mut missing = Vec::new();
-        check_parse_warnings(&warnings, &mut missing);
-        assert_eq!(missing, vec!["ParseWarning:cascade-loss:Condition"]);
+        let gaps = merge_coverage_gaps(&[], vec![], &warnings);
+        assert_eq!(gaps[0].handler, "ParseWarning:cascade-loss:Condition");
     }
 
     #[test]
@@ -13590,6 +15010,1329 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             card_face_gaps(&face).is_empty(),
             "Drain Life's bounded prior-damage gain must be a handled coverage feature, got {:?}",
             card_face_gaps(&face)
+        );
+    }
+    #[test]
+    fn extra_turn_coverage_distinguishes_default_one_from_fixed_two() {
+        fn parsed_card(name: &str, oracle: &str) -> CardCoverageResult {
+            let parsed =
+                crate::parser::parse_oracle_text(oracle, name, &[], &["Sorcery".to_string()], &[]);
+            let mut face = make_face();
+            face.name = name.to_string();
+            face.oracle_text = Some(oracle.to_string());
+            face.abilities = parsed.abilities;
+            coverage_result_for_face(face)
+        }
+
+        let warp = parsed_card(
+            "Time Warp",
+            "Target player takes an extra turn after this one.",
+        );
+        let stretch = parsed_card(
+            "Time Stretch",
+            "Target player takes two extra turns after this one.",
+        );
+        let warp_effect = warp
+            .parse_details
+            .iter()
+            .find(|item| item.label == "ExtraTurn")
+            .expect("Time Warp coverage contains ExtraTurn");
+        let stretch_effect = stretch
+            .parse_details
+            .iter()
+            .find(|item| item.label == "ExtraTurn")
+            .expect("Time Stretch coverage contains ExtraTurn");
+        assert!(!warp_effect.details.iter().any(|(key, _)| key == "count"));
+        assert!(stretch_effect
+            .details
+            .iter()
+            .any(|(key, value)| key == "count" && value == "2"));
+        assert_ne!(warp_effect.details, stretch_effect.details);
+    }
+
+    fn build_test_ability_item(def: &AbilityDefinition) -> ParsedItem {
+        let trigger_registry = build_trigger_registry();
+        let static_registry = build_static_registry();
+        build_ability_item(
+            def,
+            &trigger_registry,
+            &static_registry,
+            TokenStaticTraversal::Include,
+        )
+    }
+
+    fn test_ability_is_supported(def: &AbilityDefinition) -> bool {
+        let trigger_registry = build_trigger_registry();
+        let static_registry = build_static_registry();
+        is_ability_supported(
+            def,
+            &trigger_registry,
+            &static_registry,
+            TokenStaticTraversal::Include,
+        )
+    }
+
+    fn collect_test_ability_missing_parts(def: &AbilityDefinition, missing: &mut Vec<String>) {
+        let trigger_registry = build_trigger_registry();
+        let static_registry = build_static_registry();
+        collect_ability_missing_parts(
+            def,
+            &trigger_registry,
+            &static_registry,
+            TokenStaticTraversal::Include,
+            missing,
+        );
+    }
+
+    fn token_ability_with_static(static_ability: StaticDefinition) -> AbilityDefinition {
+        AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Token {
+                name: "Coverage Token".to_string(),
+                power: PtValue::Fixed(1),
+                toughness: PtValue::Fixed(1),
+                types: vec!["Creature".to_string()],
+                colors: vec![],
+                keywords: vec![],
+                tapped: false,
+                count: QuantityExpr::Fixed { value: 1 },
+                owner: TargetFilter::Controller,
+                attach_to: None,
+                enters_attacking: false,
+                supertypes: vec![],
+                static_abilities: vec![static_ability],
+                enter_with_counters: vec![],
+            },
+        )
+    }
+
+    fn token_trigger_with_static(static_ability: StaticDefinition) -> TriggerDefinition {
+        TriggerDefinition::new(TriggerMode::ChangesZone)
+            .execute(token_ability_with_static(static_ability))
+            .description("When this creature enters".to_string())
+    }
+
+    fn coverage_result_for_face(face: CardFace) -> CardCoverageResult {
+        let card_name = face.name.clone();
+        let mut export = serde_json::Map::new();
+        export.insert(
+            card_name.to_lowercase(),
+            serde_json::to_value(face).expect("test face should serialize"),
+        );
+        let db = CardDatabase::from_json_str(&serde_json::Value::Object(export).to_string())
+            .expect("test export should deserialize");
+        analyze_coverage(&db)
+            .cards
+            .into_iter()
+            .find(|card| card.card_name == card_name)
+            .expect("coverage should include test card")
+    }
+
+    /// Build an `AtomicCard` for a FIN Tiered spell with its real MTGJSON
+    /// keyword array, so the tests exercise the production MTGJSON→face path.
+    fn tiered_atomic_card(name: &str, oracle: &str, keywords: &[&str]) -> AtomicCard {
+        AtomicCard {
+            name: name.to_string(),
+            mana_cost: Some("{1}{R}".to_string()),
+            colors: vec!["R".to_string()],
+            color_identity: vec!["R".to_string()],
+            power: None,
+            toughness: None,
+            loyalty: None,
+            defense: None,
+            text: Some(oracle.to_string()),
+            layout: "normal".to_string(),
+            type_line: Some("Instant".to_string()),
+            types: vec!["Instant".to_string()],
+            subtypes: vec![],
+            supertypes: vec![],
+            keywords: if keywords.is_empty() {
+                None
+            } else {
+                Some(keywords.iter().map(|k| (*k).to_string()).collect())
+            },
+            side: None,
+            face_name: None,
+            mana_value: 2.0,
+            legalities: Default::default(),
+            leadership_skills: None,
+            printings: Vec::new(),
+            rulings: Vec::new(),
+            is_game_changer: false,
+            identifiers: AtomicIdentifiers {
+                scryfall_oracle_id: Some(format!("{}-oracle", name.to_lowercase())),
+                scryfall_id: Some(format!("{}-face", name.to_lowercase())),
+            },
+            foreign_data: Vec::new(),
+            related_cards: crate::database::mtgjson::SetRelatedCards::default(),
+        }
+    }
+
+    const FIRE_MAGIC_ORACLE: &str = "Tiered (Choose one additional cost.)\n\
+        \u{2022} Fire \u{2014} {0} \u{2014} Fire Magic deals 1 damage to each creature.\n\
+        \u{2022} Fira \u{2014} {2} \u{2014} Fire Magic deals 2 damage to each creature.\n\
+        \u{2022} Firaga \u{2014} {5} \u{2014} Fire Magic deals 3 damage to each creature.";
+
+    /// CR 702.183a: the `Tiered` header line is a printed line the parser
+    /// represents as the typed `Keyword::Tiered` parse item (the MTGJSON keyword
+    /// array is the only source for it), which is exactly what closes the
+    /// cardinality gap that made the whole modal block a `SilentDrop` before the
+    /// variant landed. Faces are built through the production MTGJSON→face path
+    /// and reloaded through the serde-backed coverage harness.
+    ///
+    /// Vincent's Limit Break keeps its separate, deferred swallow seam:
+    /// `Swallow:Duration_UntilEndOfTurn` is its only residual gap. Update the
+    /// Vincent expectation when that duration-attribution seam is fixed.
+    #[test]
+    fn tiered_modal_blocks_are_not_silent_drops() {
+        // (name, verbatim Oracle text, real MTGJSON keywords, fully supported?)
+        let cases: &[(&str, &str, &[&str], bool)] = &[
+            (
+                "Fire Magic",
+                FIRE_MAGIC_ORACLE,
+                &["Fira", "Firaga", "Fire", "Tiered"],
+                true,
+            ),
+            (
+                "Ice Magic",
+                "Tiered (Choose one additional cost.)\n\
+                 \u{2022} Blizzard \u{2014} {0} \u{2014} Return target creature to its owner's hand.\n\
+                 \u{2022} Blizzara \u{2014} {2} \u{2014} Target creature's owner puts it on their choice of the top or bottom of their library.\n\
+                 \u{2022} Blizzaga \u{2014} {5}{U} \u{2014} Target creature's owner shuffles it into their library.",
+                &["Blizzaga", "Blizzara", "Blizzard", "Tiered"],
+                true,
+            ),
+            (
+                "Thunder Magic",
+                "Tiered (Choose one additional cost.)\n\
+                 \u{2022} Thunder \u{2014} {0} \u{2014} Thunder Magic deals 2 damage to target creature.\n\
+                 \u{2022} Thundara \u{2014} {3} \u{2014} Thunder Magic deals 4 damage to target creature.\n\
+                 \u{2022} Thundaga \u{2014} {5}{R} \u{2014} Thunder Magic deals 8 damage to target creature.",
+                &["Thundaga", "Thundara", "Thunder", "Tiered"],
+                true,
+            ),
+            (
+                "Cloud's Limit Break",
+                "Tiered (Choose one additional cost.)\n\
+                 \u{2022} Cross-Slash \u{2014} {0} \u{2014} Destroy target tapped creature.\n\
+                 \u{2022} Blade Beam \u{2014} {1} \u{2014} Destroy any number of target tapped creatures with different controllers.\n\
+                 \u{2022} Omnislash \u{2014} {3}{W} \u{2014} Destroy all tapped creatures.",
+                &["Blade Beam", "Cross-Slash", "Omnislash", "Tiered"],
+                true,
+            ),
+            (
+                "Tifa's Limit Break",
+                "Tiered (Choose one additional cost.)\n\
+                 \u{2022} Somersault \u{2014} {0} \u{2014} Target creature gets +2/+2 until end of turn.\n\
+                 \u{2022} Meteor Strikes \u{2014} {2} \u{2014} Double target creature's power and toughness until end of turn.\n\
+                 \u{2022} Final Heaven \u{2014} {6}{G} \u{2014} Triple target creature's power and toughness until end of turn.",
+                &[
+                    "Double",
+                    "Final Heaven",
+                    "Meteor Strikes",
+                    "Somersault",
+                    "Tiered",
+                    "Triple",
+                ],
+                true,
+            ),
+            (
+                "Restoration Magic",
+                "Tiered (Choose one additional cost.)\n\
+                 \u{2022} Cure \u{2014} {0} \u{2014} Target permanent gains hexproof and indestructible until end of turn.\n\
+                 \u{2022} Cura \u{2014} {1} \u{2014} Target permanent gains hexproof and indestructible until end of turn. You gain 3 life.\n\
+                 \u{2022} Curaga \u{2014} {3}{W} \u{2014} Permanents you control gain hexproof and indestructible until end of turn. You gain 6 life.",
+                &["Cura", "Curaga", "Cure", "Tiered"],
+                true,
+            ),
+            (
+                "Vincent's Limit Break",
+                "Tiered (Choose one additional cost.)\n\
+                 Until end of turn, target creature you control gains \"When this creature dies, return it to the battlefield tapped under its owner's control\" and has the chosen base power and toughness.\n\
+                 \u{2022} Galian Beast \u{2014} {0} \u{2014} 3/2.\n\
+                 \u{2022} Death Gigas \u{2014} {1} \u{2014} 5/2.\n\
+                 \u{2022} Hellmasker \u{2014} {3} \u{2014} 7/2.",
+                &["Death Gigas", "Galian Beast", "Hellmasker", "Tiered"],
+                false,
+            ),
+        ];
+
+        for (name, oracle, keywords, fully_supported) in cases {
+            let face = build_oracle_face(&tiered_atomic_card(name, oracle, keywords), None);
+            let mode_count = face
+                .modal
+                .as_ref()
+                .unwrap_or_else(|| panic!("{name} must parse as a Tiered modal"))
+                .mode_count;
+            let card = coverage_result_for_face(face);
+
+            assert!(
+                !card
+                    .gap_details
+                    .iter()
+                    .any(|gap| gap.handler.starts_with("SilentDrop")),
+                "{name} must not report a SilentDrop: {:?}",
+                card.gap_details
+            );
+
+            if *fully_supported {
+                assert!(
+                    card.gap_details.is_empty(),
+                    "{name} must be fully covered: {:?}",
+                    card.gap_details
+                );
+                assert!(card.supported, "{name} must be supported");
+            } else {
+                let handlers: Vec<&str> = card
+                    .gap_details
+                    .iter()
+                    .map(|gap| gap.handler.as_str())
+                    .collect();
+                assert_eq!(
+                    handlers,
+                    vec!["Swallow:Duration_UntilEndOfTurn"],
+                    "Vincent's only residual gap is the deferred duration-attribution \
+                     swallow seam; update this expectation when that seam is fixed"
+                );
+                assert!(!card.supported, "Vincent must remain unsupported");
+            }
+
+            // Positive reach-guard (non-vacuity): the Tiered header is
+            // represented by exactly one Keyword parse item, so the top-level
+            // parse-item count is one keyword plus one item per mode.
+            if *name == "Fire Magic" {
+                let tiered_items: Vec<&ParsedItem> = card
+                    .parse_details
+                    .iter()
+                    .filter(|item| {
+                        item.category == ParseCategory::Keyword && item.label == "Tiered"
+                    })
+                    .collect();
+                assert_eq!(
+                    tiered_items.len(),
+                    1,
+                    "exactly one typed Tiered keyword item: {:?}",
+                    card.parse_details
+                );
+                assert!(tiered_items[0].supported);
+                assert_eq!(
+                    card.parse_details.len(),
+                    1 + mode_count,
+                    "one Tiered keyword item plus one parse root per mode"
+                );
+            }
+        }
+    }
+
+    /// Paired negative: the same Fire Magic face built with **no** MTGJSON
+    /// keyword array still trips the silent-drop guard with the exact
+    /// pre-fix label. Proves the fix is the typed keyword item and that the
+    /// guard still bites when it is absent.
+    #[test]
+    fn tiered_block_without_mtgjson_keyword_still_reports_silent_drop() {
+        let face = build_oracle_face(
+            &tiered_atomic_card("Fire Magic", FIRE_MAGIC_ORACLE, &[]),
+            None,
+        );
+        let card = coverage_result_for_face(face);
+
+        assert!(
+            !card.supported,
+            "without the Tiered keyword item the card remains unsupported"
+        );
+        assert!(
+            card.gap_details
+                .iter()
+                .any(|gap| gap.handler == "SilentDrop:3_of_4"),
+            "expected SilentDrop:3_of_4, got {:?}",
+            card.gap_details
+        );
+    }
+
+    #[test]
+    fn token_static_is_projected_and_preserves_full_coverage() {
+        let mut face = make_face();
+        face.name = "Supported Token Static".to_string();
+        face.abilities.push(token_ability_with_static(
+            StaticDefinition::new(StaticMode::MustAttack)
+                .affected(TargetFilter::SelfRef)
+                .description("This token attacks each combat if able.".to_string()),
+        ));
+
+        let token = build_parse_details_for_face(&face)
+            .into_iter()
+            .find(|item| item.category == ParseCategory::Ability && item.label == "Token")
+            .expect("token ability should be projected");
+        let must_attack = token
+            .children
+            .iter()
+            .find(|item| item.category == ParseCategory::Static && item.label == "MustAttack")
+            .expect("token static should be a nested parse item");
+        assert!(must_attack.supported);
+        assert!(
+            must_attack
+                .details
+                .iter()
+                .any(|(key, value)| key == "affects" && value == "self"),
+            "the token static's SelfRef scope must be visible in coverage details: {must_attack:?}"
+        );
+        assert!(
+            card_face_gaps(&face).is_empty(),
+            "a supported token static must not create a coverage gap"
+        );
+
+        let card = coverage_result_for_face(face);
+        assert!(card.supported);
+        assert!(card.gap_details.is_empty());
+    }
+
+    #[test]
+    fn token_static_child_does_not_mask_a_separate_silent_drop() {
+        let mut face = make_face();
+        face.abilities.push(token_ability_with_static(
+            StaticDefinition::new(StaticMode::MustAttack)
+                .affected(TargetFilter::SelfRef)
+                .description("This token attacks each combat if able.".to_string()),
+        ));
+
+        let parse_details = build_parse_details_for_face(&face);
+        assert_eq!(
+            count_effective_parsed_items(&parse_details),
+            1,
+            "a token's nested static is detail for its creation line, not a second line"
+        );
+
+        let mut missing = Vec::new();
+        check_silent_drops(
+            &Some(
+                "Create a 1/1 creature token that attacks each combat if able.\n\
+                 This line was silently dropped."
+                    .to_string(),
+            ),
+            "Test Card",
+            &parse_details,
+            &mut missing,
+        );
+        assert_eq!(missing, vec!["SilentDrop:1_of_2"]);
+    }
+
+    /// Regression (#8564): a `sub_ability` chain is ONE parse root that covers
+    /// TWO printed lines — Opt ("Scry 1." + "Draw a card."), Bladebrand, Tragic
+    /// Slip, Evasive Maneuvers. Counting roots against printed lines flagged all
+    /// of them as silent drops and flipped them to unsupported, even though the
+    /// root's `source_text` demonstrably spans both lines.
+    #[test]
+    fn chained_sub_ability_spanning_two_printed_lines_is_not_a_silent_drop() {
+        const ORACLE: &str = "Scry 1.\nDraw a card.";
+
+        let mut face = make_face();
+        face.abilities.push(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Scry {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            )
+            .description(ORACLE.to_string())
+            .sub_ability(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            )),
+        );
+
+        let parse_details = build_parse_details_for_face(&face);
+        // The cardinality ceiling alone still suspects this card: one root
+        // against two printed lines. Only the text evidence clears it.
+        assert_eq!(count_effective_parsed_items(&parse_details), 1);
+        assert_eq!(effective_oracle_lines(ORACLE).len(), 2);
+
+        let mut missing = Vec::new();
+        check_silent_drops(
+            &Some(ORACLE.to_string()),
+            "Test Card",
+            &parse_details,
+            &mut missing,
+        );
+        assert!(
+            missing.is_empty(),
+            "a chained ability whose source_text spans both printed lines is not a drop: {missing:?}"
+        );
+    }
+
+    /// CR 706.2: a roll's outcome rows are the resolution table of the line above
+    /// them, and the parser emits every row as a child of that one ability — so
+    /// they must fold into their header the way modal bullets fold into a
+    /// `choose` header. Without the fold a fully parsed roll counts N+1 printed
+    /// lines against 1 parse root and reads as a silent drop (measured: 21 such
+    /// cards, e.g. Arcane Investigator, Component Pouch, Herald of Hadar).
+    #[test]
+    fn outcome_rows_fold_into_their_header() {
+        const HEADER: &str = "Search the Room \u{2014} {5}{U}: Roll a d20.";
+        let oracle = format!(
+            "{HEADER}\n             1\u{2014}9 | Draw a card.\n             10\u{2014}20 | Draw two cards."
+        );
+
+        assert_eq!(
+            effective_oracle_lines(&oracle).len(),
+            1,
+            "three printed lines, but the two outcome rows belong to the roll above them"
+        );
+
+        // A level band ("2+ | ...") folds by the same rule.
+        let levels = format!("{HEADER}\n2+ | Draw a card.\n8+ | Draw two cards.");
+        assert_eq!(effective_oracle_lines(&levels).len(), 1);
+
+        // ...and a fully parsed roll is therefore not flagged.
+        let mut face = make_face();
+        face.abilities.push(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            )
+            .description(HEADER.to_string()),
+        );
+        let parse_details = build_parse_details_for_face(&face);
+        let mut missing = Vec::new();
+        check_silent_drops(&Some(oracle), "Test Card", &parse_details, &mut missing);
+        assert!(
+            missing.is_empty(),
+            "outcome rows are covered by the ability their header produced: {missing:?}"
+        );
+    }
+
+    /// The fold must not swallow a row that OPENS a card: it has no header to
+    /// belong to, so it is a printed line in its own right. Without the
+    /// `!effective.is_empty()` guard this card would count ZERO effective lines
+    /// and every card shaped like it would be silently unfalsifiable.
+    #[test]
+    fn a_leading_outcome_row_still_counts_as_its_own_line() {
+        assert_eq!(
+            effective_oracle_lines("1\u{2014}9 | Draw a card.").len(),
+            1,
+            "a row with no preceding header is its own line, not a fold target"
+        );
+    }
+
+    /// A nested `source_text`-less node must NOT absorb the offset owed to a
+    /// by-design anonymous top-level item. Here the keyword line ("Flash") is
+    /// anonymous by design, the ability's undescribed `sub_ability` link is
+    /// anonymous incidentally, and the third printed line is a genuine drop.
+    /// Counting anonymity recursively made `anonymous` 2 against `uncovered` 2
+    /// and silently cleared the card; scoping the offset to top-level items —
+    /// the same granularity as the cardinality ceiling — keeps the drop visible.
+    #[test]
+    fn a_nested_anonymous_node_does_not_absorb_a_genuine_drop() {
+        const COVERED: &str = "Target creature gets +2/+2 until end of turn.";
+        let oracle = format!("Flash\n{COVERED}\nThis line was silently dropped.");
+
+        let mut face = make_face();
+        face.keywords.push(Keyword::Flash);
+        face.abilities.push(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Pump {
+                    power: PtValue::Fixed(2),
+                    toughness: PtValue::Fixed(2),
+                    target: TargetFilter::Any,
+                },
+            )
+            .description(COVERED.to_string())
+            // Undescribed link: incidentally anonymous, and detail for the line
+            // its parent already covers.
+            .sub_ability(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 1 },
+                    target: TargetFilter::Controller,
+                },
+            )),
+        );
+
+        let parse_details = build_parse_details_for_face(&face);
+        assert_eq!(
+            count_anonymous_parse_items(&parse_details),
+            1,
+            "only the by-design keyword item is anonymous at top level"
+        );
+
+        let mut missing = Vec::new();
+        check_silent_drops(&Some(oracle), "Test Card", &parse_details, &mut missing);
+        assert_eq!(missing, vec!["SilentDrop:2_of_3"]);
+    }
+
+    /// CR 601.3: casting restrictions are projected into the parse tree as
+    /// typed metadata, so a fully parsed restriction must cover its printed
+    /// line rather than hiding it from the silent-drop denominator.
+    #[test]
+    fn casting_restriction_line_is_not_a_silent_drop() {
+        const ORACLE: &str =
+            "Flash\nTragic Backstory — Cast this spell only if a creature died this turn.";
+
+        assert_eq!(effective_oracle_lines(ORACLE).len(), 2);
+        let parsed = crate::parser::parse_oracle_text(
+            ORACLE,
+            "Grim Wanderer",
+            &[],
+            &["Creature".to_string()],
+            &[],
+        );
+        assert_eq!(parsed.casting_restrictions.len(), 1);
+
+        let mut face = make_face();
+        face.keywords.push(Keyword::Flash);
+        face.oracle_text = Some(ORACLE.to_string());
+        face.casting_restrictions = parsed.casting_restrictions;
+        let parse_details = build_parse_details_for_face(&face);
+        let mut missing = Vec::new();
+        check_silent_drops(
+            &Some(ORACLE.to_string()),
+            "Grim Wanderer",
+            &parse_details,
+            &mut missing,
+        );
+        assert!(
+            missing.is_empty(),
+            "a fully modeled casting restriction is not a drop: {missing:?}"
+        );
+    }
+
+    /// CR 601.2b / CR 601.2h: "Spend only [colors] mana on X" is consumed into
+    /// `casting_restrictions`, so its line must not be classified as a silent drop.
+    #[test]
+    fn spend_only_on_x_casting_restriction_line_is_not_a_silent_drop() {
+        use crate::types::ability::CastingRestriction;
+        use crate::types::mana::ManaColor;
+
+        for (name, types, oracle, expected_restrictions, expected_unsupported_substring) in [
+            (
+                "Consume Spirit",
+                vec!["Sorcery".to_string()],
+                "Spend only black mana on X.\nConsume Spirit deals X damage to any target and you gain X life.",
+                vec![CastingRestriction::SpendOnlyOnX {
+                    colors: vec![ManaColor::Black],
+                }],
+                None,
+            ),
+            (
+                "Drain Life",
+                vec!["Sorcery".to_string()],
+                "Spend only black mana on X.\nDrain Life deals X damage to any target. You gain life equal to the damage dealt, but not more life than the player's life total before the damage was dealt, the planeswalker's loyalty before the damage was dealt, or the creature's toughness.",
+                vec![CastingRestriction::SpendOnlyOnX {
+                    colors: vec![ManaColor::Black],
+                }],
+                None,
+            ),
+            (
+                "Soul Burn",
+                vec!["Sorcery".to_string()],
+                "Spend only black and/or red mana on X.\nSoul Burn deals X damage to any target. You gain life equal to the damage dealt, but not more than the amount of {B} spent on X, the player\u{2019}s life total before the damage was dealt, the planeswalker\u{2019}s loyalty before the damage was dealt, or the creature\u{2019}s toughness.",
+                vec![CastingRestriction::SpendOnlyOnX {
+                    colors: vec![ManaColor::Black, ManaColor::Red],
+                }],
+                None,
+            ),
+            (
+                "Emblazoned Golem",
+                vec!["Artifact".to_string(), "Creature".to_string()],
+                "Kicker {X}\nSpend only colored mana on X. No more than one mana of each color may be spent this way.\nIf this creature was kicked, it enters with X +1/+1 counters on it.",
+                vec![CastingRestriction::SpendOnlyOnX {
+                    colors: vec![
+                        ManaColor::White,
+                        ManaColor::Blue,
+                        ManaColor::Black,
+                        ManaColor::Red,
+                        ManaColor::Green,
+                    ],
+                }],
+                Some("No more than one mana of each color"),
+            ),
+        ] {
+            let parsed = crate::parser::parse_oracle_text(oracle, name, &[], &types, &[]);
+            assert_eq!(
+                parsed.casting_restrictions, expected_restrictions,
+                "{name}: parsed casting restrictions must match exact typed AST"
+            );
+
+            let mut face = make_face();
+            face.name = name.to_string();
+            face.oracle_text = Some(oracle.to_string());
+            face.keywords = parsed.extracted_keywords;
+            face.abilities = parsed.abilities;
+            face.triggers = parsed.triggers;
+            face.static_abilities = parsed.statics;
+            face.replacements = parsed.replacements;
+            face.modal = parsed.modal;
+            face.additional_cost = parsed.additional_cost;
+            face.strive_cost = parsed.strive_cost;
+            face.casting_restrictions = parsed.casting_restrictions;
+            face.casting_options = parsed.casting_options;
+            face.solve_condition = parsed.solve_condition;
+            face.parse_warnings = parsed.parse_warnings;
+
+            let parse_details = build_parse_details_for_face(&face);
+            let mut missing = Vec::new();
+            check_silent_drops(
+                &Some(oracle.to_string()),
+                name,
+                &parse_details,
+                &mut missing,
+            );
+            assert!(
+                !missing.iter().any(|gap| gap.starts_with("SilentDrop:")),
+                "{name}: spend-only-on-X casting restriction line must not be classified as a silent drop, got {missing:?}"
+            );
+
+            if let Some(substring) = expected_unsupported_substring {
+                let has_unsupported_ability = face.abilities.iter().any(|a| {
+                    matches!(&*a.effect, crate::types::ability::Effect::Unimplemented { name, description }
+                        if name.contains(substring) || description.as_deref().is_some_and(|d| d.contains(substring)))
+                });
+                let has_unsupported_item = parse_details.iter().any(|item| {
+                    !item.supported
+                        && (item.source_text.as_deref().is_some_and(|t| t.contains(substring))
+                            || item.details.iter().any(|(_, v)| v.contains(substring)))
+                });
+                assert!(
+                    has_unsupported_ability || has_unsupported_item,
+                    "{name}: expected explicit unsupported remainder mentioning {substring:?}, got abilities={:?}, parse_details={:?}",
+                    face.abilities,
+                    parse_details
+                );
+            }
+        }
+    }
+
+    /// The exclusion above must not become a blanket amnesty for anything that
+    /// merely looks like a cost preamble. `parse_casting_restriction_line`
+    /// returns `None` for an unrecognized cost, so Pie-Eating Contest's "gobble
+    /// X" keeps its honest gap.
+    #[test]
+    fn unrecognized_additional_cost_line_is_still_a_silent_drop() {
+        const ORACLE: &str = "As an additional cost to cast this spell, gobble X.\n\
+             X target creatures you control each get +2/+2 until end of turn.";
+
+        let mut face = make_face();
+        face.abilities.push(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Pump {
+                    power: PtValue::Fixed(2),
+                    toughness: PtValue::Fixed(2),
+                    target: TargetFilter::Any,
+                },
+            )
+            .description(
+                "X target creatures you control each get +2/+2 until end of turn.".to_string(),
+            ),
+        );
+
+        let parse_details = build_parse_details_for_face(&face);
+        let mut missing = Vec::new();
+        check_silent_drops(
+            &Some(ORACLE.to_string()),
+            "Pie-Eating Contest",
+            &parse_details,
+            &mut missing,
+        );
+        assert_eq!(missing, vec!["SilentDrop:1_of_2"]);
+    }
+
+    /// Unrecognized spend-only lines (like "Spend only mana produced by basic lands to cast this spell")
+    /// must not be swallowed by a generic "spend only " prefix check when SpendOnlyOnX does not match.
+    ///
+    /// Tests both the `check_silent_drops` pipeline guard and the discriminating `audit_card_lines`
+    /// coverage authority at `crates/engine/src/game/coverage.rs:11058-11073` for supported and
+    /// unrecognized spend-only lines.
+    #[test]
+    fn unrecognized_spend_only_line_is_still_a_silent_drop() {
+        use crate::types::ability::{
+            AbilityDefinition, AbilityKind, CastingRestriction, Effect, QuantityExpr, TargetFilter,
+        };
+        use crate::types::mana::ManaColor;
+
+        const UNRECOGNIZED_ORACLE: &str =
+            "Spend only mana produced by basic lands to cast this spell.\nDraw two cards.";
+
+        let mut unrecognized_face = make_face();
+        // Give face SpendOnlyOnX to prove that having a SpendOnlyOnX restriction does NOT
+        // grant blanket immunity to an unrecognized "Spend only" line.
+        unrecognized_face
+            .casting_restrictions
+            .push(CastingRestriction::SpendOnlyOnX {
+                colors: vec![ManaColor::Black],
+            });
+        unrecognized_face.abilities.push(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 2 },
+                    target: TargetFilter::Controller,
+                },
+            )
+            .description("Draw two cards.".to_string()),
+        );
+
+        // 1. Retain the existing check_silent_drops unrecognized-line guard
+        let parse_details = build_parse_details_for_face(&unrecognized_face);
+        let mut missing = Vec::new();
+        check_silent_drops(
+            &Some(UNRECOGNIZED_ORACLE.to_string()),
+            "Basic Spell",
+            &parse_details,
+            &mut missing,
+        );
+        assert_eq!(missing, vec!["SilentDrop:1_of_2"]);
+
+        // 2. Discriminating audit_card_lines assertion for the unrecognized line:
+        // Because extract_spend_only_on_x_prefix returns None for this unrecognized line,
+        // audit_card_lines must NOT treat it as covered_by_casting, and must emit SilentDrop.
+        // If audit_card_lines reverted to `lower.starts_with("spend only ")`, this assertion would fail.
+        let unrecognized_findings = audit_card_lines(UNRECOGNIZED_ORACLE, &unrecognized_face);
+        assert!(
+            unrecognized_findings.iter().any(|f| matches!(
+                f,
+                SemanticFinding::SilentDrop { oracle_line }
+                    if oracle_line == "Spend only mana produced by basic lands to cast this spell."
+            )),
+            "Unrecognized spend-only line must be emitted as SilentDrop by audit_card_lines: {unrecognized_findings:?}"
+        );
+
+        // 3. Discriminating audit_card_lines assertion for a supported SpendOnlyOnX line:
+        // A valid "Spend only [colors] mana on X" line with SpendOnlyOnX present on face
+        // must be recognized as covered_by_casting and not emitted as SilentDrop.
+        const SUPPORTED_ORACLE: &str = "Spend only black mana on X.\nDraw two cards.";
+        let mut supported_face = make_face();
+        supported_face
+            .casting_restrictions
+            .push(CastingRestriction::SpendOnlyOnX {
+                colors: vec![ManaColor::Black],
+            });
+        supported_face.abilities.push(
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Draw {
+                    count: QuantityExpr::Fixed { value: 2 },
+                    target: TargetFilter::Controller,
+                },
+            )
+            .description("Draw two cards.".to_string()),
+        );
+
+        let supported_findings = audit_card_lines(SUPPORTED_ORACLE, &supported_face);
+        assert!(
+            !supported_findings.iter().any(|f| matches!(
+                f,
+                SemanticFinding::SilentDrop { oracle_line }
+                    if oracle_line == "Spend only black mana on X."
+            )),
+            "Supported SpendOnlyOnX line must not be emitted as SilentDrop by audit_card_lines: {supported_findings:?}"
+        );
+        assert!(
+            supported_findings.is_empty(),
+            "Supported SpendOnlyOnX card should have no semantic findings: {supported_findings:?}"
+        );
+    }
+
+    #[test]
+    fn serialized_sentry_coverage_keeps_the_void_must_attack_static() {
+        // The real Oracle parse and CardDatabase serialization exceed libtest's
+        // default stack in debug builds. Give this integration-shaped coverage
+        // regression a bounded explicit stack rather than relying on the test
+        // runner's process-wide RUST_MIN_STACK setting.
+        std::thread::Builder::new()
+            .name("sentry-coverage".into())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                const NAME: &str = "The Sentry, Golden Guardian";
+                const ORACLE: &str = "Flying, vigilance, indestructible\nWhen The Sentry enters, target opponent creates The Void, a legendary 5/5 black Horror Villain creature token with flying, indestructible, and \"The Void attacks each combat if able.\"";
+
+        // This is the current AtomicCards Oracle record, parsed and then
+        // serialized through CardDatabase just as coverage-report consumes it.
+        // Keeping the real record here guards the otherwise easy-to-miss gap
+        // between a correct token AST and an incomplete coverage projection.
+        let parsed = crate::parser::parse_oracle_text(
+            ORACLE,
+            NAME,
+            &[],
+            &["Creature".to_string()],
+            &["Angel".to_string()],
+        );
+        let mut face = make_face();
+        face.name = NAME.to_string();
+        face.oracle_text = Some(ORACLE.to_string());
+        face.keywords = parsed.extracted_keywords;
+        face.abilities = parsed.abilities;
+        face.triggers = parsed.triggers;
+        face.static_abilities = parsed.statics;
+        face.replacements = parsed.replacements;
+        face.modal = parsed.modal;
+        face.additional_cost = parsed.additional_cost;
+        face.strive_cost = parsed.strive_cost;
+        face.casting_restrictions = parsed.casting_restrictions;
+        face.casting_options = parsed.casting_options;
+        face.solve_condition = parsed.solve_condition;
+        face.parse_warnings = parsed.parse_warnings;
+
+        let card = coverage_result_for_face(face);
+        let trigger = card
+            .parse_details
+            .iter()
+            .find(|item| item.category == ParseCategory::Trigger)
+            .expect("The Sentry's ETB trigger should be visible to coverage");
+        let token = trigger
+            .children
+            .iter()
+            .find(|item| item.category == ParseCategory::Ability && item.label == "Token")
+            .expect("The Void token should be nested under the ETB trigger");
+        let must_attack = token
+            .children
+            .iter()
+            .find(|item| item.category == ParseCategory::Static && item.label == "MustAttack")
+            .expect("The Void's forced-attack static must be shown in coverage data");
+        assert!(must_attack.supported);
+                assert!(must_attack
+                    .details
+                    .iter()
+                    .any(|(key, value)| key == "affects" && value == "self"));
+            })
+            .expect("Sentry coverage thread starts")
+            .join()
+            .expect("Sentry coverage thread completes");
+    }
+
+    #[test]
+    fn unsupported_token_static_is_a_nested_coverage_gap() {
+        let mut face = make_face();
+        face.name = "Unsupported Token Static".to_string();
+        face.abilities.push(token_ability_with_static(
+            StaticDefinition::new(StaticMode::Other("FutureTokenStatic".to_string()))
+                .affected(TargetFilter::SelfRef),
+        ));
+
+        let gaps = card_face_gaps(&face);
+        assert_eq!(gaps, vec!["Static:FutureTokenStatic".to_string()]);
+
+        let card = coverage_result_for_face(face);
+        assert!(!card.supported);
+        assert_eq!(card.gap_details.len(), 1);
+        assert_eq!(card.gap_details[0].handler, "Static:FutureTokenStatic");
+        let token = card
+            .parse_details
+            .iter()
+            .find(|item| item.category == ParseCategory::Ability && item.label == "Token")
+            .expect("token ability should be projected");
+        assert!(
+            token.children.iter().any(|item| {
+                item.category == ParseCategory::Static
+                    && item.label == "FutureTokenStatic"
+                    && !item.supported
+            }),
+            "the unsupported token static must be visible as the parse-tree child that produces the gap: {token:?}"
+        );
+    }
+
+    #[test]
+    fn granted_static_is_recursively_projected_and_counted_as_a_gap() {
+        let nested = StaticDefinition::new(StaticMode::Other("FutureGrantedStatic".to_string()));
+        let parent = StaticDefinition::new(StaticMode::MustAttack).modifications(vec![
+            ContinuousModification::GrantStaticAbility {
+                definition: Box::new(nested),
+            },
+        ]);
+        let mut face = make_face();
+        face.static_abilities.push(parent);
+
+        assert_eq!(
+            card_face_gaps(&face),
+            vec!["Static:FutureGrantedStatic".to_string()]
+        );
+        let parent = build_parse_details_for_face(&face)
+            .into_iter()
+            .find(|item| item.category == ParseCategory::Static && item.label == "MustAttack")
+            .expect("printed parent static should be projected");
+        assert!(parent.children.iter().any(|item| {
+            item.category == ParseCategory::Static
+                && item.label == "FutureGrantedStatic"
+                && !item.supported
+        }));
+    }
+
+    #[test]
+    fn canonical_gap_merge_keeps_analysis_and_warning_findings_in_one_result() {
+        let analysis = vec!["ResolverFeature:static_condition:Future".to_string()];
+        let tree = vec![GapDetail {
+            handler: "Static:FutureStatic".to_string(),
+            source_text: Some("This token has a future static.".to_string()),
+        }];
+        let warnings = vec![OracleDiagnostic::swallowed_clause(
+            "Condition_If",
+            "If a condition is met, do something.",
+            None,
+        )];
+
+        let gaps = merge_coverage_gaps(&analysis, tree, &warnings);
+        let public = public_gap_details(&gaps);
+        assert_eq!(gaps.len(), 3);
+        assert_eq!(public.len(), 3);
+        assert!(public.iter().any(|gap| {
+            gap.handler == "Static:FutureStatic"
+                && gap.source_text.as_deref() == Some("This token has a future static.")
+        }));
+        assert!(public
+            .iter()
+            .any(|gap| gap.handler == "Swallow:Condition_If"));
+    }
+
+    #[test]
+    fn every_non_token_static_carrier_projects_its_static_child() {
+        let static_def = || {
+            StaticDefinition::new(StaticMode::MustAttack)
+                .affected(TargetFilter::SelfRef)
+                .description("This permanent attacks each combat if able.".to_string())
+        };
+        let definitions = [
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::GenericEffect {
+                    static_abilities: vec![static_def()],
+                    duration: None,
+                    target: None,
+                    end_cost: None,
+                },
+            ),
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Counter {
+                    target: TargetFilter::Any,
+                    source_rider: Some(CounterSourceRider::LosesAbilities {
+                        static_def: Box::new(static_def()),
+                        duration: Box::new(Duration::UntilHostLeavesPlay),
+                    }),
+                    countered_spell_zone: None,
+                },
+            ),
+            AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::CreateEmblem {
+                    statics: vec![static_def()],
+                    triggers: vec![token_trigger_with_static(static_def())],
+                },
+            ),
+        ];
+
+        for definition in definitions {
+            let item = build_test_ability_item(&definition);
+            assert!(item.children.iter().any(|child| {
+                child.category == ParseCategory::Static
+                    && child.label == "MustAttack"
+                    && child.supported
+            }));
+            assert!(test_ability_is_supported(&definition));
+        }
+    }
+
+    #[test]
+    fn token_static_coverage_traverses_trigger_execute() {
+        let supported_static = StaticDefinition::new(StaticMode::MustAttack)
+            .affected(TargetFilter::SelfRef)
+            .description("This token attacks each combat if able.".to_string());
+        let mut supported_face = make_face();
+        supported_face.name = "Supported Trigger Token Static".to_string();
+        supported_face
+            .triggers
+            .push(token_trigger_with_static(supported_static));
+
+        let supported_card = coverage_result_for_face(supported_face);
+        assert!(supported_card.supported);
+        assert!(supported_card.gap_details.is_empty());
+        let supported_trigger = supported_card
+            .parse_details
+            .iter()
+            .find(|item| item.category == ParseCategory::Trigger)
+            .expect("trigger should be projected");
+        let supported_token = supported_trigger
+            .children
+            .iter()
+            .find(|item| item.category == ParseCategory::Ability && item.label == "Token")
+            .expect("trigger execute should project its token ability");
+        let supported_must_attack = supported_token
+            .children
+            .iter()
+            .find(|item| item.category == ParseCategory::Static && item.label == "MustAttack")
+            .expect("token static should remain nested below trigger execute");
+        assert!(supported_must_attack.supported);
+        assert!(supported_must_attack
+            .details
+            .iter()
+            .any(|(key, value)| key == "affects" && value == "self"));
+
+        let mut unsupported_face = make_face();
+        unsupported_face.name = "Unsupported Trigger Token Static".to_string();
+        unsupported_face.triggers.push(token_trigger_with_static(
+            StaticDefinition::new(StaticMode::Other("FutureTokenStatic".to_string()))
+                .affected(TargetFilter::SelfRef),
+        ));
+
+        assert_eq!(
+            card_face_gaps(&unsupported_face),
+            vec!["Static:FutureTokenStatic".to_string()]
+        );
+
+        let unsupported_card = coverage_result_for_face(unsupported_face);
+        assert!(!unsupported_card.supported);
+        assert_eq!(unsupported_card.gap_details.len(), 1);
+        assert_eq!(
+            unsupported_card.gap_details[0].handler,
+            "Static:FutureTokenStatic"
+        );
+        let unsupported_trigger = unsupported_card
+            .parse_details
+            .iter()
+            .find(|item| item.category == ParseCategory::Trigger)
+            .expect("trigger should be projected");
+        let unsupported_token = unsupported_trigger
+            .children
+            .iter()
+            .find(|item| item.category == ParseCategory::Ability && item.label == "Token")
+            .expect("trigger execute should project its token ability");
+        assert!(unsupported_token.children.iter().any(|item| {
+            item.category == ParseCategory::Static
+                && item.label == "FutureTokenStatic"
+                && !item.supported
+        }));
+    }
+
+    #[test]
+    fn replacement_declines_exclude_token_static_coverage() {
+        let invalid_subtype = "CoverageDeclineOnlySubtype".to_string();
+        let parser_misfire = format!("ParserMisfire:InvalidSubtype({invalid_subtype})");
+        let token_static =
+            StaticDefinition::new(StaticMode::Other("FutureTokenStatic".to_string()))
+                .affected(TargetFilter::SelfRef)
+                .modifications(vec![
+                    ContinuousModification::AddSubtype {
+                        subtype: invalid_subtype,
+                    },
+                    ContinuousModification::GrantAbility {
+                        definition: Box::new(AbilityDefinition::new(
+                            AbilityKind::Spell,
+                            Effect::unimplemented(
+                                "future_token_static_payload",
+                                "unsupported payload",
+                            ),
+                        )),
+                    },
+                ]);
+        let decline =
+            token_ability_with_static(token_static).condition(AbilityCondition::HasMaxSpeed);
+
+        let mut included_face = make_face();
+        included_face.abilities.push(decline.clone());
+        let mut included_missing = Vec::new();
+        check_subtype_lexicon(&included_face, &HashSet::new(), &mut included_missing);
+        assert_eq!(
+            included_missing,
+            vec![parser_misfire.clone()],
+            "ordinary ability traversal must still inspect token-carried modifications"
+        );
+
+        let trigger_registry = build_trigger_registry();
+        let static_registry = build_static_registry();
+        assert!(is_ability_supported(
+            &decline,
+            &trigger_registry,
+            &static_registry,
+            TokenStaticTraversal::Exclude,
+        ));
+        assert!(!is_ability_supported(
+            &decline,
+            &trigger_registry,
+            &static_registry,
+            TokenStaticTraversal::Include,
+        ));
+        assert!(!ability_definition_has_unimplemented_parts(
+            &decline,
+            TokenStaticTraversal::Exclude,
+        ));
+        assert!(ability_definition_has_unimplemented_parts(
+            &decline,
+            TokenStaticTraversal::Include,
+        ));
+
+        for (label, mode) in [
+            (
+                "optional",
+                ReplacementMode::Optional {
+                    decline: Some(Box::new(decline.clone())),
+                },
+            ),
+            (
+                "may-cost",
+                ReplacementMode::MayCost {
+                    cost: AbilityCost::Tap,
+                    payment_record: None,
+                    decline: Some(Box::new(decline.clone())),
+                },
+            ),
+        ] {
+            let mut face = make_face();
+            face.replacements
+                .push(ReplacementDefinition::new(ReplacementEvent::Draw).mode(mode.clone()));
+
+            let mut subtype_missing = Vec::new();
+            check_subtype_lexicon(&face, &HashSet::new(), &mut subtype_missing);
+            assert!(
+                subtype_missing.is_empty(),
+                "{label} decline token statics must not leak {parser_misfire}"
+            );
+
+            let mut effect_owned_face = make_face();
+            effect_owned_face.abilities.push(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::AddTargetReplacement {
+                    replacement: Box::new(
+                        ReplacementDefinition::new(ReplacementEvent::Draw).mode(mode.clone()),
+                    ),
+                    target: TargetFilter::Any,
+                },
+            ));
+            let mut effect_owned_subtype_missing = Vec::new();
+            check_subtype_lexicon(
+                &effect_owned_face,
+                &HashSet::new(),
+                &mut effect_owned_subtype_missing,
+            );
+            assert!(
+                effect_owned_subtype_missing.is_empty(),
+                "effect-owned {label} decline token statics must not leak {parser_misfire}"
+            );
+
+            let replacement = build_parse_details_for_face(&face)
+                .into_iter()
+                .find(|item| item.category == ParseCategory::Replacement)
+                .expect("replacement should be projected");
+            let projected_decline = replacement
+                .children
+                .iter()
+                .find(|item| item.category == ParseCategory::Ability && item.label == "Token")
+                .expect("replacement decline should remain projected");
+            assert!(
+                projected_decline.children.is_empty(),
+                "{label} decline bodies must retain their pre-token-static parse projection"
+            );
+            assert!(card_face_gaps(&face).is_empty(), "{label} decline gaps");
+            assert!(
+                !card_face_has_unimplemented_parts(&face),
+                "{label} decline unimplemented-parts coverage"
+            );
+
+            let card = coverage_result_for_face(face);
+            assert!(card.supported, "{label} decline support");
+            assert!(card.gap_details.is_empty(), "{label} decline gap details");
+
+            let mut features = HashMap::new();
+            extract_card_features(
+                &CardFace {
+                    replacements: vec![
+                        ReplacementDefinition::new(ReplacementEvent::Draw).mode(mode)
+                    ],
+                    ..make_face()
+                },
+                &mut features,
+            );
+            assert_eq!(
+                features.get("condition:HasMaxSpeed"),
+                Some(&FeatureSupport::Handled),
+                "{label} decline features must be traversed"
+            );
+        }
+    }
+
+    #[test]
+    fn add_target_replacement_payloads_reach_every_coverage_consumer() {
+        let execute = token_ability_with_static(
+            StaticDefinition::new(StaticMode::MustAttack)
+                .affected(TargetFilter::SelfRef)
+                .description("This token attacks each combat if able.".to_string()),
+        );
+        let decline = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::unimplemented(
+                "add_target_replacement_decline",
+                "unsupported replacement decline",
+            ),
+        )
+        .condition(AbilityCondition::HasMaxSpeed);
+        let definition = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::AddTargetReplacement {
+                replacement: Box::new(
+                    ReplacementDefinition::new(ReplacementEvent::Draw)
+                        .execute(execute)
+                        .mode(ReplacementMode::MayCost {
+                            cost: AbilityCost::Tap,
+                            payment_record: None,
+                            decline: Some(Box::new(decline)),
+                        }),
+                ),
+                target: TargetFilter::Any,
+            },
+        );
+
+        let projected = build_test_ability_item(&definition);
+        let token = projected
+            .children
+            .iter()
+            .find(|child| child.category == ParseCategory::Ability && child.label == "Token")
+            .expect("the replacement execute payload should be projected");
+        assert!(token.children.iter().any(|child| {
+            child.category == ParseCategory::Static
+                && child.label == "MustAttack"
+                && child.supported
+                && child
+                    .details
+                    .iter()
+                    .any(|(key, value)| key == "affects" && value == "self")
+        }));
+        assert!(projected.children.iter().any(|child| {
+            child.category == ParseCategory::Ability
+                && child.label == "add_target_replacement_decline"
+                && !child.supported
+        }));
+
+        let expected_gap = "Effect:add_target_replacement_decline".to_string();
+        let mut missing = Vec::new();
+        collect_test_ability_missing_parts(&definition, &mut missing);
+        assert_eq!(missing, vec![expected_gap.clone()]);
+        assert!(ability_definition_has_unimplemented_parts(
+            &definition,
+            TokenStaticTraversal::Include,
+        ));
+        assert!(!test_ability_is_supported(&definition));
+
+        let mut face = make_face();
+        face.abilities.push(definition.clone());
+        assert_eq!(card_face_gaps(&face), vec![expected_gap.clone()]);
+        assert!(card_face_has_unimplemented_parts(&face));
+
+        let card = coverage_result_for_face(face);
+        assert!(!card.supported);
+        assert_eq!(card.gap_details.len(), 1);
+        assert_eq!(card.gap_details[0].handler, expected_gap);
+
+        let mut features = HashMap::new();
+        extract_ability_features(&definition, &mut features);
+        assert_eq!(
+            features.get("condition:HasMaxSpeed"),
+            Some(&FeatureSupport::Handled),
+            "the effect-owned replacement decline must reach feature extraction"
         );
     }
 
@@ -13756,7 +16499,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                 visited.push((actual_edge, name.clone()));
             });
             let expected_names: Vec<_> = visited.iter().map(|(_, name)| name.clone()).collect();
-            let projected = build_ability_item(&definition);
+            let projected = build_test_ability_item(&definition);
             assert_eq!(
                 projected
                     .children
@@ -13766,8 +16509,11 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                 expected_names,
                 "the parse-details report must project every direct payload"
             );
-            assert!(ability_definition_has_unimplemented_parts(&definition));
-            assert!(!is_ability_supported(&definition));
+            assert!(ability_definition_has_unimplemented_parts(
+                &definition,
+                TokenStaticTraversal::Include,
+            ));
+            assert!(!test_ability_is_supported(&definition));
             for (_, name) in &visited {
                 assert!(ability_tree_any(&definition, &|payload| {
                     matches!(payload.effect.as_ref(), Effect::Unimplemented { name: payload_name, .. } if payload_name == name)
@@ -13775,7 +16521,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             }
 
             let mut missing = Vec::new();
-            collect_ability_missing_parts(&definition, &mut missing);
+            collect_test_ability_missing_parts(&definition, &mut missing);
             let expected_gaps: Vec<_> = visited
                 .iter()
                 .map(|(_, name)| format!("Effect:{name}"))
@@ -13832,9 +16578,12 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
         let mut visited = Vec::new();
         visit_direct_effect_ability_payloads(&empty.effect, |edge, _| visited.push(edge));
         assert!(visited.is_empty());
-        assert!(build_ability_item(&empty).children.is_empty());
-        assert!(!ability_definition_has_unimplemented_parts(&empty));
-        assert!(is_ability_supported(&empty));
+        assert!(build_test_ability_item(&empty).children.is_empty());
+        assert!(!ability_definition_has_unimplemented_parts(
+            &empty,
+            TokenStaticTraversal::Include,
+        ));
+        assert!(test_ability_is_supported(&empty));
 
         let supported = AbilityDefinition::new(
             AbilityKind::Spell,
@@ -13849,10 +16598,13 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                 )],
             },
         );
-        assert!(is_ability_supported(&supported));
-        assert!(!ability_definition_has_unimplemented_parts(&supported));
+        assert!(test_ability_is_supported(&supported));
+        assert!(!ability_definition_has_unimplemented_parts(
+            &supported,
+            TokenStaticTraversal::Include,
+        ));
         let mut missing = Vec::new();
-        collect_ability_missing_parts(&supported, &mut missing);
+        collect_test_ability_missing_parts(&supported, &mut missing);
         assert!(missing.is_empty());
     }
 
@@ -13878,12 +16630,61 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             },
         );
         let mut subtypes = Vec::new();
-        visit_ability_modifications(&definition, &mut |modification| {
-            if let ContinuousModification::AddSubtype { subtype } = modification {
-                subtypes.push(subtype.clone());
-            }
-        });
+        visit_ability_modifications(
+            &definition,
+            TokenStaticTraversal::Include,
+            &mut |modification| {
+                if let ContinuousModification::AddSubtype { subtype } = modification {
+                    subtypes.push(subtype.clone());
+                }
+            },
+        );
         assert_eq!(subtypes, vec!["Wizard"]);
+    }
+
+    #[test]
+    fn return_as_aura_grants_reach_every_coverage_consumer() {
+        let decline = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::unimplemented("aura_decline", "unsupported optional replacement decline"),
+        )
+        .condition(AbilityCondition::HasMaxSpeed);
+        let definition = AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::ReturnAsAura {
+                enchant_filter: TargetFilter::Any,
+                grants: vec![ContinuousModification::GrantReplacement {
+                    replacement: Box::new(ReplacementDefinition::new(ReplacementEvent::Draw).mode(
+                        ReplacementMode::Optional {
+                            decline: Some(Box::new(decline)),
+                        },
+                    )),
+                }],
+            },
+        );
+
+        let projected = build_test_ability_item(&definition);
+        assert_eq!(projected.children.len(), 1);
+        assert_eq!(projected.children[0].label, "aura_decline");
+
+        let mut missing = Vec::new();
+        collect_test_ability_missing_parts(&definition, &mut missing);
+        assert_eq!(missing, vec!["Effect:aura_decline"]);
+        assert!(!test_ability_is_supported(&definition));
+
+        let mut face = make_face();
+        face.abilities.push(definition.clone());
+        assert_eq!(card_face_gaps(&face), vec!["Effect:aura_decline"]);
+        assert!(card_face_has_unimplemented_parts(&face));
+
+        let mut features = HashMap::new();
+        extract_ability_features(&definition, &mut features);
+        assert_eq!(
+            features.get("condition:HasMaxSpeed"),
+            Some(&FeatureSupport::Handled),
+            "the optional decline must use its own excluded-token traversal without \
+             skipping its ordinary structural features"
+        );
     }
 
     #[test]
@@ -13892,7 +16693,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             "delayed_payload",
             "unsupported delayed effect",
         ));
-        let projected = build_ability_item(&unsupported);
+        let projected = build_test_ability_item(&unsupported);
         assert_eq!(
             projected.children.len(),
             1,
@@ -14179,15 +16980,27 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             .unwrap();
 
         assert!(!card.supported);
-        assert_eq!(card.gap_count, 1);
-        assert_eq!(card.gap_details[0].handler, "Swallow:Condition_If");
+        // The swallowed-clause diagnostic is the specific reason the parser
+        // lost semantics, while the silent-drop audit independently records
+        // that the entire Oracle line has no parse-tree representation. Keep
+        // both in the canonical gap set rather than allowing one coverage
+        // consumer to hide the other.
+        assert_eq!(card.gap_count, 2);
+        assert!(card
+            .gap_details
+            .iter()
+            .any(|gap| gap.handler == "Swallow:Condition_If"));
+        assert!(card
+            .gap_details
+            .iter()
+            .any(|gap| gap.handler == "SilentDrop:0_of_1"));
         let top_gap = summary
             .top_gaps
             .iter()
             .find(|gap| gap.handler == "Swallow:Condition_If")
             .unwrap();
         assert_eq!(top_gap.total_count, 1);
-        assert_eq!(top_gap.single_gap_cards, 1);
+        assert_eq!(top_gap.single_gap_cards, 0);
         assert!(top_gap.single_gap_by_format.is_empty());
         assert_eq!(top_gap.oracle_patterns.len(), 1);
         assert_eq!(top_gap.oracle_patterns[0].count, 1);
@@ -14196,7 +17009,9 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             vec!["Alpha".to_string()]
         );
         assert!(top_gap.independence_ratio.is_none());
-        assert!(top_gap.co_occurrences.is_empty());
+        assert!(top_gap.co_occurrences.iter().any(|co_occurrence| {
+            co_occurrence.handler == "SilentDrop:0_of_1" && co_occurrence.shared_cards == 1
+        }));
     }
 
     #[test]
@@ -14510,7 +17325,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             },
         );
 
-        let item = build_ability_item(&def);
+        let item = build_test_ability_item(&def);
         assert_eq!(item.label, "MustBeBlocked");
         assert!(item
             .details
@@ -14560,7 +17375,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             },
         );
 
-        let item = build_ability_item(&def);
+        let item = build_test_ability_item(&def);
         assert_eq!(item.label, "grant Flying, grant Haste");
     }
 
@@ -15843,7 +18658,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
     /// (e.g. Vicious Rivalry, Fix What's Broken) produce exactly one Oracle
     /// line for the "As an additional cost..." preamble. That line must be
     /// represented by a `ParsedItem` so that `count_effective_parsed_items`
-    /// matches `count_effective_oracle_lines` and the silent-drop audit
+    /// matches `effective_oracle_lines` and the silent-drop audit
     /// doesn't falsely flag the card as unsupported.
     #[test]
     fn additional_cost_emits_parsed_item_for_supported_cost() {
@@ -15873,6 +18688,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                  Destroy all artifacts and creatures with mana value X or less."
                     .to_string(),
             ),
+            "Test Card",
             &parse_details,
             &mut missing,
         );
@@ -15921,7 +18737,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
         );
 
         let mut missing = Vec::new();
-        check_silent_drops(&face.oracle_text, &parse_details, &mut missing);
+        check_silent_drops(&face.oracle_text, "Test Card", &parse_details, &mut missing);
         assert!(
             missing.is_empty(),
             "represented per-target surcharge must not be reported as a silent drop: {missing:?}"
@@ -15944,6 +18760,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             AbilityKind::Spell,
             Effect::ExtraTurn {
                 target: TargetFilter::Controller,
+                count: QuantityExpr::Fixed { value: 1 },
             },
         ));
 
@@ -15960,32 +18777,10 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
         assert_eq!(count_effective_parsed_items(&parse_details), 2);
 
         let mut missing = Vec::new();
-        check_silent_drops(&face.oracle_text, &parse_details, &mut missing);
+        check_silent_drops(&face.oracle_text, "Test Card", &parse_details, &mut missing);
         assert!(
             missing.is_empty(),
             "implemented casting metadata must not trigger SilentDrop: {missing:?}"
-        );
-    }
-
-    #[test]
-    fn audit_only_missing_labels_are_visible_in_gap_details() {
-        let mut details = Vec::new();
-        append_missing_gap_details(
-            &[
-                "SilentDrop:1_of_2".to_string(),
-                "ResolverFeature:Foo".to_string(),
-            ],
-            &mut details,
-        );
-        append_missing_gap_details(&["SilentDrop:1_of_2".to_string()], &mut details);
-
-        assert_eq!(
-            details
-                .iter()
-                .map(|detail| detail.handler.as_str())
-                .collect::<Vec<_>>(),
-            vec!["SilentDrop:1_of_2", "ResolverFeature:Foo"],
-            "every unsupported predicate must have exactly one reportable gap"
         );
     }
 
@@ -16006,16 +18801,16 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
         );
     }
 
-    /// Regression: `count_effective_oracle_lines` must recognize modal
+    /// Regression: `effective_oracle_lines` must recognize modal
     /// headers with "choose up to four" (and higher cardinals) so spells
     /// like Moment of Reckoning don't inflate their Oracle-line count.
     #[test]
-    fn count_effective_oracle_lines_recognizes_choose_up_to_four() {
+    fn effective_oracle_lines_recognizes_choose_up_to_four() {
         let text = "Choose up to four. You may choose the same mode more than once.\n\
                     \u{2022} Destroy target nonland permanent.\n\
                     \u{2022} Return target nonland permanent card from your graveyard to the battlefield.";
         // 1 modal header; both bullets fold into the header.
-        assert_eq!(count_effective_oracle_lines(text), 1);
+        assert_eq!(effective_oracle_lines(text).len(), 1);
     }
 
     /// CR 700.2 + CR 107.3m: dynamic modal headers ("choose up to X —",
@@ -16026,7 +18821,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
     /// unrecognized — the Ruinous case returns 6 (not 2) and the "that many"
     /// case returns 4 (not 1), failing these assertions.
     #[test]
-    fn count_effective_oracle_lines_folds_dynamic_modal_headers() {
+    fn effective_oracle_lines_folds_dynamic_modal_headers() {
         // Ruinous shape (em-dash "choose up to X —"): enters line + dynamic
         // header + 4 bullets → 2 (enters line + folded header).
         let ruinous = "The Ruinous Wrecking Crew enters with X +1/+1 counters on it.\n\
@@ -16035,7 +18830,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                        \u{2022} Target opponent loses 2 life.\n\
                        \u{2022} Destroy target token.\n\
                        \u{2022} Each player sacrifices a creature of their choice.";
-        assert_eq!(count_effective_oracle_lines(ruinous), 2);
+        assert_eq!(effective_oracle_lines(ruinous).len(), 2);
 
         // Hawkeye shape (period "choose up to that many."): dynamic header + 3
         // bullets → 1 (folded header).
@@ -16043,19 +18838,19 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                          \u{2022} Net \u{2014} Target creature can't block this turn.\n\
                          \u{2022} Explosive \u{2014} Deals 2 damage to target player.\n\
                          \u{2022} Boomerang \u{2014} Discard a card, then draw a card.";
-        assert_eq!(count_effective_oracle_lines(that_many), 1);
+        assert_eq!(effective_oracle_lines(that_many).len(), 1);
 
         // Hostile (A1): a NON-modal "choose up to that many <nouns>" selection
         // clause with 0 bullets is unchanged by the recognizer — there are no
         // bullets to fold (Heroic Feast text, one paragraph).
         let heroic_feast = "Choose up to that many target creatures you control. \
                             Put a +1/+1 counter on each of them.";
-        assert_eq!(count_effective_oracle_lines(heroic_feast), 1);
+        assert_eq!(effective_oracle_lines(heroic_feast).len(), 1);
 
         // Regression guard: a FIXED "choose up to two —" header still folds its
         // own 2 bullets (the existing word-cardinal path is unaffected).
         let fixed = "Choose up to two \u{2014}\n\u{2022} Draw a card.\n\u{2022} You gain 2 life.";
-        assert_eq!(count_effective_oracle_lines(fixed), 1);
+        assert_eq!(effective_oracle_lines(fixed).len(), 1);
     }
 
     #[test]
@@ -16064,13 +18859,14 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
         let mut missing = Vec::new();
         check_silent_drops(
             &Some("Teferi, Temporal Archmage can be your commander.".to_string()),
+            "Teferi, Temporal Archmage",
             &parse_details,
             &mut missing,
         );
 
         assert!(missing.is_empty());
         assert_eq!(
-            count_effective_oracle_lines("Teferi, Temporal Archmage can be your commander."),
+            effective_oracle_lines("Teferi, Temporal Archmage can be your commander.").len(),
             0
         );
 
@@ -16102,13 +18898,13 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             );
 
             let mut missing = Vec::new();
-            check_silent_drops(&Some(oracle.to_string()), &[], &mut missing);
+            check_silent_drops(&Some(oracle.to_string()), "Test Card", &[], &mut missing);
             assert!(
                 missing.is_empty(),
                 "deck-construction line falsely counted as SilentDrop: {oracle} -> {missing:?}"
             );
             assert_eq!(
-                count_effective_oracle_lines(oracle),
+                effective_oracle_lines(oracle).len(),
                 0,
                 "deck-construction line should not count as a runtime oracle line: {oracle}"
             );
@@ -16128,6 +18924,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                     shards: vec![ManaCostShard::Blue],
                     generic: 0,
                 },
+                reach: crate::types::statics::CostReductionReach::ColoredManaOnly,
             },
             affected: Some(TargetFilter::SelfRef),
             modifications: vec![],
@@ -16151,6 +18948,54 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
         assert!(audit_card_lines(oracle, &face).is_empty());
     }
 
+    /// CR 118.7b/c/d: the reach guard for the arm above. A Defiler line that
+    /// PRINTS "This effect reduces only the amount of blue mana you pay" while
+    /// emitting the CR 118.7b default reach is the engine playing the card
+    /// wrong, so coverage must refuse to call it supported. Identical to
+    /// `defiler_cost_reduction_static_does_not_count_as_silent_drop` except for
+    /// the reach, so a regression that stops reading `reach` turns this red
+    /// while leaving that one green.
+    #[test]
+    fn defiler_cost_reduction_static_with_dropped_rider_counts_as_silent_drop() {
+        let mut face = make_face();
+        let oracle = "As an additional cost to cast blue permanent spells, you may pay 2 life. Those spells cost {U} less to cast if you paid life this way. This effect reduces only the amount of blue mana you pay.";
+        face.oracle_text = Some(oracle.to_string());
+        face.static_abilities.push(StaticDefinition {
+            mode: StaticMode::DefilerCostReduction {
+                color: ManaColor::Blue,
+                life_cost: 2,
+                mana_reduction: ManaCost::Cost {
+                    shards: vec![ManaCostShard::Blue],
+                    generic: 0,
+                },
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
+            },
+            affected: Some(TargetFilter::SelfRef),
+            modifications: vec![],
+            condition: None,
+            per_player_condition: None,
+            affected_zone: None,
+            effect_zone: None,
+            active_zones: vec![],
+            characteristic_defining: false,
+            description: Some(
+                "As an additional cost to cast blue permanent spells, you may pay 2 life. Those spells cost less to cast.".to_string(),
+            ),
+            attack_defended: None,
+            source_controller: None,
+            source_object: None,
+            bypass_beneficiary: None,
+            protection_does_not_remove: None,
+            room_door: None,
+        });
+
+        assert!(
+            !audit_card_lines(oracle, &face).is_empty(),
+            "a Defiler reducer that drops the printed colored-only rider must \
+             not be reported as covered"
+        );
+    }
+
     #[test]
     fn split_defiler_cost_reduction_static_does_not_count_as_silent_drop() {
         let mut face = make_face();
@@ -16164,6 +19009,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                     shards: vec![ManaCostShard::Blue],
                     generic: 0,
                 },
+                reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
             },
             affected: Some(TargetFilter::SelfRef),
             modifications: vec![],
@@ -16200,6 +19046,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                     shards: vec![ManaCostShard::Blue],
                     generic: 0,
                 },
+                reach: crate::types::statics::CostReductionReach::ColoredManaOnly,
             },
             affected: Some(TargetFilter::SelfRef),
             modifications: vec![],
@@ -16912,7 +19759,12 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             .description("must be blocked by a Dalek if able".to_string());
 
         assert!(
-            !is_static_supported(&residual, &trigger_registry, &static_registry),
+            !is_static_supported(
+                &residual,
+                &trigger_registry,
+                &static_registry,
+                TokenStaticTraversal::Include,
+            ),
             "an Unimplemented-carrying GrantAbility residual must be unsupported"
         );
 
@@ -16928,14 +19780,18 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             }])
             .description("first strike".to_string());
         assert!(
-            is_static_supported(&supported, &trigger_registry, &static_registry),
+            is_static_supported(
+                &supported,
+                &trigger_registry,
+                &static_registry,
+                TokenStaticTraversal::Include,
+            ),
             "a plain keyword-grant continuous static must be supported"
         );
     }
 
     /// Regression for PR #8012 (Bombur, Gentle Dreamer) — maintainer review
-    /// round 3, which cited this exact `is_static_supported` gate
-    /// (`coverage.rs:7794-7816` as of that review): a recipient-scoped
+    /// round 3, which cited this exact `is_static_supported` gate: a recipient-scoped
     /// `unless` tail with no runtime binding authority falls back to
     /// `Not(Unrecognized{..})`, a NESTED unrecognized leaf. Before the fix,
     /// `is_static_supported` matched only a TOP-LEVEL
@@ -16954,7 +19810,12 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
         });
 
         assert!(
-            !is_static_supported(&def, &trigger_registry, &static_registry),
+            !is_static_supported(
+                &def,
+                &trigger_registry,
+                &static_registry,
+                TokenStaticTraversal::Include,
+            ),
             "a CantUntap static gated on Not(Unrecognized) must be reported \
              unsupported, not silently accepted as fully parsed"
         );
@@ -16968,7 +19829,12 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                 condition: Box::new(StaticCondition::HasEnduringStory),
             });
         assert!(
-            is_static_supported(&supported, &trigger_registry, &static_registry),
+            is_static_supported(
+                &supported,
+                &trigger_registry,
+                &static_registry,
+                TokenStaticTraversal::Include,
+            ),
             "Not(HasEnduringStory) must remain supported"
         );
     }
@@ -17089,6 +19955,143 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
         assert!(
             card_face_gaps(&face).is_empty(),
             "CountsAsNamed statics should be recognized as supported"
+        );
+    }
+    #[test]
+    fn choice_type_coverage_format_distinguishes_generic_and_restricted_domains() {
+        assert_eq!(fmt_choice_type(&ChoiceType::card_type()), "card type");
+        assert_eq!(
+            fmt_choice_type(&ChoiceType::CardType {
+                options: vec![crate::types::card_type::CoreType::Artifact],
+            }),
+            "restricted card type"
+        );
+    }
+
+    /// The coverage walker delegates containment to
+    /// `AbilityCost::contains_unimplemented` — the single authority. The
+    /// `OneOf` case is revert-discriminating: the deleted `Composite`-only
+    /// private copy answered `false` for an `Unimplemented` nested under a
+    /// disjunction.
+    #[test]
+    fn additional_cost_unimplemented_delegates_to_ability_cost_authority() {
+        use crate::types::ability::{Effect, QuantityExpr};
+        use crate::types::mana::ManaCost;
+
+        let pay_life = || AbilityCost::PayLife {
+            amount: QuantityExpr::Fixed { value: 2 },
+        };
+        let unimplemented = || AbilityCost::Unimplemented {
+            description: "frobnicate".to_string(),
+        };
+
+        assert!(additional_cost_has_unimplemented(
+            &AdditionalCost::Required(AbilityCost::Composite {
+                costs: vec![pay_life(), unimplemented()],
+            }),
+        ));
+        assert!(additional_cost_has_unimplemented(
+            &AdditionalCost::Required(AbilityCost::OneOf {
+                costs: vec![
+                    AbilityCost::Mana {
+                        cost: ManaCost::generic(1),
+                    },
+                    AbilityCost::Composite {
+                        costs: vec![unimplemented()],
+                    },
+                ],
+            }),
+        ));
+        assert!(additional_cost_has_unimplemented(
+            &AdditionalCost::Required(AbilityCost::EffectCost {
+                effect: Box::new(Effect::Unimplemented {
+                    name: "static_structure".to_string(),
+                    description: None,
+                }),
+                player_scope: None,
+            }),
+        ));
+    }
+
+    /// The parsed-item and gap collectors must traverse the same complete
+    /// cost-tree shape as `AbilityCost::contains_unimplemented` — including
+    /// `OneOf`/`PerCounter` nesting and an `EffectCost`'s embedded effect —
+    /// otherwise a nested unpayable cost is reported as supported.
+    #[test]
+    fn cost_tree_collectors_traverse_oneof_percounter_and_effect_cost() {
+        use crate::types::ability::{QuantityExpr, TargetFilter};
+        use crate::types::counter::CounterType;
+
+        let unimplemented = || AbilityCost::Unimplemented {
+            description: "frobnicate".to_string(),
+        };
+        let one_of = || AbilityCost::OneOf {
+            costs: vec![
+                AbilityCost::PayLife {
+                    amount: QuantityExpr::Fixed { value: 2 },
+                },
+                unimplemented(),
+            ],
+        };
+        let per_counter = || AbilityCost::PerCounter {
+            counter: CounterType::Age,
+            target: TargetFilter::SelfRef,
+            base: Box::new(unimplemented()),
+        };
+        let effect_cost = || AbilityCost::EffectCost {
+            effect: Box::new(Effect::Unimplemented {
+                name: "unparsed_verb_arguments".to_string(),
+                description: None,
+            }),
+            player_scope: None,
+        };
+        let modeled = || AbilityCost::OneOf {
+            costs: vec![
+                AbilityCost::PayLife {
+                    amount: QuantityExpr::Fixed { value: 2 },
+                },
+                AbilityCost::Mana {
+                    cost: crate::types::mana::ManaCost::generic(1),
+                },
+            ],
+        };
+
+        for (cost, expected_gap, expected_label) in [
+            (one_of(), "Cost:frobnicate", "frobnicate"),
+            (per_counter(), "Cost:frobnicate", "frobnicate"),
+            (
+                effect_cost(),
+                "Cost:unparsed_verb_arguments",
+                "unparsed_verb_arguments",
+            ),
+        ] {
+            let mut missing = Vec::new();
+            collect_ability_cost_missing_parts(&cost, &mut missing);
+            assert_eq!(
+                missing,
+                vec![expected_gap.to_string()],
+                "gap collector must see the nested unpayable leaf in {cost:?}"
+            );
+
+            let mut items = Vec::new();
+            build_cost_item(&cost, &mut items);
+            assert!(
+                items
+                    .iter()
+                    .any(|item| !item.supported && item.label == expected_label),
+                "parsed-item collector must emit the unsupported leaf for {cost:?}"
+            );
+        }
+
+        // Reach-guard: a fully modeled disjunction collects nothing.
+        let mut missing = Vec::new();
+        collect_ability_cost_missing_parts(&modeled(), &mut missing);
+        assert!(missing.is_empty(), "modeled tree must collect no gap");
+        let mut items = Vec::new();
+        build_cost_item(&modeled(), &mut items);
+        assert!(
+            items.is_empty(),
+            "modeled tree must emit no unsupported item"
         );
     }
 }

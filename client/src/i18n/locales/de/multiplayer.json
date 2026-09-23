@@ -1,4 +1,22 @@
 {
+  "lan": {
+    "title": "Lokales Netzwerk",
+    "guidance": "Gib eine Serveradresse ein, um manuell beizutreten. HTTPS-Browserseiten benötigen einen sicheren wss://-Server; verwende die Desktop-App für lokale ws://-Adressen.",
+    "unavailable": "LAN-Hosting und -Suche erfordern eine aktuelle Desktop-App.",
+    "checking": "LAN-Unterstützung wird geprüft…",
+    "start": "LAN-Hosting starten",
+    "stop": "LAN-Hosting stoppen",
+    "scan": "LAN-Server suchen",
+    "pending": "Wird ausgeführt…",
+    "running": "LAN-Hosting läuft. Teile eine Adresse mit Spielern in deinem Netzwerk.",
+    "empty": "Keine LAN-Server gefunden. Prüfe, ob der Host im selben Netzwerk läuft, und versuche es erneut.",
+    "add": "Server hinzufügen",
+    "copy": "Adresse kopieren",
+    "copied": "Adresse kopiert",
+    "error": "LAN-Vorgang fehlgeschlagen. {{detail}}",
+    "added": "Server hinzugefügt. Verwende einen dedizierten Server, sobald seine Verbindung kompatibel und bereit ist.",
+    "originUnavailable": "LAN-Hosting ist für diese App-Version oder Herkunft nicht verfügbar."
+  },
   "concedeDialog": {
     "title": "Spiel aufgeben?",
     "game": {
@@ -85,7 +103,8 @@
     "firstMessageInvalid": "Der Host hat die Verbindung vor der Einrichtung abgelehnt. Aktualisiere beide Fenster und versuche es erneut.",
     "versionRequired": "Dieser Host benötigt das Übertragungsprotokoll v{{version}}. Aktualisiere beide Fenster und versuche es erneut.",
     "versionMismatch": "Übertragungsprotokoll stimmt nicht überein: Dein Client hat v{{guestVersion}} gesendet, der Host verwendet jedoch v{{hostVersion}}. Aktualisiere beide Fenster.",
-    "malformedAuthority": "Der Host hat eine ungültige Verbindungsberechtigung abgelehnt. Tritt mit einem neuen Raumcode erneut bei."
+    "malformedAuthority": "Der Host hat eine ungültige Verbindungsberechtigung abgelehnt. Tritt mit einem neuen Raumcode erneut bei.",
+    "frameUndecodable": "Der Host hat eine Nachricht gesendet, die dieser Client nicht lesen konnte. Aktualisiere beide Fenster und versuche es erneut."
   },
   "serverOfflinePrompt": {
     "title": "Matchmaking nicht erreichbar",
@@ -113,18 +132,28 @@
     "draftBadge": "{{setCode}} Draft",
     "p2pBadgeTitle": "Peer-to-Peer-Spiel (der Host führt die Engine aus)",
     "sandboxBadgeTitle": "Dieses Spiel erlaubt Debug-Aktionen. Zum Testen nutzen — keine kompetitive Partie.",
+    "hintSlow": "LANGSAM",
+    "hintSlowTitle": "Dieser Server hat zuletzt langsam auf Spieler reagiert.",
+    "hintUnreliable": "UNZUVERLÄSSIG",
+    "hintUnreliableTitle": "Spieler konnten sich zuletzt oft nicht mit diesem Server verbinden.",
     "rankedBadgeTitle": "Ranglistenraum",
     "rankedBadge": "RANGLISTE",
     "anonymous": "Anonym",
     "by": "von {{name}}",
     "passwordProtected": "Passwortgeschützt",
-    "join": "Beitreten"
+    "join": "Beitreten",
+    "originTitle": "Gelistet von {{name}} {{kind}}",
+    "kindFull": "(Spielserver)",
+    "kindLobbyOnly": "(Lobby-Broker)"
+  },
+  "connectionMode": {
+    "label": "Verbindung",
+    "server": "Offizieller Server",
+    "p2p": "P2P"
   },
   "serverPicker": {
     "title": "Server",
-    "subtitle": "Wähle eine Region oder verbinde dich mit einer selbst gehosteten Instanz.",
-    "noneLabel": "Keiner (nur P2P)",
-    "directCodes": "direkte Codes",
+    "subtitle": "Wähle, wo du hostest und welche Lobbys du durchsuchst.",
     "official": "Offiziell",
     "selfHosted": "Selbst gehostet",
     "customUrlPlaceholder": "wss://dein-server.beispiel/ws",
@@ -133,7 +162,23 @@
     "urlError": "Die URL muss mit ws:// oder wss:// beginnen",
     "connected": "Verbunden",
     "connectionFailed": "Verbindung fehlgeschlagen",
-    "testing": "Wird getestet…"
+    "testing": "Wird getestet…",
+    "hostingServer": "Host-Server",
+    "hostingServerHelp": "Wo die von dir gehosteten Spiele erstellt und registriert werden.",
+    "sources": "Lobby-Quellen",
+    "sourcesHelp": "Offene Tische aller Quellen unten werden zu einer Liste zusammengeführt.",
+    "addSource": "Quelle hinzufügen",
+    "remove": "Entfernen",
+    "useForHosting": "Zum Hosten verwenden",
+    "sourceStatusConnecting": "Verbinde…",
+    "sourceStatusDegraded": "Nicht erreichbar",
+    "sourceDuplicate": "Dieser Server ist bereits eine Lobby-Quelle.",
+    "sourceCapReached": "Es können bis zu {{max}} Quellen hinzugefügt werden.",
+    "directoryOrigin": "Verzeichnis",
+    "sourceScore": "Punktzahl {{score}}",
+    "enable": "Aktivieren",
+    "disable": "Deaktivieren",
+    "incompatibleVersion": "Inkompatibel — Serverversion {{version}}"
   },
   "lobbyDraftRooms": {
     "noRooms": "Keine Draft-Räume verfügbar",
@@ -154,10 +199,7 @@
     "createDraft": "Draft erstellen"
   },
   "lobbyView": {
-    "directConnection": "Direktverbindung",
     "onlineLobby": "Online-Lobby",
-    "pickServerTitle": "Wähle einen Server, um den Online-Lobby-Modus zu nutzen",
-    "pickServer": "Server wählen",
     "online": "{{count}} online",
     "format": "Format",
     "allFormats": "Alle Formate",
@@ -169,26 +211,25 @@
     "noFormatGames": "Derzeit keine {{format}}-Spiele.",
     "noOpenGames": "Derzeit keine offenen Spiele.",
     "showAllFormats": "Alle Formate anzeigen",
-    "p2pNotice": "Dedizierter Server nicht verfügbar. Du kannst trotzdem direkt mit einem 5-stelligen Raumcode hosten oder beitreten.",
-    "joinByCode": "Per Code beitreten",
     "joinATable": "Einem Tisch beitreten",
-    "p2pCodePlaceholder": "5-stelligen P2P-Code eingeben",
     "serverCodePlaceholder": "Code oder CODE@IP:PORT eingeben",
     "join": "Beitreten",
     "host": "Hosten",
-    "hostP2PDescription": "Erstelle einen direkten Raum für einen Gegner.",
     "hostServerDescription": "Öffne einen Raum und warte auf Spieler.",
     "hostDraft": "Draft hosten",
     "hostGame": "Spiel hosten",
-    "hostP2PGame": "P2P-Spiel hosten",
     "passwordRequired": "Passwort erforderlich",
     "passwordPlaceholder": "Passwort eingeben",
-    "watch": "Watch"
+    "watch": "Watch",
+    "sourcesDegraded": "Einige Lobby-Quellen sind nicht erreichbar",
+    "invalidJoinServer": "Die Serveradresse in diesem Beitrittscode ist ungültig."
   },
   "hostSetup": {
+    "dedicatedUnavailable": "Derzeit ist kein dedizierter Server verfügbar. Du kannst ein Spiel per P2P hosten.",
     "hostDirectMatch": "Direkte Partie hosten",
     "hostMatch": "Partie hosten",
-    "p2pNotice": "Der dedizierte Server ist nicht verfügbar, daher nutzt dieser Raum eine Direktverbindung.",
+    "p2pNotice": "Peer-to-Peer-Modus. Dieser Raum verbindet die Spieler direkt, statt auf einem Server zu laufen.",
+    "p2pSeatCap": "P2P-Tische haben höchstens {{max}} Plätze, daher ist die Spielerzahl begrenzt.",
     "roomName": "Raumname",
     "optional": "(optional)",
     "roomNamePlaceholder": "z. B. Freitagabend Commander",
@@ -213,6 +254,10 @@
     "startWhenFull": "Starten, wenn voll",
     "ranked": "Rangliste",
     "listInLobby": "In Lobby listen",
+    "hostServer": "Hosten auf",
+    "hostServerHelp": "Welcher Server diese Partie ausführt. Deine Browsing- und Direktcode-Einstellungen ändern sich nicht.",
+    "hostServerScore": "{{name}} — Zustand {{score}}",
+    "hostServerUnscored": "{{name}} — noch nicht bewertet",
     "sandboxMode": "Sandbox-Modus — Debug-Aktionen erlauben",
     "sandboxModeHelp": "Der Host kann den Spielzustand direkt manipulieren (Karten verschieben, Leben ändern, Marken anpassen) und anderen Spielern Debug-Berechtigung erteilen. Zum Testen oder für Sandbox-Spiele nutzen — nicht für kompetitive Partien. Diese Einstellung kann nach dem Spielstart nicht mehr geändert werden.",
     "setPassword": "Passwort festlegen",
@@ -253,6 +298,8 @@
     "descriptionDraftLobby": "Warten, bis Spieler dem Draft-Pod beitreten.",
     "descriptionDeckSelectFormat": "Wähle ein Deck für {{format}}.",
     "descriptionDeckSelect": "Wähle das Deck, das du online mitbringen möchtest.",
+    "offlineUnavailableTitle": "Mehrspieler ist offline nicht verfügbar.",
+    "offlineUnavailableDescription": "Stelle die Verbindung wieder her oder deaktiviere den Offline-Modus, um ein Mehrspielerspiel zu hosten oder ihm beizutreten.",
     "eyebrow": "Mehrspieler",
     "activeDeck": "Aktives Deck",
     "edit": "Bearbeiten",
@@ -260,7 +307,8 @@
     "noDeckWarning": "Kein Deck ausgewählt — du musst vor dem Hosten eines auswählen.",
     "pickDeck": "Deck wählen",
     "anonymous": "Anonym",
-    "joining": "Tritt bei"
+    "joining": "Tritt bei",
+    "joinNeedsServer": "Wähle einen Server, bevor du einem Spiel beitrittst."
   },
   "draftLobbyPanel": {
     "draftPod": "Draft-Pod",

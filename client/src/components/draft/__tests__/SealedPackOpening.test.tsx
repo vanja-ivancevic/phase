@@ -12,6 +12,8 @@ const VIEW: DraftPlayerView = {
   status: "Deckbuilding",
   kind: "Sealed",
   launch_capability: "None",
+  distribution: "PickAndPass",
+  commanders_required: 0,
   current_pack_number: 0,
   pick_number: 0,
   pass_direction: "Left",

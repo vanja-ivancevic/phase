@@ -1,3 +1,6 @@
+import { boundedDiagnosticProbe, recordDiagnostic, registerEngineDiagnostics } from "../services/troubleshooting";
+import type { EngineDiagnosticSnapshot } from "../services/troubleshooting";
+import { trackEvent } from "../services/telemetry";
 import type {
   AiActionProposal,
   AiDecisionDiagnosticReceipt,
@@ -18,7 +21,11 @@ import type {
   SubmitResult,
   ViewerSnapshot,
 } from "./types";
-import type { InteractionSubmission } from "./generated/interaction";
+import type {
+  InteractionPreview,
+  InteractionPreviewRequest,
+  InteractionSubmission,
+} from "./generated/interaction";
 import {
   actionRejectionError,
   AdapterError,
@@ -178,8 +185,48 @@ export function getHostAdapter(): WasmAdapter {
  * Falls back to direct main-thread WASM calls if Worker creation fails
  * (e.g., restrictive CSP, very old browser).
  */
+/** How much of a card-database load failure to put in a user-facing message.
+ *  serde's "unknown variant" error enumerates every variant of the enum it
+ *  rejected, which runs to thousands of characters; everything diagnostic is in
+ *  the opening clause, so the tail is noise in a toast. */
+const CARD_DB_ERROR_MAX_CHARS = 180;
+
+function describeCardDbError(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err ?? "");
+  if (!message) return "";
+  const trimmed =
+    message.length > CARD_DB_ERROR_MAX_CHARS
+      ? `${message.slice(0, CARD_DB_ERROR_MAX_CHARS)}…`
+      : message;
+  return `: ${trimmed}`;
+}
+
 export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapability {
   private initialized = false;
+  private disposed = false;
+  private unregisterDiagnostics: (() => void) | null = null;
+
+  constructor() {
+    this.registerDiagnostics();
+  }
+
+  private diagnosticSnapshot(): EngineDiagnosticSnapshot {
+    return {
+      observedAt: Date.now(),
+      initialized: this.initialized,
+      initializing: !this.initialized && this.initPromise !== null,
+      disposed: this.disposed,
+      execution: this.engine ? "worker" : this.fallback ? "main-thread" : "unavailable",
+    };
+  }
+
+  private registerDiagnostics(): void {
+    this.unregisterDiagnostics ??= registerEngineDiagnostics({
+      snapshot: () => this.diagnosticSnapshot(),
+      ping: () => this.initialized ? boundedDiagnosticProbe(() => this.ping()) : Promise.reject(new Error("Engine unavailable")),
+    });
+  }
+
   cardDbLoaded = false;
 
   // Worker-based engine (primary path)
@@ -265,6 +312,8 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   }
 
   async initialize(): Promise<void> {
+    this.disposed = false;
+    this.registerDiagnostics();
     if (this.initialized) return;
     if (this.initPromise) return this.initPromise;
     const generation = this.lifecycleGeneration;
@@ -328,6 +377,14 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   // Concurrent callers now share one load; mirrors `initPromise` above.
   private cardDbPromise: Promise<void> | null = null;
 
+  // Why the failure is kept rather than only logged: `ensureCardDb` is
+  // best-effort by design and resolves even when the load failed, so callers
+  // that require the database cannot tell *why* it is absent. Without this the
+  // engine worker answers them with "Card database not loaded", which names a
+  // missing call rather than the real cause -- a schema-rejected pool reads as
+  // a forgotten `loadCardDb`.
+  private cardDbError: unknown = null;
+
   private ensureCardDb(): Promise<void> {
     if (this.cardDbLoaded) return Promise.resolve();
     if (this.cardDbPromise) return this.cardDbPromise;
@@ -344,7 +401,9 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
         if (this.engine && this.aiPool && !this.aiPool.isCardDbLoaded) {
           await this.ensureAiPool();
         }
+        this.cardDbError = null;
       } catch (err) {
+        this.cardDbError = err;
         console.warn("Failed to load card database:", err);
       }
     })();
@@ -375,7 +434,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   };
 
   async submitAction(action: GameAction, actor: PlayerId): Promise<SubmitResult> {
-    this.assertInitialized();
+    this.assertInitialized("submitAction");
     try {
       const submit = () => this.engine
         ? this.engine.submitAction(actor, action)
@@ -399,7 +458,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     submission: InteractionSubmission,
     actor: PlayerId,
   ): Promise<SubmitResult> {
-    this.assertInitialized();
+    this.assertInitialized("submitInteraction");
     try {
       const result = this.engine ? await this.engine.submitInteraction(actor, submission) : await this.fallback!.submitInteraction(submission, actor);
       this.invalidateAiDecisionDiagnostics();
@@ -410,7 +469,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   }
 
   async previewManaPayment(action: GameAction, actor: PlayerId): Promise<ObjectId[]> {
-    this.assertInitialized();
+    this.assertInitialized("previewManaPayment");
     try {
       if (this.engine) return await this.engine.previewManaPayment(actor, action);
       return await this.fallback!.previewManaPayment(action, actor);
@@ -419,8 +478,21 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     }
   }
 
+  async previewInteraction(
+    request: InteractionPreviewRequest,
+    actor: PlayerId,
+  ): Promise<InteractionPreview> {
+    this.assertInitialized("previewInteraction");
+    try {
+      if (this.engine) return await this.engine.previewInteraction(actor, request);
+      return await this.fallback!.previewInteraction(request, actor);
+    } catch (err) {
+      throw await classifyEngineErrorAsync(err, this.takePanic);
+    }
+  }
+
   async getState(): Promise<GameState> {
-    this.assertInitialized();
+    this.assertInitialized("getState");
     try {
       // WASM `get_game_state` now returns ClientGameState { state, derived }.
       // Flatten to the store's GameState shape by attaching `derived` as an
@@ -436,7 +508,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   }
 
   async getFilteredState(viewerId: number): Promise<GameState> {
-    this.assertInitialized();
+    this.assertInitialized("getFilteredState");
     try {
       const wrapped = this.engine
         ? await this.engine.getFilteredState(viewerId)
@@ -448,7 +520,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   }
 
   async getLegalActions(): Promise<LegalActionsResult> {
-    this.assertInitialized();
+    this.assertInitialized("getLegalActions");
     try {
       if (this.engine) return await this.engine.getLegalActions();
       return await this.fallback!.getLegalActions();
@@ -458,7 +530,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   }
 
   async getLegalActionsForViewer(viewerId: number): Promise<LegalActionsResult> {
-    this.assertInitialized();
+    this.assertInitialized("getLegalActionsForViewer");
     try {
       if (this.engine) return await this.engine.getLegalActionsForViewer(viewerId);
       return await this.fallback!.getLegalActionsForViewer(viewerId);
@@ -478,7 +550,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
    * every `derived` consumer.
    */
   async getSnapshot(): Promise<EngineSnapshot> {
-    this.assertInitialized();
+    this.assertInitialized("getSnapshot");
     try {
       const raw = this.engine
         ? await this.engine.getSnapshot()
@@ -494,7 +566,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   }
 
   async getViewerSnapshot(viewerId: number): Promise<ViewerSnapshot> {
-    this.assertInitialized();
+    this.assertInitialized("getViewerSnapshot");
     try {
       const wrapped = this.engine
         ? await this.engine.getViewerSnapshot(viewerId)
@@ -511,7 +583,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     difficulty: string,
     playerId: number,
   ): Promise<AiActionProposal | null> {
-    this.assertInitialized();
+    this.assertInitialized("getAiActionProposal");
     try {
       const captureEpoch = this.aiDecisionDiagnosticsEpoch;
       const capture = this.aiDecisionDiagnosticsEnabled;
@@ -590,10 +662,23 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     }
   }
 
+  async getAiTacticalActionProposal(
+    difficulty: string,
+    playerId: number,
+  ): Promise<AiActionProposal | null> {
+    this.assertInitialized("getAiTacticalActionProposal");
+    try {
+      if (this.engine) return await this.engine.getAiTacticalActionProposal(difficulty, playerId);
+      return await this.fallback!.getAiTacticalActionProposal(difficulty, playerId);
+    } catch (err) {
+      throw await classifyEngineErrorAsync(err, this.takePanic);
+    }
+  }
+
   async submitAiActionProposal(
     proposal: AiActionProposal,
   ): Promise<AiProposalSubmission> {
-    this.assertInitialized();
+    this.assertInitialized("submitAiActionProposal");
     try {
       const outcome = this.engine
         ? await this.engine.submitAiActionProposal(proposal)
@@ -735,20 +820,28 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     }
   }
 
-  private async requireCardDbForRestore(): Promise<void> {
+  private async requireCardDb(): Promise<void> {
     await this.ensureCardDb();
     // Soft-failed ensureCardDb leaves cardDbLoaded false and skips
     // rehydrate_game_from_card_db — restored CardName NamedChoices then have
     // empty legal actions and softlock the AI (#6393). Refuse DB-less restore
     // / P2P host resume the same way warmCardDatabase surfaces load failure.
+    // Every caller that reads CARD_DB goes through here, so the cause travels
+    // with the refusal instead of staying behind in a console warning.
     if (!this.cardDbLoaded) {
-      throw new Error("Card database failed to load");
+      // `new Error(msg, { cause })` is ES2022 and this bundle targets ES2020,
+      // so the cause is attached the way `network/connection.ts` does it.
+      const error = new Error(
+        `Card database failed to load${describeCardDbError(this.cardDbError)}`,
+      );
+      Object.assign(error, { cause: this.cardDbError });
+      throw error;
     }
   }
 
   async restoreState(state: PersistedGameState): Promise<void> {
-    this.assertInitialized();
-    await this.requireCardDbForRestore();
+    this.assertInitialized("restoreState");
+    await this.requireCardDb();
     const json = JSON.stringify(state);
     if (this.engine) await this.engine.restoreState(json);
     else await this.fallback!.restoreState(json);
@@ -756,7 +849,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   }
 
   async resumeRestoredGameState(): Promise<RestoredGameStateResult> {
-    this.assertInitialized();
+    this.assertInitialized("resumeRestoredGameState");
     try {
       const resumed = this.engine
         ? await this.engine.resumeRestoredGameState()
@@ -781,7 +874,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
    * runtime on restore.
    */
   async exportPersistenceState(): Promise<string> {
-    this.assertInitialized();
+    this.assertInitialized("exportPersistenceState");
     if (this.engine) return this.engine.exportState();
     return this.fallback!.exportState();
   }
@@ -799,7 +892,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
    * when a host session ends.
    */
   async setMultiplayerMode(enabled: boolean): Promise<void> {
-    this.assertInitialized();
+    this.assertInitialized("setMultiplayerMode");
     if (this.engine) {
       await this.engine.setMultiplayerMode(enabled);
     } else {
@@ -809,7 +902,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   }
 
   async applySeatMutation(stateJson: string, mutationJson: string): Promise<unknown> {
-    this.assertInitialized();
+    this.assertInitialized("applySeatMutation");
     // No `ensureCardDb()` here: `apply_seat_mutation` never reads CARD_DB. Its
     // `WasmDeckResolver` resolves only against the static `STARTER_DECKS` table
     // (crates/engine/src/starter_decks.rs) and otherwise clones the passed-in
@@ -830,7 +923,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   }
 
   async projectSeatView(stateJson: string): Promise<unknown> {
-    this.assertInitialized();
+    this.assertInitialized("projectSeatView");
     if (this.engine) {
       return this.engine.projectSeatView(stateJson);
     }
@@ -848,10 +941,10 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
    * Mirrors `server-core::GameSession::from_persisted`.
    */
   async resumeMultiplayerHostState(state: PersistedGameState): Promise<RestoredGameStateResult> {
-    this.assertInitialized();
+    this.assertInitialized("resumeMultiplayerHostState");
     // Same CARD_DB requirement as restoreState — resume rehydrates abilities
     // only when the DB is loaded (engine-wasm resume_multiplayer_host_state).
-    await this.requireCardDbForRestore();
+    await this.requireCardDb();
     const json = JSON.stringify(state);
     const resumed = this.engine
       ? await this.engine.resumeMultiplayerHostState(json)
@@ -881,7 +974,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   }
 
   async estimateBracket(deck: BracketDeckRequest): Promise<BracketEstimate | null> {
-    this.assertInitialized();
+    this.assertInitialized("estimateBracket");
     if (this.engine) {
       return this.engine.estimateBracketForDeck(deck);
     }
@@ -897,7 +990,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
    */
   async warmCardDatabase(): Promise<void> {
     await this.initialize();
-    await this.requireCardDbForRestore();
+    await this.requireCardDb();
   }
 
   /**
@@ -908,7 +1001,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
    */
   async checkDeckCompatibility(request: unknown): Promise<unknown> {
     await this.initialize();
-    await this.ensureCardDb();
+    await this.requireCardDb();
     if (this.engine) {
       return this.engine.evaluateDeckCompatibility(request);
     }
@@ -929,7 +1022,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
    */
   async evaluateDeckFormatGate(request: unknown): Promise<unknown> {
     await this.initialize();
-    await this.ensureCardDb();
+    await this.requireCardDb();
     if (this.engine) {
       return this.engine.evaluateDeckFormatGate(request);
     }
@@ -971,21 +1064,21 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
    */
   async getCardFaceData(cardName: string): Promise<unknown> {
     await this.initialize();
-    await this.ensureCardDb();
+    await this.requireCardDb();
     if (this.engine) return this.engine.getCardFaceData(cardName);
     return this.fallback!.getCardFaceData(cardName);
   }
 
   async getCardParseDetails(cardName: string): Promise<unknown> {
     await this.initialize();
-    await this.ensureCardDb();
+    await this.requireCardDb();
     if (this.engine) return this.engine.getCardParseDetails(cardName);
     return this.fallback!.getCardParseDetails(cardName);
   }
 
   async getCardRulings(cardName: string): Promise<unknown> {
     await this.initialize();
-    await this.ensureCardDb();
+    await this.requireCardDb();
     if (this.engine) return this.engine.getCardRulings(cardName);
     return this.fallback!.getCardRulings(cardName);
   }
@@ -1021,6 +1114,9 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   }
 
   dispose(): void {
+    this.disposed = true;
+    this.unregisterDiagnostics?.();
+    this.unregisterDiagnostics = null;
     this.setAiDecisionDiagnosticsEnabled(false);
     this.aiDecisionDiagnosticListeners.clear();
     this.lifecycleGeneration += 1;
@@ -1043,7 +1139,7 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
   }
 
   async ping(): Promise<string> {
-    this.assertInitialized();
+    this.assertInitialized("ping");
     if (this.engine) {
       return this.engine.ping();
     }
@@ -1057,9 +1153,9 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     matchConfig?: MatchConfig,
     firstPlayer?: number,
   ): Promise<SubmitResult> {
-    this.assertInitialized();
+    this.assertInitialized("initializeGame");
     if (deckData) {
-      await this.ensureCardDb();
+      await this.requireCardDb();
     }
     const seed = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
     if (this.engine) {
@@ -1101,9 +1197,9 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     matchConfig?: MatchConfig,
     firstPlayer?: number,
   ): Promise<SubmitResult> {
-    this.assertInitialized();
+    this.assertInitialized("initializeMultiplayerHostGame");
     if (deckData) {
-      await this.ensureCardDb();
+      await this.requireCardDb();
     }
     const seed = Math.floor(Math.random() * Number.MAX_SAFE_INTEGER);
     if (this.engine) {
@@ -1135,8 +1231,16 @@ export class WasmAdapter implements EngineAdapter, AiDecisionDiagnosticsCapabili
     return this.engine;
   }
 
-  private assertInitialized(): void {
+  private assertInitialized(operation: keyof WasmAdapter): void {
     if (!this.initialized) {
+      const engine = this.diagnosticSnapshot();
+      recordDiagnostic({ kind: "engine-not-initialized", observedAt: engine.observedAt, operation, engine });
+      trackEvent("wasm_not_initialized", {
+        operation,
+        initializing: engine.initializing,
+        disposed: engine.disposed,
+        observed_at: engine.observedAt,
+      });
       throw new AdapterError(
         AdapterErrorCode.NOT_INITIALIZED,
         "Adapter not initialized. Call initialize() first.",
@@ -1154,6 +1258,10 @@ interface MainThreadFallback {
   submitAction(action: GameAction, actor: PlayerId): Promise<SubmitResult>;
   submitInteraction(submission: InteractionSubmission, actor: PlayerId): Promise<SubmitResult>;
   previewManaPayment(action: GameAction, actor: PlayerId): Promise<ObjectId[]>;
+  previewInteraction(
+    request: InteractionPreviewRequest,
+    actor: PlayerId,
+  ): Promise<InteractionPreview>;
   getState(): Promise<GameState>;
   getFilteredState(viewerId: number): Promise<GameState>;
   getLegalActions(): Promise<LegalActionsResult>;
@@ -1161,6 +1269,7 @@ interface MainThreadFallback {
   getLegalActionsForViewer(viewerId: number): Promise<LegalActionsResult>;
   getViewerSnapshot(viewerId: number): Promise<ViewerSnapshot>;
   getAiActionProposal(difficulty: string, playerId: number): Promise<AiActionProposal | null>;
+  getAiTacticalActionProposal(difficulty: string, playerId: number): Promise<AiActionProposal | null>;
   getAiActionProposalWithDiagnostics(
     difficulty: string,
     playerId: number,
@@ -1269,6 +1378,13 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
         return unwrapActionOutcome<ObjectId[]>(wasm.preview_mana_payment_js(actor, action));
       }),
 
+    previewInteraction: (request: InteractionPreviewRequest, actor: PlayerId) =>
+      enqueue(() => {
+        return unwrapActionOutcome<InteractionPreview>(
+          wasm.preview_interaction_js(actor, request),
+        );
+      }),
+
     // null from any of these three getters means WASM `GAME_STATE` is None
     // (worker restart, PWA update desync, panic recovery). Throw with the
     // Rust sentinel so the adapter's classifyEngineError escalates to
@@ -1325,6 +1441,9 @@ async function createMainThreadFallback(): Promise<MainThreadFallback> {
 
     getAiActionProposal: (difficulty: string, playerId: number) =>
       enqueue(() => (wasm.get_ai_action_proposal(difficulty, playerId) ?? null) as AiActionProposal | null),
+
+    getAiTacticalActionProposal: (difficulty: string, playerId: number) =>
+      enqueue(() => (wasm.get_ai_tactical_action_proposal(difficulty, playerId) ?? null) as AiActionProposal | null),
 
     getAiActionProposalWithDiagnostics: (difficulty: string, playerId: number) =>
       enqueue(() => (wasm.get_ai_action_proposal_with_diagnostics(difficulty, playerId) ?? null) as {

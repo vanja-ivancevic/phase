@@ -298,7 +298,7 @@ fn jeweled_amulet_bounced_mid_stack_does_not_note_on_new_incarnation() {
         "reach-guard: the zone change must have bumped the object's incarnation"
     );
 
-    // (3) CR 112.7a: the ability is independent of its departed source and
+    // (3) CR 113.7a: the ability is independent of its departed source and
     // still resolves.
     runner.resolve_top();
     assert!(
@@ -897,11 +897,15 @@ fn ice_cauldron_rider_binds_mana_to_the_last_exiled_card() {
         is_face_down: false,
         cant_spend_mana: false,
         object,
+        spend_only_on_x_colors: None,
+        spend_only_on_x_generic_count: 0,
     };
     assert!(bound.allows(&PaymentContext::Spell(&meta_for(Some(exiled)))));
-    assert!(!bound.allows(&PaymentContext::Spell(&meta_for(Some(ObjectId(
-        exiled.0 + 1
-    ))))));
+    assert!(
+        !bound.allows(&PaymentContext::Spell(&meta_for(Some(ObjectId(
+            exiled.0 + 1
+        )))))
+    );
     assert!(!bound.allows(&PaymentContext::Spell(&meta_for(None))));
     assert!(!bound.allows(&PaymentContext::Activation {
         source_types: &[],
@@ -969,6 +973,8 @@ fn ice_cauldron_rider_without_linked_exile_produces_unspendable_mana() {
             is_face_down: false,
             cant_spend_mana: false,
             object: Some(ObjectId(9_999_999)),
+            spend_only_on_x_colors: None,
+            spend_only_on_x_generic_count: 0,
         };
         assert!(
             !unit

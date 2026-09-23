@@ -18,9 +18,10 @@ use axum::extract::{Request, State, WebSocketUpgrade};
 use axum::middleware::{from_fn, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::Router;
+use axum::{Json, Router};
 use clap::Parser;
 use engine::ai_support::{
+    activation_block_reasons_for_viewer as engine_activation_block_reasons_for_viewer,
     auto_pass_recommended_for_viewer as engine_auto_pass_for_viewer,
     end_continuous_effect_offers as engine_end_continuous_effect_offers,
     legal_actions_full as engine_legal_actions_full,
@@ -33,16 +34,17 @@ use engine::game::validate_name_deck_for_format_full;
 use engine::types::action_rejection::{ActionRejection, ActionRejectionCode};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
-use engine::types::game_state::GameState;
-use engine::types::interaction::InteractionSubmission;
+use engine::types::game_state::{GameState, TrustedGameStateEnvelope};
+use engine::types::interaction::{InteractionPreviewRequest, InteractionSubmission};
 use engine::types::player::PlayerId;
 use engine::types::GameLogEntry;
 use http::{HeaderMap, HeaderValue};
 use lobby_broker::{
-    check_build_commit, conn_holds_reservation, Broker, BrokerEnv, BuildCommitCheck, ConnState,
-    Outbound, NOT_OWNED_RESERVATION,
+    check_build_commit, conn_holds_reservation, validate_announcement, Broker, BrokerEnv,
+    BuildCommitCheck, ConnState, Outbound, RawAnnouncement, ServerAnnouncement, ServerInfoDocument,
+    DIRECTORY_VERSION, INFO_PATH, MAX_SERVER_NAME_LEN, NOT_OWNED_RESERVATION,
 };
-use rand::{Rng, TryRngCore};
+use rand::TryRngCore;
 use seat_reducer::types::{DeckChoice, DeckResolver, ReducerCtx};
 use server_core::ai_seats_wire_guard::{guard_create_ai_seats, MAX_FULL_GAME_PLAYER_COUNT};
 use server_core::client_hello_guard::guard_client_hello;
@@ -50,10 +52,12 @@ use server_core::client_message_wire_guard::{
     guard_broker_projection_inbound, guard_client_message_before_dispatch, wire_rejection_message,
 };
 use server_core::draft_action_payload_guard::guard_draft_action_payload;
-use server_core::draft_session::{draft_seats_needing_auto_pick, DraftSessionManager};
+use server_core::draft_session::{
+    draft_seats_needing_auto_pick, DraftMatchPlayer, DraftMatchSpawn, DraftSessionManager,
+};
 use server_core::draft_wire_guard::{
-    guard_create_draft_with_settings, guard_draft_action, guard_join_draft_with_password,
-    guard_reconnect_draft,
+    guard_chaos_layout_for_kind, guard_create_draft_with_settings, guard_draft_action,
+    guard_join_draft_with_password, guard_reconnect_draft,
 };
 use server_core::emote_guard::guard_emote;
 use server_core::game_action_payload_guard::guard_game_action_payload;
@@ -74,8 +78,8 @@ use server_core::protocol::{
 use server_core::resolve_deck;
 use server_core::seat_mutation_wire_guard::guard_seat_mutation;
 use server_core::session::{
-    ActionResult, FullRuntime, GameSession, RevisionedActionResult, SessionActionError,
-    SessionManager,
+    ActionResult, FullRuntime, GameSession, HostingMode, PreviewRefusal, RevisionedActionResult,
+    SessionActionError, SessionManager,
 };
 use server_core::spectator_wire_guard::{
     guard_draft_spectator_capacity, guard_game_spectator_capacity, guard_spectate_draft,
@@ -192,7 +196,7 @@ type SharedGameSpectators = Arc<Mutex<HashMap<String, Vec<mpsc::UnboundedSender<
 fn restore_persisted_session(json: &str, db: SharedDb) -> Result<GameSession, String> {
     let persisted = serde_json::from_str::<server_core::PersistedSession>(json)
         .map_err(|error| error.to_string())?;
-    GameSession::from_persisted(persisted, db.as_ref())
+    GameSession::from_persisted(persisted, &db)
 }
 
 /// Admit a persisted draft row only when its SQLite key names the enclosed
@@ -486,6 +490,16 @@ fn build_game_started_message(
         });
     let derived = derive_transport_views(&session.state, &filtered, Some(player));
     let viewer_interaction = derive_viewer_interaction(&session.state, &filtered, player);
+    // CR 118.3 + CR 117.1: derived per recipient from the same raw pre-filter
+    // state binding its sibling `spell_costs` came from. No `if is_actor`
+    // wrapper: the entry point self-gates on `turn_control::is_authorized_submitter`,
+    // which is the SAME function `server_core::is_acting` delegates to.
+    let activation_block_reasons =
+        engine_activation_block_reasons_for_viewer(&session.state, player);
+    debug_assert!(
+        activation_block_reasons.is_empty() || is_actor,
+        "a non-empty CR 118.3 read-out implies an authorized viewer"
+    );
 
     ServerMessage::GameStarted {
         state_revision: session.state_revision,
@@ -507,6 +521,7 @@ fn build_game_started_message(
         } else {
             HashMap::new()
         },
+        activation_block_reasons,
         derived,
         viewer_interaction,
         player_token,
@@ -550,6 +565,7 @@ fn build_game_started_messages(session: &mut GameSession) -> Vec<(PlayerId, Serv
 fn build_state_update_message(
     result: &ActionResult,
     state_revision: u64,
+    full_key: &server_core::FullSessionKey,
     player: PlayerId,
     rewind_targets: Vec<RewindOption>,
 ) -> Result<ServerMessage, String> {
@@ -584,8 +600,16 @@ fn build_state_update_message(
     } else {
         Vec::new()
     };
+    // CR 118.3 + CR 117.1: same raw state binding the sibling `spell_costs`
+    // came from (both destructured from this `ActionResult`).
+    let activation_block_reasons = engine_activation_block_reasons_for_viewer(raw_state, player);
+    debug_assert!(
+        activation_block_reasons.is_empty() || is_actor,
+        "a non-empty CR 118.3 read-out implies an authorized viewer"
+    );
 
     Ok(ServerMessage::StateUpdate {
+        full_key: Some(full_key.clone()),
         state_revision,
         state: filtered,
         events: server_core::filter_events_for_player(events, raw_state, player),
@@ -609,6 +633,7 @@ fn build_state_update_message(
         } else {
             HashMap::new()
         },
+        activation_block_reasons,
         derived,
         viewer_interaction,
         rewind_targets,
@@ -638,6 +663,10 @@ fn build_spectator_game_started_message(session: &GameSession) -> Result<ServerM
         mana_payment_shortcut_actions: Vec::new(),
         spell_costs: HashMap::new(),
         legal_actions_by_object: HashMap::new(),
+        // CR 117.1: a spectator is a non-seat viewer with no action authority,
+        // so the read-out is empty by the same existing design as the two
+        // siblings above.
+        activation_block_reasons: HashMap::new(),
         derived,
         viewer_interaction,
         player_token: None,
@@ -654,6 +683,7 @@ fn build_spectator_game_started_message(session: &GameSession) -> Result<ServerM
 }
 
 fn build_spectator_state_update_message(
+    full_key: &server_core::FullSessionKey,
     raw_state: &GameState,
     events: &[GameEvent],
     log_entries: &[GameLogEntry],
@@ -673,6 +703,7 @@ fn build_spectator_state_update_message(
     let eliminated_players = raw_state.eliminated_players.clone();
 
     Ok(ServerMessage::StateUpdate {
+        full_key: Some(full_key.clone()),
         state_revision,
         state: filtered,
         events: server_core::filter_events_for_player(events, raw_state, SPECTATOR_PLAYER_ID),
@@ -684,6 +715,9 @@ fn build_spectator_state_update_message(
         log_entries: log_entries.to_vec(),
         spell_costs: HashMap::new(),
         legal_actions_by_object: HashMap::new(),
+        // CR 117.1: spectators have no action authority — empty by the same
+        // existing design as the two siblings above.
+        activation_block_reasons: HashMap::new(),
         derived,
         viewer_interaction,
         // Empty for the same reason as the spectator `GameStarted` builder
@@ -898,6 +932,13 @@ struct Cli {
     /// `NGROK_AUTHTOKEN` is set, the live tunnel URL is used when this is unset.
     #[arg(long, env = "PUBLIC_URL")]
     public_url: Option<String>,
+
+    /// Directory endpoint to announce this server to, e.g.
+    /// `https://lobby.phase-rs.dev/servers/announce`. Requires --public-url,
+    /// which must be an `https://` URL — the directory lists `wss://`
+    /// addresses only. Off by default.
+    #[arg(long, env = "PHASE_ANNOUNCE_TO", requires = "public_url")]
+    announce_to: Option<Url>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -922,24 +963,23 @@ fn ai_result_broadcast_delay() -> Duration {
     ai_result_broadcast_delay_from(std::env::var("PHASE_AI_RESULT_DELAY_MS").ok().as_deref())
 }
 
-fn select_card_data_source(data_dir: &Path, dev_fixture: bool) -> Result<CardDataSource, String> {
-    let export_path = data_dir.join("card-data.json");
+/// An absent export selects the export anyway: one authority decides whether a
+/// bootstrapped file can be provided, and it is `load_data_file`, which holds
+/// the directory lock across the whole replacement. A file that is absent for
+/// the instant another start holds it aside is not a reason to exit.
+fn select_card_data_source(data_dir: &Path, dev_fixture: bool) -> CardDataSource {
+    let export_path = data_dir.join(data_bootstrap::CARD_DATA_FILE);
     if export_path.is_file() {
-        return Ok(CardDataSource::Export(export_path));
+        return CardDataSource::Export(export_path);
     }
     if dev_fixture {
-        return Ok(CardDataSource::DevFixture(
-            data_dir.join("mtgjson/test_fixture.json"),
-        ));
+        return CardDataSource::DevFixture(data_dir.join("mtgjson/test_fixture.json"));
     }
-    Err(format!(
-        "card-data.json is missing from {}; startup data bootstrap did not provide it",
-        data_dir.display()
-    ))
+    CardDataSource::Export(export_path)
 }
 
 fn bootstrap_required(data_dir: &Path, dev_fixture: bool) -> bool {
-    !dev_fixture || data_dir.join("card-data.json").is_file()
+    !dev_fixture || data_dir.join(data_bootstrap::CARD_DATA_FILE).is_file()
 }
 
 fn fatal_startup(message: impl std::fmt::Display) -> ! {
@@ -1170,7 +1210,9 @@ fn reject_if_disabled(msg: &ClientMessage, mode: ServerMode) -> Option<&'static 
         | ClientMessage::JoinGame { .. }
         | ClientMessage::Action { .. }
         | ClientMessage::Interaction { .. }
+        | ClientMessage::PreviewInteraction { .. }
         | ClientMessage::PreviewManaPayment { .. }
+        | ClientMessage::ExportAuthoritativeState
         | ClientMessage::Reconnect { .. }
         | ClientMessage::AbandonGame
         | ClientMessage::SeatMutate { .. }
@@ -1209,7 +1251,8 @@ fn reject_if_disabled(msg: &ClientMessage, mode: ServerMode) -> Option<&'static 
         | ClientMessage::StartTournamentRound { .. }
         | ClientMessage::ReportMatchResult { .. }
         | ClientMessage::DropFromTournament { .. }
-        | ClientMessage::EndTournament { .. } => None,
+        | ClientMessage::EndTournament { .. }
+        | ClientMessage::RenewTournamentCredential { .. } => None,
 
         // Draft messages — Full-only (draft sessions are server-hosted).
         ClientMessage::CreateDraftWithSettings { .. }
@@ -1287,13 +1330,20 @@ fn client_forbidden_draft_action_reason(action: &draft_core::types::DraftAction)
         DraftAction::SetSeatConnected { .. } => {
             Some("SetSeatConnected is server-internal; not allowed from client".to_string())
         }
+        // A shared-stack decision is ordinary player intent, exactly as `Pick`
+        // is: the seat is re-scoped to the authenticated one by
+        // `authorize_client_draft_action`, and the pile index is bounded by
+        // `guard_draft_action_payload`. Classifying it server-internal would
+        // refuse EVERY shared-stack decision at the transport, before the
+        // reducer ever saw one.
         DraftAction::StartDraft
         | DraftAction::Pick { .. }
         | DraftAction::PickWithDraftEffect { .. }
         | DraftAction::SubmitDeck { .. }
         | DraftAction::ReportMatchResult { .. }
         | DraftAction::AdvanceRound
-        | DraftAction::ReplaceSeatWithBot { .. } => None,
+        | DraftAction::ReplaceSeatWithBot { .. }
+        | DraftAction::SharedStackDecision { .. } => None,
     }
 }
 
@@ -1410,7 +1460,12 @@ fn full_socket_authority(message: &ClientMessage) -> FullSocketAuthority {
         | ClientMessage::StartTournamentRound { .. }
         | ClientMessage::ReportMatchResult { .. }
         | ClientMessage::DropFromTournament { .. }
-        | ClientMessage::EndTournament { .. } => FullSocketAuthority::Independent,
+        | ClientMessage::EndTournament { .. }
+        // Rotation is authorized by the presented credential exactly as the
+        // four gated actions are, so it takes the same `Independent` seat
+        // authority: a holder must be able to rotate from a fresh socket, which
+        // is the whole point of a credential that is not socket-bound.
+        | ClientMessage::RenewTournamentCredential { .. } => FullSocketAuthority::Independent,
 
         ClientMessage::CreateGame { .. }
         | ClientMessage::JoinGame { .. }
@@ -1429,7 +1484,9 @@ fn full_socket_authority(message: &ClientMessage) -> FullSocketAuthority {
 
         ClientMessage::Action { .. }
         | ClientMessage::Interaction { .. }
+        | ClientMessage::PreviewInteraction { .. }
         | ClientMessage::PreviewManaPayment { .. }
+        | ClientMessage::ExportAuthoritativeState
         | ClientMessage::AbandonGame
         | ClientMessage::SeatMutate { .. }
         | ClientMessage::Concede
@@ -1610,7 +1667,7 @@ async fn disconnect_full_seat_if_current(
         return;
     };
 
-    let notify_senders = {
+    let (notify_senders, full_key) = {
         // The only nested acquisition in this path is state -> connections.
         // Both guards are released before the notification fan-out below.
         let mut mgr = state.lock().await;
@@ -1622,6 +1679,11 @@ async fn disconnect_full_seat_if_current(
         {
             return;
         }
+        let full_key = mgr
+            .sessions
+            .get(game_code)
+            .and_then(|session| session.full_runtime.as_ref())
+            .map(|runtime| runtime.key.clone());
 
         let mut conns = connections.lock().await;
         let Some(players) = conns.get_mut(game_code) else {
@@ -1636,10 +1698,11 @@ async fn disconnect_full_seat_if_current(
 
         players.remove(&player_id);
         mgr.handle_disconnect(game_code, player_id);
-        players.values().cloned().collect::<Vec<_>>()
+        (players.values().cloned().collect::<Vec<_>>(), full_key)
     };
 
     let message = ServerMessage::OpponentDisconnected {
+        full_key,
         grace_seconds: 120,
         player: Some(player_id),
     };
@@ -1744,6 +1807,163 @@ async fn reconnect_draft_seat(
     Ok(view)
 }
 
+#[derive(Debug)]
+struct DraftMatchAttachment {
+    match_start: ServerMessage,
+    game_started: ServerMessage,
+}
+
+/// Attach an authenticated draft seat to its current spawned Full game.
+///
+/// The draft token remains the root capability. The Full token and generation
+/// are derived from the current pairing and live game session, never accepted
+/// from the client.
+async fn attach_current_draft_match(
+    draft_state: &SharedDraftState,
+    state: &SharedState,
+    connections: &SharedConnections,
+    identity: &mut SocketIdentity,
+    draft_code: &str,
+    tx: &mpsc::UnboundedSender<ServerMessage>,
+) -> Result<Option<DraftMatchAttachment>, String> {
+    let (attached_draft, draft_seat, draft_token) = identity
+        .draft_seat()
+        .ok_or_else(|| "Socket is not attached to a draft seat".to_string())?;
+    let draft_token = draft_token.to_string();
+    if attached_draft != draft_code {
+        return Err(DRAFT_SOCKET_AUTHORITY_REJECTION.to_string());
+    }
+
+    let draft_manager = draft_state.lock().await;
+    if !draft_socket_is_current_while_state_locked(&draft_manager, connections, identity, tx).await
+    {
+        return Err(DRAFT_SOCKET_AUTHORITY_REJECTION.to_string());
+    }
+    let draft_session = draft_manager
+        .sessions
+        .get(draft_code)
+        .ok_or_else(|| format!("Draft not found: {draft_code}"))?;
+    let Some((pairing, game_code, game_player)) = draft_session.active_match_for_seat(draft_seat)
+    else {
+        return Ok(None);
+    };
+    let opponent_index = match game_player {
+        PlayerId(0) => 1,
+        PlayerId(1) => 0,
+        _ => return Err("Draft match player identity is inconsistent".to_string()),
+    };
+    let opponent_seat = usize::from(pairing.players[opponent_index].0);
+    let match_id = pairing.match_id.clone();
+    let round = pairing.round;
+    let game_code = game_code.to_string();
+    let opponent_name = draft_session
+        .display_names
+        .get(opponent_seat)
+        .filter(|name| !name.is_empty())
+        .cloned()
+        .unwrap_or_else(|| format!("Player {opponent_seat}"));
+    let previous_full = identity
+        .full_seat()
+        .map(|(code, player, _)| (code.to_string(), player));
+
+    let (player_token, full_key, game_started, was_disconnected) = {
+        let mut manager = state.lock().await;
+        let player_index = usize::from(game_player.0);
+        let (player_token, full_key, was_disconnected) = {
+            let Some(session) = manager.sessions.get(&game_code) else {
+                warn!(
+                    draft = %draft_code,
+                    game = %game_code,
+                    "draft pairing references a game that is no longer resident"
+                );
+                return Ok(None);
+            };
+            let full_key = session
+                .full_runtime
+                .as_ref()
+                .map(|runtime| runtime.key.clone())
+                .ok_or_else(|| "Draft match Full identity is unavailable".to_string())?;
+            if full_key.game_code != game_code {
+                return Err("Draft match Full identity is inconsistent".to_string());
+            }
+            let player_token = session
+                .player_tokens
+                .get(player_index)
+                .filter(|token| !token.is_empty())
+                .cloned()
+                .ok_or_else(|| "Draft match player identity is unavailable".to_string())?;
+            if session.player_for_token(&player_token) != Some(game_player) {
+                return Err("Draft match player identity is inconsistent".to_string());
+            }
+            (player_token, full_key, !session.connected[player_index])
+        };
+
+        manager.handle_reconnect(&game_code, &player_token)?;
+        let session = manager
+            .sessions
+            .get(&game_code)
+            .expect("draft match remains present after reconnect");
+        let game_started = build_game_started_message(session, game_player, None, Vec::new());
+
+        let mut conns = connections.lock().await;
+        if let Some((previous_game, previous_player)) = previous_full {
+            if previous_game != game_code || previous_player != game_player {
+                if let Some(players) = conns.get_mut(&previous_game) {
+                    if players
+                        .get(&previous_player)
+                        .is_some_and(|sender| sender.same_channel(tx))
+                    {
+                        players.remove(&previous_player);
+                        manager.handle_disconnect(&previous_game, previous_player);
+                    }
+                }
+            }
+        }
+        conns
+            .entry(game_code.clone())
+            .or_default()
+            .insert(game_player, tx.clone());
+
+        (player_token, full_key, game_started, was_disconnected)
+    };
+    drop(draft_manager);
+
+    identity.set_session(game_code.clone(), game_player, player_token);
+
+    if was_disconnected {
+        let reconnect_senders = {
+            let conns = connections.lock().await;
+            conns
+                .get(&game_code)
+                .into_iter()
+                .flat_map(|players| players.iter())
+                .filter(|(player, _)| **player != game_player)
+                .map(|(_, sender)| sender.clone())
+                .collect::<Vec<_>>()
+        };
+        let message = ServerMessage::OpponentReconnected {
+            full_key: Some(full_key.clone()),
+            player: Some(game_player),
+        };
+        for sender in reconnect_senders {
+            let _ = sender.send(message.clone());
+        }
+    }
+
+    Ok(Some(DraftMatchAttachment {
+        match_start: ServerMessage::DraftMatchStart {
+            match_id,
+            round,
+            game_code,
+            full_key,
+            player_token: draft_token,
+            your_player: game_player,
+            opponent_name,
+        },
+        game_started,
+    }))
+}
+
 /// Mark a draft seat disconnected only if this socket still owns its sender
 /// entry. A superseded socket's close event must leave the replacement's seat
 /// connected and must not remove its sender from broadcasts or match launches.
@@ -1833,7 +2053,10 @@ async fn serve() {
     );
     let data_path = cli.data_dir.as_path();
     let dev_fixture = dev_fixture_enabled();
-    if bootstrap_required(data_path, dev_fixture) {
+    // The two load sites need the same inputs the pre-pass used, so the block
+    // yields them: a directory the operator opted out of managing is never
+    // rearranged, and that verdict has one source.
+    let bootstrap = if bootstrap_required(data_path, dev_fixture) {
         let identity = data_bootstrap::ChannelIdentity::embedded()
             .unwrap_or_else(|error| fatal_startup(error));
         let options = data_bootstrap::BootstrapOptions {
@@ -1845,18 +2068,31 @@ async fn serve() {
         {
             fatal_startup(error);
         }
+        Some((options, identity))
     } else {
         warn!(
             path = %data_path.display(),
             "using PHASE_DEV_FIXTURE=1 test fixture; startup data bootstrap is disabled"
         );
-    }
-    let card_data_source = select_card_data_source(data_path, dev_fixture)
-        .unwrap_or_else(|message| fatal_startup(message));
+        None
+    };
+    let (bootstrap_options, identity) = match &bootstrap {
+        Some((options, identity)) => (Some(options), identity.as_ref()),
+        None => (None, None),
+    };
+    let card_data_source = select_card_data_source(data_path, dev_fixture);
     let card_db = match card_data_source {
-        CardDataSource::Export(path) => CardDatabase::from_export(&path).unwrap_or_else(|error| {
-            fatal_startup(format!("failed to load {}: {error}", path.display()))
-        }),
+        // The payload goes unread: the authority builds the path from the data
+        // directory and the file name, exactly as this arm's payload was built.
+        CardDataSource::Export(_) => data_bootstrap::load_data_file(
+            data_path,
+            data_bootstrap::CARD_DATA_FILE,
+            bootstrap_options,
+            identity,
+            CardDatabase::from_export,
+        )
+        .await
+        .unwrap_or_else(|error| fatal_startup(error)),
         CardDataSource::DevFixture(path) => {
             CardDatabase::from_mtgjson(&path).unwrap_or_else(|error| {
                 fatal_startup(format!(
@@ -1915,16 +2151,22 @@ async fn serve() {
     session_manager.game_log = Arc::clone(&game_log);
     let state: SharedState = Arc::new(Mutex::new(session_manager));
     let draft_sessions: SharedDraftState = Arc::new(Mutex::new(DraftSessionManager::new()));
-    let draft_pools_path = data_path.join("draft-pools.json");
-    let draft_pools: SharedDraftPools = match draft_pools::DraftPools::from_path(&draft_pools_path)
+    let draft_pools: SharedDraftPools = match data_bootstrap::load_data_file(
+        data_path,
+        data_bootstrap::DRAFT_POOLS_FILE,
+        bootstrap_options,
+        identity,
+        draft_pools::DraftPools::from_path,
+    )
+    .await
     {
         Ok(pools) => {
             info!(sets = pools.len(), "draft pools loaded");
             Arc::new(pools)
         }
+        // The error opens with the path, so the field would repeat it.
         Err(e) => {
             warn!(
-                path = %draft_pools_path.display(),
                 error = %e,
                 "draft pools unavailable; server-hosted drafts cannot start"
             );
@@ -2165,6 +2407,11 @@ async fn serve() {
                         })
                         .collect::<Vec<_>>()
                 };
+                // Nothing else is held here: the branch below takes
+                // `bg_game_spectators` at its end and the lobby-expiry branch
+                // takes `bg_lobby` before `bg_state`, so the lobby lock this
+                // call takes is nested under neither.
+                delist_removed_sessions(&bg_lobby, &bg_lobby_subs, &removed).await;
                 {
                     let conns = bg_connections.lock().await;
                     for session in &removed {
@@ -2400,6 +2647,39 @@ async fn serve() {
         cli.port
     );
 
+    // Both fallible announce-setup steps happen once, here, and share one
+    // `error!` arm: a bad configuration is a single startup error the operator
+    // is watching for, rather than a warning every 60 s forever — and, for the
+    // HTTP client, rather than a panic inside a detached task whose handle
+    // nothing holds. `requires = "public_url"` guarantees the flag was
+    // supplied; it guarantees nothing about the value surviving
+    // `validate_public_url`.
+    if let Some(endpoint) = cli.announce_to.clone() {
+        let announce_setup = announcement_from_state(&app_state).and_then(|base| {
+            reqwest::Client::builder()
+                .timeout(ANNOUNCE_REQUEST_TIMEOUT)
+                .build()
+                .map(|client| (base, client))
+                .map_err(|error| format!("could not build the announce HTTP client: {error}"))
+        });
+        match announce_setup {
+            Ok((base, client)) => {
+                // The handle is discarded as a bare statement, matching the
+                // expiry task above: `JoinHandle` is not `#[must_use]`.
+                spawn_announce_task(
+                    endpoint,
+                    client,
+                    base,
+                    app_state.player_count.clone(),
+                    ANNOUNCE_INTERVAL,
+                );
+            }
+            Err(error) => {
+                error!(%error, "--announce-to is set but this server cannot announce itself")
+            }
+        }
+    }
+
     let listener = tokio::net::TcpListener::bind((cli.bind, cli.port))
         .await
         .expect("failed to bind");
@@ -2550,6 +2830,32 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// `lobby_broker::ServerMode` mirrors `server_core::protocol::ServerMode`
+/// variant-for-variant and serde-shape-for-serde-shape (its own doc comment
+/// says so), so this is a total translation with no fallback. Same shape as
+/// `to_server_message`'s conversion in the other direction.
+fn directory_mode(mode: Mode) -> lobby_broker::ServerMode {
+    match mode {
+        ServerMode::Full => lobby_broker::ServerMode::Full,
+        ServerMode::LobbyOnly => lobby_broker::ServerMode::LobbyOnly,
+    }
+}
+
+/// Public identity document — the same values `ServerHello` advertises
+/// (`handle_socket`), served over plain HTTP so a directory can verify an
+/// announcement without opening a WebSocket. `lobby_broker::directory` owns the
+/// shape; the Cloudflare Durable Object serves the same document.
+async fn server_info(State(app_state): State<AppState>) -> Json<ServerInfoDocument> {
+    Json(ServerInfoDocument {
+        mode: directory_mode(app_state.mode),
+        protocol_version: PROTOCOL_VERSION,
+        lobby_protocol_version: LOBBY_PROTOCOL_VERSION,
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
+        build_commit: Some(build_commit().to_string()),
+        public_url: app_state.public_url,
+    })
+}
+
 #[cfg(test)]
 mod lifecycle_tests {
     use std::collections::HashMap;
@@ -2563,10 +2869,129 @@ mod lifecycle_tests {
     use url::Url;
 
     use super::{
-        ai_result_broadcast_delay_from, bootstrap_required, origin_is_allowed,
-        prune_game_connections, select_card_data_source, validate_public_url, CardDataSource, Cli,
-        SharedConnections,
+        ai_result_broadcast_delay_from, bootstrap_required, build_state_update_message,
+        delist_removed_sessions, origin_is_allowed, prune_game_connections,
+        select_card_data_source, validate_public_url, CardDataSource, Cli, RegisterGameRequest,
+        ServerMessage, SharedConnections, SharedLobby, SharedLobbySubscribers, SysEnv,
     };
+
+    /// CR 118.3 + CR 117.1 — matrix row 21 (actor axis), at a REAL
+    /// `ServerMessage` construction site rather than at the engine entry point.
+    ///
+    /// `build_state_update_message` is the sync builder behind `phase-server`'s
+    /// `StateUpdate` fan-out. It derives `activation_block_reasons` from the
+    /// SAME `raw_state` binding its sibling `spell_costs` is destructured from,
+    /// and passes no `if is_actor` wrapper — the engine entry point self-gates
+    /// on `turn_control::is_authorized_submitter`, which is exactly what
+    /// `server_core::is_acting` delegates to.
+    ///
+    /// Both halves asserted in one test so neither is vacuous: the acting seat
+    /// receives a NON-EMPTY read-out, and the non-acting seat receives an empty
+    /// one from the SAME `ActionResult`.
+    ///
+    /// RUNNER: CI. Tilt's test resources are scoped `-p phase-engine -p phase-ai`
+    /// and never compile `phase-server`, so a green `test-engine` is no evidence
+    /// for this test.
+    #[test]
+    fn state_update_publishes_the_cost_block_readout_only_to_the_acting_seat() {
+        // DB-free by construction: `GameState::new_two_player` + `create_object`
+        // only, mirroring `mana_display_self_sacrifice_clone_gate.rs`. `phase-server`
+        // does not enable the engine's `test-support` feature, so `GameScenario`
+        // is not available here.
+        use engine::game::game_object::GameObject;
+        use engine::types::ability::{
+            AbilityCost, AbilityDefinition, AbilityKind, Effect, QuantityExpr, TargetFilter,
+        };
+        use engine::types::game_state::{GameState, WaitingFor};
+        use engine::types::identifiers::CardId;
+        use engine::types::phase::Phase;
+        use engine::types::player::PlayerId;
+        use engine::types::zones::Zone;
+        use std::sync::Arc as StdArc;
+
+        const P0: PlayerId = PlayerId(0);
+        const P1: PlayerId = PlayerId(1);
+
+        let mut raw_state = GameState::new_two_player(42);
+        raw_state.phase = Phase::PreCombatMain;
+        raw_state.waiting_for = WaitingFor::Priority { player: P0 };
+        raw_state.priority_player = P0;
+        raw_state.players[0].life = 1;
+
+        // `game::zones` is `pub(crate)`, so the object is placed directly:
+        // insert into `objects` and push onto the battlefield, which is exactly
+        // what `create_object` does for a pre-existing permanent.
+        let obj = engine::types::identifiers::ObjectId(raw_state.next_object_id);
+        raw_state.next_object_id += 1;
+        raw_state.objects.insert(
+            obj,
+            GameObject::new(
+                obj,
+                CardId(1),
+                P0,
+                "Costly Engine".to_string(),
+                Zone::Battlefield,
+            ),
+        );
+        raw_state.battlefield.push_back(obj);
+        // One unaffordable, resource-verdict ability: `Pay 5 life: draw` at 1 life.
+        {
+            let o = raw_state.objects.get_mut(&obj).expect("object exists");
+            StdArc::make_mut(&mut o.abilities).push(
+                AbilityDefinition::new(
+                    AbilityKind::Activated,
+                    Effect::Draw {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        target: TargetFilter::Controller,
+                    },
+                )
+                .cost(AbilityCost::PayLife {
+                    amount: QuantityExpr::Fixed { value: 5 },
+                }),
+            );
+        }
+
+        let (legal_actions, spell_costs, by_object) =
+            engine::ai_support::legal_actions_full(&raw_state);
+        let result: server_core::session::ActionResult = (
+            raw_state,
+            Vec::new(),
+            legal_actions,
+            Vec::new(),
+            false,
+            spell_costs,
+            by_object,
+        );
+
+        let full_key = server_core::FullSessionKey {
+            game_code: "GAME01".to_string(),
+            generation: 1,
+        };
+        let readout_for =
+            |player| match build_state_update_message(&result, 1, &full_key, player, Vec::new())
+                .expect("the snapshot guard admits this small board")
+            {
+                ServerMessage::StateUpdate {
+                    activation_block_reasons,
+                    ..
+                } => activation_block_reasons,
+                other => panic!("expected a StateUpdate, got {other:?}"),
+            };
+
+        let acting = readout_for(P0);
+        let other = readout_for(P1);
+
+        // PAIRED POSITIVE, mandatory: without it, a builder that dropped the
+        // field entirely would satisfy the negative below.
+        assert!(
+            acting.get(&obj).is_some_and(|entries| entries.len() == 1),
+            "the acting seat's StateUpdate carries the CR 118.3 read-out; got {acting:?}"
+        );
+        assert!(
+            other.is_empty(),
+            "a non-acting recipient of the SAME ActionResult gets an empty map; got {other:?}"
+        );
+    }
 
     #[test]
     fn ai_result_delay_uses_safe_default_and_bounded_override() {
@@ -2623,11 +3048,27 @@ mod lifecycle_tests {
         let temp = tempfile::tempdir().expect("temp dir");
 
         assert!(bootstrap_required(temp.path(), false));
-        assert!(select_card_data_source(temp.path(), false).is_err());
+        assert_eq!(
+            select_card_data_source(temp.path(), false),
+            CardDataSource::Export(temp.path().join("card-data.json"))
+        );
         assert!(!bootstrap_required(temp.path(), true));
         assert_eq!(
-            select_card_data_source(temp.path(), true).expect("explicit fixture source"),
+            select_card_data_source(temp.path(), true),
             CardDataSource::DevFixture(temp.path().join("mtgjson/test_fixture.json"))
+        );
+    }
+
+    /// The state a concurrent start's move-aside leaves for the instant between
+    /// the rename and the refill, both under its lock.
+    #[test]
+    fn an_export_held_aside_by_another_start_selects_the_export() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        std::fs::write(temp.path().join("card-data.json.replacing"), "{}").expect("held copy");
+
+        assert_eq!(
+            select_card_data_source(temp.path(), false),
+            CardDataSource::Export(temp.path().join("card-data.json"))
         );
     }
 
@@ -2677,6 +3118,48 @@ mod lifecycle_tests {
         assert_eq!(validate_public_url("file:///var/lib/phase-server"), None);
     }
 
+    /// V13. The flag pair is a coupling clap enforces, not a runtime check:
+    /// a directory row is an address, and there is no address to announce
+    /// without `--public-url`.
+    #[test]
+    fn announce_to_requires_a_public_url() {
+        // `Cli` is not `Debug`, so `expect_err` is not available here.
+        let alone = match Cli::try_parse_from([
+            "phase-server",
+            "--announce-to",
+            "https://d.example/servers/announce",
+        ]) {
+            Ok(_) => panic!("--announce-to alone must not parse"),
+            Err(error) => error,
+        };
+        // The `kind`, not merely that it errored: a typo'd flag name would
+        // otherwise pass this as `UnknownArgument`.
+        assert_eq!(
+            alone.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        // Paired positive: the same invocation WITH --public-url parses, and
+        // both fields are populated.
+        let both = Cli::try_parse_from([
+            "phase-server",
+            "--announce-to",
+            "https://d.example/servers/announce",
+            "--public-url",
+            "https://play.example.com",
+        ])
+        .expect("--announce-to with --public-url parses");
+        assert_eq!(
+            both.announce_to.as_ref().map(Url::to_string),
+            Some("https://d.example/servers/announce".to_string())
+        );
+        assert_eq!(both.public_url.as_deref(), Some("https://play.example.com"));
+
+        // Absent by default: announcing is opt-in.
+        let default = Cli::try_parse_from(["phase-server"]).expect("default CLI parses");
+        assert!(default.announce_to.is_none());
+    }
+
     #[tokio::test]
     async fn disconnect_expiry_prunes_only_the_finished_game_connections() {
         let connections: SharedConnections = Arc::new(Mutex::new(HashMap::new()));
@@ -2707,6 +3190,83 @@ mod lifecycle_tests {
         let conns = connections.lock().await;
         assert!(!conns.contains_key("EXPIRED"));
         assert!(conns.contains_key("ACTIVE"));
+    }
+
+    #[tokio::test]
+    async fn delist_removed_sessions_delists_every_removed_room_and_leaves_the_rest() {
+        // The reaper hands this helper every session it removed in one tick,
+        // which is more than one, so a single-room fixture would admit a
+        // projection that stranded all but the first.
+        use engine::game::deck_loading::PlayerDeckPayload;
+        let mut mgr = server_core::session::SessionManager::new();
+        let (code_a, _) = mgr.create_game(PlayerDeckPayload::default(), None);
+        let (code_b, _) = mgr.create_game(PlayerDeckPayload::default(), None);
+        let (kept_code, _) = mgr.create_game(PlayerDeckPayload::default(), None);
+
+        let lobby: SharedLobby = Arc::new(Mutex::new(Broker::new()));
+        {
+            let mut lob = lobby.lock().await;
+            for code in [&code_a, &code_b, &kept_code] {
+                lob.lobby_mut().register_game(
+                    code,
+                    RegisterGameRequest {
+                        host_name: "Host".to_string(),
+                        public: true,
+                        ..Default::default()
+                    },
+                    &SysEnv,
+                );
+            }
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let subscribers: SharedLobbySubscribers = Arc::new(Mutex::new(vec![tx]));
+
+        // Reach guard: all three rooms really are listed, so the assertions
+        // below cannot pass against a lobby that was never populated.
+        {
+            let lob = lobby.lock().await;
+            for code in [&code_a, &code_b, &kept_code] {
+                assert!(
+                    lob.lobby().has_game(code),
+                    "fixture did not register {code}"
+                );
+            }
+        }
+
+        let removed: Vec<_> = [&code_a, &code_b]
+            .into_iter()
+            .map(|code| mgr.remove_game(code).expect("the session is removed"))
+            .collect();
+        delist_removed_sessions(&lobby, &subscribers, &removed).await;
+
+        {
+            let lob = lobby.lock().await;
+            for code in [&code_a, &code_b] {
+                assert!(
+                    !lob.lobby().has_game(code),
+                    "a removed session must not stay listed: {code}"
+                );
+            }
+            assert!(
+                lob.lobby().has_game(&kept_code),
+                "a session the reaper did not remove must stay listed"
+            );
+        }
+
+        let mut announced = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                ServerMessage::LobbyGameRemoved { game_code } => announced.push(game_code),
+                other => panic!("expected only LobbyGameRemoved, got {other:?}"),
+            }
+        }
+        announced.sort();
+        let mut expected = vec![code_a, code_b];
+        expected.sort();
+        assert_eq!(
+            announced, expected,
+            "every removed public room announces once"
+        );
     }
 
     // -- Tournament reaper fan-out -----------------------------------------
@@ -2770,9 +3330,12 @@ mod lifecycle_tests {
             LobbyClientMessage::CreateTournament {
                 name: "Friday Night".into(),
                 arity: MatchArity::HEAD_TO_HEAD,
-                scoring: ScoringPolicy::default(),
+                scoring: Some(ScoringPolicy::default()),
                 bracket: BracketShape::Swiss,
                 total_rounds: None,
+                plus_rounds: None,
+                format: None,
+                match_type: None,
             },
             &env,
         );
@@ -2933,14 +3496,17 @@ mod restored_full_startup_tests {
     }
 
     fn restore(snapshot: &FullPersistSnapshot) -> GameSession {
-        GameSession::from_persisted(snapshot.persisted.clone(), &CardDatabase::default())
-            .expect("persisted test session restores")
+        GameSession::from_persisted(
+            snapshot.persisted.clone(),
+            &Arc::new(CardDatabase::default()),
+        )
+        .expect("persisted test session restores")
     }
 
     #[test]
     fn startup_restore_keeps_ordinary_priority_as_a_revision_preserving_noop() {
         let mut source_manager = SessionManager::new();
-        let (game_code, _) = source_manager.create_game(PlayerDeckPayload::default());
+        let (game_code, _) = source_manager.create_game(PlayerDeckPayload::default(), None);
         let source = source_manager
             .sessions
             .get(&game_code)
@@ -2970,7 +3536,7 @@ mod restored_full_startup_tests {
     #[test]
     fn startup_game_over_uses_terminal_persistence_instead_of_exposure() {
         let mut source_manager = SessionManager::new();
-        let (game_code, token) = source_manager.create_game(PlayerDeckPayload::default());
+        let (game_code, token) = source_manager.create_game(PlayerDeckPayload::default(), None);
         let source = source_manager
             .sessions
             .get_mut(&game_code)
@@ -3041,15 +3607,19 @@ fn admin_token_from_env() -> Option<String> {
 /// rather than through the response body a compressing layer would wrap —
 /// keeping the layer off that route entirely removes any dependence on that
 /// implementation detail continuing to hold across axum/tower-http upgrades.
-/// Every other route (health check, the P2P draft backup API, and — when
-/// `admin_token` is set — the bearer-guarded `/admin/*` routes) is served
-/// through gzip `CompressionLayer` so JSON/text responses shrink whenever the
-/// client advertises `Accept-Encoding: gzip`.
+/// Every other route (health check, the `lobby_broker::directory::INFO_PATH`
+/// identity document, the P2P draft backup API, and — when `admin_token` is
+/// set — the bearer-guarded `/admin/*` routes) is served through gzip
+/// `CompressionLayer` so JSON/text responses shrink whenever the client
+/// advertises `Accept-Encoding: gzip`.
 fn build_router(app_state: AppState, cors: CorsLayer, admin_token: Option<&str>) -> Router {
     let ws_router: Router<AppState> = Router::new().route("/ws", get(ws_handler));
 
     let mut http_router: Router<AppState> = Router::new()
         .route("/health", get(health))
+        // The constant, never a `"/info"` literal: every server kind must
+        // answer its info document on the same path a directory probes.
+        .route(INFO_PATH, get(server_info))
         .route("/p2p-draft-backup", post(admin::p2p_backup_store))
         .route(
             "/p2p-draft-backup/{code}",
@@ -3134,6 +3704,159 @@ fn validate_public_url(raw: &str) -> Option<String> {
             None
         }
     }
+}
+
+/// How often a server re-asserts its directory listing. The directory expires
+/// rows that stop being re-asserted, so this is a heartbeat, not a one-shot
+/// registration.
+const ANNOUNCE_INTERVAL: Duration = Duration::from_secs(60);
+/// Ceiling on one announce POST. A directory that hangs must never accumulate
+/// in-flight requests behind a 60 s heartbeat.
+const ANNOUNCE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Build this server's directory announcement from live state. `Err` when the
+/// server has no announceable address: no `--public-url` (a malformed value is
+/// dropped by [`validate_public_url`], so the flag being present guarantees
+/// nothing about the value), a non-`https` one (the directory lists `wss://`
+/// only, and an `http://` public URL would announce an address this server does
+/// not serve), or one whose host the directory contract refuses.
+///
+/// Assembly only, with one deliberate exception: every rule it could have
+/// inlined — scheme, host shape, normalisation — lives in
+/// `lobby_broker::directory` and is applied by the same
+/// [`validate_announcement`] the directory itself runs. The exception is the
+/// name cap: `name` is the host truncated to [`MAX_SERVER_NAME_LEN`], while
+/// `url` keeps the full host, so a host too long to be a display name still
+/// yields an announceable address rather than no announcement at all.
+fn announcement_from_state(state: &AppState) -> Result<ServerAnnouncement, String> {
+    let public_url = state.public_url.as_deref().ok_or_else(|| {
+        "no public URL to announce (--public-url is unset, or was dropped as malformed)".to_string()
+    })?;
+    let parsed =
+        Url::parse(public_url).map_err(|error| format!("unparseable --public-url: {error}"))?;
+    if parsed.scheme() != "https" {
+        return Err(format!(
+            "--public-url scheme is `{}`; a directory listing must be wss://, which requires an \
+             https:// public URL",
+            parsed.scheme()
+        ));
+    }
+    // `host_str()` + `port()`, never `authority()` — the latter carries
+    // userinfo through into the announced address.
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "--public-url has no host".to_string())?;
+    let port_suffix = parsed
+        .port()
+        .map_or(String::new(), |port| format!(":{port}"));
+    // A host longer than the NAME cap must not disable announcing outright:
+    // `MAX_SERVER_URL_LEN` is 256 while `MAX_SERVER_NAME_LEN` is 64, so a host
+    // between those bounds yields an address the directory contract accepts and
+    // a display name it rejects. Truncate the name rather than fail the whole
+    // announcement — `url()` keeps the full host, and that is the field
+    // identity turns on.
+    //
+    // Truncating by CHARACTERS, which is the unit `validate_required_label`
+    // itself bounds (`value.chars().count()`), so this is the exact inverse of
+    // the check it has to satisfy and cannot split a codepoint. Characters and
+    // bytes also coincide here, but the guarantee for that is `Url::host_str()`
+    // having already applied IDNA ToASCII on a special scheme — and the scheme
+    // was checked to be `https` above (measured: `https://bücher.example`
+    // parses to host `xn--bcher-kva.example`). That guarantee is UPSTREAM of
+    // this line. The directory contract's own ASCII rule is not: it runs inside
+    // `validate_announcement` below, so nothing here may lean on it.
+    let name: String = host.chars().take(MAX_SERVER_NAME_LEN).collect();
+    // `/ws` by construction: this server is describing its own route, and
+    // `build_router` registers exactly that path.
+    let raw = RawAnnouncement {
+        directory_version: DIRECTORY_VERSION,
+        url: format!("wss://{host}{port_suffix}/ws"),
+        name,
+        mode: directory_mode(state.mode),
+        server_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_version: PROTOCOL_VERSION,
+        lobby_protocol_version: LOBBY_PROTOCOL_VERSION,
+        current_players: state.player_count.load(Ordering::Relaxed),
+    };
+    validate_announcement(&raw)
+}
+
+/// Heartbeat POSTing `base` every `period`, refreshing only the live player
+/// count. Warn-and-retry: a directory that is down, slow or rejecting must
+/// never affect the game server. Detached like the expiry task in `serve` — it
+/// ends with the runtime at process exit.
+///
+/// `base` is already validated (built once by [`announcement_from_state`] at
+/// startup) and `client` is already built (by the caller, carrying
+/// [`ANNOUNCE_REQUEST_TIMEOUT`]), so the task has no *fallible* setup — it
+/// cannot fail to build an announcement and it cannot fail to build a client.
+/// Both of those failures are the caller's single startup `error!`; building
+/// the client in here instead would put either a fourth outcome or a silent
+/// panic inside a task that is required never to die and whose handle
+/// production discards. Three per-tick failure classes remain, each logged at
+/// warn with the tick skipped and the loop continuing: a transport error, a
+/// non-success status, and a serialization error from `serde_json::to_vec`.
+/// `period` is a parameter so the test drives the real loop without a
+/// wall-clock minute; production passes [`ANNOUNCE_INTERVAL`]. The handle is
+/// returned only so that test can assert the task is still alive.
+///
+/// # Panics
+///
+/// `period` must be non-zero. `tokio::time::interval` panics on a zero period,
+/// and it would do so at the first poll *inside* the spawned task — precisely
+/// the unobservable failure mode the caller-built `client` exists to avoid,
+/// since production discards the handle. The `debug_assert!` below moves that
+/// failure onto the caller's thread instead.
+fn spawn_announce_task(
+    endpoint: Url,
+    client: reqwest::Client,
+    base: ServerAnnouncement,
+    player_count: SharedPlayerCount,
+    period: Duration,
+) -> tokio::task::JoinHandle<()> {
+    // Deliberately in the synchronous body rather than beside the `interval`
+    // call it guards: a panic raised inside the spawned task is exactly the
+    // unobservable failure this assertion exists to catch, so it has to fire on
+    // the caller's thread to be worth anything. No runtime branch — the loop
+    // keeps exactly its three per-tick failure classes.
+    debug_assert!(!period.is_zero(), "announce period must be non-zero");
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        // A stalled process must not fire a burst of announcements on catch-up.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            // `interval`'s first tick completes immediately, so the server
+            // announces at startup and then every `period`.
+            interval.tick().await;
+            let announcement = base.with_current_players(player_count.load(Ordering::Relaxed));
+            let body = match serde_json::to_vec(&announcement) {
+                Ok(body) => body,
+                Err(error) => {
+                    warn!(%error, "could not serialize the directory announcement; skipping this tick");
+                    continue;
+                }
+            };
+            let sent = client
+                .post(endpoint.clone())
+                .header(http::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .send()
+                .await;
+            match sent {
+                Ok(response) if response.status().is_success() => {}
+                Ok(response) => warn!(
+                    status = %response.status(),
+                    endpoint = %endpoint,
+                    "directory refused this announcement; retrying next tick"
+                ),
+                Err(error) => warn!(
+                    %error,
+                    endpoint = %endpoint,
+                    "could not reach the directory; retrying next tick"
+                ),
+            }
+        }
+    })
 }
 
 /// Open an embedded ngrok HTTP tunnel that forwards public traffic to the local
@@ -3583,6 +4306,19 @@ async fn broadcast_player_count(lobby_subscribers: &SharedLobbySubscribers, coun
     }
 }
 
+/// The single place a `PlayerSlotsUpdate` is built: the message is rebuilt per
+/// recipient, so no send site can skip `slots_for_recipient`.
+fn send_player_slots<'a>(
+    recipients: impl IntoIterator<Item = (&'a PlayerId, &'a mpsc::UnboundedSender<ServerMessage>)>,
+    slots: &[server_core::PlayerSlotInfo],
+) {
+    for (pid, sender) in recipients {
+        let _ = sender.send(ServerMessage::PlayerSlotsUpdate {
+            slots: GameSession::slots_for_recipient(slots, *pid),
+        });
+    }
+}
+
 /// Send PlayerSlotsUpdate to all connected players in a game.
 async fn broadcast_player_slots(
     state: &SharedState,
@@ -3596,12 +4332,77 @@ async fn broadcast_player_slots(
             None => return,
         }
     };
-    let msg = ServerMessage::PlayerSlotsUpdate { slots };
     let conns = connections.lock().await;
     if let Some(players) = conns.get(game_code) {
-        for sender in players.values() {
-            let _ = sender.send(msg.clone());
+        send_player_slots(players.iter(), &slots);
+    }
+}
+
+/// Delists every destroyed code and returns those that were still publicly
+/// listed, for the `LobbyGameRemoved` fan-out.
+///
+/// The guarantee is one-sided: destroying a session or draft removes its lobby
+/// entry. The reverse does not hold — `LobbyManager::check_expired` reaps on a
+/// registration timestamp that is never refreshed, so an entry is an
+/// advertisement with a TTL and can lapse while its subject is alive.
+///
+/// `public_game` returns `None` both for a private entry and for a missing one,
+/// which is exactly the `existed && public_before` condition the game-start
+/// delists compute by hand; `unregister_game` on an absent code is a no-op.
+fn delist_destroyed_sessions<'a>(
+    lob: &mut lobby_broker::lobby::LobbyManager,
+    codes: impl Iterator<Item = &'a str>,
+) -> Vec<String> {
+    let mut announce = Vec::new();
+    for code in codes {
+        if lob.public_game(code).is_some() {
+            announce.push(code.to_string());
         }
+        lob.unregister_game(code);
+    }
+    announce
+}
+
+/// Takes the lobby lock alone and drops the guard before awaiting the
+/// subscriber fan-out, so a caller must hold neither the lobby lock nor any
+/// lock the loops order after it.
+async fn delist_and_announce<'a>(
+    lobby: &SharedLobby,
+    subscribers: &SharedLobbySubscribers,
+    codes: impl Iterator<Item = &'a str>,
+) {
+    let announce = {
+        let mut lob_guard = lobby.lock().await;
+        delist_destroyed_sessions(lob_guard.lobby_mut(), codes)
+    };
+    announce_delisted(subscribers, announce).await;
+}
+
+/// Delists the sessions the reaper removed. Projecting them onto their game
+/// codes inside the helper puts that step under test and leaves the wider
+/// `expired` list the removals were filtered from unable to typecheck here.
+async fn delist_removed_sessions(
+    lobby: &SharedLobby,
+    subscribers: &SharedLobbySubscribers,
+    removed: &[server_core::session::GameSession],
+) {
+    delist_and_announce(
+        lobby,
+        subscribers,
+        removed.iter().map(|session| session.game_code.as_str()),
+    )
+    .await;
+}
+
+/// Fans out one `LobbyGameRemoved` per code returned by
+/// [`delist_destroyed_sessions`].
+async fn announce_delisted(lobby_subscribers: &SharedLobbySubscribers, codes: Vec<String>) {
+    for game_code in codes {
+        broadcast_to_lobby_subscribers(
+            lobby_subscribers,
+            ServerMessage::LobbyGameRemoved { game_code },
+        )
+        .await;
     }
 }
 
@@ -3703,19 +4504,23 @@ fn to_server_message(m: lobby_broker::LobbyServerMessage) -> ServerMessage {
         L::TournamentCreated {
             code,
             organizer_token,
+            expires_at_ms,
             view,
         } => ServerMessage::TournamentCreated {
             code,
             organizer_token,
+            expires_at_ms,
             view,
         },
         L::TournamentJoined {
             code,
             player_token,
+            expires_at_ms,
             view,
         } => ServerMessage::TournamentJoined {
             code,
             player_token,
+            expires_at_ms,
             view,
         },
         L::TournamentUpdate { code, view } => ServerMessage::TournamentUpdate { code, view },
@@ -3723,6 +4528,38 @@ fn to_server_message(m: lobby_broker::LobbyServerMessage) -> ServerMessage {
         L::TournamentListUpdate { tournaments } => {
             ServerMessage::TournamentListUpdate { tournaments }
         }
+        // The two correlated settlement replies. `request_id` is the same
+        // re-exported `TournamentRequestId` on both enums, so this stays a pure
+        // re-tag like every arm above it.
+        L::TournamentActionAck {
+            request_id,
+            code,
+            view,
+        } => ServerMessage::TournamentActionAck {
+            request_id,
+            code,
+            view,
+        },
+        L::TournamentActionRejected {
+            request_id,
+            message,
+        } => ServerMessage::TournamentActionRejected {
+            request_id,
+            message,
+        },
+        // `role` is the same re-exported `TournamentRole` on both enums, so
+        // this stays a pure re-tag like every arm above it.
+        L::TournamentCredentialRenewed {
+            code,
+            role,
+            token,
+            expires_at_ms,
+        } => ServerMessage::TournamentCredentialRenewed {
+            code,
+            role,
+            token,
+            expires_at_ms,
+        },
     }
 }
 
@@ -3766,6 +4603,7 @@ fn to_lobby_client_message(msg: &ClientMessage) -> Option<lobby_broker::LobbyCli
             draft_metadata,
             start_when_full,
             ranked,
+            booster_pack_pool: _,
         } => L::CreateGameWithSettings {
             deck: deck.clone(),
             display_name: display_name.clone(),
@@ -3837,12 +4675,18 @@ fn to_lobby_client_message(msg: &ClientMessage) -> Option<lobby_broker::LobbyCli
             scoring,
             bracket,
             total_rounds,
+            plus_rounds,
+            format,
+            match_type,
         } => L::CreateTournament {
             name: name.clone(),
             arity: *arity,
             scoring: *scoring,
             bracket: *bracket,
             total_rounds: *total_rounds,
+            plus_rounds: *plus_rounds,
+            format: *format,
+            match_type: *match_type,
         },
         ClientMessage::JoinTournament {
             code,
@@ -3854,34 +4698,66 @@ fn to_lobby_client_message(msg: &ClientMessage) -> Option<lobby_broker::LobbyCli
             display_name: display_name.clone(),
         },
         ClientMessage::GetTournament { code } => L::GetTournament { code: code.clone() },
+        // The four GATED actions FORWARD their correlator rather than dropping
+        // it. Binding it by name is compiler-forced; forwarding the bound value
+        // is not — `request_id: _` on the pattern plus `request_id: None` on the
+        // construction compiles perfectly and is exactly the bug: it would
+        // silently uncorrelate every request from a native `phase-server`
+        // client while the Cloudflare Worker path, which never re-tags, kept
+        // working. `tournament_variants_survive_the_canonical_lobby_roundtrip`
+        // is the guard, and it only bites because one fixture carries a real
+        // `Some(..)` — under `skip_serializing_if = "Option::is_none"` a
+        // forwarded `None` and a discarded one serialize identically.
         ClientMessage::StartTournamentRound {
             code,
             organizer_token,
+            request_id,
         } => L::StartTournamentRound {
             code: code.clone(),
             organizer_token: organizer_token.clone(),
+            request_id: *request_id,
         },
         ClientMessage::ReportMatchResult {
             code,
             pairing_id,
             player_token,
             outcome,
+            request_id,
         } => L::ReportMatchResult {
             code: code.clone(),
             pairing_id: *pairing_id,
             player_token: player_token.clone(),
             outcome: outcome.clone(),
+            request_id: *request_id,
         },
-        ClientMessage::DropFromTournament { code, player_token } => L::DropFromTournament {
+        ClientMessage::DropFromTournament {
+            code,
+            player_token,
+            request_id,
+        } => L::DropFromTournament {
             code: code.clone(),
             player_token: player_token.clone(),
+            request_id: *request_id,
         },
         ClientMessage::EndTournament {
             code,
             organizer_token,
+            request_id,
         } => L::EndTournament {
             code: code.clone(),
             organizer_token: organizer_token.clone(),
+            request_id: *request_id,
+        },
+        ClientMessage::RenewTournamentCredential {
+            code,
+            role,
+            token,
+            rotation_nonce,
+        } => L::RenewTournamentCredential {
+            code: code.clone(),
+            role: *role,
+            token: token.clone(),
+            rotation_nonce: rotation_nonce.clone(),
         },
         _ => return None,
     })
@@ -4044,6 +4920,8 @@ fn persist_full_session_async(game_db: &SharedGameDb, session: &GameSession) {
 /// Session-configuration inputs for [`create_and_connect_multiplayer_session`].
 struct MultiplayerSessionRequest {
     resolved: engine::game::deck_loading::PlayerDeckPayload,
+    /// The host's submitted card-name list — seat 0's deck provenance.
+    host_choice: seat_reducer::types::DeckChoice,
     display_name: String,
     timer_seconds: Option<u32>,
     pc: u8,
@@ -4051,15 +4929,86 @@ struct MultiplayerSessionRequest {
     format_config: Option<engine::types::format::FormatConfig>,
     start_when_full: bool,
     ranked: bool,
-    ai_requests: Vec<(
-        u8,
-        phase_ai::config::AiDifficulty,
-        engine::game::deck_loading::PlayerDeckPayload,
-    )>,
+    booster_pack_pool: Option<Vec<String>>,
+    ai_requests: Vec<server_core::session::AiSeatSetup>,
     public: bool,
     password: Option<String>,
     host_tx: mpsc::UnboundedSender<ServerMessage>,
     context: ServerContext,
+}
+
+/// The single authority for what deck each AI seat gets and what choice
+/// describes it. `Err` refuses the create, matching every other deck failure
+/// in the handler this replaces the inline loop in — a seat whose deck cannot
+/// be resolved has no honest provenance to record.
+fn ai_seat_setups(
+    db: &engine::database::CardDatabase,
+    ai_seats: &[server_core::protocol::AiSeatRequest],
+    pc: u8,
+    format_config: Option<&engine::types::format::FormatConfig>,
+    match_type: engine::types::match_config::MatchType,
+) -> Result<Vec<server_core::session::AiSeatSetup>, String> {
+    use seat_reducer::types::DeckChoice;
+
+    let mut setups = Vec::new();
+    for seat in ai_seats {
+        if seat.seat_index == 0 || seat.seat_index >= pc {
+            continue;
+        }
+        let effective = match &seat.deck {
+            Some(DeckChoice::DeckList(deck)) => deck.as_ref().clone(),
+            Some(DeckChoice::Named(name)) => named_starter_or_random(name),
+            Some(DeckChoice::Random) | None => match &seat.deck_name {
+                Some(name) if name.eq_ignore_ascii_case("random") => {
+                    server_core::starter_decks::random_starter_deck()
+                }
+                Some(name) => named_starter_or_random(name),
+                None => server_core::starter_decks::random_starter_deck(),
+            },
+        };
+        if let Some(fc) = format_config {
+            if let Err(reasons) = validate_name_deck_for_format_full(
+                db,
+                &effective.main_deck,
+                &effective.sideboard,
+                &effective.commander,
+                &effective.companion,
+                &effective.planar_deck,
+                &effective.scheme_deck,
+                &effective.signature_spell,
+                // Constructed play: no draft, no concession.
+                &[],
+                fc,
+                Some(match_type),
+                usize::from(pc),
+            ) {
+                return Err(format!(
+                    "AI deck for seat {} not legal for {}: {}",
+                    seat.seat_index,
+                    fc.format.label(),
+                    reasons.join("; ")
+                ));
+            }
+        }
+        let resolved = resolve_deck(db, &effective)?;
+        setups.push(server_core::session::AiSeatSetup {
+            seat_index: seat.seat_index,
+            difficulty: seat.difficulty,
+            // The deck the seat actually got. `seat.deck` would report
+            // `Random` for a seat holding a named starter — a field whose whole
+            // purpose is the choice, naming something that is not it.
+            choice: DeckChoice::DeckList(Box::new(effective)),
+            resolved,
+        });
+    }
+    Ok(setups)
+}
+
+fn named_starter_or_random(name: &str) -> engine::starter_decks::DeckData {
+    server_core::starter_decks::find_starter_deck(name).unwrap_or_else(|| {
+        warn!(deck = %name, "unknown AI deck name, using random");
+        server_core::starter_decks::random_starter_deck()
+    })
 }
 
 /// Phases 1–2 of the `CreateGameWithSettings` full multiplayer path.
@@ -4080,6 +5029,7 @@ async fn create_and_connect_multiplayer_session(
 ) -> Result<(String, String, PlayerId, u32, server_core::FullSessionKey), String> {
     let MultiplayerSessionRequest {
         resolved,
+        host_choice,
         display_name,
         timer_seconds,
         pc,
@@ -4087,6 +5037,7 @@ async fn create_and_connect_multiplayer_session(
         format_config,
         start_when_full,
         ranked,
+        booster_pack_pool,
         ai_requests,
         public,
         password,
@@ -4112,6 +5063,7 @@ async fn create_and_connect_multiplayer_session(
         }
         let (game_code, player_token) = mgr.create_game_n_players(
             resolved,
+            Some(host_choice),
             display_name.clone(),
             timer_seconds,
             pc,
@@ -4130,19 +5082,9 @@ async fn create_and_connect_multiplayer_session(
         if let Some(session) = mgr.sessions.get_mut(&game_code) {
             session.start_when_full = start_when_full;
             session.ranked = ranked;
-            for (seat_index, difficulty, deck) in &ai_requests {
-                let seat = *seat_index as usize;
-                session.display_names[seat] = format!("AI ({difficulty:?})");
-                session.connected[seat] = true;
-                session.decks[seat] = Some(deck.clone());
-                let pid = PlayerId(*seat_index);
-                session.ai_seats.insert(pid);
-                let config = phase_ai::config::create_config_for_players(
-                    *difficulty,
-                    phase_ai::config::Platform::Native,
-                    pc,
-                );
-                session.ai_configs.insert(pid, config);
+            session.booster_pack_pool = booster_pack_pool;
+            for setup in ai_requests {
+                session.seat_ai(setup);
             }
         }
 
@@ -4557,16 +5499,65 @@ async fn report_draft_game_over(
     broadcast_draft_views(&draft_code, connections, draft_state).await;
 }
 
-/// When the draft pod is pairing or in match play, generate pairings (server-internal)
-/// and spawn 2-player game sessions for each pending table.
+/// Bind a spawned draft game to its exact Full lifetime before announcing it.
+fn initialize_draft_match_runtime(
+    game_manager: &mut SessionManager,
+    game_db: &SharedGameDb,
+    spawn: &DraftMatchSpawn,
+) -> Result<server_core::FullSessionKey, String> {
+    let full_key = game_db
+        .create_full_session_key(&spawn.game_code)
+        .map_err(|error| format!("Failed to bind draft match identity: {error}"))?;
+    let session = game_manager
+        .sessions
+        .get_mut(&spawn.game_code)
+        .ok_or_else(|| format!("Spawned draft match is missing: {}", spawn.game_code))?;
+    // These seats have not attached yet. Keep their presence accurate without
+    // starting reconnect expiry before an actual socket has disconnected.
+    session.connected.fill(false);
+    initialize_full_runtime(game_db, session, full_key.clone())?;
+
+    Ok(full_key)
+}
+
+/// Build the initial match announcement from the draft seat's stable credential.
+fn build_draft_match_start_message(
+    draft_manager: &DraftSessionManager,
+    draft_code: &str,
+    spawn: &DraftMatchSpawn,
+    full_key: &server_core::FullSessionKey,
+    player: &DraftMatchPlayer,
+    opponent_name: &str,
+) -> Result<ServerMessage, String> {
+    let draft_token = draft_manager
+        .sessions
+        .get(draft_code)
+        .and_then(|session| session.player_tokens.get(usize::from(player.draft_seat)))
+        .filter(|token| !token.is_empty())
+        .cloned()
+        .ok_or_else(|| "Draft match credential disappeared before announcement".to_string())?;
+
+    Ok(ServerMessage::DraftMatchStart {
+        match_id: spawn.match_id.clone(),
+        round: spawn.round,
+        game_code: spawn.game_code.clone(),
+        full_key: full_key.clone(),
+        player_token: draft_token,
+        your_player: player.game_player,
+        opponent_name: opponent_name.to_string(),
+    })
+}
+
+/// Generate pairings and spawn 2-player game sessions for pending draft tables.
 async fn maybe_spawn_draft_matches(
     draft_code: &str,
     draft_state: &SharedDraftState,
     game_state: &SharedState,
     db: &SharedDb,
+    game_db: &SharedGameDb,
     connections: &SharedConnections,
 ) {
-    let spawns = {
+    let spawns: Vec<(DraftMatchSpawn, server_core::FullSessionKey)> = {
         let mut draft_mgr = draft_state.lock().await;
         let mut game_mgr = game_state.lock().await;
         if let Err(error) = draft_mgr.ensure_pairings_generated(draft_code) {
@@ -4583,7 +5574,28 @@ async fn maybe_spawn_draft_matches(
             .map(|s| s.session.current_round)
             .unwrap_or(1);
         match draft_mgr.spawn_match_games_for_round(draft_code, &mut game_mgr, db, round) {
-            Ok(s) => s,
+            Ok(spawned) => spawned
+                .into_iter()
+                .filter_map(|spawn| {
+                    match initialize_draft_match_runtime(&mut game_mgr, game_db, &spawn) {
+                        Ok(full_key) => Some((spawn, full_key)),
+                        Err(error) => {
+                            warn!(
+                                draft = %draft_code,
+                                match_id = %spawn.match_id,
+                                game = %spawn.game_code,
+                                %error,
+                                "failed to initialize draft match"
+                            );
+                            game_mgr.remove_game(&spawn.game_code);
+                            if let Some(session) = draft_mgr.sessions.get_mut(draft_code) {
+                                session.active_matches.remove(&spawn.match_id);
+                            }
+                            None
+                        }
+                    }
+                })
+                .collect(),
             Err(e) => {
                 warn!(draft = %draft_code, error = %e, "draft match spawn skipped");
                 return;
@@ -4598,13 +5610,13 @@ async fn maybe_spawn_draft_matches(
     // Reacquire draft state before the sender map so a reconnect cannot renew
     // its engine state between pairing generation and match-start delivery.
     // Draft reconnects use the same draft state -> connections ordering.
-    let _draft_manager = draft_state.lock().await;
+    let draft_manager = draft_state.lock().await;
     let conns = connections.lock().await;
     let Some(players) = conns.get(draft_code) else {
         return;
     };
 
-    for spawn in spawns {
+    for (spawn, full_key) in spawns {
         info!(
             draft = %draft_code,
             match_id = %spawn.match_id,
@@ -4612,13 +5624,24 @@ async fn maybe_spawn_draft_matches(
             "draft match game spawned"
         );
         for (player, seat) in [(&spawn.player_a, 0usize), (&spawn.player_b, 1usize)] {
-            let msg = ServerMessage::DraftMatchStart {
-                match_id: spawn.match_id.clone(),
-                round: spawn.round,
-                game_code: spawn.game_code.clone(),
-                player_token: player.game_token.clone(),
-                your_player: player.game_player,
-                opponent_name: spawn.opponent_names[seat].clone(),
+            let msg = match build_draft_match_start_message(
+                &draft_manager,
+                draft_code,
+                &spawn,
+                &full_key,
+                player,
+                &spawn.opponent_names[seat],
+            ) {
+                Ok(message) => message,
+                Err(error) => {
+                    warn!(
+                        draft = %draft_code,
+                        match_id = %spawn.match_id,
+                        seat = player.draft_seat,
+                        %error
+                    );
+                    continue;
+                }
             };
             if let Some(sender) = players.get(&PlayerId(player.draft_seat)) {
                 let _ = sender.send(msg);
@@ -4740,50 +5763,51 @@ fn spawn_pick_timer(
 
         let pod_size = session.player_tokens.len();
         let seats = draft_seats_needing_auto_pick(&mut session.session, pod_size);
+        // DELEGATES to `DraftSessionManager::pick_random_for_seat` rather than
+        // re-deriving the body. One authority, and the delegation is also what
+        // removes the second `current_pack` guard this body used to carry: that
+        // guard re-imposed the pick-and-pass filter one layer ABOVE the
+        // distribution dispatch `draft_seats_needing_auto_pick` and
+        // `pick_random_for_seat` now perform, which would have made every
+        // shared-stack arm below it dead. The CR 903.13b pick-step derivation
+        // (and the shared-stack forced decision) live there, in the one copy.
         for seat_idx in seats {
-            if let Some(pack) = &session.session.current_pack[seat_idx] {
-                if !pack.0.is_empty() {
-                    // CR 903.13b: the expired pick timer takes the kind's WHOLE
-                    // pick step — one card for the four CR 905.1a kinds, two for
-                    // CommanderDraft, dropping to the remainder on an odd final
-                    // pick. Read from the procedure so this and the reducer's
-                    // `expected` agree by construction. Was a hardcoded single
-                    // id, which stalled a Commander pod at `WrongPickCardCount`.
-                    // Same mechanism as `server-core`'s disconnected-seat
-                    // auto-pick, which carries the full derivation.
-                    let cards_per_pick =
-                        usize::from(session.session.config.kind.procedure().cards_per_pick)
-                            .min(pack.0.len());
-                    let mut rng = rand::rng();
-                    // Distinct ids: drawing twice by index into the pack could
-                    // pick the same card twice, which the reducer rejects.
-                    let mut remaining: Vec<String> =
-                        pack.0.iter().map(|c| c.instance_id.clone()).collect();
-                    let card_instance_ids: Vec<String> = (0..cards_per_pick)
-                        .map(|_| remaining.swap_remove(rng.random_range(0..remaining.len())))
-                        .collect();
-                    let action = draft_core::types::DraftAction::Pick {
-                        seat: seat_idx as u8,
-                        card_instance_ids,
-                    };
-                    if let Err(e) = draft_core::session::apply(&mut session.session, action, None) {
-                        warn!(
-                            draft = %timer_draft_code,
-                            seat = seat_idx,
-                            error = %e,
-                            "auto-pick failed"
-                        );
-                    }
-                }
+            if let Err(e) = mgr.pick_random_for_seat(&timer_draft_code, seat_idx as u8, None) {
+                warn!(
+                    draft = %timer_draft_code,
+                    seat = seat_idx,
+                    error = %e,
+                    "auto-pick failed"
+                );
             }
         }
 
-        session.timer_remaining_ms = None;
+        if let Some(session) = mgr.sessions.get_mut(&timer_draft_code) {
+            session.timer_remaining_ms = None;
+        }
 
         drop(mgr);
         broadcast_draft_views(&timer_draft_code, &timer_connections, &timer_draft_state).await;
 
         // Re-arm for the next pick window if the draft is still in progress.
+        //
+        // UNCONDITIONAL, and that is load-bearing for a shared-stack pod: this
+        // self-re-arm is what keeps one from stalling.
+        // `should_rearm_pick_timer` governs only the POST-ACTION restart and is
+        // keyed on `DraftPickWindow = (status, current_pack_number,
+        // pick_number)` — two counters a shared-stack session never moves — so
+        // the post-action path never re-arms for one and only this loop does.
+        //
+        // The residual defect is therefore FAIRNESS, not a stall: after a
+        // shared-stack decision the clock is not restarted, so the next seat
+        // begins its turn with whatever seconds its opponent left behind. That
+        // is DELIBERATELY DEFERRED. The fix is a `DraftPickWindow`
+        // tuple-to-named-struct retype across eleven sites in this file plus
+        // five existing assertions and a new `DraftSession` method, and the
+        // whole benefit accrues to the server-authoritative draft path, which
+        // no shipped client reaches. Recorded here so the next reader neither
+        // re-derives the wrong severity ("the pod stalls" — it does not) nor
+        // concludes the gap was missed.
         let still_drafting = {
             let mgr = timer_draft_state.lock().await;
             let status = mgr
@@ -4855,11 +5879,10 @@ impl DeckResolver for ServerDeckResolver<'_> {
         // The reducer stays at the name-only layer (see `DeckResolver` docs),
         // but we MUST still validate the names against the card database here
         // — otherwise a deck containing unresolvable names propagates through
-        // `apply_seat_delta` as `None`, and `start_game` silently substitutes
-        // an empty `PlayerDeckPayload` (see `Session::start_game`). The result
-        // is CR 704.5b losing every player on their first draw step with no
-        // user-visible error. Validating here causes the reducer to return
-        // `Err`, which phase-server then surfaces to the client.
+        // `apply_seat_delta` as `None` and `start_game` refuses the whole
+        // table with `SeatDeckMissing`, naming a seat rather than the deck
+        // that caused it. Validating here causes the reducer to return `Err`,
+        // which phase-server then surfaces to the client.
         server_core::resolve_deck(self.db, &deck)?;
         Ok(engine::game::deck_loading::PlayerDeckList {
             main_deck: deck.main_deck,
@@ -5025,7 +6048,7 @@ async fn draft_pack_generator_for_start(
 async fn broadcast_ai_results(
     connections: &SharedConnections,
     game_spectators: &SharedGameSpectators,
-    game_code: &str,
+    full_key: &server_core::FullSessionKey,
     player_count: u8,
     eliminated: &[PlayerId],
     ai_results: &[RevisionedActionResult],
@@ -5035,6 +6058,8 @@ async fn broadcast_ai_results(
     // client to choose a frame-sized delay or disable pacing entirely. The
     // delay is presentation policy, not game authority.
     let ai_result_delay = ai_result_broadcast_delay();
+    let game_code = &full_key.game_code;
+    // Broadcast AI follow-up results with delays
     for (i, (ai_revision, result)) in ai_results.iter().enumerate() {
         if !ai_result_delay.is_zero() {
             tokio::time::sleep(ai_result_delay).await;
@@ -5102,7 +6127,24 @@ async fn broadcast_ai_results(
                     } else {
                         HashMap::new()
                     };
+                    // CR 118.3: the STALENESS axis is the one part of disclosure
+                    // the engine cannot self-gate — "is this the final transition
+                    // of the fan-out" is a property of the transport's batch, not
+                    // of any `GameState`. An intermediate transition advertises no
+                    // actions, so it must advertise no read-out either. The
+                    // `is_actor` half is redundant with the entry point's own gate
+                    // and is kept only to mirror its `p_spell_costs` sibling above.
+                    let p_activation_block_reasons = if is_last && is_actor {
+                        engine_activation_block_reasons_for_viewer(ai_raw_state, *pid)
+                    } else {
+                        HashMap::new()
+                    };
+                    debug_assert!(
+                        p_activation_block_reasons.is_empty() || is_actor,
+                        "a non-empty CR 118.3 read-out implies an authorized viewer"
+                    );
                     let _ = s.send(ServerMessage::StateUpdate {
+                        full_key: Some(full_key.clone()),
                         state_revision: *ai_revision,
                         state: pstate.clone(),
                         events: server_core::filter_events_for_player(
@@ -5118,6 +6160,7 @@ async fn broadcast_ai_results(
                         log_entries: ai_log_entries.clone(),
                         spell_costs: p_spell_costs,
                         legal_actions_by_object: object_action_payloads(&p_by_object),
+                        activation_block_reasons: p_activation_block_reasons,
                         derived: derive_transport_views(ai_raw_state, pstate, Some(*pid)),
                         viewer_interaction: derive_viewer_interaction(ai_raw_state, pstate, *pid),
                         rewind_targets: rewind_targets.to_vec(),
@@ -5127,6 +6170,7 @@ async fn broadcast_ai_results(
         }
         let (ai_raw_state, ai_events, _, ai_log_entries, _, _, _) = result;
         if let Ok(spectator_msg) = build_spectator_state_update_message(
+            full_key,
             ai_raw_state,
             ai_events,
             ai_log_entries,
@@ -5175,6 +6219,7 @@ async fn broadcast_takeback_approved(
     connections: &SharedConnections,
     game_spectators: &SharedGameSpectators,
     game_code: &str,
+    full_key: &server_core::FullSessionKey,
     player_count: u8,
     state_revision: u64,
     snapshot: server_core::BroadcastSnapshot,
@@ -5217,7 +6262,19 @@ async fn broadcast_takeback_approved(
                 } else {
                     HashMap::new()
                 };
+                // CR 118.3 + CR 117.1: derived from `raw_state` (`snapshot.0`) —
+                // the SAME binding the sibling `spell_costs` (`snapshot.3`) came
+                // from. This path has no `session` in scope, and reading a
+                // different state here is precisely the freshness hazard the
+                // per-site state-binding rule exists to prevent.
+                let p_activation_block_reasons =
+                    engine_activation_block_reasons_for_viewer(&raw_state, *pid);
+                debug_assert!(
+                    p_activation_block_reasons.is_empty() || is_actor,
+                    "a non-empty CR 118.3 read-out implies an authorized viewer"
+                );
                 let _ = s.send(ServerMessage::StateUpdate {
+                    full_key: Some(full_key.clone()),
                     state_revision,
                     state: pstate.clone(),
                     events: vec![],
@@ -5229,6 +6286,7 @@ async fn broadcast_takeback_approved(
                     log_entries: vec![],
                     spell_costs: p_spell_costs,
                     legal_actions_by_object: object_action_payloads(&p_by_object),
+                    activation_block_reasons: p_activation_block_reasons,
                     derived: derive_transport_views(&raw_state, pstate, Some(*pid)),
                     viewer_interaction: derive_viewer_interaction(&raw_state, pstate, *pid),
                     // Captured by the caller under the same lock as the
@@ -5263,7 +6321,7 @@ async fn broadcast_takeback_approved(
     // `Conceded`/`GameOver`. Without this, a spectator would stay frozen on
     // the pre-rollback state until some later action produced a new update.
     if let Ok(spectator_msg) =
-        build_spectator_state_update_message(&raw_state, &[], &[], state_revision)
+        build_spectator_state_update_message(full_key, &raw_state, &[], &[], state_revision)
     {
         let mut specs = game_spectators.lock().await;
         if let Some(spectators) = specs.get_mut(game_code) {
@@ -5312,6 +6370,15 @@ fn operation_failed_message(msg: &ClientMessage, message: String) -> Option<Serv
                 message,
             })
         }
+        ClientMessage::ExportAuthoritativeState => {
+            Some(ServerMessage::AuthoritativeStateExportFailed { message })
+        }
+        ClientMessage::PreviewInteraction { request } => {
+            Some(ServerMessage::InteractionPreviewFailed {
+                request_id: request.request_id.clone(),
+                message,
+            })
+        }
         ClientMessage::ClientHello { .. }
         | ClientMessage::CreateGame { .. }
         | ClientMessage::JoinGame { .. }
@@ -5350,7 +6417,8 @@ fn operation_failed_message(msg: &ClientMessage, message: String) -> Option<Serv
         | ClientMessage::StartTournamentRound { .. }
         | ClientMessage::ReportMatchResult { .. }
         | ClientMessage::DropFromTournament { .. }
-        | ClientMessage::EndTournament { .. } => None,
+        | ClientMessage::EndTournament { .. }
+        | ClientMessage::RenewTournamentCredential { .. } => None,
     }
 }
 
@@ -5423,6 +6491,66 @@ impl GameSubmission {
             }
         }
     }
+}
+
+/// Answer one interaction preview to its requester alone.
+///
+/// Takes NO socket: the reply rides the connection's own `tx`, which shares the
+/// one `biased` `tokio::select!` loop with `socket.recv()` on a single task, so
+/// it reaches exactly this socket with no interleaving hazard. That is also why
+/// this is a free function rather than an inline dispatch arm — `axum`'s
+/// `WebSocket` has no test constructor, so a socket-taking handler could not be
+/// driven from a test at all.
+///
+/// `connections` is read only through the socket-currency check; nothing is
+/// broadcast, and no lock is held across the send.
+async fn handle_preview_interaction(
+    request: InteractionPreviewRequest,
+    state: &SharedState,
+    connections: &SharedConnections,
+    tx: &mpsc::UnboundedSender<ServerMessage>,
+    identity: &SocketIdentity,
+) {
+    let request_id = request.request_id.clone();
+    let response = match (identity.game_code.clone(), identity.player_token.clone()) {
+        (Some(game_code), Some(player_token)) => {
+            let mgr = state.lock().await;
+            if !full_socket_is_current_while_state_locked(&mgr, connections, identity, tx).await {
+                ServerMessage::InteractionPreviewFailed {
+                    request_id,
+                    message: FULL_SOCKET_AUTHORITY_REJECTION.to_string(),
+                }
+            } else {
+                // No handler-level payload re-guard, deliberately:
+                // `guard_client_message_before_dispatch` already charged this
+                // frame at the wire, and `preview_interaction` re-charges every
+                // member and answers its own `PayloadTooLarge` INSIDE the
+                // preview — a correlated, non-tearing answer on this request's
+                // own channel, identical to what the local WASM seat gets.
+                match mgr.preview_interaction_with_rejection(&game_code, &player_token, &request) {
+                    Ok(preview) => ServerMessage::InteractionPreview { preview },
+                    Err(PreviewRefusal::Rejected(rejection)) => {
+                        ServerMessage::InteractionPreviewFailed {
+                            request_id,
+                            message: rejection.message,
+                        }
+                    }
+                    Err(PreviewRefusal::Operational(error)) => {
+                        ServerMessage::InteractionPreviewFailed {
+                            request_id,
+                            message: error,
+                        }
+                    }
+                }
+            }
+        }
+        _ => ServerMessage::InteractionPreviewFailed {
+            request_id,
+            message: "Not in a game".to_string(),
+        },
+    };
+
+    let _ = tx.send(response);
 }
 
 /// Apply one authenticated game submission from a Full-mode game socket, then
@@ -5546,6 +6674,12 @@ async fn handle_full_game_submission(
                 // message this transition produces.
                 let rewind_targets = session.rewind_options();
                 let player_count = session.player_count;
+                let full_key = session
+                    .full_runtime
+                    .as_ref()
+                    .expect("authenticated Full action retains its exact runtime")
+                    .key
+                    .clone();
                 let game_over_winner = match &session.state.waiting_for {
                     engine::types::game_state::WaitingFor::GameOver { winner } => Some(*winner),
                     _ => None,
@@ -5584,6 +6718,7 @@ async fn handle_full_game_submission(
                             terminal,
                             rewind_targets,
                             ai_failure,
+                            full_key,
                         )
                     })
             }
@@ -5610,6 +6745,7 @@ async fn handle_full_game_submission(
             terminal,
             rewind_targets,
             ai_failure,
+            full_key,
         )) => {
             if let Err(reason) = guard_state_snapshot_broadcast(StateSnapshotParts {
                 state: &raw_state,
@@ -5689,7 +6825,24 @@ async fn handle_full_game_submission(
                             } else {
                                 HashMap::new()
                             };
+                            // CR 118.3: the STALENESS axis again — a human action
+                            // followed by AI play must not advertise the pre-AI
+                            // action set, so it must not advertise a read-out
+                            // describing a board the player is not being offered
+                            // actions on. `is_actor` mirrors the `p_spell_costs`
+                            // sibling above and is redundant with the entry
+                            // point's own gate.
+                            let p_activation_block_reasons = if ai_results.is_empty() && is_actor {
+                                engine_activation_block_reasons_for_viewer(&raw_state, *pid)
+                            } else {
+                                HashMap::new()
+                            };
+                            debug_assert!(
+                                p_activation_block_reasons.is_empty() || is_actor,
+                                "a non-empty CR 118.3 read-out implies an authorized viewer"
+                            );
                             let _ = s.send(ServerMessage::StateUpdate {
+                                full_key: Some(full_key.clone()),
                                 state_revision: human_revision,
                                 state: pstate.clone(),
                                 events: server_core::filter_events_for_player(
@@ -5703,6 +6856,7 @@ async fn handle_full_game_submission(
                                 log_entries: log_entries.clone(),
                                 spell_costs: p_spell_costs,
                                 legal_actions_by_object: object_action_payloads(&p_by_object),
+                                activation_block_reasons: p_activation_block_reasons,
                                 derived: derive_transport_views(&raw_state, pstate, Some(*pid)),
                                 viewer_interaction: derive_viewer_interaction(
                                     &raw_state, pstate, *pid,
@@ -5714,6 +6868,7 @@ async fn handle_full_game_submission(
                 }
             }
             if let Ok(spectator_msg) = build_spectator_state_update_message(
+                &full_key,
                 &raw_state,
                 &events,
                 &log_entries,
@@ -5731,7 +6886,7 @@ async fn handle_full_game_submission(
             broadcast_ai_results(
                 connections,
                 game_spectators,
-                &game_code,
+                &full_key,
                 player_count,
                 &eliminated,
                 &ai_results,
@@ -6282,7 +7437,12 @@ async fn handle_client_message(
                 }
                 return;
             }
-            let (game_code, player_token) = mgr.create_game(resolved);
+            // Seat 0's provenance, not just its resolved deck: a restart
+            // rebuilds `decks` from `deck_choices` alone, and seat 0 is
+            // immutable, so a host seat recorded without its submitted list
+            // restores empty and no reseat can ever refill it.
+            let (game_code, player_token) =
+                mgr.create_game(resolved, Some(DeckChoice::DeckList(Box::new(deck))));
             let full_key = match game_db.create_full_session_key(&game_code) {
                 Ok(key) => key,
                 Err(error) => {
@@ -6380,7 +7540,15 @@ async fn handle_client_message(
             };
 
             let mut mgr = state.lock().await;
-            match mgr.join_game(&game_code, resolved) {
+            // Same provenance record as `JoinGameWithPassword` below: a seat
+            // filled without its submitted list restores empty on restart.
+            match mgr.join_game_with_name_and_reservation(
+                &game_code,
+                resolved,
+                Some(DeckChoice::DeckList(Box::new(deck))),
+                String::new(),
+                None,
+            ) {
                 Ok((player_token, _filtered_state)) => {
                     mgr.set_card_names(&game_code, db.card_names());
                     let session = mgr.sessions.get_mut(&game_code).unwrap();
@@ -6501,16 +7669,13 @@ async fn handle_client_message(
                                     request_id,
                                     source_ids,
                                 },
-                                Err(SessionActionError::Rejected(rejection)) => {
+                                Err(PreviewRefusal::Rejected(rejection)) => {
                                     ServerMessage::ManaPaymentPreviewRejected {
                                         request_id,
                                         rejection,
                                     }
                                 }
-                                Err(SessionActionError::RequestRejected(reason)) => {
-                                    ServerMessage::RequestRejected { reason }
-                                }
-                                Err(SessionActionError::Operational(error)) => {
+                                Err(PreviewRefusal::Operational(error)) => {
                                     ServerMessage::ManaPaymentPreviewFailed {
                                         request_id,
                                         message: error,
@@ -6529,6 +7694,58 @@ async fn handle_client_message(
             if let Ok(json) = serde_json::to_string(&response) {
                 let _ = socket.send(Message::text(json)).await;
             }
+        }
+
+        ClientMessage::ExportAuthoritativeState => {
+            // The native P2P host is always Player 1 (seat zero). Its local
+            // server deliberately redacts normal broadcast snapshots per
+            // viewer, but the host needs an unredacted snapshot to report an
+            // engine stall. The export is a trusted engine envelope, not a
+            // PersistedSession, so reconnect tokens and server metadata never
+            // leave the server.
+            let response = match (identity.game_code.as_deref(), identity.player_id) {
+                (Some(game_code), Some(PlayerId(0))) => {
+                    let mut manager = state.lock().await;
+                    match manager.sessions.get_mut(game_code) {
+                        Some(session) if session.hosting == HostingMode::SingleUser => {
+                            let mut snapshot = session.state.clone();
+                            snapshot.capture_rng_word_pos();
+                            match serde_json::to_string(&TrustedGameStateEnvelope::capture(
+                                snapshot,
+                            )) {
+                                Ok(state) => ServerMessage::AuthoritativeStateExport { state },
+                                Err(error) => ServerMessage::AuthoritativeStateExportFailed {
+                                    message: format!(
+                                        "Failed to serialize authoritative game state: {error}"
+                                    ),
+                                },
+                            }
+                        }
+                        Some(_) => ServerMessage::AuthoritativeStateExportFailed {
+                            message:
+                                "Authoritative state export is available only from a local host"
+                                    .to_string(),
+                        },
+                        None => ServerMessage::AuthoritativeStateExportFailed {
+                            message: "Game session is no longer available".to_string(),
+                        },
+                    }
+                }
+                (Some(_), Some(_)) => ServerMessage::AuthoritativeStateExportFailed {
+                    message: "Only the game host can export authoritative state".to_string(),
+                },
+                _ => ServerMessage::AuthoritativeStateExportFailed {
+                    message: "Not in a game".to_string(),
+                },
+            };
+
+            if let Ok(json) = serde_json::to_string(&response) {
+                let _ = socket.send(Message::text(json)).await;
+            }
+        }
+
+        ClientMessage::PreviewInteraction { request } => {
+            handle_preview_interaction(request, state, connections, tx, identity).await;
         }
 
         ClientMessage::Action { action } => {
@@ -6733,8 +7950,7 @@ async fn handle_client_message(
                     }
 
                     // Send current room state
-                    let slots_msg = ServerMessage::PlayerSlotsUpdate { slots: slot_info };
-                    let _ = tx.send(slots_msg);
+                    send_player_slots(std::iter::once((&player, tx)), &slot_info);
                 }
 
                 ReconnectOutcome::InGame {
@@ -6759,6 +7975,7 @@ async fn handle_client_message(
                             .collect::<Vec<_>>()
                     };
                     let reconnect_msg = ServerMessage::OpponentReconnected {
+                        full_key: Some(full_key.clone()),
                         player: Some(player),
                     };
                     for sender in reconnect_senders {
@@ -6794,6 +8011,7 @@ async fn handle_client_message(
                             if let Ok(msg) = build_state_update_message(
                                 &result,
                                 state_revision,
+                                &full_key,
                                 pid,
                                 rewind_targets.clone(),
                             ) {
@@ -6870,6 +8088,7 @@ async fn handle_client_message(
             draft_metadata,
             start_when_full,
             ranked,
+            booster_pack_pool,
         } => {
             info!(
                 display_name = %display_name,
@@ -7004,68 +8223,22 @@ async fn handle_client_message(
                 }
             }
 
-            let mut ai_requests = Vec::new();
-            for seat in &ai_seats {
-                if seat.seat_index == 0 || seat.seat_index >= pc {
-                    continue;
+            let ai_requests = match ai_seat_setups(
+                db,
+                &ai_seats,
+                pc,
+                format_config.as_ref(),
+                match_config.match_type,
+            ) {
+                Ok(setups) => setups,
+                Err(reason) => {
+                    let msg = ServerMessage::error(reason);
+                    if let Ok(json) = serde_json::to_string(&msg) {
+                        let _ = socket.send(Message::text(json)).await;
+                    }
+                    return;
                 }
-                let ai_deck_data = match &seat.deck {
-                    Some(DeckChoice::DeckList(deck)) => deck.as_ref().clone(),
-                    Some(DeckChoice::Named(name)) => {
-                        server_core::starter_decks::find_starter_deck(name).unwrap_or_else(|| {
-                            warn!(deck = %name, "unknown AI deck name, using random");
-                            server_core::starter_decks::random_starter_deck()
-                        })
-                    }
-                    Some(DeckChoice::Random) | None => match &seat.deck_name {
-                        Some(name) if name.eq_ignore_ascii_case("random") => {
-                            server_core::starter_decks::random_starter_deck()
-                        }
-                        Some(name) => server_core::starter_decks::find_starter_deck(name)
-                            .unwrap_or_else(|| {
-                                warn!(deck = %name, "unknown AI deck name, using random");
-                                server_core::starter_decks::random_starter_deck()
-                            }),
-                        None => server_core::starter_decks::random_starter_deck(),
-                    },
-                };
-                if let Some(ref fc) = format_config {
-                    if let Err(reasons) = validate_name_deck_for_format_full(
-                        db,
-                        &ai_deck_data.main_deck,
-                        &ai_deck_data.sideboard,
-                        &ai_deck_data.commander,
-                        &ai_deck_data.companion,
-                        &ai_deck_data.planar_deck,
-                        &ai_deck_data.scheme_deck,
-                        &ai_deck_data.signature_spell,
-                        // Constructed play, as above: no draft, no concession.
-                        &[],
-                        fc,
-                        Some(match_config.match_type),
-                        usize::from(pc),
-                    ) {
-                        let msg = ServerMessage::error(format!(
-                            "AI deck for seat {} not legal for {}: {}",
-                            seat.seat_index,
-                            fc.format.label(),
-                            reasons.join("; ")
-                        ));
-                        if let Ok(json) = serde_json::to_string(&msg) {
-                            let _ = socket.send(Message::text(json)).await;
-                        }
-                        return;
-                    }
-                }
-                let ai_resolved = match resolve_deck(db, &ai_deck_data) {
-                    Ok(d) => d,
-                    Err(e) => {
-                        error!(error = %e, "AI deck resolve failed, cloning host deck");
-                        resolved.clone()
-                    }
-                };
-                ai_requests.push((seat.seat_index, seat.difficulty, ai_resolved));
-            }
+            };
 
             if !ai_requests.is_empty() && ai_requests.len() as u8 == pc - 1 {
                 // --- AI game path: create, start, and run initial AI actions ---
@@ -7087,16 +8260,19 @@ async fn handle_client_message(
                         ));
                         return;
                     }
-                    let (game_code, player_token) = match mgr.create_game_with_ai(
-                        resolved,
-                        display_name.clone(),
-                        timer_seconds,
-                        match_config,
-                        ai_requests,
-                        db.card_names(),
-                        format_config.clone(),
-                        db.as_ref(),
-                    ) {
+                    let (game_code, player_token) = match mgr
+                        .create_game_with_ai_with_booster_pack_pool(
+                            resolved,
+                            DeckChoice::DeckList(Box::new(deck)),
+                            display_name.clone(),
+                            timer_seconds,
+                            match_config,
+                            ai_requests,
+                            db.card_names(),
+                            format_config.clone(),
+                            booster_pack_pool.clone(),
+                            db,
+                        ) {
                         Ok(created) => created,
                         Err(error) => {
                             let _ = tx.send(ServerMessage::error(error));
@@ -7215,6 +8391,7 @@ async fn handle_client_message(
                         game_db,
                         MultiplayerSessionRequest {
                             resolved,
+                            host_choice: DeckChoice::DeckList(Box::new(deck)),
                             display_name: display_name.clone(),
                             timer_seconds,
                             pc,
@@ -7222,6 +8399,7 @@ async fn handle_client_message(
                             format_config,
                             start_when_full,
                             ranked,
+                            booster_pack_pool,
                             ai_requests,
                             public,
                             password: password.clone(), // original still needed for Phase 3
@@ -7817,15 +8995,16 @@ async fn handle_client_message(
                 },
             }
 
-            // Collects a bracket-violation message to broadcast after the state lock releases and
+            // Collects a refused-start message to broadcast after the state lock releases and
             // after the joiner receives their direct error (mirrors the seat-delta path).
-            let mut bracket_broadcast: Option<String> = None;
+            let mut start_error_broadcast: Option<String> = None;
 
             let join_outcome = {
                 let mut mgr = state.lock().await;
                 match mgr.join_game_with_name_and_reservation(
                     &game_code,
                     resolved,
+                    Some(DeckChoice::DeckList(Box::new(deck))),
                     display_name,
                     reservation_token.clone(),
                 ) {
@@ -7844,32 +9023,40 @@ async fn handle_client_message(
                         let should_start = session.is_full() && session.start_when_full;
                         let public_before =
                             session.lobby_meta.as_ref().is_some_and(|meta| meta.public);
-                        if should_start {
-                            if let Err(bracket_err) = session.start_game(db.as_ref()) {
-                                // start_game guarantees no mutation on Err, so the session still
-                                // holds the joining player. We keep them seated — rolling back
-                                // would require deleting their deck/token which is more invasive.
-                                // The host can correct the deck(s) and trigger a new start.
-                                persist_full_session_async(game_db, session);
-                                // Capture the message so we can fan it out to all connected
-                                // players after the state lock releases (mirrors seat-delta path).
-                                bracket_broadcast =
-                                    Some(format!("Cannot start cEDH game: {bracket_err}"));
-                                // Evaluate to Err so the outer match join_outcome sends an Error
-                                // message to the client via the existing Err(e) arm.
-                                Err(format!("Cannot start cEDH game: {bracket_err}"))
-                            } else {
-                                // Persist updated session (now has the new player and is started)
-                                persist_full_session_async(game_db, session);
-                                Ok(JoinOutcome::Started {
-                                    player_token,
-                                    joiner,
-                                    public_before,
-                                })
-                            }
+                        let started = should_start
+                            && match session.start_game(db) {
+                                Ok(()) => true,
+                                Err(start_err) => {
+                                    // A refused start writes nothing: `start_game` returns
+                                    // ahead of its first mutation on both Err arms, and
+                                    // `apply_seat_delta` withholds the reducer's started
+                                    // flag. So the room is still pregame and the joiner —
+                                    // already holding a token, deck and display name — is
+                                    // a waiting player, indistinguishable from one who
+                                    // joined a room that was not yet full.
+                                    //
+                                    // Whether the refusal can be cleared depends on the
+                                    // seat it names: seat 0 is `SeatImmutable`, and only
+                                    // `SeatKind::Ai` carries a rewritable deck, so a
+                                    // human seat's deck is fixed at join.
+                                    //
+                                    // The message is fanned out to the whole room after
+                                    // the state lock releases (mirrors the seat-delta
+                                    // path). `Display` carries the cEDH prefix on that
+                                    // arm, so the bracket message is unchanged while a
+                                    // missing-deck refusal reports itself honestly.
+                                    start_error_broadcast = Some(start_err.to_string());
+                                    false
+                                }
+                            };
+                        persist_full_session_async(game_db, session);
+                        if started {
+                            Ok(JoinOutcome::Started {
+                                player_token,
+                                joiner,
+                                public_before,
+                            })
                         } else {
-                            // Persist updated session (now has the new player, not yet started)
-                            persist_full_session_async(game_db, session);
                             match session.full_runtime.as_ref() {
                                 Some(runtime) => Ok(JoinOutcome::Waiting {
                                     player_token,
@@ -7927,24 +9114,29 @@ async fn handle_client_message(
                         game_code: game_code.clone(),
                         player_id: joiner,
                         player_token,
-                        full_key: Some(full_key),
+                        full_key: Some(full_key.clone()),
                     };
                     if let Ok(json) = serde_json::to_string(&attached) {
                         let _ = socket.send(Message::text(json)).await;
                     }
 
                     // Notify all connected players about the updated room state
-                    let slots_msg = ServerMessage::PlayerSlotsUpdate { slots: slot_info };
                     let slot_senders = {
                         let conns = connections.lock().await;
                         conns
                             .get(&game_code)
-                            .map(|players| players.values().cloned().collect::<Vec<_>>())
+                            .map(|players| {
+                                players
+                                    .iter()
+                                    .map(|(pid, sender)| (*pid, sender.clone()))
+                                    .collect::<Vec<_>>()
+                            })
                             .unwrap_or_default()
                     };
-                    for sender in slot_senders {
-                        let _ = sender.send(slots_msg.clone());
-                    }
+                    send_player_slots(
+                        slot_senders.iter().map(|(pid, sender)| (pid, sender)),
+                        &slot_info,
+                    );
 
                     let updated = {
                         let mut lob_guard = lobby.lock().await;
@@ -7964,6 +9156,7 @@ async fn handle_client_message(
                     let viewer_interaction =
                         derive_viewer_interaction(&raw_state, &filtered_state, joiner);
                     let msg = ServerMessage::StateUpdate {
+                        full_key: Some(full_key),
                         state_revision,
                         state: filtered_state,
                         events: vec![],
@@ -7975,6 +9168,11 @@ async fn handle_client_message(
                         log_entries: vec![],
                         spell_costs: HashMap::new(),
                         legal_actions_by_object: HashMap::new(),
+                        // CR 117.1b: the game has not started, so no player has
+                        // priority and no activated ability can be activated —
+                        // the read-out has nothing to describe. Empty by the
+                        // same existing design as its two siblings above.
+                        activation_block_reasons: HashMap::new(),
                         derived,
                         viewer_interaction,
                         // `JoinOutcome::Waiting` — the game has not started, so
@@ -8051,11 +9249,12 @@ async fn handle_client_message(
                 }
             }
 
-            // If a cEDH bracket violation blocked the auto-start, fan the error out to all
-            // players already connected to the room. The joiner's socket is not yet registered
-            // in `connections` (registration only happens on Ok arms above), so this broadcast
-            // naturally excludes them — they already received the direct error above.
-            if let Some(err_msg) = bracket_broadcast {
+            // If the auto-start was refused, fan the error out to every player
+            // connected to the room. The joiner is one of them: `attach_full_seat`
+            // on the `JoinOutcome::Waiting` arm registered their sender, so this is
+            // the single delivery of the refusal to them — the room-wide message and
+            // their own notice are the same message, not a duplicate pair.
+            if let Some(err_msg) = start_error_broadcast {
                 let conns = connections.lock().await;
                 if let Some(players) = conns.get(&game_code) {
                     let msg = ServerMessage::error(err_msg);
@@ -8155,7 +9354,12 @@ async fn handle_client_message(
                             }
                             connections.lock().await.remove(&game_code);
                             game_spectators.lock().await.remove(&game_code);
-                            lobby.lock().await.lobby_mut().unregister_game(&game_code);
+                            delist_and_announce(
+                                lobby,
+                                lobby_subscribers,
+                                std::iter::once(game_code.as_str()),
+                            )
+                            .await;
                             error!(game = %game_code, "terminal preparation did not leave this Full key active; retaining in-memory retirement");
                             let _ = tx.send(ServerMessage::error(error));
                             return;
@@ -8167,7 +9371,12 @@ async fn handle_client_message(
                             // read failure to the committing client.
                             connections.lock().await.remove(&game_code);
                             game_spectators.lock().await.remove(&game_code);
-                            lobby.lock().await.lobby_mut().unregister_game(&game_code);
+                            delist_and_announce(
+                                lobby,
+                                lobby_subscribers,
+                                std::iter::once(game_code.as_str()),
+                            )
+                            .await;
                             error!(game = %game_code, %error, "terminal delivery preparation failed after terminal commit");
                             let _ = tx.send(ServerMessage::error(error));
                             return;
@@ -8231,7 +9440,12 @@ async fn handle_client_message(
 
             connections.lock().await.remove(&game_code);
             game_spectators.lock().await.remove(&game_code);
-            lobby.lock().await.lobby_mut().unregister_game(&game_code);
+            delist_and_announce(
+                lobby,
+                lobby_subscribers,
+                std::iter::once(game_code.as_str()),
+            )
+            .await;
 
             let msg = ServerMessage::GameAbandoned { game_code };
             if let Ok(json) = serde_json::to_string(&msg) {
@@ -8308,10 +9522,16 @@ async fn handle_client_message(
                                 Ok(None)
                             };
                             let rewind_targets = session.rewind_options();
+                            let full_key = session
+                                .full_runtime
+                                .as_ref()
+                                .expect("authenticated concession retains its exact runtime")
+                                .key
+                                .clone();
                             terminal
                                 .map_err(SessionActionError::Operational)
                                 .map(|terminal| {
-                                    (revision, result, winner, terminal, rewind_targets)
+                                    (revision, result, winner, terminal, rewind_targets, full_key)
                                 })
                         }
                         Err(error) => Err(error),
@@ -8331,7 +9551,7 @@ async fn handle_client_message(
                         let _ = socket.send(Message::text(json)).await;
                     }
                 }
-                Ok((revision, result, winner, terminal, rewind_targets)) => {
+                Ok((revision, result, winner, terminal, rewind_targets, full_key)) => {
                     let terminal_deliveries = match terminal {
                         Some(artifact) => match prepare_full_terminal(game_db, artifact).await {
                             Ok(deliveries) => deliveries,
@@ -8349,6 +9569,7 @@ async fn handle_client_message(
                             if let Ok(update) = build_state_update_message(
                                 &result,
                                 revision,
+                                &full_key,
                                 *player,
                                 rewind_targets.clone(),
                             ) {
@@ -8418,13 +9639,21 @@ async fn handle_client_message(
                                 })
                             });
                             let rewind_targets = session.rewind_options();
+                            let full_key = session
+                                .full_runtime
+                                .as_ref()
+                                .expect("authenticated concession retains its exact runtime")
+                                .key
+                                .clone();
                             terminal_artifact(
                                 session,
                                 winner,
                                 "Match conceded".to_string(),
                                 ranked_result,
                             )
-                            .map(|terminal| (revision, result, winner, terminal, rewind_targets))
+                            .map(|terminal| {
+                                (revision, result, winner, terminal, rewind_targets, full_key)
+                            })
                             .map_err(SessionActionError::Operational)
                         }
                         Err(error) => Err(error),
@@ -8438,7 +9667,7 @@ async fn handle_client_message(
                         let _ = socket.send(Message::text(json)).await;
                     }
                 }
-                Ok((revision, result, winner, terminal, rewind_targets)) => {
+                Ok((revision, result, winner, terminal, rewind_targets, full_key)) => {
                     let terminal_deliveries = match prepare_full_terminal(game_db, terminal).await {
                         Ok(deliveries) => deliveries,
                         Err(error) => {
@@ -8453,6 +9682,7 @@ async fn handle_client_message(
                             if let Ok(update) = build_state_update_message(
                                 &result,
                                 revision,
+                                &full_key,
                                 *player,
                                 rewind_targets.clone(),
                             ) {
@@ -8544,6 +9774,12 @@ async fn handle_client_message(
             // eliminations from it would be exactly that staleness.
             let rewind_targets = session.rewind_options();
             let eliminated = session.state.eliminated_players.clone();
+            let full_key = session
+                .full_runtime
+                .as_ref()
+                .expect("authenticated takeback retains its exact runtime")
+                .key
+                .clone();
             // GH #1507: persist the rolled-back state immediately, in the
             // same lock as the rollback itself — otherwise SQLite still
             // holds the pre-rollback `GameState` until some later action
@@ -8597,6 +9833,7 @@ async fn handle_client_message(
                         connections,
                         game_spectators,
                         &game_code,
+                        &full_key,
                         player_count,
                         state_revision,
                         snapshot,
@@ -8607,7 +9844,7 @@ async fn handle_client_message(
                     broadcast_ai_results(
                         connections,
                         game_spectators,
-                        &game_code,
+                        &full_key,
                         player_count,
                         &eliminated,
                         &ai_results,
@@ -8668,6 +9905,12 @@ async fn handle_client_message(
             // arm above.
             let rewind_targets = session.rewind_options();
             let eliminated = session.state.eliminated_players.clone();
+            let full_key = session
+                .full_runtime
+                .as_ref()
+                .expect("authenticated takeback retains its exact runtime")
+                .key
+                .clone();
             // GH #1507: persist the rolled-back state immediately — see the
             // matching comment in the `RequestTakeback` arm above.
             if approved_snapshot.is_some() {
@@ -8699,6 +9942,7 @@ async fn handle_client_message(
                         connections,
                         game_spectators,
                         &game_code,
+                        &full_key,
                         player_count,
                         state_revision,
                         snapshot,
@@ -8709,7 +9953,7 @@ async fn handle_client_message(
                     broadcast_ai_results(
                         connections,
                         game_spectators,
-                        &game_code,
+                        &full_key,
                         player_count,
                         &eliminated,
                         &ai_results,
@@ -8961,7 +10205,7 @@ async fn handle_client_message(
                 current_players,
                 max_players,
                 public_before,
-                bracket_error,
+                start_error,
             ) = {
                 let mut mgr = state.lock().await;
                 if !full_socket_is_current_while_state_locked(&mgr, connections, identity, tx).await
@@ -9036,14 +10280,15 @@ async fn handle_client_message(
                 // seat), per the `GameSession` contract; it does not belong on the
                 // host's seat-editing path.
                 let mut started = delta.now_started;
-                // Collect a bracket-violation message to broadcast after releasing the state lock.
-                // start_game guarantees no mutation on Err, so session state is untouched.
-                let bracket_error: Option<String> = if started {
-                    match session.start_game(db.as_ref()) {
+                // Collect a refused-start message to broadcast after releasing the state lock.
+                // `start_game` mutates nothing on Err, and `apply_seat_delta` above no longer
+                // commits the reducer's started flag, so a refusal leaves the room editable.
+                let start_error: Option<String> = if started {
+                    match session.start_game(db) {
                         Ok(()) => None,
-                        Err(bracket_err) => {
+                        Err(start_err) => {
                             started = false;
-                            Some(format!("Cannot start cEDH game: {bracket_err}"))
+                            Some(start_err.to_string())
                         }
                     }
                 } else {
@@ -9068,7 +10313,7 @@ async fn handle_client_message(
                     current_players,
                     max_players,
                     public_before,
-                    bracket_error,
+                    start_error,
                 )
             };
 
@@ -9083,20 +10328,15 @@ async fn handle_client_message(
                         }
                     }
 
-                    // If the start was blocked by a bracket violation, notify all players.
-                    if let Some(ref err_msg) = bracket_error {
+                    // If the start was refused, notify all players.
+                    if let Some(ref err_msg) = start_error {
                         let msg = ServerMessage::error(err_msg.clone());
                         for sender in players.values() {
                             let _ = sender.send(msg.clone());
                         }
                     }
 
-                    let msg = ServerMessage::PlayerSlotsUpdate {
-                        slots: slot_info.clone(),
-                    };
-                    for sender in players.values() {
-                        let _ = sender.send(msg.clone());
-                    }
+                    send_player_slots(players.iter(), &slot_info);
                 }
             }
 
@@ -9242,8 +10482,15 @@ async fn handle_client_message(
                 // core layout holds the result, so reconnect/start never reroll
                 // a pod and a client never transmits assignments.
                 server_core::protocol::DraftSourceIntent::Chaos { candidate_codes } => {
-                    let seed = rand::rngs::OsRng.try_next_u64().map_err(|error| {
-                        format!("Unable to seed Chaos draft assignments: {error}")
+                    // Asked BEFORE the entropy draw and before this pod is
+                    // registered and broadcast, because the reducer's answer at
+                    // `StartDraft` would otherwise arrive on a full lobby that
+                    // can never start. The engine owns both the verdict and its
+                    // wording; this boundary only asks earlier.
+                    let seed = guard_chaos_layout_for_kind(kind).and_then(|()| {
+                        rand::rngs::OsRng.try_next_u64().map_err(|error| {
+                            format!("Unable to seed Chaos draft assignments: {error}")
+                        })
                     });
                     seed.and_then(|seed| {
                         draft_pools
@@ -9625,8 +10872,15 @@ async fn handle_client_message(
                         );
                     }
 
-                    maybe_spawn_draft_matches(&draft_code, draft_state, state, db, connections)
-                        .await;
+                    maybe_spawn_draft_matches(
+                        &draft_code,
+                        draft_state,
+                        state,
+                        db,
+                        game_db,
+                        connections,
+                    )
+                    .await;
 
                     // Persist draft session after mutation
                     persist_draft_session_async(game_db, &draft_code, draft_state).await;
@@ -9686,6 +10940,33 @@ async fn handle_client_message(
 
             match result {
                 Ok(view) => {
+                    match attach_current_draft_match(
+                        draft_state,
+                        state,
+                        connections,
+                        identity,
+                        &draft_code,
+                        tx,
+                    )
+                    .await
+                    {
+                        Ok(Some(attachment)) => {
+                            for message in [attachment.match_start, attachment.game_started] {
+                                if let Ok(json) = serde_json::to_string(&message) {
+                                    let _ = socket.send(Message::text(json)).await;
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(reason) => {
+                            let msg = ServerMessage::DraftActionRejected { reason };
+                            if let Ok(json) = serde_json::to_string(&msg) {
+                                let _ = socket.send(Message::text(json)).await;
+                            }
+                            return;
+                        }
+                    }
+
                     let msg = ServerMessage::DraftStateUpdate { view };
                     if let Ok(json) = serde_json::to_string(&msg) {
                         let _ = socket.send(Message::text(json)).await;
@@ -9804,7 +11085,8 @@ async fn handle_client_message(
         | ClientMessage::StartTournamentRound { .. }
         | ClientMessage::ReportMatchResult { .. }
         | ClientMessage::DropFromTournament { .. }
-        | ClientMessage::EndTournament { .. } => {
+        | ClientMessage::EndTournament { .. }
+        | ClientMessage::RenewTournamentCredential { .. } => {
             dispatch_broker(
                 &client_msg,
                 lobby,
@@ -9865,7 +11147,11 @@ mod state_transport_derived_tests {
     }
 
     fn state_update_action_fields(result: &ActionResult, viewer: PlayerId) -> (usize, bool) {
-        match build_state_update_message(result, 1, viewer, Vec::new())
+        let full_key = server_core::FullSessionKey {
+            game_code: "ABC123".to_string(),
+            generation: 1,
+        };
+        match build_state_update_message(result, 1, &full_key, viewer, Vec::new())
             .expect("fixture state update")
         {
             ServerMessage::StateUpdate {
@@ -9966,7 +11252,7 @@ mod state_transport_derived_tests {
         #[tokio::test]
         async fn resolve_all_handler_sends_the_final_snapshot_before_its_acknowledgement() {
             let mut manager = SessionManager::new();
-            let (game_code, player_token) = manager.create_game(PlayerDeckPayload::default());
+            let (game_code, player_token) = manager.create_game(PlayerDeckPayload::default(), None);
             let ai_player = PlayerId(1);
             let session = manager
                 .sessions
@@ -10007,7 +11293,10 @@ mod state_transport_derived_tests {
             apply(
                 &mut session.state,
                 PlayerId(0),
-                GameAction::BeginResolveAll { max_resolutions: 1 },
+                GameAction::BeginResolveAll {
+                    max_resolutions: 1,
+                    scope: ResolveAllScope::Shared,
+                },
             )
             .expect("priority holder may start Resolve All consent");
             let epoch = match session.state.waiting_for {
@@ -10136,7 +11425,7 @@ mod state_transport_derived_tests {
         #[tokio::test]
         async fn resolve_all_limit_rejection_keeps_request_correlation() {
             let mut manager = SessionManager::new();
-            let (game_code, player_token) = manager.create_game(PlayerDeckPayload::default());
+            let (game_code, player_token) = manager.create_game(PlayerDeckPayload::default(), None);
             let state: SharedState = Arc::new(Mutex::new(manager));
             let draft_state: SharedDraftState = Arc::new(Mutex::new(DraftSessionManager::new()));
             let connections: SharedConnections = Arc::new(Mutex::new(HashMap::new()));
@@ -10316,6 +11605,412 @@ mod ranked_tests {
 }
 
 #[cfg(test)]
+mod interaction_preview_route_tests {
+    use super::*;
+    use engine::game::deck_loading::PlayerDeckPayload;
+    use engine::types::interaction::{
+        InteractionAvailability, InteractionPreview, InteractionPreviewRequest,
+        InteractionPreviewStatus, InteractionSubmission, PreviewRequestId,
+    };
+    use server_core::filter_state_for_player;
+    use server_core::{AiDriverFailure, AiDriverFault};
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    fn empty_identity() -> SocketIdentity {
+        SocketIdentity {
+            game_code: None,
+            player_id: None,
+            player_token: None,
+            lobby_subscribed: false,
+            session_span: None,
+            client_hello: None,
+            lobby_host_game: None,
+            seat_reservations: Vec::new(),
+            lobby_reservations: Vec::new(),
+            lobby_organized_tournaments: Vec::new(),
+            lobby_joined_tournaments: Vec::new(),
+            draft_code: None,
+            draft_seat: None,
+            draft_token: None,
+            spectator_draft_code: None,
+            spectator_visibility: None,
+            spectator_game_code: None,
+        }
+    }
+
+    /// The witness is minted by `derive_viewer_interaction`, never hand-built:
+    /// a fabricated id would be indistinguishable from a stale one.
+    fn live_witness(
+        manager: &SessionManager,
+        game_code: &str,
+        token0: &str,
+        token1: &str,
+    ) -> (String, String, InteractionSubmission) {
+        let state = &manager.sessions.get(game_code).expect("session").state;
+        for (player, token, other) in [(PlayerId(0), token0, token1), (PlayerId(1), token1, token0)]
+        {
+            let filtered = filter_state_for_player(state, player);
+            let view = derive_viewer_interaction(state, &filtered, player);
+            if let InteractionAvailability::ProgressAvailable { witness } = view.availability {
+                return (token.to_string(), other.to_string(), witness);
+            }
+        }
+        panic!("a started session must publish a progress witness for some seat");
+    }
+
+    /// Two seats, both senders installed through the production
+    /// `attach_full_seat`, plus a live engine-minted preview request for
+    /// whichever seat holds the capability.
+    async fn two_seat_table() -> (
+        SharedState,
+        SharedConnections,
+        String,
+        InteractionPreviewRequest,
+        (
+            SocketIdentity,
+            mpsc::UnboundedSender<ServerMessage>,
+            mpsc::UnboundedReceiver<ServerMessage>,
+        ),
+        (
+            SocketIdentity,
+            mpsc::UnboundedSender<ServerMessage>,
+            mpsc::UnboundedReceiver<ServerMessage>,
+        ),
+    ) {
+        let mut manager = SessionManager::new();
+        let (game_code, token0) = manager.create_game(PlayerDeckPayload::default(), None);
+        let (token1, _) = manager
+            .join_game(&game_code, PlayerDeckPayload::default(), None)
+            .expect("the second seat joins and starts the game");
+        let (acting_token, other_token, witness) =
+            live_witness(&manager, &game_code, &token0, &token1);
+
+        let request = InteractionPreviewRequest {
+            request_id: PreviewRequestId("req-1".to_string()),
+            interaction_id: witness.interaction_id.clone(),
+            response: witness.response.clone(),
+        };
+
+        let state: SharedState = Arc::new(Mutex::new(manager));
+        let connections: SharedConnections = Arc::new(Mutex::new(HashMap::new()));
+
+        let (requester_tx, requester_rx) = mpsc::unbounded_channel();
+        let mut requester_identity = empty_identity();
+        attach_full_seat(
+            &state,
+            &connections,
+            &mut requester_identity,
+            game_code.clone(),
+            acting_token,
+            &requester_tx,
+        )
+        .await
+        .expect("the requesting seat attaches");
+
+        let (other_tx, other_rx) = mpsc::unbounded_channel();
+        let mut other_identity = empty_identity();
+        attach_full_seat(
+            &state,
+            &connections,
+            &mut other_identity,
+            game_code.clone(),
+            other_token,
+            &other_tx,
+        )
+        .await
+        .expect("the second seat attaches");
+
+        (
+            state,
+            connections,
+            game_code,
+            request,
+            (requester_identity, requester_tx, requester_rx),
+            (other_identity, other_tx, other_rx),
+        )
+    }
+
+    fn fault() -> AiDriverFault {
+        AiDriverFault {
+            id: 1,
+            after_state_revision: 0,
+            cause: AiDriverFailure::ActionSafetyCapReached { limit: 1 },
+        }
+    }
+
+    /// Row 1. Fan the answer out through `connections` and the negative below
+    /// fails: the other seat's `rx` yields a frame.
+    #[tokio::test]
+    async fn preview_answers_the_requester_and_no_other_seat() {
+        let (
+            state,
+            connections,
+            game_code,
+            request,
+            (requester_identity, requester_tx, mut requester_rx),
+            (_other_identity, _other_tx, mut other_rx),
+        ) = two_seat_table().await;
+
+        handle_preview_interaction(
+            request.clone(),
+            &state,
+            &connections,
+            &requester_tx,
+            &requester_identity,
+        )
+        .await;
+
+        // Positive (i): the route ran. An unreached route yields an empty channel,
+        // which would also satisfy the negative below.
+        let preview: InteractionPreview = match requester_rx
+            .try_recv()
+            .expect("the requesting seat is answered")
+        {
+            ServerMessage::InteractionPreview { preview } => preview,
+            other => panic!("the requester must receive a preview, got {other:?}"),
+        };
+        assert!(
+            matches!(preview.status, InteractionPreviewStatus::Confirmable),
+            "the answer must reach the reducer simulation: {:?}",
+            preview.status
+        );
+        assert_eq!(preview.request_id, request.request_id);
+        assert_eq!(preview.interaction_id, request.interaction_id);
+        assert!(matches!(requester_rx.try_recv(), Err(TryRecvError::Empty)));
+
+        // The negative.
+        assert!(
+            matches!(other_rx.try_recv(), Err(TryRecvError::Empty)),
+            "a preview must reach no seat but the requester"
+        );
+
+        // Positive (ii): the instrument is alive. The landed production fan-out
+        // over the SAME `connections` map fills the SAME receiver, so a dead
+        // channel cannot pass both legs of this row.
+        broadcast_ai_failure(&connections, &game_code, Some(fault())).await;
+        assert!(
+            matches!(other_rx.try_recv(), Ok(ServerMessage::AiDriverFault { .. })),
+            "the second seat's channel is reachable by a real fan-out"
+        );
+    }
+
+    /// Row 1's sibling: the socket-currency check refuses a sender that is not
+    /// the one registered for this seat, and answers on the correlated channel.
+    #[tokio::test]
+    async fn preview_from_a_superseded_socket_is_refused() {
+        let (
+            state,
+            connections,
+            _game_code,
+            request,
+            (requester_identity, _requester_tx, mut requester_rx),
+            (_other_identity, _other_tx, _other_rx),
+        ) = two_seat_table().await;
+
+        let (stale_tx, mut stale_rx) = mpsc::unbounded_channel();
+        handle_preview_interaction(
+            request.clone(),
+            &state,
+            &connections,
+            &stale_tx,
+            &requester_identity,
+        )
+        .await;
+
+        match stale_rx.try_recv().expect("the stale socket is answered") {
+            ServerMessage::InteractionPreviewFailed {
+                request_id,
+                message,
+            } => {
+                assert_eq!(request_id, request.request_id);
+                assert_eq!(message, FULL_SOCKET_AUTHORITY_REJECTION);
+            }
+            other => panic!("expected a correlated authority refusal, got {other:?}"),
+        }
+        assert!(
+            matches!(requester_rx.try_recv(), Err(TryRecvError::Empty)),
+            "a refused stale socket must not leak an answer to the live seat"
+        );
+    }
+
+    /// A socket with no attached seat never reaches the session at all, and is
+    /// still answered on the correlated channel rather than left hanging.
+    #[tokio::test]
+    async fn preview_before_joining_is_refused_on_the_correlated_channel() {
+        let (state, connections, _game_code, request, _requester, _other) = two_seat_table().await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        handle_preview_interaction(
+            request.clone(),
+            &state,
+            &connections,
+            &tx,
+            &empty_identity(),
+        )
+        .await;
+
+        match rx.try_recv().expect("a pre-join preview is answered") {
+            ServerMessage::InteractionPreviewFailed {
+                request_id,
+                message,
+            } => {
+                assert_eq!(request_id, request.request_id);
+                assert_eq!(message, "Not in a game");
+            }
+            other => panic!("expected a correlated refusal, got {other:?}"),
+        }
+    }
+
+    /// Row 11's transport half: a session-level refusal reaches the client as a
+    /// correlated failure carrying the session's own reason, not as an `Error`
+    /// (which the native client treats as a session teardown).
+    #[tokio::test]
+    async fn an_interlocked_session_answers_a_correlated_failure_not_an_error() {
+        let (
+            state,
+            connections,
+            game_code,
+            request,
+            (requester_identity, requester_tx, mut requester_rx),
+            (_other_identity, _other_tx, _other_rx),
+        ) = two_seat_table().await;
+
+        {
+            let mut manager = state.lock().await;
+            let session = manager.sessions.get_mut(&game_code).expect("session");
+            session.ai_driver_fault = Some(fault());
+        }
+
+        handle_preview_interaction(
+            request.clone(),
+            &state,
+            &connections,
+            &requester_tx,
+            &requester_identity,
+        )
+        .await;
+
+        match requester_rx.try_recv().expect("the requester is answered") {
+            ServerMessage::InteractionPreviewFailed {
+                request_id,
+                message,
+            } => {
+                assert_eq!(request_id, request.request_id);
+                assert!(
+                    message.contains("Native AI driver fault"),
+                    "the session's own reason must ride the correlated channel: {message}"
+                );
+            }
+            other => panic!("an interlock must not tear the session down: {other:?}"),
+        }
+
+        // Reach guard: with the interlock cleared the identical request is
+        // answered, so the failure above is the interlock and not a broken table.
+        {
+            let mut manager = state.lock().await;
+            manager
+                .sessions
+                .get_mut(&game_code)
+                .expect("session")
+                .ai_driver_fault = None;
+        }
+        handle_preview_interaction(
+            request,
+            &state,
+            &connections,
+            &requester_tx,
+            &requester_identity,
+        )
+        .await;
+        assert!(matches!(
+            requester_rx.try_recv(),
+            Ok(ServerMessage::InteractionPreview { .. })
+        ));
+    }
+
+    /// Row 5's non-compiler-enforced leg. `to_lobby_client_message` carries
+    /// `_ => return None`, so no compile error would catch a preview leaking
+    /// into a broker clone. `SubscribeLobby` is the in-test positive: without
+    /// it a wholesale-`None` regression would satisfy this.
+    #[test]
+    fn preview_is_never_projected_into_the_lobby_broker() {
+        let frame = ClientMessage::PreviewInteraction {
+            request: InteractionPreviewRequest {
+                request_id: PreviewRequestId("req-1".to_string()),
+                interaction_id: engine::types::interaction::InteractionId("i-1".to_string()),
+                response: engine::types::interaction::InteractionResponse::Choose {
+                    choice_id: engine::types::interaction::InteractionChoiceId("a".to_string()),
+                },
+            },
+        };
+        assert!(to_lobby_client_message(&frame).is_none());
+        assert!(to_lobby_client_message(&ClientMessage::SubscribeLobby).is_some());
+    }
+
+    /// Row 5's three compiler-enforced legs, asserted by value rather than by
+    /// "it compiled": the preview is classified exactly as `Interaction` is at
+    /// each, and its operational failure is CORRELATED where `Interaction`'s is
+    /// not — an uncorrelated `ActionFailed` would leave the pending promise
+    /// hanging. Move it to `reject_if_disabled`'s always-allowed group and the
+    /// LobbyOnly leg fails; give it `Independent` and the authority leg fails.
+    #[test]
+    fn preview_is_classified_exactly_as_its_submission_sibling() {
+        let request = InteractionPreviewRequest {
+            request_id: PreviewRequestId("req-1".to_string()),
+            interaction_id: engine::types::interaction::InteractionId("i-1".to_string()),
+            response: engine::types::interaction::InteractionResponse::Choose {
+                choice_id: engine::types::interaction::InteractionChoiceId("a".to_string()),
+            },
+        };
+        let preview = ClientMessage::PreviewInteraction {
+            request: request.clone(),
+        };
+        let interaction = ClientMessage::Interaction {
+            submission: InteractionSubmission {
+                interaction_id: request.interaction_id.clone(),
+                response: request.response.clone(),
+            },
+        };
+
+        assert!(reject_if_disabled(&preview, ServerMode::Full).is_none());
+        assert!(reject_if_disabled(&preview, ServerMode::LobbyOnly).is_some());
+        assert_eq!(
+            reject_if_disabled(&preview, ServerMode::LobbyOnly),
+            reject_if_disabled(&interaction, ServerMode::LobbyOnly)
+        );
+
+        assert_eq!(
+            full_socket_authority(&preview),
+            FullSocketAuthority::CurrentSeat
+        );
+        assert_eq!(
+            full_socket_authority(&preview),
+            full_socket_authority(&interaction)
+        );
+        // Non-vacuity for the equality above: not every variant is CurrentSeat.
+        assert_eq!(
+            full_socket_authority(&ClientMessage::Ping { timestamp: 1 }),
+            FullSocketAuthority::Independent
+        );
+
+        match operation_failed_message(&preview, "disabled".to_string()) {
+            Some(ServerMessage::InteractionPreviewFailed {
+                request_id,
+                message,
+            }) => {
+                assert_eq!(request_id, request.request_id);
+                assert_eq!(message, "disabled");
+            }
+            other => panic!("a preview failure must stay correlated, got {other:?}"),
+        }
+        assert!(matches!(
+            operation_failed_message(&interaction, "disabled".to_string()),
+            Some(ServerMessage::ActionFailed { .. })
+        ));
+    }
+}
+
+#[cfg(test)]
 mod full_socket_authority_tests {
     use super::*;
     use engine::game::deck_loading::PlayerDeckPayload;
@@ -10345,7 +12040,7 @@ mod full_socket_authority_tests {
 
     fn test_session() -> (SharedState, SharedConnections, String, String) {
         let mut manager = SessionManager::new();
-        let (game_code, player_token) = manager.create_game(PlayerDeckPayload::default());
+        let (game_code, player_token) = manager.create_game(PlayerDeckPayload::default(), None);
         (
             Arc::new(Mutex::new(manager)),
             Arc::new(Mutex::new(HashMap::new())),
@@ -10563,7 +12258,7 @@ mod full_socket_authority_tests {
         let (state, connections, game_x, token_x) = test_session();
         let (game_y, token_y) = {
             let mut manager = state.lock().await;
-            manager.create_game(PlayerDeckPayload::default())
+            manager.create_game(PlayerDeckPayload::default(), None)
         };
         let (x_tx, _x_rx) = mpsc::unbounded_channel();
         let mut identity_x = empty_identity();
@@ -10634,7 +12329,8 @@ mod full_socket_authority_tests {
                 .expect("open game database"),
         );
         let mut original_manager = SessionManager::new();
-        let (game_code, player_token) = original_manager.create_game(PlayerDeckPayload::default());
+        let (game_code, player_token) =
+            original_manager.create_game(PlayerDeckPayload::default(), None);
         {
             let session = original_manager
                 .sessions
@@ -10754,9 +12450,11 @@ mod full_socket_authority_tests {
 mod draft_socket_authority_tests {
     use super::*;
     use draft_core::types::{
-        DeckAddableCards, DraftConfig, DraftKind, DraftSource, PodPolicy, SetLayout,
-        SpectatorVisibility, TournamentFormat,
+        DeckAddableCards, DraftConfig, DraftKind, DraftPairing, DraftSource, DraftStatus,
+        PairingStatus, PodPolicy, SetLayout, SpectatorVisibility, TournamentFormat,
     };
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
 
     fn empty_identity() -> SocketIdentity {
         SocketIdentity {
@@ -10825,6 +12523,308 @@ mod draft_socket_authority_tests {
                 password: None,
             },
         ]
+    }
+
+    #[tokio::test]
+    async fn initial_draft_match_token_attaches_the_current_full_match() {
+        use super::issue_4548_full_create_tests::{recv_server_message, spawn_full_mode_server};
+
+        let (url, server, _temp_dir, app_state) = spawn_full_mode_server().await;
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            let (draft_code, draft_token, expected_key, initial_match_start) = {
+                let mut drafts = app_state.draft_sessions.lock().await;
+                let config = DraftConfig {
+                    source: DraftSource::single_set("TST".to_string()),
+                    set_code: "TST".to_string(),
+                    kind: DraftKind::Premier,
+                    pod_size: 8,
+                    cards_per_pack: 14,
+                    pack_count: 3,
+                    min_deck_size: 40,
+                    addable_cards: DeckAddableCards::standard_basics(),
+                    rng_seed: 42,
+                    tournament_format: TournamentFormat::Swiss,
+                    pod_policy: PodPolicy::Competitive,
+                    spectator_visibility: SpectatorVisibility::default(),
+                };
+                let (draft_code, draft_token, _) = drafts.create_draft(config, "Alice".to_string());
+                let mut games = app_state.sessions.lock().await;
+                // Any synthetic disconnect created by initialization would
+                // expire before this fixture's first socket attachment.
+                games.reconnect.grace_period = Duration::ZERO;
+                let (game_code, _host_token) = games
+                    .create_game_n_players(
+                        engine::game::deck_loading::PlayerDeckPayload::default(),
+                        None,
+                        "Alice".to_string(),
+                        None,
+                        2,
+                        Default::default(),
+                        None,
+                    )
+                    .expect("create draft match game");
+                games
+                    .join_game_with_name(
+                        &game_code,
+                        engine::game::deck_loading::PlayerDeckPayload::default(),
+                        None,
+                        "Bob".to_string(),
+                    )
+                    .expect("join draft match game");
+                games
+                    .sessions
+                    .get_mut(&game_code)
+                    .expect("draft match game exists")
+                    .game_started = true;
+
+                let draft = drafts.sessions.get_mut(&draft_code).expect("draft exists");
+                draft.session.status = DraftStatus::MatchInProgress;
+                draft.session.current_round = 1;
+                draft.session.pairings.push(DraftPairing {
+                    round: 1,
+                    table: 0,
+                    players: [PlayerId(0), PlayerId(1)],
+                    match_id: "r1-t0".to_string(),
+                    status: PairingStatus::Pending,
+                    winner: None,
+                });
+                draft
+                    .active_matches
+                    .insert("r1-t0".to_string(), game_code.clone());
+                let spawn = DraftMatchSpawn {
+                    match_id: "r1-t0".to_string(),
+                    round: 1,
+                    game_code,
+                    player_a: server_core::draft_session::DraftMatchPlayer {
+                        draft_seat: 0,
+                        game_player: PlayerId(0),
+                    },
+                    player_b: server_core::draft_session::DraftMatchPlayer {
+                        draft_seat: 1,
+                        game_player: PlayerId(1),
+                    },
+                    opponent_names: ["Bob".to_string(), "Alice".to_string()],
+                };
+                let key = initialize_draft_match_runtime(&mut games, &app_state.game_db, &spawn)
+                    .expect("bind draft match runtime");
+                let initial_match_start = build_draft_match_start_message(
+                    &drafts,
+                    &draft_code,
+                    &spawn,
+                    &key,
+                    &spawn.player_a,
+                    &spawn.opponent_names[0],
+                )
+                .expect("build initial draft match announcement");
+                (draft_code, draft_token, key, initial_match_start)
+            };
+
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            {
+                let mut games = app_state.sessions.lock().await;
+                let session = &games.sessions[&expected_key.game_code];
+                assert!(session.game_started);
+                assert_eq!(session.connected, vec![false, false]);
+                assert!(
+                    games.reconnect.check_expired().is_empty(),
+                    "awaiting the first attachment must not expire the match"
+                );
+            }
+
+            let announced_token = match initial_match_start {
+                ServerMessage::DraftMatchStart {
+                    player_token,
+                    full_key,
+                    your_player: PlayerId(0),
+                    ..
+                } => {
+                    assert_eq!(player_token, draft_token);
+                    assert_eq!(full_key, expected_key);
+                    player_token
+                }
+                other => panic!("expected initial DraftMatchStart, got {other:?}"),
+            };
+
+            let (mut socket, _) = tokio_tungstenite::connect_async(url)
+                .await
+                .expect("connect");
+            assert!(matches!(
+                recv_server_message(&mut socket).await,
+                ServerMessage::ServerHello { .. }
+            ));
+            socket
+                .send(WsMessage::Text(
+                    serde_json::to_string(&ClientMessage::ClientHello {
+                        client_version: env!("CARGO_PKG_VERSION").to_string(),
+                        build_commit: build_commit().to_string(),
+                        protocol_version: PROTOCOL_VERSION,
+                        lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                        wire_formats: Vec::new(),
+                    })
+                    .expect("hello json")
+                    .into(),
+                ))
+                .await
+                .expect("send hello");
+            socket
+                .send(WsMessage::Text(
+                    serde_json::to_string(&ClientMessage::ReconnectDraft {
+                        draft_code,
+                        player_token: announced_token.clone(),
+                    })
+                    .expect("draft reconnect json")
+                    .into(),
+                ))
+                .await
+                .expect("send draft reconnect");
+
+            match recv_server_message(&mut socket).await {
+                ServerMessage::DraftMatchStart {
+                    player_token,
+                    full_key,
+                    your_player: PlayerId(0),
+                    ..
+                } => {
+                    assert_eq!(player_token, announced_token);
+                    assert_eq!(full_key, expected_key);
+                }
+                other => panic!("expected DraftMatchStart, got {other:?}"),
+            }
+            match recv_server_message(&mut socket).await {
+                ServerMessage::GameStarted {
+                    full_key: Some(full_key),
+                    your_player: PlayerId(0),
+                    ..
+                } => assert_eq!(full_key, expected_key),
+                other => panic!("expected matching GameStarted, got {other:?}"),
+            }
+            assert!(matches!(
+                recv_server_message(&mut socket).await,
+                ServerMessage::DraftStateUpdate { .. }
+            ));
+
+            socket
+                .send(WsMessage::Text(
+                    serde_json::to_string(&ClientMessage::Action {
+                        action: GameAction::GrantDebugPermission {
+                            player_id: PlayerId(1),
+                        },
+                    })
+                    .expect("action json")
+                    .into(),
+                ))
+                .await
+                .expect("send action");
+
+            loop {
+                match recv_server_message(&mut socket).await {
+                    ServerMessage::ActionRejected { rejection } => {
+                        assert_eq!(rejection.code, ActionRejectionCode::ActionNotAllowed);
+                        break;
+                    }
+                    ServerMessage::ActionFailed { message }
+                    | ServerMessage::Error { message, .. } => {
+                        panic!("draft match action missed Full authority: {message}")
+                    }
+                    _ => {}
+                }
+            }
+
+            socket
+                .close(None)
+                .await
+                .expect("close attached game socket");
+            loop {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                let mut games = app_state.sessions.lock().await;
+                if games
+                    .reconnect
+                    .is_disconnected(&expected_key.game_code, PlayerId(0))
+                {
+                    assert_eq!(
+                        games.reconnect.check_expired(),
+                        vec![expected_key.game_code.clone()],
+                        "an actual socket disconnect must still expire normally"
+                    );
+                    break;
+                }
+            }
+        })
+        .await;
+        server.abort();
+
+        outcome.expect("draft attachment, action, or disconnect response timed out");
+    }
+
+    #[tokio::test]
+    async fn draft_reconnect_sends_the_view_when_its_active_game_is_missing() {
+        use super::issue_4548_full_create_tests::{recv_server_message, spawn_full_mode_server};
+
+        let (url, server, _temp_dir, app_state) = spawn_full_mode_server().await;
+        let (drafts, _, draft_code, draft_token) = test_draft();
+        {
+            let mut drafts = drafts.lock().await;
+            let draft = drafts.sessions.get_mut(&draft_code).expect("draft exists");
+            draft.session.status = DraftStatus::MatchInProgress;
+            draft.session.current_round = 1;
+            draft.session.pairings.push(DraftPairing {
+                round: 1,
+                table: 0,
+                players: [PlayerId(0), PlayerId(1)],
+                match_id: "r1-t0".to_string(),
+                status: PairingStatus::Pending,
+                winner: None,
+            });
+            draft
+                .active_matches
+                .insert("r1-t0".to_string(), "GONE01".to_string());
+            assert!(draft.active_match_for_seat(0).is_some());
+            *app_state.draft_sessions.lock().await = std::mem::take(&mut *drafts);
+        }
+
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            let (mut socket, _) = tokio_tungstenite::connect_async(url)
+                .await
+                .expect("connect");
+            assert!(matches!(
+                recv_server_message(&mut socket).await,
+                ServerMessage::ServerHello { .. }
+            ));
+            for message in [
+                ClientMessage::ClientHello {
+                    client_version: env!("CARGO_PKG_VERSION").to_string(),
+                    build_commit: build_commit().to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                    wire_formats: Vec::new(),
+                },
+                ClientMessage::ReconnectDraft {
+                    draft_code: draft_code.clone(),
+                    player_token: draft_token,
+                },
+            ] {
+                socket
+                    .send(WsMessage::Text(
+                        serde_json::to_string(&message)
+                            .expect("client message json")
+                            .into(),
+                    ))
+                    .await
+                    .expect("send client message");
+            }
+
+            match recv_server_message(&mut socket).await {
+                ServerMessage::DraftStateUpdate { view } => {
+                    assert_eq!(view.status, DraftStatus::MatchInProgress);
+                    assert_eq!(view.seats[0].seat_index, 0);
+                }
+                other => panic!("missing Full game must not block the draft view: {other:?}"),
+            }
+            assert!(app_state.connections.lock().await[&draft_code].contains_key(&PlayerId(0)));
+        })
+        .await;
+        server.abort();
+        outcome.expect("draft view response timed out");
     }
 
     #[tokio::test]
@@ -11195,8 +13195,12 @@ mod live_spectator_tests {
         let mut state = GameState::new_two_player(42);
         state.eliminated_players.push(PlayerId(1));
 
-        let msg =
-            build_spectator_state_update_message(&state, &[], &[], 1).expect("fixture snapshot");
+        let full_key = server_core::FullSessionKey {
+            game_code: "GAME01".to_string(),
+            generation: 1,
+        };
+        let msg = build_spectator_state_update_message(&full_key, &state, &[], &[], 1)
+            .expect("fixture snapshot");
 
         match msg {
             ServerMessage::StateUpdate {
@@ -11506,6 +13510,25 @@ mod full_create_guard_tests {
         assert!(err.contains("archenemy_player"));
     }
 
+    /// The `format_config.validate_for_player_count(pc)?` call
+    /// (`guard_full_create_game_settings_inbound`, line 1265) is one of the
+    /// five production call sites; `fields()`'s `player_count: 2` clamps to
+    /// `pc == 2`, which falls outside `CommanderDraft`'s own registry range
+    /// (3-8) — this is a retryable wire rejection (the client can resubmit
+    /// with a corrected `player_count`), unlike the same check's use at
+    /// `server_core::session::GameSession::from_persisted`.
+    #[test]
+    fn full_create_guard_rejects_player_count_outside_format_registry_range() {
+        let deck = deck();
+        let mut fields = fields(&deck, None, None);
+        let format_config = engine::types::format::FormatConfig::commander_draft();
+        fields.format_config = Some(&format_config);
+
+        let err = guard_full_create_game_settings_inbound(fields, &[]).unwrap_err();
+
+        assert!(err.contains("player_count"));
+    }
+
     #[test]
     fn full_create_guard_rejects_limited_range_until_supported() {
         let deck = deck();
@@ -11711,6 +13734,7 @@ mod issue_4548_full_create_tests {
                 draft_metadata: None,
                 start_when_full: true,
                 ranked: false,
+                booster_pack_pool: None,
             };
             socket
                 .send(WsMessage::Text(
@@ -11886,6 +13910,7 @@ mod issue_4548_full_create_tests {
                 draft_metadata: None,
                 start_when_full: true,
                 ranked: false,
+                booster_pack_pool: None,
             };
             socket
                 .send(WsMessage::Text(
@@ -11966,6 +13991,7 @@ mod issue_4548_full_create_tests {
                 draft_metadata: None,
                 start_when_full: true,
                 ranked: false,
+                booster_pack_pool: None,
             };
             let create_json = serde_json::to_string(&create).expect("create json");
             assert!(create_json.len() > 8 * 1024);
@@ -12006,7 +14032,7 @@ mod game_submission_tests {
     use super::issue_4548_full_create_tests::{recv_server_message, spawn_full_mode_server};
     use super::*;
     use engine::game::interaction::MAX_INTERACTION_STRING_LEN;
-    use engine::types::actions::DebugAction;
+    use engine::types::actions::{DebugAction, DebugCardCreationKind};
     use engine::types::interaction::{InteractionChoiceId, InteractionId, InteractionResponse};
     use engine::types::zones::Zone;
     use futures_util::SinkExt;
@@ -12027,6 +14053,7 @@ mod game_submission_tests {
                 attach_to: None,
                 run_etb: false,
                 nonlegendary: false,
+                creation_kind: DebugCardCreationKind::Card,
             }))
         };
 
@@ -12093,6 +14120,7 @@ mod game_submission_tests {
             draft_metadata: None,
             start_when_full: true,
             ranked: false,
+            booster_pack_pool: None,
         };
         socket
             .send(WsMessage::Text(
@@ -12116,6 +14144,7 @@ mod game_submission_tests {
 
     async fn create_started_ai_game(
         socket: &mut WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>,
+        booster_pack_pool: Option<Vec<String>>,
     ) -> (String, String, server_core::FullSessionKey) {
         let create = ClientMessage::CreateGameWithSettings {
             deck: DeckData::default(),
@@ -12125,11 +14154,14 @@ mod game_submission_tests {
             timer_seconds: None,
             player_count: 2,
             match_config: Default::default(),
+            // An explicit empty list, matching the host's `DeckData::default()`:
+            // this harness runs on an empty `CardDatabase`, where a random
+            // starter deck resolves to nothing and the create is refused.
             ai_seats: vec![AiSeatRequest {
                 seat_index: 1,
                 difficulty: phase_ai::config::AiDifficulty::Easy,
                 deck_name: None,
-                deck: None,
+                deck: Some(DeckChoice::DeckList(Box::default())),
             }],
             format_config: None,
             room_name: None,
@@ -12137,6 +14169,7 @@ mod game_submission_tests {
             draft_metadata: None,
             start_when_full: true,
             ranked: false,
+            booster_pack_pool,
         };
         socket
             .send(WsMessage::Text(
@@ -12162,6 +14195,37 @@ mod game_submission_tests {
             }
         }
         created.expect("Full game identity")
+    }
+
+    #[tokio::test]
+    async fn native_shaped_full_create_preserves_cube_pool_through_start_and_ordinary_control() {
+        let (url, server, _temp_dir, app_state) = spawn_full_mode_server().await;
+        let pool = vec![
+            "Cube Card".to_string(),
+            "Cube Card".to_string(),
+            "Undealt sentinel".to_string(),
+        ];
+        let mut native_host = connect_and_hello(url.clone()).await;
+        let (cube_code, _, _) = create_started_ai_game(&mut native_host, Some(pool.clone())).await;
+        let sessions = app_state.sessions.lock().await;
+        let cube = sessions.sessions.get(&cube_code).expect("Cube session");
+        assert_eq!(cube.booster_pack_pool, Some(pool.clone()));
+        assert_eq!(
+            cube.state
+                .booster_pack_pool
+                .as_ref()
+                .map(|pool| pool.as_slice()),
+            Some(pool.as_slice())
+        );
+        drop(sessions);
+
+        let mut ordinary_host = connect_and_hello(url).await;
+        let (ordinary_code, _, _) = create_started_ai_game(&mut ordinary_host, None).await;
+        assert!(app_state.sessions.lock().await.sessions[&ordinary_code]
+            .state
+            .booster_pack_pool
+            .is_none());
+        server.abort();
     }
 
     async fn reconnect_started_game(
@@ -12274,7 +14338,8 @@ mod game_submission_tests {
         let (url, server, _temp_dir, app_state) = spawn_full_mode_server().await;
         let result = tokio::time::timeout(Duration::from_secs(10), async {
             let mut socket_a = connect_and_hello(url.clone()).await;
-            let (game_code, player_token, full_key) = create_started_ai_game(&mut socket_a).await;
+            let (game_code, player_token, full_key) =
+                create_started_ai_game(&mut socket_a, None).await;
 
             let mut socket_b = connect_and_hello(url).await;
             reconnect_started_game(&mut socket_b, &game_code, &player_token, full_key.clone())
@@ -12634,6 +14699,202 @@ mod game_submission_tests {
 }
 
 #[cfg(test)]
+mod refused_auto_start_join_tests {
+    use super::issue_4548_full_create_tests::{recv_server_message, spawn_full_mode_server};
+    use super::*;
+    use futures_util::SinkExt;
+    use server_core::protocol::{AiSeatRequest, DeckData};
+    use tokio_tungstenite::tungstenite::Message as WsMessage;
+    use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+
+    type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+    async fn connect_and_hello(url: &str) -> TestSocket {
+        let (mut socket, _) = tokio_tungstenite::connect_async(url)
+            .await
+            .expect("connect");
+        assert!(matches!(
+            recv_server_message(&mut socket).await,
+            ServerMessage::ServerHello { .. }
+        ));
+        send(
+            &mut socket,
+            &ClientMessage::ClientHello {
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                build_commit: build_commit().to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                lobby_protocol_version: Some(LOBBY_PROTOCOL_VERSION),
+                wire_formats: Vec::new(),
+            },
+        )
+        .await;
+        socket
+    }
+
+    async fn send(socket: &mut TestSocket, message: &ClientMessage) {
+        socket
+            .send(WsMessage::Text(
+                serde_json::to_string(message)
+                    .expect("client message json")
+                    .into(),
+            ))
+            .await
+            .expect("send client message");
+    }
+
+    /// Everything the socket says before it goes quiet. The handler's reply to
+    /// a refused auto-start is several messages long and the assertions are
+    /// about which ones are present, so collecting the whole burst reports a
+    /// missing message as a listing rather than as a hung receive.
+    async fn drain(socket: &mut TestSocket) -> Vec<ServerMessage> {
+        let mut received = Vec::new();
+        while let Ok(message) =
+            tokio::time::timeout(Duration::from_millis(750), recv_server_message(socket)).await
+        {
+            received.push(message);
+        }
+        received
+    }
+
+    /// A join that fills the room and then has its auto-start refused must
+    /// still hand the joiner their seat.
+    ///
+    /// The refusal is the cEDH bracket gate in `GameSession::start_game`: seat 1
+    /// runs at cEDH difficulty while no deck at the table is declared at that
+    /// bracket tier. The gate returns before `start_game` writes anything, so
+    /// the room is pregame with the joiner seated — and a joiner who never
+    /// learns their token can neither reconnect nor free the seat they hold.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_auto_start_still_attaches_the_joiner_to_their_seat() {
+        let (url, server, _temp_dir, app_state) = spawn_full_mode_server().await;
+
+        let mut host = connect_and_hello(&url).await;
+        send(
+            &mut host,
+            &ClientMessage::CreateGameWithSettings {
+                deck: DeckData::default(),
+                display_name: "Alice".to_string(),
+                public: false,
+                password: None,
+                timer_seconds: None,
+                // Three seats with one AI leaves a human seat open, so the
+                // create path does not take its own start-immediately branch.
+                player_count: 3,
+                match_config: Default::default(),
+                ai_seats: vec![AiSeatRequest {
+                    seat_index: 1,
+                    difficulty: phase_ai::config::AiDifficulty::CEDH,
+                    deck_name: None,
+                    // An explicit empty list: this harness runs on an empty
+                    // `CardDatabase`, where a random starter deck resolves to
+                    // nothing and the create is refused.
+                    deck: Some(DeckChoice::DeckList(Box::default())),
+                }],
+                format_config: None,
+                room_name: None,
+                host_peer_id: None,
+                draft_metadata: None,
+                start_when_full: true,
+                ranked: false,
+                booster_pack_pool: None,
+            },
+        )
+        .await;
+
+        let game_code = drain(&mut host)
+            .await
+            .into_iter()
+            .find_map(|message| match message {
+                ServerMessage::GameCreated { game_code, .. } => Some(game_code),
+                ServerMessage::Error { message, .. } => panic!("create was refused: {message}"),
+                _ => None,
+            })
+            .expect("the create reported a game code");
+
+        let mut guest = connect_and_hello(&url).await;
+        send(
+            &mut guest,
+            &ClientMessage::JoinGameWithPassword {
+                game_code: game_code.clone(),
+                deck: DeckData::default(),
+                display_name: "Bob".to_string(),
+                password: None,
+                reservation_token: None,
+            },
+        )
+        .await;
+        let replies = drain(&mut guest).await;
+
+        let attached = replies.iter().find_map(|message| match message {
+            ServerMessage::SessionAttached {
+                game_code,
+                player_id,
+                player_token,
+                ..
+            } => Some((game_code.clone(), *player_id, player_token.clone())),
+            _ => None,
+        });
+        let refusal = replies.iter().find_map(|message| match message {
+            ServerMessage::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        });
+
+        let (full, arms_auto_start, pregame, seat_of_token) = {
+            let mgr = app_state.sessions.lock().await;
+            let session = mgr.sessions.get(&game_code).expect("the room is live");
+            (
+                session.is_full(),
+                session.start_when_full,
+                session.is_pregame(),
+                attached
+                    .as_ref()
+                    .and_then(|(_, _, token)| session.player_for_token(token)),
+            )
+        };
+        server.abort();
+
+        // A `StateUpdate` carries the whole GameState, so failures report the
+        // burst by message type rather than by value.
+        let kinds = replies
+            .iter()
+            .map(|message| {
+                serde_json::to_value(message).expect("server message json")["type"]
+                    .as_str()
+                    .expect("tagged server message")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        // Reach guard: these two are exactly the handler's `should_start`, so a
+        // run where the auto-start was never attempted fails here instead of
+        // passing the assertions below for the wrong reason.
+        assert!(
+            full && arms_auto_start,
+            "the join did not arm an auto-start (full: {full}, start_when_full: {arms_auto_start})"
+        );
+        // The tier the estimator reports for an unbracketed deck is incidental;
+        // the gate and the seat it names are the reach guard.
+        let refusal = refusal.unwrap_or_default();
+        assert!(
+            refusal.starts_with("Cannot start cEDH game: seat 0 is not declared cEDH"),
+            "the bracket gate did not refuse the start (got {refusal:?} out of {kinds:?})"
+        );
+        assert!(pregame, "a refused start left the room flagged as started");
+
+        let (attached_code, player_id, _) = attached.unwrap_or_else(|| {
+            panic!("the joiner holds a seat they were never given: no SessionAttached in {kinds:?}")
+        });
+        assert_eq!(attached_code, game_code);
+        assert_eq!(player_id, PlayerId(2));
+        assert_eq!(
+            seat_of_token,
+            Some(PlayerId(2)),
+            "the token the joiner was handed does not resolve to their seat"
+        );
+    }
+}
+
+#[cfg(test)]
 mod mode_gate_tests {
     use super::*;
     use engine::types::actions::GameAction;
@@ -12661,6 +14922,7 @@ mod mode_gate_tests {
                 request_id: 1,
                 action: GameAction::PassPriority,
             },
+            ClientMessage::ExportAuthoritativeState,
             ClientMessage::Reconnect {
                 game_code: "X".into(),
                 player_token: "t".into(),
@@ -12748,6 +15010,13 @@ mod mode_gate_tests {
             ),
             Some(ServerMessage::ManaPaymentPreviewFailed { request_id: 5, message }) if message == "disabled"
         ));
+        assert!(matches!(
+            operation_failed_message(
+                &ClientMessage::ExportAuthoritativeState,
+                "disabled".to_string(),
+            ),
+            Some(ServerMessage::AuthoritativeStateExportFailed { message }) if message == "disabled"
+        ));
         assert!(
             operation_failed_message(&ClientMessage::ConcedeMatch, "disabled".to_string(),)
                 .is_none()
@@ -12817,6 +15086,7 @@ mod mode_gate_tests {
                 request_id: 1,
                 action: GameAction::PassPriority,
             },
+            ClientMessage::ExportAuthoritativeState,
             ClientMessage::AbandonGame,
             ClientMessage::Concede,
             ClientMessage::ConcedeMatch,
@@ -12884,17 +15154,28 @@ mod mode_gate_tests {
 
     use server_core::protocol::{
         BracketShape, MatchArity, PairingOutcome, PairingView, PlayerSummary, PodOutcome,
-        ScoringPolicy, TournamentStatus, TournamentSummary, TournamentView,
+        ReportGate, ScoringPolicy, TournamentAction, TournamentRequestId, TournamentRole,
+        TournamentStatus, TournamentSummary, TournamentView,
     };
+    use std::collections::BTreeSet;
 
     fn tournament_client_frames() -> Vec<ClientMessage> {
         vec![
             ClientMessage::CreateTournament {
                 name: "Friday Night".into(),
                 arity: MatchArity::COMMANDER_POD,
-                scoring: ScoringPolicy::default_for_arity(MatchArity::COMMANDER_POD),
+                scoring: Some(ScoringPolicy::default_for_arity(MatchArity::COMMANDER_POD)),
                 bracket: BracketShape::Swiss,
                 total_rounds: Some(4),
+                plus_rounds: None,
+                // A concrete label, so the round-trip cannot pass against a
+                // projection that hardcoded `format: None` instead of forwarding
+                // it — matching the server-direction fixture's treatment.
+                format: Some(engine::types::format::GameFormat::Commander),
+                // A concrete value (not `None`), so the round-trip cannot pass
+                // against a projection that dropped `match_type` and emitted
+                // `None`. `Bo1` is the valid single-game structure for a pod.
+                match_type: Some(engine::types::match_config::MatchType::Bo1),
             },
             ClientMessage::JoinTournament {
                 code: "TOUR01".into(),
@@ -12904,10 +15185,21 @@ mod mode_gate_tests {
             ClientMessage::GetTournament {
                 code: "TOUR01".into(),
             },
+            // Deliberately CORRELATED, and the only fixture here that is.
+            // `skip_serializing_if = "Option::is_none"` means a `None`
+            // correlator emits no key at all, so under an all-`None` table a
+            // projection that FORWARDED the field and one that DISCARDED it
+            // serialize to byte-identical strings — and
+            // `tournament_variants_survive_the_canonical_lobby_roundtrip`, whose
+            // whole job is to catch a dropped field, would pass either way.
+            // A real `Some(..)` is what makes that instrument fire.
             ClientMessage::StartTournamentRound {
                 code: "TOUR01".into(),
                 organizer_token: "org-tok".into(),
+                request_id: Some(TournamentRequestId(7)),
             },
+            // The remaining three stay uncorrelated, so the same pass also
+            // proves a pre-correlation frame still round-trips unchanged.
             ClientMessage::ReportMatchResult {
                 code: "TOUR01".into(),
                 pairing_id: 7,
@@ -12918,14 +15210,23 @@ mod mode_gate_tests {
                         .into_iter()
                         .collect(),
                 },
+                request_id: None,
             },
             ClientMessage::DropFromTournament {
                 code: "TOUR01".into(),
                 player_token: "player-tok".into(),
+                request_id: None,
             },
             ClientMessage::EndTournament {
                 code: "TOUR01".into(),
                 organizer_token: "org-tok".into(),
+                request_id: None,
+            },
+            ClientMessage::RenewTournamentCredential {
+                code: "TOUR01".into(),
+                role: TournamentRole::Organizer,
+                token: "org-tok".into(),
+                rotation_nonce: "nonce".into(),
             },
         ]
     }
@@ -12952,6 +15253,17 @@ mod mode_gate_tests {
                 current_round: 1,
                 total_rounds: 3,
                 created_at: 1_000,
+                scoring: ScoringPolicy::default_for_arity(MatchArity::HEAD_TO_HEAD),
+                // A NON-EMPTY set: an empty one would round-trip through a
+                // projection that dropped the field entirely.
+                open_actions: BTreeSet::from([
+                    TournamentAction::StartRound,
+                    TournamentAction::EndTournament,
+                    TournamentAction::Drop,
+                ]),
+                // A concrete label, so the round-trip cannot pass by dropping it.
+                format: Some(engine::types::format::GameFormat::Commander),
+                match_type: engine::types::match_config::MatchType::Bo3,
             },
             players: vec![alice.clone(), bob.clone()],
             // Every `PairingOutcome` shape, so the round-trip cannot pass by
@@ -12962,6 +15274,7 @@ mod mode_gate_tests {
                     round: 1,
                     players: vec![alice.clone()],
                     outcome: Some(PairingOutcome::Bye),
+                    report_gate: ReportGate::Bye,
                 },
                 PairingView {
                     id: 1,
@@ -12970,6 +15283,7 @@ mod mode_gate_tests {
                     outcome: Some(PairingOutcome::Forfeit {
                         winner: "key-a".into(),
                     }),
+                    report_gate: ReportGate::Forfeit,
                 },
                 PairingView {
                     id: 2,
@@ -12981,18 +15295,21 @@ mod mode_gate_tests {
                             .into_iter()
                             .collect(),
                     })),
+                    report_gate: ReportGate::Open,
                 },
                 PairingView {
                     id: 3,
                     round: 1,
                     players: vec![alice.clone(), bob.clone()],
                     outcome: Some(PairingOutcome::Reported(PodOutcome::Draw)),
+                    report_gate: ReportGate::Open,
                 },
                 PairingView {
                     id: 4,
                     round: 2,
                     players: vec![alice, bob],
                     outcome: None,
+                    report_gate: ReportGate::Open,
                 },
             ],
             standings: Vec::new(),
@@ -13008,7 +15325,7 @@ mod mode_gate_tests {
     #[test]
     fn tournament_variants_survive_the_canonical_lobby_roundtrip() {
         let frames = tournament_client_frames();
-        assert_eq!(frames.len(), 7, "every new client variant is covered");
+        assert_eq!(frames.len(), 8, "every new client variant is covered");
 
         for msg in &frames {
             let projected = to_lobby_client_message(msg).unwrap_or_else(|| {
@@ -13038,11 +15355,13 @@ mod mode_gate_tests {
             lobby_broker::LobbyServerMessage::TournamentCreated {
                 code: "TOUR01".into(),
                 organizer_token: "org-tok".into(),
+                expires_at_ms: 1_700_000_000_000,
                 view: view.clone(),
             },
             lobby_broker::LobbyServerMessage::TournamentJoined {
                 code: "TOUR01".into(),
                 player_token: "player-tok".into(),
+                expires_at_ms: 1_700_000_000_000,
                 view: view.clone(),
             },
             lobby_broker::LobbyServerMessage::TournamentUpdate {
@@ -13055,8 +15374,25 @@ mod mode_gate_tests {
             lobby_broker::LobbyServerMessage::TournamentListUpdate {
                 tournaments: vec![view.summary.clone()],
             },
+            // `TournamentRequestId` is one type re-exported by both crates, so
+            // the lobby literal and the canonical mirror name the same struct.
+            lobby_broker::LobbyServerMessage::TournamentActionAck {
+                request_id: TournamentRequestId(7),
+                code: "TOUR01".into(),
+                view: view.clone(),
+            },
+            lobby_broker::LobbyServerMessage::TournamentActionRejected {
+                request_id: TournamentRequestId(7),
+                message: "not the organizer".into(),
+            },
+            lobby_broker::LobbyServerMessage::TournamentCredentialRenewed {
+                code: "TOUR01".into(),
+                role: TournamentRole::Player,
+                token: "rotated-tok".into(),
+                expires_at_ms: 1_700_000_000_000,
+            },
         ];
-        assert_eq!(messages.len(), 5, "every new server variant is covered");
+        assert_eq!(messages.len(), 8, "every new server variant is covered");
 
         for msg in messages {
             let expected = serde_json::to_string(&msg).expect("lobby form serializes");
@@ -13607,11 +15943,31 @@ mod handshake_tests {
                 seat: 1,
                 name: None,
             },
+            draft_core::types::DraftAction::SharedStackDecision {
+                seat: 0,
+                pile: 0,
+                decision: draft_core::types::SharedStackPileDecision::Take,
+            },
         ];
         for action in allowed {
             assert!(
                 client_forbidden_draft_action_reason(&action).is_none(),
                 "expected {action:?} to be allowed from client"
+            );
+        }
+        // Paired positive, already in this file's sibling tests and restated
+        // here so the allow-list above cannot degrade into an allow-everything:
+        // the two server-internal variants are still refused.
+        for forbidden in [
+            draft_core::types::DraftAction::GeneratePairings,
+            draft_core::types::DraftAction::SetSeatConnected {
+                seat: 0,
+                connected: true,
+            },
+        ] {
+            assert!(
+                client_forbidden_draft_action_reason(&forbidden).is_some(),
+                "expected {forbidden:?} to stay server-internal"
             );
         }
     }
@@ -13711,9 +16067,12 @@ mod handshake_tests {
             LobbyClientMessage::CreateTournament {
                 name: "Friday Night".into(),
                 arity: MatchArity::HEAD_TO_HEAD,
-                scoring: ScoringPolicy::default(),
+                scoring: Some(ScoringPolicy::default()),
                 bracket: BracketShape::Swiss,
                 total_rounds: None,
+                plus_rounds: None,
+                format: None,
+                match_type: None,
             },
             &env,
         );
@@ -13791,7 +16150,7 @@ mod issue_4548_deadlock_tests {
 
         let game_code = {
             let mut mgr = state.lock().await;
-            let (code, _token) = mgr.create_game(PlayerDeckPayload::default());
+            let (code, _token) = mgr.create_game(PlayerDeckPayload::default(), None);
             code
         }; // state lock released here — matches the fixed handler path
 
@@ -13817,7 +16176,7 @@ mod issue_4548_deadlock_tests {
 
         let game_code = {
             let mut mgr = state.lock().await;
-            let (code, _token) = mgr.create_game(PlayerDeckPayload::default());
+            let (code, _token) = mgr.create_game(PlayerDeckPayload::default(), None);
             code
         };
 
@@ -13862,6 +16221,7 @@ mod issue_4548_deadlock_tests {
                 &game_db,
                 MultiplayerSessionRequest {
                     resolved: PlayerDeckPayload::default(),
+                    host_choice: seat_reducer::types::DeckChoice::Random,
                     display_name: "Alice".to_string(),
                     timer_seconds: None,
                     pc: 2,
@@ -13869,6 +16229,7 @@ mod issue_4548_deadlock_tests {
                     format_config: None,
                     start_when_full: false,
                     ranked: false,
+                    booster_pack_pool: None,
                     ai_requests: vec![],
                     public: false,
                     password: None,
@@ -13889,6 +16250,288 @@ mod issue_4548_deadlock_tests {
         .await
         .expect(
             "create_and_connect_multiplayer_session must release state+connections before returning",
+        );
+    }
+}
+
+#[cfg(test)]
+mod ai_seat_setup_tests {
+    use engine::database::CardDatabase;
+    use engine::types::match_config::MatchType;
+    use phase_ai::config::AiDifficulty;
+    use seat_reducer::types::DeckChoice;
+    use server_core::protocol::AiSeatRequest;
+
+    use super::ai_seat_setups;
+
+    fn db_with(names: &[&str]) -> CardDatabase {
+        let entries: serde_json::Map<String, serde_json::Value> = names
+            .iter()
+            .map(|name| {
+                (
+                    name.to_lowercase(),
+                    serde_json::json!({
+                        "name": name,
+                        "mana_cost": { "type": "NoCost" },
+                        "card_type": {
+                            "supertypes": [], "core_types": ["Land"], "subtypes": []
+                        },
+                        "power": null,
+                        "toughness": null,
+                        "loyalty": null,
+                        "defense": null,
+                        "oracle_text": null,
+                        "abilities": [],
+                        "triggers": [],
+                        "static_abilities": [],
+                        "replacements": [],
+                        "keywords": []
+                    }),
+                )
+            })
+            .collect();
+        CardDatabase::from_json_str(&serde_json::Value::Object(entries).to_string())
+            .expect("fixture database parses")
+    }
+
+    fn list(names: &[&str]) -> DeckChoice {
+        DeckChoice::DeckList(Box::new(engine::starter_decks::DeckData {
+            main_deck: names.iter().map(|n| n.to_string()).collect(),
+            ..Default::default()
+        }))
+    }
+
+    fn request(deck: Option<DeckChoice>, deck_name: Option<&str>) -> AiSeatRequest {
+        AiSeatRequest {
+            seat_index: 1,
+            difficulty: AiDifficulty::Easy,
+            deck_name: deck_name.map(str::to_string),
+            deck,
+        }
+    }
+
+    #[test]
+    fn a_resolvable_ai_deck_is_set_up_with_the_choice_that_describes_it() {
+        // The paired positive control for the refusal below, which a function
+        // that refused everything would satisfy vacuously.
+        let db = db_with(&["Forest"]);
+
+        let setups = ai_seat_setups(
+            &db,
+            &[request(Some(list(&["Forest"])), None)],
+            2,
+            None,
+            MatchType::Bo1,
+        )
+        .expect("a resolvable deck is accepted");
+
+        assert_eq!(setups.len(), 1);
+        let DeckChoice::DeckList(recorded) = &setups[0].choice else {
+            panic!("expected a recorded list, got {:?}", setups[0].choice);
+        };
+        assert_eq!(
+            server_core::deck_resolve::resolve_deck(&db, recorded)
+                .expect("the recorded choice re-resolves")
+                .main_deck
+                .len(),
+            setups[0].resolved.main_deck.len()
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_ai_deck_refuses_the_create() {
+        let db = db_with(&["Forest"]);
+
+        let result = ai_seat_setups(
+            &db,
+            &[request(Some(list(&["Nonexistent Card"])), None)],
+            2,
+            None,
+            MatchType::Bo1,
+        );
+
+        // No setup is produced: the seat cannot be installed with a deck no
+        // recorded choice describes.
+        assert!(result.is_err(), "expected a refusal, got {result:?}");
+    }
+
+    #[test]
+    fn a_deck_name_only_request_records_the_named_deck() {
+        let starter = server_core::starter_decks::find_starter_deck("Red Deck Wins")
+            .expect("the starter table names this deck");
+        let names: Vec<&str> = starter.main_deck.iter().map(String::as_str).collect();
+        let db = db_with(&names);
+
+        let setups = ai_seat_setups(
+            &db,
+            &[request(None, Some("Red Deck Wins"))],
+            2,
+            None,
+            MatchType::Bo1,
+        )
+        .expect("a named starter deck resolves");
+
+        assert_eq!(setups.len(), 1);
+        assert_eq!(
+            setups[0].choice,
+            DeckChoice::DeckList(Box::new(starter)),
+            "the recorded choice must be the deck the seat actually got, not `Random`"
+        );
+    }
+}
+
+#[cfg(test)]
+mod player_slots_projection_tests {
+    use super::*;
+    use engine::game::deck_loading::PlayerDeckPayload;
+    use engine::types::format::FormatConfig;
+    use phase_ai::config::AiDifficulty;
+    use server_core::session::AiSeatSetup;
+    use server_core::SeatKind;
+
+    fn ai_seat_deck(msg: Option<ServerMessage>) -> DeckChoice {
+        match msg {
+            Some(ServerMessage::PlayerSlotsUpdate { slots }) => match &slots[1].kind {
+                SeatKind::Ai { deck, .. } => deck.clone(),
+                other => panic!("seat 1 is not an AI seat: {other:?}"),
+            },
+            other => panic!("expected PlayerSlotsUpdate, got {other:?}"),
+        }
+    }
+
+    /// The host matches an AI seat's recorded list against its local catalog to
+    /// decide the seat is already dealt; no other client surface reads it.
+    #[tokio::test]
+    async fn a_guest_receives_random_where_the_host_receives_the_ai_seats_list() {
+        let installed = DeckChoice::DeckList(Box::new(engine::starter_decks::DeckData {
+            main_deck: vec!["Forest".to_string()],
+            ..Default::default()
+        }));
+        let state: SharedState = Arc::new(Mutex::new(SessionManager::new()));
+        let connections: SharedConnections = Arc::new(Mutex::new(HashMap::new()));
+
+        let game_code = {
+            let mut mgr = state.lock().await;
+            let (code, _token) = mgr
+                .create_game_n_players(
+                    PlayerDeckPayload::default(),
+                    None,
+                    String::new(),
+                    None,
+                    3,
+                    engine::types::match_config::MatchConfig::default(),
+                    Some(FormatConfig::commander()),
+                )
+                .expect("commander seats three");
+            mgr.sessions.get_mut(&code).unwrap().seat_ai(AiSeatSetup {
+                seat_index: 1,
+                difficulty: AiDifficulty::Medium,
+                choice: installed.clone(),
+                resolved: PlayerDeckPayload::default(),
+            });
+            code
+        };
+
+        let (host_tx, mut host_rx) = mpsc::unbounded_channel();
+        let (guest_tx, mut guest_rx) = mpsc::unbounded_channel();
+        {
+            let mut conns = connections.lock().await;
+            let room = conns.entry(game_code.clone()).or_default();
+            room.insert(PlayerId(0), host_tx);
+            room.insert(PlayerId(2), guest_tx);
+        }
+
+        broadcast_player_slots(&state, &connections, &game_code).await;
+
+        assert_eq!(ai_seat_deck(host_rx.recv().await), installed);
+        assert_eq!(ai_seat_deck(guest_rx.recv().await), DeckChoice::Random);
+    }
+}
+
+#[cfg(test)]
+mod delist_tests {
+    use lobby_broker::lobby::{LobbyManager, RegisterGameRequest};
+    use lobby_broker::BrokerEnv;
+
+    use super::delist_destroyed_sessions;
+
+    struct FixedEnv;
+    impl BrokerEnv for FixedEnv {
+        fn now_ms(&self) -> u64 {
+            1_000
+        }
+        fn new_token(&self) -> String {
+            "token".to_string()
+        }
+        fn new_game_code(&self) -> String {
+            "CODE00".to_string()
+        }
+    }
+
+    fn register(lob: &mut LobbyManager, code: &str, public: bool) {
+        lob.register_game(
+            code,
+            RegisterGameRequest {
+                host_name: "Host".to_string(),
+                public,
+                ..Default::default()
+            },
+            &FixedEnv,
+        );
+    }
+
+    #[test]
+    fn a_destroyed_public_room_is_delisted_and_announced() {
+        let mut lob = LobbyManager::new();
+        register(&mut lob, "PUB001", true);
+
+        let announce = delist_destroyed_sessions(&mut lob, std::iter::once("PUB001"));
+
+        assert!(!lob.has_game("PUB001"));
+        assert_eq!(announce, vec!["PUB001".to_string()]);
+    }
+
+    #[test]
+    fn a_private_room_is_delisted_without_an_announcement() {
+        let mut lob = LobbyManager::new();
+        register(&mut lob, "PRIV01", false);
+
+        let announce = delist_destroyed_sessions(&mut lob, std::iter::once("PRIV01"));
+
+        // Reach guard: it really was registered, so the removal is measured.
+        assert!(!lob.has_game("PRIV01"));
+        assert!(announce.is_empty(), "private entry announced: {announce:?}");
+    }
+
+    #[test]
+    fn an_unregistered_code_is_neither_removed_nor_announced() {
+        let mut lob = LobbyManager::new();
+        register(&mut lob, "PUB001", true);
+
+        let announce = delist_destroyed_sessions(&mut lob, std::iter::once("GONE01"));
+
+        assert!(announce.is_empty(), "absent code announced: {announce:?}");
+        // The bystander entry is untouched.
+        assert!(lob.has_game("PUB001"));
+    }
+
+    /// The multi-code axis: one call clears every code it is handed and returns
+    /// only the ones that were publicly listed.
+    #[test]
+    fn one_call_delists_every_code_and_announces_only_the_public_ones() {
+        let mut lob = LobbyManager::new();
+        register(&mut lob, "PUBA01", true);
+        register(&mut lob, "PUBB01", true);
+        register(&mut lob, "PRIVC1", false);
+
+        let codes = ["PUBA01", "PUBB01", "PRIVC1"];
+        let announce = delist_destroyed_sessions(&mut lob, codes.iter().copied());
+
+        assert!(codes.iter().all(|code| !lob.has_game(code)));
+        assert_eq!(
+            announce,
+            vec!["PUBA01".to_string(), "PUBB01".to_string()],
+            "only the public entries are announced"
         );
     }
 }
@@ -14065,8 +16708,10 @@ mod admin_auth_tests {
 
 #[cfg(test)]
 mod compression_tests {
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
+
+    use axum::http::StatusCode;
 
     use lobby_broker::Broker;
     use server_core::draft_session::DraftSessionManager;
@@ -14076,9 +16721,14 @@ mod compression_tests {
     use tower_http::cors::CorsLayer;
     use url::Url;
 
-    use super::{build_router, draft_pools, persistence, AppState, ServerContext, ServerMode};
+    use super::{
+        announcement_from_state, build_commit, build_router, draft_pools, persistence,
+        spawn_announce_task, validate_announcement, AppState, RawAnnouncement, ServerContext,
+        ServerInfoDocument, ServerMode, ANNOUNCE_REQUEST_TIMEOUT, DIRECTORY_VERSION, INFO_PATH,
+        LOBBY_PROTOCOL_VERSION, MAX_SERVER_NAME_LEN, PROTOCOL_VERSION,
+    };
 
-    fn test_app_state(temp_dir: &tempfile::TempDir) -> AppState {
+    fn test_app_state(temp_dir: &tempfile::TempDir, mode: ServerMode) -> AppState {
         let game_db_path = temp_dir.path().join("games.db");
         let game_db = Arc::new(
             persistence::GameDb::open(&game_db_path, persistence::SessionRetention::Multiplayer)
@@ -14096,7 +16746,7 @@ mod compression_tests {
             game_db,
             draft_spectators: Arc::new(Mutex::new(std::collections::HashMap::new())),
             game_spectators: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            mode: ServerMode::Full,
+            mode,
             context: ServerContext::default(),
             public_url: None,
             allowed_origin: None,
@@ -14105,8 +16755,9 @@ mod compression_tests {
 
     async fn spawn_compressed_test_server(
         temp_dir: &tempfile::TempDir,
+        mode: ServerMode,
     ) -> (String, tokio::task::JoinHandle<()>) {
-        let app_state = test_app_state(temp_dir);
+        let app_state = test_app_state(temp_dir, mode);
         let app = build_router(app_state, CorsLayer::permissive(), None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -14186,7 +16837,7 @@ mod compression_tests {
     #[tokio::test]
     async fn health_response_is_uncompressed_regardless_of_accept_encoding() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (addr, server) = spawn_compressed_test_server(&temp_dir).await;
+        let (addr, server) = spawn_compressed_test_server(&temp_dir, ServerMode::Full).await;
 
         let (headers, body) = raw_http_get(&addr, "/health", &[("Accept-Encoding", "gzip")]).await;
 
@@ -14209,7 +16860,7 @@ mod compression_tests {
         const HOST_PEER: &str = "peer-compression-test";
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let app_state = test_app_state(&temp_dir);
+        let app_state = test_app_state(&temp_dir, ServerMode::Full);
         // A highly compressible payload comfortably over the predicate's
         // minimum size, matching the redactor's "JSON object" requirement.
         let padding = "a".repeat(4096);
@@ -14264,7 +16915,7 @@ mod compression_tests {
     #[tokio::test]
     async fn ws_upgrade_still_succeeds_through_the_compressed_router() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
-        let (addr, server) = spawn_compressed_test_server(&temp_dir).await;
+        let (addr, server) = spawn_compressed_test_server(&temp_dir, ServerMode::Full).await;
 
         let connected = tokio_tungstenite::connect_async(format!("ws://{addr}/ws")).await;
         assert!(
@@ -14274,6 +16925,282 @@ mod compression_tests {
         );
 
         server.abort();
+    }
+
+    /// Recorded announce requests: the header map and the raw body bytes of
+    /// every POST the directory stub received.
+    type AnnounceLog = Arc<std::sync::Mutex<Vec<(axum::http::HeaderMap, Vec<u8>)>>>;
+
+    /// A directory stub on an ephemeral port that records every announce POST
+    /// and answers `status`. Inlines the listener+spawn shape
+    /// `large_json_response_is_gzip_compressed_when_accepted` uses.
+    async fn spawn_recording_directory(
+        status: axum::http::StatusCode,
+    ) -> (Url, AnnounceLog, tokio::task::JoinHandle<()>) {
+        let log: AnnounceLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let handler_log = log.clone();
+        let app = axum::Router::new().route(
+            "/servers/announce",
+            axum::routing::post(
+                move |headers: axum::http::HeaderMap, body: axum::body::Bytes| {
+                    let log = handler_log.clone();
+                    async move {
+                        log.lock()
+                            .expect("announce log")
+                            .push((headers, body.to_vec()));
+                        status
+                    }
+                },
+            ),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind directory stub");
+        let addr = listener.local_addr().expect("local addr");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("directory stub");
+        });
+        let endpoint =
+            Url::parse(&format!("http://{addr}/servers/announce")).expect("directory endpoint");
+        (endpoint, log, server)
+    }
+
+    /// Polls to a deadline rather than sleeping a fixed interval, so a slow
+    /// machine does not turn a passing case into a flake.
+    async fn wait_for_requests(log: &AnnounceLog, want: usize) -> usize {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let count = log.lock().expect("announce log").len();
+            if count >= want {
+                return count;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {count} of {want} announce requests arrived within 2s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Every recorded request must carry the JSON content type and a body the
+    /// directory's OWN validator accepts — not merely well-shaped bytes.
+    /// Returns each request's announced player count, in arrival order.
+    fn recorded_player_counts(log: &AnnounceLog) -> Vec<u32> {
+        let records = log.lock().expect("announce log");
+        assert!(!records.is_empty(), "no announce request was recorded");
+        records
+            .iter()
+            .map(|(headers, body)| {
+                assert_eq!(
+                    headers
+                        .get(axum::http::header::CONTENT_TYPE)
+                        .and_then(|value| value.to_str().ok()),
+                    Some("application/json")
+                );
+                let raw: RawAnnouncement =
+                    serde_json::from_slice(body).expect("wire body is a RawAnnouncement");
+                validate_announcement(&raw)
+                    .expect("the directory's own validator accepts the wire body")
+                    .current_players()
+            })
+            .collect()
+    }
+
+    /// V11. The info route serves exactly the identity `ServerHello`
+    /// advertises, on the shared constant path.
+    #[tokio::test]
+    async fn info_route_serves_the_server_hello_identity() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let (addr, server) = spawn_compressed_test_server(&temp_dir, ServerMode::Full).await;
+
+        let (headers, body) = raw_http_get(&addr, INFO_PATH, &[]).await;
+        // Reach-guard: without this a 404 body would be "tested" as a serde
+        // failure instead of failing here.
+        assert!(
+            headers.starts_with("http/1.1 200"),
+            "expected 200 on {INFO_PATH}, got:\n{headers}"
+        );
+        let document: ServerInfoDocument =
+            serde_json::from_slice(&body).expect("info document parses");
+        assert_eq!(document.mode, lobby_broker::ServerMode::Full);
+        assert_eq!(document.server_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(document.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(document.lobby_protocol_version, LOBBY_PROTOCOL_VERSION);
+        assert_eq!(document.build_commit.as_deref(), Some(build_commit()));
+        server.abort();
+
+        // The sibling: `mode` tracks this server's actual role, so a hard-coded
+        // "Full" fails here.
+        let (addr, server) = spawn_compressed_test_server(&temp_dir, ServerMode::LobbyOnly).await;
+        let (headers, body) = raw_http_get(&addr, INFO_PATH, &[]).await;
+        assert!(
+            headers.starts_with("http/1.1 200"),
+            "expected 200 on {INFO_PATH}, got:\n{headers}"
+        );
+        let document: ServerInfoDocument =
+            serde_json::from_slice(&body).expect("info document parses");
+        assert_eq!(document.mode, lobby_broker::ServerMode::LobbyOnly);
+        server.abort();
+    }
+
+    /// V14. The announcement is assembled from live `AppState`, and only from
+    /// an `https://` public URL.
+    #[test]
+    fn announcement_from_state_carries_url_mode_and_live_player_count() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        // LobbyOnly rather than Full, so a hard-coded mode fails here.
+        let mut state = test_app_state(&temp_dir, ServerMode::LobbyOnly);
+        state.public_url = Some("https://play.example.com".to_string());
+        // Non-zero, so a stubbed-zero implementation fails.
+        state.player_count.store(7, Ordering::Relaxed);
+
+        let announcement = announcement_from_state(&state).expect("state is announceable");
+        assert_eq!(announcement.url().as_str(), "wss://play.example.com/ws");
+        assert_eq!(announcement.name(), "play.example.com");
+        assert_eq!(announcement.mode(), lobby_broker::ServerMode::LobbyOnly);
+        assert_eq!(announcement.current_players(), 7);
+        assert_eq!(announcement.directory_version(), DIRECTORY_VERSION);
+
+        // A non-default port survives; the scheme default does not.
+        state.public_url = Some("https://play.example.com:8443".to_string());
+        assert_eq!(
+            announcement_from_state(&state)
+                .expect("state is announceable")
+                .url()
+                .as_str(),
+            "wss://play.example.com:8443/ws"
+        );
+        state.public_url = Some("https://play.example.com:443".to_string());
+        assert_eq!(
+            announcement_from_state(&state)
+                .expect("state is announceable")
+                .url()
+                .as_str(),
+            "wss://play.example.com/ws"
+        );
+
+        // (a) Reachable whenever a malformed `--public-url` was dropped by
+        // `validate_public_url`, not only via the ngrok fallback.
+        state.public_url = None;
+        assert!(announcement_from_state(&state).is_err());
+        // (b) Without this the server would announce an address it does not
+        // serve, and warn every 60 s forever.
+        state.public_url = Some("http://myserver.example:9374".to_string());
+        let error =
+            announcement_from_state(&state).expect_err("an http:// public URL is not announceable");
+        assert!(
+            error.contains("http"),
+            "the scheme found must be named: {error}"
+        );
+        // (c) The silent-default-port case: `Url::port()` is `None` at :80, so
+        // this would otherwise become wss://host.example/ws, claiming 443.
+        state.public_url = Some("http://host.example:80".to_string());
+        assert!(announcement_from_state(&state).is_err());
+
+        // A host longer than the NAME cap but well inside the URL cap must
+        // still announce: the name is truncated, the ADDRESS is not. Without
+        // the truncation this returns `Err` and the server never announces at
+        // all. Every label is 60 bytes (inside rule 8's 63) and the whole host
+        // is 121 characters — a valid DNS name that exceeds
+        // MAX_SERVER_NAME_LEN.
+        let long_label = "a".repeat(60);
+        let long_host = format!("{long_label}.{long_label}");
+        assert!(long_host.chars().count() > MAX_SERVER_NAME_LEN);
+        state.public_url = Some(format!("https://{long_host}"));
+        let announcement =
+            announcement_from_state(&state).expect("a long but legal host is still announceable");
+        assert_eq!(announcement.name().len(), MAX_SERVER_NAME_LEN);
+        assert!(long_host.starts_with(announcement.name()));
+        assert_eq!(
+            announcement.url().as_str(),
+            format!("wss://{long_host}/ws"),
+            "the address must keep the FULL host; only the display name is truncated"
+        );
+    }
+
+    /// V16. The heartbeat actually POSTs: right shape, right cadence, and a
+    /// directory that rejects forever does not kill it.
+    #[tokio::test]
+    async fn announce_task_posts_json_repeatedly_and_survives_failures() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let mut state = test_app_state(&temp_dir, ServerMode::Full);
+        // `test_app_state` leaves `public_url: None`, which would make the base
+        // unbuildable and leave this test recording ZERO requests while every
+        // ">= 2"-shaped assertion below passed unreached.
+        state.public_url = Some("https://play.example.com".to_string());
+        state.player_count.store(3, Ordering::Relaxed);
+        let base = announcement_from_state(&state).expect("fixture must be announceable");
+        // Built the way `serve()` builds it, so the test drives the real
+        // parameterised loop rather than a differently-configured client.
+        // `reqwest::Client` is a cheap `Arc` handle, so cloning it per case is
+        // what sharing one configured client looks like.
+        let client = reqwest::Client::builder()
+            .timeout(ANNOUNCE_REQUEST_TIMEOUT)
+            .build()
+            .expect("announce client builds");
+
+        // (A) `interval`'s first tick is immediate, so a 30 s period still
+        // announces at startup — pinned without a 30 s wait.
+        let (endpoint, log, recorder) = spawn_recording_directory(StatusCode::OK).await;
+        let handle = spawn_announce_task(
+            endpoint,
+            client.clone(),
+            base.clone(),
+            state.player_count.clone(),
+            std::time::Duration::from_secs(30),
+        );
+        wait_for_requests(&log, 1).await;
+        assert_eq!(recorded_player_counts(&log), vec![3]);
+        handle.abort();
+        recorder.abort();
+
+        // (B) A directory returning 500 forever: the loop keeps announcing and
+        // the task stays alive. A `?` or an early return on the error path
+        // fails this.
+        let (endpoint, log, recorder) =
+            spawn_recording_directory(StatusCode::INTERNAL_SERVER_ERROR).await;
+        let handle = spawn_announce_task(
+            endpoint,
+            client.clone(),
+            base.clone(),
+            state.player_count.clone(),
+            std::time::Duration::from_millis(25),
+        );
+        let seen = wait_for_requests(&log, 2).await;
+        assert!(seen >= 2, "expected a repeating heartbeat, saw {seen}");
+        assert!(
+            !handle.is_finished(),
+            "a directory rejecting every announcement must not end the heartbeat"
+        );
+        // The live count is re-read per tick rather than replayed from the
+        // frozen base.
+        state.player_count.store(9, Ordering::Relaxed);
+        wait_for_requests(&log, seen + 2).await;
+        assert_eq!(
+            recorded_player_counts(&log).last().copied(),
+            Some(9),
+            "the loop must refresh the player count, not replay the base"
+        );
+        handle.abort();
+        recorder.abort();
+
+        // (C) Paired positive: (B) is not an artifact of the error path — the
+        // success path loops too.
+        state.player_count.store(3, Ordering::Relaxed);
+        let (endpoint, log, recorder) = spawn_recording_directory(StatusCode::OK).await;
+        let handle = spawn_announce_task(
+            endpoint,
+            client.clone(),
+            base,
+            state.player_count.clone(),
+            std::time::Duration::from_millis(25),
+        );
+        let seen = wait_for_requests(&log, 2).await;
+        assert!(seen >= 2, "expected a repeating heartbeat, saw {seen}");
+        assert!(!handle.is_finished());
+        assert!(recorded_player_counts(&log).iter().all(|count| *count == 3));
+        handle.abort();
+        recorder.abort();
     }
 }
 
@@ -14514,6 +17441,107 @@ mod p2p_backup_delete_tests {
     }
 
     #[tokio::test]
+    async fn public_backup_store_and_get_redact_intergame_launch_pool() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let app_state = test_app_state(&temp_dir);
+        let snapshot = serde_json::json!({
+            "intergameCommands": [{
+                "launchPayload": { "deckPayload": {
+                    "booster_pack_pool": ["Cube", "Cube", "Undealt sentinel"],
+                    "main_deck": ["Public card"]
+                }}
+            }]
+        })
+        .to_string();
+
+        let stored = admin::p2p_backup_store(
+            State(app_state.clone()),
+            Json(admin::P2pBackupRequest {
+                draft_code: DRAFT_CODE.to_string(),
+                host_peer_id: HOST_PEER.to_string(),
+                snapshot_json: snapshot,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(stored.status(), StatusCode::OK);
+
+        let (_, stored_snapshot, _) = app_state
+            .game_db
+            .load_p2p_backup(DRAFT_CODE)
+            .expect("load")
+            .expect("stored backup");
+        let stored: serde_json::Value =
+            serde_json::from_str(&stored_snapshot).expect("snapshot JSON");
+        let stored_deck = &stored["intergameCommands"][0]["launchPayload"]["deckPayload"];
+        assert!(stored_deck.get("booster_pack_pool").is_none());
+        assert_eq!(stored_deck["main_deck"], serde_json::json!(["Public card"]));
+
+        let response = admin::p2p_backup_get(
+            State(app_state),
+            Path(DRAFT_CODE.to_string()),
+            Query(admin::P2pBackupGetQuery {
+                host_peer_id: HOST_PEER.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let response: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+        let public: serde_json::Value =
+            serde_json::from_str(response["snapshot_json"].as_str().expect("snapshot JSON"))
+                .expect("snapshot JSON");
+        assert!(
+            public["intergameCommands"][0]["launchPayload"]["deckPayload"]
+                .get("booster_pack_pool")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn public_backup_get_defensively_redacts_legacy_intergame_launch_pool() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let app_state = test_app_state(&temp_dir);
+        app_state
+            .game_db
+            .save_p2p_backup(
+                DRAFT_CODE,
+                HOST_PEER,
+                &serde_json::json!({
+                    "intergameCommands": [{ "launchPayload": { "deckPayload": {
+                        "booster_pack_pool": ["legacy Cube"], "main_deck": ["Public card"]
+                    }}}]
+                })
+                .to_string(),
+            )
+            .expect("seed raw legacy backup");
+
+        let response = admin::p2p_backup_get(
+            State(app_state),
+            Path(DRAFT_CODE.to_string()),
+            Query(admin::P2pBackupGetQuery {
+                host_peer_id: HOST_PEER.to_string(),
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let response: serde_json::Value = serde_json::from_slice(&body).expect("response JSON");
+        let public: serde_json::Value =
+            serde_json::from_str(response["snapshot_json"].as_str().expect("snapshot JSON"))
+                .expect("snapshot JSON");
+        let deck = &public["intergameCommands"][0]["launchPayload"]["deckPayload"];
+        assert!(deck.get("booster_pack_pool").is_none());
+        assert_eq!(deck["main_deck"], serde_json::json!(["Public card"]));
+    }
+
+    #[tokio::test]
     async fn delete_rejects_missing_host_peer_id_and_preserves_row() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let app_state = test_app_state(&temp_dir);
@@ -14603,7 +17631,7 @@ mod metrics_tests {
     use phase_ai::config::AiDifficulty;
     use server_core::draft_session::DraftSessionManager;
     use server_core::protocol::{AiSeatRequest, ClientMessage, DeckData, ServerMessage};
-    use server_core::session::SessionManager;
+    use server_core::session::{GameSession, SessionManager};
     use tokio::sync::{mpsc, Mutex};
     use tokio_tungstenite::tungstenite::Message as WsMessage;
 
@@ -14675,9 +17703,9 @@ mod metrics_tests {
 
         let (occupied, abandoned, empty) = {
             let mut mgr = state.sessions.lock().await;
-            let (a, _) = mgr.create_game(PlayerDeckPayload::default());
-            let (b, _) = mgr.create_game(PlayerDeckPayload::default());
-            let (c, _) = mgr.create_game(PlayerDeckPayload::default());
+            let (a, _) = mgr.create_game(PlayerDeckPayload::default(), None);
+            let (b, _) = mgr.create_game(PlayerDeckPayload::default(), None);
+            let (c, _) = mgr.create_game(PlayerDeckPayload::default(), None);
             (a, b, c)
         };
 
@@ -14717,7 +17745,7 @@ mod metrics_tests {
 
         let code = {
             let mut mgr = state.sessions.lock().await;
-            let (code, _) = mgr.create_game(PlayerDeckPayload::default());
+            let (code, _) = mgr.create_game(PlayerDeckPayload::default(), None);
             code
         };
 
@@ -14963,6 +17991,7 @@ mod metrics_tests {
             draft_metadata: None,
             start_when_full: true,
             ranked: false,
+            booster_pack_pool: None,
         }
     }
 
@@ -15106,15 +18135,18 @@ mod metrics_tests {
 
     /// Every full-mode creation path must check capacity under the same lock
     /// acquisition that inserts the session. All three are driven here over the
-    /// real websocket route, because each reaches a different insert:
-    /// `create_game`, `create_game_with_ai`, and `create_game_n_players`.
+    /// real websocket route, because each reaches a different check: the one in
+    /// the `CreateGame` arm, the one in `create_and_connect_multiplayer_session`,
+    /// and the one in the AI branch of `CreateGameWithSettings`. Two of them
+    /// share an insert (`create_game_n_players`), so the insert does not
+    /// identify the path — the check does.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_creates_cannot_exceed_the_game_cap() {
         const RACERS: u64 = 8;
         for path in [
-            "create_game",
-            "create_game_n_players",
-            "create_game_with_ai",
+            "create_game_arm",
+            "create_and_connect_multiplayer_session",
+            "create_game_with_settings_ai_branch",
         ] {
             let temp = tempfile::tempdir().expect("temp dir");
             let context = ServerContext {
@@ -15132,15 +18164,18 @@ mod metrics_tests {
             let deck = DeckData::default();
             let requests = (0..RACERS)
                 .map(|racer| match path {
-                    "create_game" => ClientMessage::CreateGame { deck: deck.clone() },
-                    "create_game_with_ai" => settings_request(
+                    "create_game_arm" => ClientMessage::CreateGame { deck: deck.clone() },
+                    "create_game_with_settings_ai_branch" => settings_request(
                         &format!("racer{racer}"),
                         deck.clone(),
+                        // Empty list for the same reason as the AI-game
+                        // harness above: this server has an empty card
+                        // database, so only an empty deck resolves.
                         vec![AiSeatRequest {
                             seat_index: 1,
                             difficulty: AiDifficulty::Medium,
                             deck_name: None,
-                            deck: None,
+                            deck: Some(seat_reducer::types::DeckChoice::DeckList(Box::default())),
                         }],
                     ),
                     _ => settings_request(&format!("racer{racer}"), deck.clone(), Vec::new()),
@@ -15173,7 +18208,7 @@ mod metrics_tests {
             // path if seat validation ever rejected the request.
             assert_eq!(
                 survivor,
-                usize::from(path == "create_game_with_ai"),
+                usize::from(path == "create_game_with_settings_ai_branch"),
                 "{path}: wrong creation path ran"
             );
             assert_eq!(
@@ -15182,6 +18217,80 @@ mod metrics_tests {
                 "{path}"
             );
         }
+    }
+
+    /// Snapshot a live room and rebuild it the way a process restart does.
+    async fn restart(sessions: &super::SharedState, game_code: &str) -> GameSession {
+        let persisted = {
+            let mgr = sessions.lock().await;
+            mgr.sessions
+                .get(game_code)
+                .expect("the room is live")
+                .to_persisted()
+        };
+        GameSession::from_persisted(persisted, &Arc::new(CardDatabase::default()))
+            .expect("the snapshot restores")
+    }
+
+    /// Both legacy seat installs must record the unresolved deck they were
+    /// filled from: a restart rebuilds `decks` from `deck_choices` alone, and a
+    /// seat with no provenance restores empty and `start_game` refuses the
+    /// table. Driven over the socket rather than against the setters, because
+    /// the setters were already correct and these two entry points were not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn legacy_create_and_join_record_their_seats_deck_provenance() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let state = app_state(&temp, ServerContext::default());
+        let sessions = state.sessions.clone();
+        let (addr, server) = spawn(state).await;
+
+        let mut host = connect_and_hello(&addr).await;
+        let created = send_create(
+            &mut host,
+            ClientMessage::CreateGame {
+                deck: DeckData::default(),
+            },
+        )
+        .await;
+        let ServerMessage::GameCreated { game_code, .. } = created else {
+            panic!("CreateGame did not create a room: {created:?}");
+        };
+
+        // Seat 1 is the one nobody filled. A host recorded without its list
+        // names seat 0 here instead, and seat 0 is `SeatImmutable` — no reseat
+        // can clear it, so that room never starts again.
+        assert_eq!(
+            restart(&sessions, &game_code)
+                .await
+                .start_game(&Arc::new(CardDatabase::default())),
+            Err(server_core::session::StartGameError::SeatDeckMissing { seat_index: 1 }),
+            "the host seat lost its deck across a restart"
+        );
+
+        let mut guest = connect_and_hello(&addr).await;
+        let joined = send_create(
+            &mut guest,
+            ClientMessage::JoinGame {
+                game_code: game_code.clone(),
+                deck: DeckData::default(),
+            },
+        )
+        .await;
+        assert!(
+            !matches!(joined, ServerMessage::Error { .. }),
+            "JoinGame was refused: {joined:?}"
+        );
+
+        // With both seats recorded the restored room is startable — the row
+        // above is the paired control proving this one is not vacuous.
+        assert_eq!(
+            restart(&sessions, &game_code)
+                .await
+                .start_game(&Arc::new(CardDatabase::default())),
+            Ok(())
+        );
+
+        server.abort();
     }
 
     /// A reservation whose upgrade never reaches `handle_socket` has to be

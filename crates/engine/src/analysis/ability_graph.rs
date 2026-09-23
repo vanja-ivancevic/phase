@@ -821,8 +821,9 @@ fn effect_projection(effect: &Effect) -> Projection {
             }
         }
         // ----- EXTRA TURNS / PHASES (CR 500.7 / CR 500.8) -----
-        Effect::ExtraTurn { .. } => {
-            b.add_extra_turn(1, AxisMagnitude::Fixed(1));
+        Effect::ExtraTurn { count, .. } => {
+            let (a, mag) = count_seed(count);
+            b.add_extra_turn(a, mag);
         }
         // CR 500.8: only an additional *combat* phase pumps a modeled axis; any
         // other extra phase carries no countable resource ⇒ Unmodeled (M2).
@@ -918,6 +919,8 @@ fn effect_projection(effect: &Effect) -> Projection {
         // like `Transform`.
         | Effect::FlipPermanent { .. }
         | Effect::SearchOutsideGame { .. }
+        // CR 400.11b: carries no nested ability edge.
+        | Effect::OpenBoosterPack { .. }
         | Effect::RevealHand { .. }
         | Effect::RevealFromHand { .. }
         | Effect::Reveal { .. }
@@ -2173,7 +2176,7 @@ pub(crate) fn candidate_cycles_from_nodes(nodes: Vec<AbilityNode>) -> Vec<Candid
 mod tests {
     use super::*;
     use crate::types::ability::{
-        default_target_filter_any, EffectScope, PlayerFilter, PtValue, SacrificeCost,
+        default_target_filter_any, EffectScope, PlayerFilter, PtValue, QuantityRef, SacrificeCost,
         TriggerDefinition, TypedFilter,
     };
     use crate::types::counter::CounterType;
@@ -2991,11 +2994,34 @@ mod tests {
             "TimeWalk",
             &activated(Effect::ExtraTurn {
                 target: TargetFilter::Controller,
+                count: fixed(1),
             }),
             None,
         );
         assert_eq!(et.net.extra_turns, 1);
         assert!(et.produces.contains(&AxisKey::ExtraTurn));
+
+        let two = build_node(
+            "TimeStretch",
+            &activated(Effect::ExtraTurn {
+                target: TargetFilter::Controller,
+                count: fixed(2),
+            }),
+            None,
+        );
+        assert_eq!(two.net.extra_turns, 2);
+
+        let dynamic = effect_projection(&Effect::ExtraTurn {
+            target: TargetFilter::Controller,
+            count: QuantityExpr::Ref {
+                qty: QuantityRef::Variable { name: "X".into() },
+            },
+        });
+        assert!(matches!(
+            dynamic,
+            Projection::Modeled { ref magnitudes, .. }
+                if magnitudes.get(&AxisKey::ExtraTurn) == Some(&AxisMagnitude::Unbounded)
+        ));
 
         // CR 500.8: an additional combat phase pumps the Combat axis.
         let combat = build_node(

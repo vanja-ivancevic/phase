@@ -637,6 +637,7 @@ pub fn resolve(
             // CR 608.2c: drop the consumed set's member-cause provenance too so
             // the side map never outlives its `tracked_object_sets` entry.
             state.tracked_set_member_causes.remove(&id);
+            state.tracked_set_participants.remove(&id);
         }
     }
 
@@ -1382,9 +1383,15 @@ pub(crate) fn materialize_token_copy_body(
     // itself copiable. `install_copiable_values_as_base` already installs
     // `loyalty`/`base_loyalty` from `values.loyalty` (CR 306.5b), so no separate
     // loyalty seed is needed here.
+    let mut values = copy.values.clone();
+    let cda_pruning = super::copy_exception::prune_copy_exception_overridden_cdas(
+        &values.static_definitions,
+        &copy.additional_modifications,
+    );
+    values.static_definitions = Arc::new(cda_pruning.definitions);
     apply_copiable_values_to_liminal_object(
         object,
-        &copy.values,
+        &values,
         copy.display_source,
         copy.printed_ref.clone(),
         copy.token_image_ref.clone(),
@@ -2462,8 +2469,9 @@ pub(crate) fn spec_emits_only_etb_pair(spec: &TokenSpec) -> bool {
 
 /// CR 603.6a + CR 111.1: The set of event keys a single produced token EMITS as
 /// it enters the battlefield, given its core types. Mirrors the event-side
-/// deriver exactly (`keys_from_event`, trigger_index.rs:462-468 for the ETB pair
-/// and :529-531 for `TokenCreated`): a token entering emits the broad
+/// deriver exactly (`keys_from_event` — the `to == Zone::Battlefield` branch of
+/// its `GameEvent::ZoneChanged` arm for the ETB pair, and its
+/// `GameEvent::TokenCreated` arm for `TokenCreated`): a token entering emits the broad
 /// `EnterBattlefield(None)`, one narrow `EnterBattlefield(Some(ct))` per core
 /// type, and `TokenCreated`. Kept in lockstep with the deriver so the §2.3a gate
 /// reasons about exactly the events siblings would observe.
@@ -3177,9 +3185,10 @@ fn resolve_attach_host(
         // CR 608.2c: a numbered anaphor resolves against the whole resolving
         // chain's targets, which is why it routes through the same authority
         // `attach::resolve_object_filter` uses rather than reading this clause's
-        // nearest target.
+        // nearest target. CR 608.2b: a slot whose target was illegal at
+        // resolution (or whose pinned referent departed, CR 400.7) names no host.
         AttachHostAuthority::ParentSlot(index) => {
-            crate::game::targeting::resolve_parent_slot_from_root(state, ability, index)
+            crate::game::targeting::resolve_live_parent_slot_from_root(state, ability, index)
                 .map(target_ref_to_attach_target)
         }
         AttachHostAuthority::Source => Some(AttachTarget::Object(ability.source_id)),
@@ -3314,6 +3323,7 @@ fn classify_attach_host_authority(filter: &TargetFilter) -> AttachHostAuthority 
         | TargetFilter::TriggeringSpellOwner
         | TargetFilter::TriggeringPlayer
         | TargetFilter::TriggeringSourceController
+        | TargetFilter::EventTargetController
         | TargetFilter::ParentTargetController
         | TargetFilter::ParentTargetOwner
         | TargetFilter::SourceChosenPlayer
@@ -3823,7 +3833,7 @@ fn junk_ability() -> AbilityDefinition {
                 card_filter: None,
                 single_use_group: None,
                 single_use: false,
-                cast_cost_raise: None,
+                cast_cost_modifier: None,
                 alt_ability_cost: None,
                 land_enter_tapped: crate::types::zones::EtbTapState::Unspecified,
             },
@@ -3892,6 +3902,7 @@ fn incubator_phyrexian_back_face() -> BackFaceData {
         parse_warnings: vec![],
         layout_kind: None,
         is_swap_snapshot: false,
+        trigger_printed_origins: Vec::new(),
     }
 }
 
@@ -3924,6 +3935,28 @@ fn shard_ability() -> AbilityDefinition {
     })
 }
 
+/// CR 111.10 (Reality Fracture): Heartwood — "{T}: Add {R} or {G}." A
+/// two-color-choice mana rock, structurally identical to Treasure/Gold's
+/// `ManaProduction::AnyOneColor` choice restricted to the token's own printed
+/// colors, with Powerstone's plain-tap (no sacrifice) cost shape.
+fn heartwood_ability() -> AbilityDefinition {
+    AbilityDefinition::new(
+        AbilityKind::Activated,
+        Effect::Mana {
+            produced: ManaProduction::AnyOneColor {
+                count: QuantityExpr::Fixed { value: 1 },
+                color_options: vec![ManaColor::Red, ManaColor::Green],
+                contribution: ManaContribution::Base,
+            },
+            restrictions: vec![],
+            grants: vec![],
+            expiry: None,
+            target: None,
+        },
+    )
+    .cost(AbilityCost::Tap)
+}
+
 /// CR 111.10: Predefined token abilities keyed by subtype.
 /// Returns ability definitions to inject for the given subtype, or empty if none.
 pub fn predefined_token_abilities(subtype: &str) -> Vec<AbilityDefinition> {
@@ -3941,6 +3974,7 @@ pub fn predefined_token_abilities(subtype: &str) -> Vec<AbilityDefinition> {
         "Junk" => vec![junk_ability()],
         "Incubator" => vec![incubator_ability()],
         "Shard" => vec![shard_ability()],
+        "Heartwood" => vec![heartwood_ability()],
         _ => vec![],
     }
 }
@@ -4803,12 +4837,10 @@ mod tests {
         );
         assert!(state.pending_token_battlefield_entry.is_none());
         assert_eq!(
-            events
-                .iter()
-                .find_map(|event| match event {
-                    GameEvent::ZoneChanged { record, .. } => record.zone_change_putter(),
-                    _ => None,
-                }),
+            events.iter().find_map(|event| match event {
+                GameEvent::ZoneChanged { record, .. } => record.zone_change_putter(),
+                _ => None,
+            }),
             Some(PlayerId(0)),
             "the liminal token retains its actor through the parked flush"
         );

@@ -14,6 +14,7 @@ import { FullscreenButton } from "./FullscreenButton.tsx";
 import { VolumeControl } from "./VolumeControl.tsx";
 import { clearGame } from "../../stores/gameStore.ts";
 import { useDraftStore } from "../../stores/draftStore.ts";
+import { useMultiplayerDraftStore } from "../../stores/multiplayerDraftStore.ts";
 import { useCardDataMeta } from "../../hooks/useCardDataMeta.ts";
 import { useConcedeHandler } from "../../hooks/useConcedeHandler.ts";
 import type { ResolvedMultiplayerBoardLayout } from "../../stores/preferencesStore.ts";
@@ -33,6 +34,8 @@ interface GameMenuProps {
   isOnlineMode: boolean;
   showAiHand: boolean;
   onToggleAiHand: () => void;
+  logPanelOpen: boolean;
+  onToggleGameLog: () => void;
   /** The currently displayed layout, already resolved from the raw preference. */
   multiplayerBoardLayout?: ResolvedMultiplayerBoardLayout;
   onToggleMultiplayerBoardLayout?: () => void;
@@ -69,6 +72,8 @@ export function GameMenu({
   isOnlineMode,
   showAiHand,
   onToggleAiHand,
+  logPanelOpen,
+  onToggleGameLog,
   multiplayerBoardLayout,
   onToggleMultiplayerBoardLayout,
   showMultiplayerSplitLayoutNudge = false,
@@ -140,7 +145,10 @@ export function GameMenu({
          container's left edge and is unaffected by the row's flow. */
       className="fixed z-40 flex items-center gap-2"
       style={{
-        left: "calc(env(safe-area-inset-left) + 0.5rem)",
+        // Fixed, so the board grid's rail padding does not apply — the
+        // left-dock log offset has to be added here, mirroring how the action
+        // rail consumes `--game-right-rail-offset`.
+        left: "calc(env(safe-area-inset-left) + 0.5rem + var(--game-left-rail-offset, 0px))",
         top: "calc(env(safe-area-inset-top) + var(--game-top-overlay-offset, 0px) + 0.75rem)",
       }}
     >
@@ -262,7 +270,13 @@ export function GameMenu({
           )}
           <div className="my-1 border-t border-gray-700/70" />
           <MenuSectionLabel label={t("gameMenu.sections.game")} />
-          <MenuButton label={t("gameMenu.resume")} onClick={() => setOpen(false)} />
+          <MenuButton
+            label={logPanelOpen ? t("gameMenu.closeGameLog") : t("gameMenu.openGameLog")}
+            onClick={() => {
+              onToggleGameLog();
+              setOpen(false);
+            }}
+          />
           <MenuButton
             label={t("gameMenu.settings")}
             onClick={() => openSurfaceFromMenu(onSettingsClick)}
@@ -324,7 +338,24 @@ export function GameMenu({
                   navigate("/draft/quick?resume=1");
                 });
               } else if (isDraftPodMatch) {
-                navigate("/draft-pod");
+                // One of THREE exits from a `draft-match` game — this menu
+                // entry, `GamePage`'s game-over button, and Concede — and all
+                // three ask the same question, so all three ask
+                // `endCommanderSession`. It owns the answer and the reasoning:
+                // a pairwise pod match is mid-tournament and must survive being
+                // left, a Commander launch is the pod's last act and must not.
+                // Do not re-inline the condition here; a second copy of that
+                // rationale is how the two drift apart.
+                //
+                // This entry is reachable for the WHOLE game, not just at game
+                // over, so it is the likeliest of the three routes.
+                //
+                // `finally`, not `then` — a teardown that rejects must not
+                // strand the player in a game they have left.
+                void useMultiplayerDraftStore
+                  .getState()
+                  .endCommanderSession()
+                  .finally(() => navigate("/draft-pod"));
               } else {
                 navigate("/");
               }

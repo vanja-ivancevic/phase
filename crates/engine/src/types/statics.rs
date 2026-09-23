@@ -719,6 +719,40 @@ pub(crate) fn is_cost_modify_mode_reduce(mode: &CostModifyMode) -> bool {
     matches!(mode, CostModifyMode::Reduce)
 }
 
+/// CR 118.7b/c/d: How far a mana-cost REDUCTION reaches when one of its colored
+/// or colorless units finds no matching component left in the cost being reduced.
+///
+/// Orthogonal to [`CostModifyMode`], which is the direction axis. This is the
+/// reach axis, and it is meaningful only for [`CostModifyMode::Reduce`] — a
+/// `Raise` only ever adds mana, and `Minimum` is a floor, so neither can strand
+/// a unit that needs a spillover decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+pub enum CostReductionReach {
+    /// CR 118.7b/c/d (the rules default): a reduction unit whose color/colorless
+    /// component is absent from the cost (118.7b), or that exceeds what that
+    /// component had left (118.7c/d), reduces GENERIC mana instead. Aang, Master
+    /// of Elements — "Spells you cast cost {W}{U}{B}{R}{G} less to cast. (This
+    /// can reduce generic costs.)" — is the card that makes this visible.
+    #[default]
+    SpillsToGeneric,
+    /// "This effect reduces only the amount of colored mana you pay." The card
+    /// overrides CR 118.7b/c/d: an unmatched or excess unit is simply lost and
+    /// never touches the generic component. Morophon, the Boundless (whose
+    /// ruling spells it out: {4}{R}{W}{W} becomes {4}{W}), Edgewalker and
+    /// Ragemonger (whose reminder text gives worked examples), Bard Class,
+    /// Head of the Class, Nekrataal Avatar, Vorthos, Steward of Myth, and the
+    /// Defiler cycle ("... only the amount of blue mana you pay").
+    ColoredManaOnly,
+}
+
+impl CostReductionReach {
+    /// Serde `skip_serializing_if` for the CR 118.7b default, so card data that
+    /// predates this axis round-trips byte-identically.
+    pub(crate) fn is_spills_to_generic(&self) -> bool {
+        matches!(self, CostReductionReach::SpillsToGeneric)
+    }
+}
+
 /// CR 116.2: Stable registry string for a [`SpecialAction`], used by the
 /// `StaticMode::ReduceActionCost` Display/FromStr round-trip.
 fn special_action_registry_str(action: SpecialAction) -> &'static str {
@@ -804,6 +838,17 @@ pub enum AttackDefenderScope {
     /// combat"). Resolved against the static source's controller at the
     /// declare-attackers step.
     Controller,
+    /// CR 508.5: the specific permanent (planeswalker or battle) carrying this
+    /// static, as opposed to any other permanent its controller happens to
+    /// defend (The Eternal Wanderer: "No more than one creature can attack
+    /// ~ each combat"). Unlike `Controller`, this does NOT restrict attacks
+    /// against the source's controller directly or against that controller's
+    /// other planeswalkers/battles — only attacks declared against THIS
+    /// object. Resolved against the static source's live `ObjectId` at the
+    /// declare-attackers step (re-scanned each combat via
+    /// `battlefield_active_statics`, so no snapshot is needed even if the
+    /// permanent leaves and re-enters the battlefield between combats).
+    ThisPermanent,
 }
 
 /// CR 508.1d + CR 611.2 / CR 604.2: how the required defending player of a
@@ -954,7 +999,12 @@ pub enum StaticMode {
     /// defending-player cap ("no more than `max` creatures can attack *you*
     /// each combat" — Judoon Enforcers), restricting only attackers whose
     /// defending player (CR 508.5) is this static's controller, so opponents
-    /// may still be attacked freely (CR 802.1 multiplayer range of influence).
+    /// may still be attacked freely (CR 802.1 multiplayer range of influence);
+    /// `Some(AttackDefenderScope::ThisPermanent)` is a defending-PERMANENT cap
+    /// ("no more than `max` creatures can attack ~ each combat" — The Eternal
+    /// Wanderer), restricting only attackers declared against this static's
+    /// own source object, leaving the source's controller and every other
+    /// permanent freely attackable.
     MaxAttackersEachCombat {
         max: u32,
         #[serde(default)]
@@ -1050,6 +1100,32 @@ pub enum StaticMode {
     CantCauseSacrificeOrExile {
         cause: ProhibitionScope,
     },
+    /// CR 701.9a (discard) + CR 701.21a (sacrifice) + CR 609.3 + CR 109.5:
+    /// "Spells and abilities <cause> can't cause you to <action list>." Sigarda,
+    /// Host of Herons / Tajuru Preserver ("... sacrifice permanents") and
+    /// Tamiyo, Collector of Tales ("... discard cards or sacrifice
+    /// permanents"). Unlike `CantCauseSacrificeOrExile` (triggered abilities
+    /// ONLY, and filtered to a specific `StaticDefinition::affected` object
+    /// subset), this protects the player wholesale against ANY spell or
+    /// ability controlled by a player matching `cause` — not just triggered
+    /// abilities — and is not filtered by which permanent/card would be
+    /// affected. When a muzzled spell/ability would force the protected
+    /// player to perform a listed action, that action is treated as
+    /// impossible for them and produces no game-state change for that player
+    /// (CR 609.3: an effect that can't do something does only as much as
+    /// possible) — a scoped multi-player instruction (e.g. "each player
+    /// sacrifices/discards") still affects every OTHER player normally.
+    ///
+    /// `actions` reuses [`CostCategory`] — already the single-authority
+    /// classifier over "what kind of action is this" for ability costs (see
+    /// its doc comment) — rather than a parallel enum for the same set of
+    /// keyword actions (CR 701.9 discard, CR 701.21 sacrifice). A future
+    /// forced action (e.g. "can't cause you to pay life") slots in as an
+    /// additional `CostCategory` variant rather than a new architecture.
+    CantCauseForcedAction {
+        cause: ProhibitionScope,
+        actions: Vec<CostCategory>,
+    },
     CastWithFlash,
     /// CR 701.38d: While voting, the controller of this permanent may vote an
     /// additional time. Each active source grants +1 to the controller's
@@ -1110,9 +1186,8 @@ pub enum StaticMode {
     ///
     /// `frequency`: None = all activations; Some(OncePerTurn) = first per turn.
     ///
-    /// Parser-complete structured gap; runtime hook deferred.
-    /// CR 702.29a (docs/MagicCompRules.txt:4202), CR 702.122a (docs/MagicCompRules.txt:4870),
-    /// CR 118.9 (docs/MagicCompRules.txt:1014).
+    /// Parser-complete structured gap; runtime hook deferred. CR 702.29a, CR 702.122a,
+    /// CR 118.9.
     AlternativeKeywordCost {
         keyword: KeywordKind,
         cost: AbilityCost,
@@ -1135,6 +1210,15 @@ pub enum StaticMode {
             deserialize_with = "super::ability::deserialize_optional_quantity_ref_compat"
         )]
         dynamic_count: Option<QuantityRef>,
+        /// CR 118.7b/c/d: whether an unmatched colored/colorless reduction unit
+        /// spills over into generic mana. Only meaningful for `Reduce`.
+        /// `#[serde(default)]` keeps card data serialized before this axis
+        /// existed reading as the CR 118.7b default.
+        #[serde(
+            default,
+            skip_serializing_if = "CostReductionReach::is_spills_to_generic"
+        )]
+        reach: CostReductionReach,
     },
     /// CR 601.2f + CR 118.8: Imposes an additional non-mana cost on spells or
     /// spells matching `spell_filter`. Distinct from [`StaticMode::ModifyCost`],
@@ -1768,7 +1852,7 @@ pub enum StaticMode {
     /// into one attach gate, so a single typed variant covers both Equipment
     /// (CR 301.5) and Aura (CR 303.4) — the `filter` (a reused `TargetFilter`)
     /// expresses "a creature with power N or greater", "a legendary creature",
-    /// "an {type}", etc. Corpus: Strata Scythe, Brass Knuckles ("a creature with
+    /// "an {type}", etc. Corpus: O-Naginata, Gate Smasher ("a creature with
     /// power/toughness N or greater"), Konda's Banner ("a legendary creature").
     ///
     /// Data-carrying variant (holds `TargetFilter`) — not registry-registered
@@ -1979,9 +2063,10 @@ pub enum StaticMode {
     LegendRuleDoesntApply,
     /// Speed may increase beyond 4, and 4+ still counts as max speed for that player.
     SpeedCanIncreaseBeyondFour,
-    /// CR 118.12a: Defiler cycle — "As an additional cost to cast [color] permanent
-    /// spells, you may pay [N] life. Those spells cost {C} less to cast."
-    /// Optional life payment during casting with conditional mana reduction.
+    /// CR 118.8 + CR 118.8b: Defiler cycle — "As an additional cost to cast [color]
+    /// permanent spells, you may pay [N] life. Those spells cost {C} less to cast."
+    /// The life payment is an OPTIONAL additional cost (CR 118.8b), announced per
+    /// CR 601.2b, with the conditional mana reduction constrained by CR 118.7b/c/d.
     DefilerCostReduction {
         /// The color of permanent spells this applies to
         color: ManaColor,
@@ -1989,6 +2074,16 @@ pub enum StaticMode {
         life_cost: u32,
         /// Mana cost reduction if life is paid
         mana_reduction: ManaCost,
+        /// CR 118.7b/c/d: all five printed Defilers close with "This effect
+        /// reduces only the amount of [color] mana you pay", which is carried
+        /// here rather than assumed. The parser accepts the template without
+        /// that rider too — MTGJSON sometimes splits the Oracle text across
+        /// lines — and such a shape correctly keeps the CR 118.7b default.
+        #[serde(
+            default,
+            skip_serializing_if = "CostReductionReach::is_spills_to_generic"
+        )]
+        reach: CostReductionReach,
     },
     /// CR 614.1b + CR 614.10: "Skip your [step] step" — replacement effect that replaces
     /// the named step with nothing. Parameterized by Phase to cover draw/untap/upkeep.
@@ -2209,6 +2304,7 @@ pub enum StaticModeKind {
     RestrictLibrarySearchToTop,
     ControlPlayersDuringOwnLibrarySearch,
     CantCauseSacrificeOrExile,
+    CantCauseForcedAction,
     CastWithFlash,
     GrantsExtraVote,
     GrantsExtraVillainousChoice,
@@ -2347,6 +2443,7 @@ impl StaticMode {
             StaticMode::CantCauseSacrificeOrExile { .. } => {
                 StaticModeKind::CantCauseSacrificeOrExile
             }
+            StaticMode::CantCauseForcedAction { .. } => StaticModeKind::CantCauseForcedAction,
             StaticMode::CastWithFlash => StaticModeKind::CastWithFlash,
             StaticMode::GrantsExtraVote => StaticModeKind::GrantsExtraVote,
             StaticMode::GrantsExtraVillainousChoice => StaticModeKind::GrantsExtraVillainousChoice,
@@ -2693,6 +2790,11 @@ impl Hash for StaticMode {
             | StaticMode::CantSearchLibrary { .. }
             | StaticMode::ControlPlayersDuringOwnLibrarySearch { .. }
             | StaticMode::CantCauseSacrificeOrExile { .. }
+            // CR 701.9a + CR 701.21a: data-carrying (`actions: Vec<CostCategory>`
+            // is not Hash-collision-safe to enumerate); consumed by direct match
+            // in game/static_abilities.rs::forced_action_muzzled, never used as a
+            // HashMap key.
+            | StaticMode::CantCauseForcedAction { .. }
             // CR 614.1c: data-carrying (CounterType + count); consumed by direct
             // match in change_zone.rs, never used as a HashMap key.
             | StaticMode::EntersWithAdditionalCounters { .. }
@@ -2742,6 +2844,7 @@ impl StaticMode {
             | StaticMode::RestrictLibrarySearchToTop { .. }
             | StaticMode::ControlPlayersDuringOwnLibrarySearch { .. }
             | StaticMode::CantCauseSacrificeOrExile { .. }
+            | StaticMode::CantCauseForcedAction { .. }
             | StaticMode::CastWithFlash
             | StaticMode::GrantsExtraVote
             | StaticMode::GrantsExtraVillainousChoice
@@ -2860,6 +2963,9 @@ impl fmt::Display for StaticMode {
                 Some(AttackDefenderScope::Controller) => {
                     write!(f, "MaxAttackersEachCombat({max},Controller)")
                 }
+                Some(AttackDefenderScope::ThisPermanent) => {
+                    write!(f, "MaxAttackersEachCombat({max},ThisPermanent)")
+                }
             },
             StaticMode::MaxBlockersEachCombat { max } => {
                 write!(f, "MaxBlockersEachCombat({max})")
@@ -2876,6 +2982,10 @@ impl fmt::Display for StaticMode {
             }
             StaticMode::CantCauseSacrificeOrExile { cause } => {
                 write!(f, "CantCauseSacrificeOrExile({cause})")
+            }
+            StaticMode::CantCauseForcedAction { cause, actions } => {
+                let parts: Vec<String> = actions.iter().map(|a| format!("{a:?}")).collect();
+                write!(f, "CantCauseForcedAction({cause},{})", parts.join("+"))
             }
             StaticMode::SuppressTriggers { events, .. } => {
                 let parts: Vec<String> = events.iter().map(|e| e.to_string()).collect();
@@ -3341,6 +3451,7 @@ impl FromStr for StaticMode {
                 amount: ManaCost::zero(),
                 spell_filter: None,
                 dynamic_count: None,
+                reach: CostReductionReach::SpillsToGeneric,
             },
             s if s.starts_with("ReduceAbilityCost(") => {
                 // Parse "ReduceAbilityCost([+|-]keyword,amount[,minimum_mana])".
@@ -3438,6 +3549,7 @@ impl FromStr for StaticMode {
                 amount: ManaCost::zero(),
                 spell_filter: None,
                 dynamic_count: None,
+                reach: CostReductionReach::SpillsToGeneric,
             },
             // CR 601.2f: Cost-floor static (Trinisphere class). Legacy unit-string
             // defaults to a zero floor — meaningful instances are constructed via
@@ -3447,6 +3559,7 @@ impl FromStr for StaticMode {
                 amount: ManaCost::zero(),
                 spell_filter: None,
                 dynamic_count: None,
+                reach: CostReductionReach::SpillsToGeneric,
             },
             "CantPayCost" => StaticMode::CantPayCost {
                 who: ProhibitionScope::AllPlayers,
@@ -3817,6 +3930,11 @@ impl FromStr for StaticMode {
                         return Ok(StaticMode::CantCauseSacrificeOrExile { cause });
                     }
                     return Ok(StaticMode::Other(other.to_string()));
+                } else if other.starts_with("CantCauseForcedAction(") {
+                    // CR 701.9a + CR 701.21a: Data-carrying — `actions` has no
+                    // `CostCategory` FromStr inverse, so round-trip preserves the
+                    // discriminant only. Mirrors SuppressTriggers.
+                    return Ok(StaticMode::Other(other.to_string()));
                 } else if other.starts_with("SuppressTriggers(") {
                     // CR 603.2g: Data-carrying — round-trip preserves discriminant only.
                     // Callers that need the full filter/events read from the typed field.
@@ -3977,8 +4095,9 @@ fn parse_static_mode_u32_arg(s: &str, prefix: &str) -> Option<u32> {
         .ok()
 }
 
-/// Round-trip the `MaxAttackersEachCombat(max[,Controller])` Display form back
-/// to its `(max, defender)` arguments. Mirrors the two `fmt::Display` branches.
+/// Round-trip the `MaxAttackersEachCombat(max[,Controller|ThisPermanent])`
+/// Display form back to its `(max, defender)` arguments. Mirrors the three
+/// `fmt::Display` branches.
 fn parse_max_attackers_each_combat_args(s: &str) -> Option<(u32, Option<AttackDefenderScope>)> {
     let args = s
         .strip_prefix("MaxAttackersEachCombat")?
@@ -3988,6 +4107,9 @@ fn parse_max_attackers_each_combat_args(s: &str) -> Option<(u32, Option<AttackDe
         None => Some((args.parse().ok()?, None)),
         Some((max, "Controller")) => {
             Some((max.parse().ok()?, Some(AttackDefenderScope::Controller)))
+        }
+        Some((max, "ThisPermanent")) => {
+            Some((max.parse().ok()?, Some(AttackDefenderScope::ThisPermanent)))
         }
         Some(_) => None,
     }
@@ -4075,6 +4197,7 @@ fn deserialize_legacy_cost_modify_string(s: &str) -> Option<StaticMode> {
         amount: ManaCost::zero(),
         spell_filter: None,
         dynamic_count: None,
+        reach: CostReductionReach::SpillsToGeneric,
     })
 }
 
@@ -4089,6 +4212,10 @@ struct LegacyModifyCostPayload {
         deserialize_with = "super::ability::deserialize_optional_quantity_ref_compat"
     )]
     dynamic_count: Option<QuantityRef>,
+    /// CR 118.7b: absent in every legacy payload (the axis postdates this
+    /// shape), so it defaults to the rules-default spillover.
+    #[serde(default)]
+    reach: CostReductionReach,
 }
 
 fn deserialize_legacy_modify_cost_object(
@@ -4114,6 +4241,7 @@ fn deserialize_legacy_modify_cost_object(
                 amount: payload.amount,
                 spell_filter: payload.spell_filter,
                 dynamic_count: payload.dynamic_count,
+                reach: payload.reach,
             }
         }),
     )
@@ -4317,6 +4445,10 @@ mod tests {
             StaticMode::MaxAttackersEachCombat {
                 max: 1,
                 defender: Some(AttackDefenderScope::Controller),
+            },
+            StaticMode::MaxAttackersEachCombat {
+                max: 1,
+                defender: Some(AttackDefenderScope::ThisPermanent),
             },
             StaticMode::MaxBlockersEachCombat { max: 3 },
             StaticMode::CantBeBlockedByMoreThan { max: 2 },
@@ -4834,6 +4966,7 @@ mod tests {
                     amount: ManaCost::generic(2),
                     spell_filter: None,
                     dynamic_count: None,
+                    reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
                 }
             );
         }
@@ -4910,6 +5043,7 @@ mod tests {
                     amount: ManaCost::zero(),
                     spell_filter: None,
                     dynamic_count: None,
+                    reach: crate::types::statics::CostReductionReach::SpillsToGeneric,
                 }
             );
         }

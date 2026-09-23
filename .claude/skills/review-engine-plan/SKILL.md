@@ -7,17 +7,18 @@ description: Review phase.rs engine, parser, AI, frontend, or rules implementati
 
 Review the plan as an architectural gate. Reject the plan if any required dimension is missing, superficial, or contradicted by code evidence.
 
-## Probe policy — you MAY and SHOULD run code
+## Probe policy — answer a concrete design uncertainty
 
 **You are not a read-only reviewer.** Building and running throwaway probes is an expected part of this
 review, and it is the only instrument that can refute a plan whose prose is internally consistent but
 whose runtime behaviour differs. Static review structurally cannot catch a predicate that reads
 correctly and answers wrongly on a real board.
 
-Use an isolated `CARGO_TARGET_DIR` and the worktree's absolute path; never build in a checkout another
-process (e.g. Tilt) owns; serialize probe activity behind any active implementation executor. That
-isolation is why no brief needs to withhold builds from you — if one says "do not run cargo", use your
-own target dir and note it in your report.
+Prefer existing tests, fixtures, commands or supported tool APIs. Small probes may answer a disputed premise; they do not authorize a separate driver, seeding service or verification framework. Honor the caller's execution constraints, including a no-build constraint, and report unavailable evidence rather than bypassing it.
+
+In every engine-implementer mode, use the supplied original task and scope/attempt history and follow its [task scope](../engine-implementer/SKILL.md#task-scope-and-verification-work) and [run limits](../engine-implementer/SKILL.md#run-limits). This includes proposed machinery corrections before measurement. A reviewer can identify a missing check, but returns it to the orchestrator instead of independently expanding or repairing tooling. Required correctness evidence remains required.
+
+When execution is permitted, use an isolated `CARGO_TARGET_DIR` and the worktree's absolute path; never build in a checkout another process (e.g. Tilt) owns; serialize probe activity behind any active implementation executor.
 
 ## Required Checks
 
@@ -124,9 +125,11 @@ Review the decomposition, not per-phase detail. Checklist:
 - **Linear ordering respects dependencies** — infrastructure before consumer.
 - **Recursive gate check** — no individual phase itself trips the T1∧T2 conjunction defined in `/engine-implementer`.
 - **Premise verification present** — charter mode preserves engine-planner Step 0.
-- **Scope entries are literal paths or directories, no globs** — the orchestrator's frozen `SCOPE_PATHS` representation and T2 directory expansion consume concrete paths (as does `/implement-task`'s snapshot pathspec machinery).
+- **Scope entries are a rule, not an inventory** — literal paths or directories, no globs (T2 directory expansion and the orchestrator's `SCOPE_PATHS` materialization consume concrete paths, as does `/implement-task`'s snapshot pathspec machinery). A missing compiler-forced site, shared registration file, or comment-only file is **not** a finding — the scope rule admits those at materialization. A missing path of any other class is.
+- **No code-state assertions** — a sentence stating how the code behaves today ("no offer mints one", "the gate records this outcome") is a finding of class *premise*. If no phase decision rests on it, the repair is a review-only revision and the finding supplies the replacement sentence — the claim the phase must establish and the measurement that buys it — for the orchestrator to apply as check-and-replace and then hand back for a fresh charter-mode round; a premise finding without replacement text is a decision revision. If a phase boundary, ordering, or unit count — or any other frozen decision: a goal, an acceptance row, a seam, a deferral attribution — rests on it, it is a design finding, and the reviewer measures the assertion before reporting — a probe, not a reading.
+- **Post-revision rounds check the edit, not just the text** — a charter-mode round spawned after a review-only revision additionally verifies each admitted `SCOPE_PATHS` addition against its stated standing class and evidence (the compiler error names the path; the registration site exists; the change is comment-only), each replaced claim against its measurement, and that no decision moved. An addition whose evidence does not establish its class, or a claim whose measurement does not buy it, is a design finding.
 
-Checks that do not apply to a charter: 6 (nom compliance), 9 (verification matrix), 11 (scope matrix), and check 3's full end-to-end trace requirement — those apply later, to each phase plan under phase-plan mode. A charter's feasibility exit (a report that no green-tree seam exists) is reviewed on its named evidence: every candidate split point named, each shown to leave the tree non-compiling or tests red.
+Corrections — a figure, a citation, wording — are returned for the orchestrator to apply, not to the planner, and a round whose findings are all corrections is a clean round. A premise finding carrying its replacement sentence is a review-only revision: the orchestrator applies it and a fresh charter-mode round follows; the charter does not freeze on that round. Checks that do not apply to a charter: 6 (nom compliance), 9 (verification matrix), 11 (scope matrix), and check 3's full end-to-end trace requirement — those apply later, to each phase plan under phase-plan mode. A charter's feasibility exit (a report that no green-tree seam exists) is reviewed on its named evidence: every candidate split point named, each shown to leave the tree non-compiling or tests red.
 
 ### Phase-plan mode (spawn inputs: charter + phase index + that phase's deferral allowlist)
 
@@ -142,7 +145,7 @@ Check **only** Sizing consistency against the plan body (check 12's substance, n
 
 ## Review Loop
 
-Return every gap to the planner. Require a revised full plan, then re-review the entire revised plan with fresh context. Repeat until a full round returns clean or the caller stops the process.
+Return every gap to the planner. Require a revised full plan, then re-review the entire revised plan with fresh context. Repeat until a full round returns clean or the caller stops the process, subject to the caller's scope and attempt limits. In the engine-implementer pipeline, return each result to the orchestrator before another revision; switching modes or phases does not reset that history.
 
 ## Output
 

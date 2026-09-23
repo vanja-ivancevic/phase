@@ -117,7 +117,7 @@ pub(crate) fn is_spells_alternative_cost_pattern(lower: &str) -> bool {
 /// "You may collect evidence N rather than pay the mana cost for [filter]
 /// spells you cast." Conspiracy Unraveler class. Separate from
 /// `is_spells_alternative_cost_pattern` because the verb is "collect evidence",
-/// not "pay". Verified: CR 118.9 (docs/MagicCompRules.txt:1014).
+/// not "pay". Verified: CR 118.9.
 pub(crate) fn is_collect_evidence_alt_cost_pattern(lower: &str) -> bool {
     lower_starts_with(lower, "you may collect evidence ")
         && scan_contains(lower, "rather than pay")
@@ -128,7 +128,7 @@ pub(crate) fn is_collect_evidence_alt_cost_pattern(lower: &str) -> bool {
 /// CR 107.4f: K'rrik-class payment substitution — "For each {C} in a cost,
 /// you may pay 2 life rather than pay that mana." Routes to
 /// `parse_pay_life_as_colored_mana`.
-/// Verified: CR 107.4f (docs/MagicCompRules.txt:507).
+/// Verified: CR 107.4f.
 pub(crate) fn is_pay_life_as_colored_mana_pattern(lower: &str) -> bool {
     lower_starts_with(lower, "for each {")
         && scan_contains(lower, "in a cost")
@@ -142,7 +142,7 @@ pub(crate) fn is_pay_life_as_colored_mana_pattern(lower: &str) -> bool {
 /// optional leading "as long as " gate (New Perspectives); the lowering
 /// (`parse_alternative_keyword_cost`) splits and types the condition, strict-failing
 /// when the gate is unrecognized.
-/// Verified: CR 702.29a (docs/MagicCompRules.txt:4202), CR 702.122a (docs/MagicCompRules.txt:4870).
+/// Verified: CR 702.29a, CR 702.122a.
 pub(crate) fn is_alternative_keyword_cost_pattern(lower: &str) -> bool {
     (lower_starts_with(lower, "you may ")
         || (lower_starts_with(lower, "as long as ") && scan_contains(lower, "you may ")))
@@ -201,6 +201,29 @@ pub(crate) fn should_defer_spell_to_effect(lower: &str) -> bool {
         return true;
     }
 
+    // CR 702.8a + CR 601.3d: "[~|this spell] has flash[ as long as <condition>]"
+    // is a self-referential Flash CASTING PERMISSION
+    // (`SpellCastingOption::AsThoughHadFlash`, built by
+    // `oracle_casting::parse_self_has_flash_option`), not a continuous keyword
+    // static — even though it also matches the generic "has " arm of
+    // `STATIC_CONTAINS_PATTERNS`. Left unclassified, Priority 7 would lower it
+    // to `StaticDefinition { affected: SelfRef, modifications:
+    // [AddKeyword(Flash)] }`, which can never actually apply: CR 611.3b makes
+    // a static's continuous effect apply while its source is on the
+    // battlefield OR in "the appropriate zone", but this engine's
+    // `for_each_static_effect_source` (an implementation choice, not itself a
+    // numbered rule) only indexes continuous-effect SOURCES from the
+    // battlefield and command zone, so a Hand-zone spell's own self-
+    // referential static is never visited. That produces a "supported but
+    // inert" card — the parser reports a non-empty static while the printed
+    // permission never grants instant-speed casting. Deferring here routes
+    // the line past
+    // Priority 7 to Priority 8e (`parse_spell_casting_option_line`), the only
+    // path that actually authorizes the cast.
+    if is_self_conditional_flash_grant(lower) {
+        return true;
+    }
+
     if is_self_spell_cost_modification(lower) {
         return false;
     }
@@ -218,6 +241,18 @@ pub(crate) fn should_defer_spell_to_effect(lower: &str) -> bool {
         || scan_contains(lower, "until end of turn")
         || scan_contains(lower, "until your next turn")
         || scan_contains(lower, "this turn")
+}
+
+/// CR 702.8a + CR 601.3d: "[~|this spell] has flash" prefix — see the call
+/// site in `should_defer_spell_to_effect` for why this must be deferred past
+/// the static classifier. `this spell` is deliberately excluded from the `~`
+/// self-reference normalization (`SELF_REF_PARSE_ONLY_PHRASES` in
+/// `oracle_util.rs`), so both spellings are matched directly here — the same
+/// `alt((tag("~"), tag("this spell")))` idiom `oracle_casting.rs` already uses
+/// for sibling self-referential casting predicates
+/// (`parse_cant_spend_mana_restriction`, `parse_negative_self_casting_restriction`).
+fn is_self_conditional_flash_grant(lower: &str) -> bool {
+    nom_primitives::parse_self_spell_has_flash_prefix(lower).is_ok()
 }
 
 fn is_spell_resolution_next_untap_restriction(lower: &str) -> bool {
@@ -298,8 +333,8 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     "has ",
     "can't be blocked",
     // CR 301.5 + CR 303.4 + CR 701.3a: positive attachment restriction on an
-    // Aura/Equipment ("~ can be attached only to {filter}") — Strata Scythe,
-    // Brass Knuckles, Konda's Banner. Routes to parse_static_line so it lowers
+    // Aura/Equipment ("~ can be attached only to {filter}") — O-Naginata,
+    // Gate Smasher, Konda's Banner. Routes to parse_static_line so it lowers
     // to StaticMode::AttachmentRestriction instead of an effect.
     "can be attached only to",
     "can't attack",
@@ -398,6 +433,12 @@ const STATIC_CONTAINS_PATTERNS: &[&str] = &[
     // the "can't" effect takes precedence over the triggered ability directing it.
     "triggered abilities ",
     "can't cause you to sacrifice or exile",
+    // CR 701.9a + CR 701.21a + CR 609.3: Sigarda, Host of Herons / Tajuru
+    // Preserver / Tamiyo, Collector of Tales-class player-level protection —
+    // the "can't" effect takes precedence over the spell/ability directing
+    // the sacrifice/discard.
+    "can't cause you to sacrifice permanents",
+    "can't cause you to discard cards",
     // CR 701.23 + CR 101.2: Mindlock Orb-class search prohibition — the "can't"
     // effect takes precedence over any effect directing a search.
     "can't search libraries",
@@ -547,7 +588,59 @@ pub(crate) fn is_static_pattern(lower: &str) -> bool {
         return true;
     }
 
-    is_static_compound_pattern(lower)
+    if is_static_compound_pattern(lower) {
+        return true;
+    }
+
+    // CR 604.1 + CR 102.1 + CR 611.3a: a printed leading turn window
+    // ("During your turn, …" / "During turns other than yours, …") scopes WHEN
+    // a static ability's statement is true — it does not change WHAT the
+    // statement is. So the routing gate must judge the statement, not the
+    // window. Peel it with the single authority
+    // `oracle_static::parse_leading_turn_scope` — the same combinator
+    // `dispatch::parse_static_line_inner`'s terminal arm uses to build the
+    // matching `StaticCondition` — and re-classify the remainder.
+    //
+    // TERMINAL by construction: every check above has already run against the
+    // FULL line, so this arm can only ADD a `true` verdict, never remove one.
+    // Returning the recursion's verdict any earlier would skip
+    // `is_static_compound_pattern` on the full line and could subtract one.
+    //
+    // That monotonicity is a property of THIS PREDICATE, and it is NOT on its
+    // own a safety argument for the consumers. Flipping a routing verdict
+    // `false -> true` is behavior-preserving only where the caller falls through
+    // on a failed static parse, and not every caller does:
+    //
+    //   * FALL-THROUGH (safe structurally): `oracle_class.rs`'s two sites are
+    //     `if let Some(def) = parse_static_line(..)`; `oracle_dispatch.rs` only
+    //     relabels an already-unsupported category — which is the whole of
+    //     Elvish Refueler's `unknown` -> `static_structure` move.
+    //   * NEGATIVE consumer (present, not hypothetical):
+    //     `oracle::is_spell_resolution_instruction_line` turns a `true` here
+    //     into `return false`, and ITS caller turns that into a `break` in the
+    //     multi-line spell-body accumulation loop. There a grown `true` set
+    //     NARROWS a spell body — the opposite direction from every other site.
+    //   * NON-FALL-THROUGH branches inside Priority 7: the strive-cost and
+    //     copy-verb/replacement routes `continue` out of the
+    //     `if is_static_pattern(..)` block without ever calling the static
+    //     parser, so reaching that block at all is itself observable.
+    //
+    // Those three are closed EMPIRICALLY, not structurally: the whole-corpus
+    // parse diff at the commit that added this arm changes exactly two cards,
+    // neither a spell-body or strive-cost reroute. That diff is the only
+    // instrument that can catch this class of regression — re-run it when
+    // widening this predicate again or adding a consumer that does not fall
+    // through.
+    //
+    // Input here is already lowercase, so the combinator is called directly
+    // rather than through `nom_on_lower` (no original-case remainder is needed
+    // at the classification layer). Recursion terminates because the tag
+    // consumes a non-empty literal.
+    if let Ok((remainder, _)) = super::oracle_static::parse_leading_turn_scope(lower) {
+        return is_static_pattern(remainder);
+    }
+
+    false
 }
 
 fn is_static_compound_pattern(lower: &str) -> bool {
@@ -1239,6 +1332,85 @@ mod tests {
     fn unquoted_cant_block_static_unchanged() {
         // No quotes → fast path → classification unchanged.
         assert!(is_static_pattern("creatures you control can't block"));
+    }
+
+    /// V8 — ROUTING GATE: the classifier accepts a windowed static line that no
+    /// earlier check in `is_static_pattern` claims, and does so as a pure
+    /// WIDENING. On the Class route (`oracle_class.rs`), `is_static_pattern` is
+    /// the ONLY gate to `parse_static_line` (no ungated leftover-static
+    /// fallback exists there, unlike the normal route's own attempt — the one
+    /// guarded by `oracle.rs`'s "Leftover permanent text can still be a valid
+    /// static even when classifier heuristics miss it" comment, which calls
+    /// `parse_static_line_with_graveyard_keyword_continuation` ungated), so
+    /// this terminal peel is what makes a windowed line reachable at all for a
+    /// card like Gourmand's Talent.
+    #[test]
+    fn leading_turn_window_is_peeled_before_static_classification() {
+        // Today (before this change) `false` — no STATIC_CONTAINS/PREFIX/compound
+        // pattern matches the FULL line, because "are zombies in addition to
+        // their other types" carries no recognized marker on its own once the
+        // leading window is counted as part of the text being scanned.
+        assert!(
+            is_static_pattern(
+                "during your turn, creatures you control are zombies in addition to their other types."
+            ),
+            "the windowed line must classify as static once the window is peeled"
+        );
+
+        // PAIRED NEGATIVE + MONOTONICITY GUARD: the peel did not invent the
+        // verdict — the un-windowed remainder is independently `true` on its
+        // own (it hits `STATIC_CONTAINS_PATTERNS`'s "in addition" style
+        // markers), and the peel alone (no statement after it) or an unrelated
+        // spell-shaped line are still `false`.
+        assert!(is_static_pattern(
+            "creatures you control are zombies in addition to their other types."
+        ));
+        assert!(!is_static_pattern("during your turn, "));
+        assert!(!is_static_pattern("target creature gets +1/+1."));
+
+        // Two classification authorities: the full-line compound test must
+        // still run FIRST, so an existing rider-contamination fixture's verdict
+        // is unaffected by this new terminal arm.
+        const NON_COUNTER_RIDER_LINE: &str = "return target creature card from your \
+             graveyard to the battlefield. if a hero enters this way, it enters with \
+             your choice of flying or vigilance.";
+        assert!(
+            is_static_pattern(NON_COUNTER_RIDER_LINE),
+            "the rider-contamination fixture's verdict must be unchanged: {NON_COUNTER_RIDER_LINE:?}"
+        );
+    }
+
+    #[test]
+    fn self_conditional_flash_grant_matches_tilde_and_this_spell() {
+        assert!(is_self_conditional_flash_grant(
+            "~ has flash as long as you've committed a crime this turn."
+        ));
+        assert!(is_self_conditional_flash_grant(
+            "this spell has flash as long as there are five or more mana values \
+             among cards in your graveyard."
+        ));
+        assert!(is_self_conditional_flash_grant("~ has flash."));
+    }
+
+    #[test]
+    fn self_conditional_flash_grant_word_boundary_excludes_flashback() {
+        // Regression: "flash" is a literal prefix of "flashback", so a naive
+        // `tag(" has flash")` would wrongly claim a real keyword-grant line
+        // like "~ has flashback {2}{U}" and defer it away from the static
+        // classifier that actually knows how to parse it.
+        assert!(!is_self_conditional_flash_grant("~ has flashback {2}{u}."));
+        assert!(!is_self_conditional_flash_grant(
+            "this spell has flashback {2}{u}."
+        ));
+    }
+
+    #[test]
+    fn should_defer_spell_to_effect_defers_self_conditional_flash_but_not_flashback() {
+        assert!(should_defer_spell_to_effect(
+            "this spell has flash as long as there are five or more mana values \
+             among cards in your graveyard."
+        ));
+        assert!(!should_defer_spell_to_effect("~ has flashback {2}{u}."));
     }
 
     #[test]

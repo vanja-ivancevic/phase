@@ -279,6 +279,17 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
             };
             cmp_val(a0, b0)
         }
+        GameAction::SelectDieRolls {
+            ignore_indices: a0, ..
+        } => {
+            let GameAction::SelectDieRolls {
+                ignore_indices: b0, ..
+            } = b
+            else {
+                unreachable!("cmp_payload: same-variant invariant");
+            };
+            cmp_val(a0, b0)
+        }
         GameAction::ChooseOutsideGameCards { selections: a0 } => {
             let GameAction::ChooseOutsideGameCards { selections: b0 } = b else {
                 unreachable!("cmp_payload: same-variant invariant");
@@ -319,6 +330,21 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
             };
             {
                 cmp_val(a0, b0)
+            }
+        }
+        GameAction::OrderCostReductions {
+            order: a0,
+            hybrid_announcement: a1,
+        } => {
+            let GameAction::OrderCostReductions {
+                order: b0,
+                hybrid_announcement: b1,
+            } = b
+            else {
+                unreachable!("cmp_payload: same-variant invariant");
+            };
+            {
+                cmp_val(a0, b0).then_with(|| cmp_val(a1, b1))
             }
         }
         GameAction::CancelCast => {
@@ -824,14 +850,16 @@ fn cmp_payload(a: &GameAction, b: &GameAction) -> Ordering {
         }
         GameAction::BeginResolveAll {
             max_resolutions: a0,
+            scope: a1,
         } => {
             let GameAction::BeginResolveAll {
                 max_resolutions: b0,
+                scope: b1,
             } = b
             else {
                 unreachable!("cmp_payload: same-variant invariant");
             };
-            cmp_val(a0, b0)
+            cmp_val(a0, b0).then_with(|| cmp_val(a1, b1))
         }
         GameAction::RespondResolveAllConsent {
             epoch: a0,
@@ -1257,6 +1285,7 @@ fn cmp_debug_action_payload(a: &DebugAction, b: &DebugAction) -> Ordering {
             attach_to: a4,
             run_etb: a5,
             nonlegendary: a6,
+            creation_kind: a7,
         } => {
             let DebugAction::CreateCard {
                 card_name: b0,
@@ -1266,6 +1295,7 @@ fn cmp_debug_action_payload(a: &DebugAction, b: &DebugAction) -> Ordering {
                 attach_to: b4,
                 run_etb: b5,
                 nonlegendary: b6,
+                creation_kind: b7,
             } = b
             else {
                 unreachable!("cmp_debug_action_payload: same-variant invariant");
@@ -1277,6 +1307,7 @@ fn cmp_debug_action_payload(a: &DebugAction, b: &DebugAction) -> Ordering {
                 .then_with(|| cmp_val(a4, b4))
                 .then_with(|| cmp_val(a5, b5))
                 .then_with(|| cmp_val(a6, b6))
+                .then_with(|| cmp_val(a7, b7))
         }
         DebugAction::RemoveObject { object_id: a0 } => {
             let DebugAction::RemoveObject { object_id: b0 } = b else {
@@ -1711,6 +1742,7 @@ mod tests {
         DecisionGroupKey, DecisionKind, DecisionTemplate, IterationCount, ReplayMode,
     };
     use crate::game::combat::AttackTarget;
+    use crate::types::actions::ResolveAllScope;
     use crate::types::actions::{
         MayTriggerAutoChoiceOp, PrecastCopyShortcutResponse, ResolveAllConsentDecision,
     };
@@ -1729,8 +1761,14 @@ mod tests {
     #[test]
     fn newer_action_variants_compare_their_payloads() {
         assert_distinct_order(
-            GameAction::BeginResolveAll { max_resolutions: 1 },
-            GameAction::BeginResolveAll { max_resolutions: 2 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 1,
+                scope: ResolveAllScope::Own,
+            },
+            GameAction::BeginResolveAll {
+                max_resolutions: 2,
+                scope: ResolveAllScope::Own,
+            },
         );
         assert_distinct_order(
             GameAction::RespondResolveAllConsent {
@@ -1876,8 +1914,14 @@ mod tests {
             },
         );
         assert_distinct_order(
-            GameAction::BeginResolveAll { max_resolutions: 1 },
-            GameAction::BeginResolveAll { max_resolutions: 2 },
+            GameAction::BeginResolveAll {
+                max_resolutions: 1,
+                scope: ResolveAllScope::Own,
+            },
+            GameAction::BeginResolveAll {
+                max_resolutions: 2,
+                scope: ResolveAllScope::Own,
+            },
         );
         assert_distinct_order(
             GameAction::RespondResolveAllConsent {

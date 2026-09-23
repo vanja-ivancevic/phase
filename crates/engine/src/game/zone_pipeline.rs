@@ -1949,11 +1949,7 @@ pub(crate) fn apply_zone_delivery_tail(
 /// that the intrinsic enter-with-counters seeding in
 /// `consult_and_deliver_zone_change` and `copy_effect_for_source` already use.
 fn entering_object_projection(state: &GameState, object_id: ObjectId) -> Option<&GameObject> {
-    state
-        .liminal_entries
-        .get(&object_id)
-        .map(|entry| entry.object.projected())
-        .or_else(|| state.objects.get(&object_id))
+    state.entering_or_live_object(object_id)
 }
 
 fn aura_enchant_filter(state: &GameState, object_id: ObjectId) -> Option<TargetFilter> {
@@ -3663,12 +3659,7 @@ pub(crate) fn deliver_replaced_zone_change(
         // stamp is scoped to this delivery for the same reason as the causal
         // source stamp: repeated moves of one ObjectId must not rebind an
         // earlier event.
-        zones::stamp_zone_change_putter(
-            state,
-            &mut events[zone_event_start..],
-            object_id,
-            putter,
-        );
+        zones::stamp_zone_change_putter(state, &mut events[zone_event_start..], object_id, putter);
         // CR 614.1d: determine whether the object actually entered the battlefield.
         // `move_to_zone` rejects a battlefield entry without moving the object when
         // a `CantEnterBattlefieldFrom` static (e.g. Grafdigger's Cage) matches, so
@@ -3999,10 +3990,15 @@ pub(crate) fn deliver_replaced_zone_change(
         } else if !enter_with_counters.is_empty() {
             // CR 122.1: Effect-driven counters for non-battlefield
             // destinations — e.g., "exile it with three egg counters
-            // on it" (Darigaaz Reincarnated). Apply directly via the
-            // shared single-authority resolver so counter-doubling
-            // replacements (Doubling Season, Hardened Scales) and
-            // event emission stay consistent.
+            // on it" (Darigaaz Reincarnated), Delay's three time
+            // counters (issue #8795). Apply directly via the shared
+            // single-authority resolver so event emission and the
+            // replacement consult stay consistent — where CR 109.2 /
+            // CR 110.1 make "a permanent" replacements (Doubling
+            // Season, Hardened Scales) decline a card that is not on
+            // the battlefield (`replacement_valid_card_matches`, and
+            // `object_replacement_candidate_applies` for a replacement
+            // without a `valid_card`).
             if !crate::game::engine_replacement::apply_etb_counters(
                 state,
                 object_id,
@@ -4684,6 +4680,11 @@ fn execute_zone_move_with_applied_terminal(
             // wait state is already set by the counter-pause / devour machinery
             // (`replacement_pause_delivery_result` reads it).
             if let Some(pending) = state.pending_replacement.as_mut() {
+                // CR 701.24a: this generic effect-driven entry also accepts an
+                // explicit library placement. Preserve it across the replacement
+                // pause so its resumed delivery does not fall back to the tail's
+                // placement-less auto-shuffle behavior.
+                pending.library_placement = library_placement;
                 pending.exile_controller = exile_controller;
                 pending.exile_duration = duration.cloned();
                 pending.exile_tracking = if track_exiled_by_source {
@@ -6379,6 +6380,7 @@ mod effect_driven_transformed_entry_tests {
             obj.base_card_types = obj.card_types.clone();
             obj.back_face = Some(BackFaceData {
                 is_swap_snapshot: false,
+                trigger_printed_origins: Vec::new(),
                 name: "MDFC Back".to_string(),
                 power: None,
                 toughness: None,
@@ -6526,9 +6528,7 @@ mod zone_causation_tests {
             .iter()
             .find_map(|event| match event {
                 GameEvent::ZoneChanged {
-                    object_id,
-                    record,
-                    ..
+                    object_id, record, ..
                 } if *object_id == land => Some(record),
                 _ => None,
             })

@@ -760,6 +760,35 @@ fn player_matches_filter(
             trigger_controller,
             source_event_subject_id(source_context),
         ),
+        // CR 608.2b + CR 608.2c: the two leaves a delayed condition's slot
+        // binder writes into a player-axis filter slot
+        // (`effects::delayed_trigger::bind_parent_slots_from_root`): a declared
+        // player slot bound to that one player, and a slot with no referent —
+        // an illegal target, whose information "fails to determine" — bound to
+        // the leaf that matches nothing. Both are load-bearing for the same
+        // reason as the arm above — the fallback below is fail-OPEN, and
+        // without them a dead slot would match every player (PR #8881).
+        TargetFilter::SpecificPlayer { id } => *id == player_id,
+        TargetFilter::None => false,
+        // The binder leaves those leaves under the boolean shape the condition
+        // was written in (`Not { slot }`, `Or { slot, slot }`, `And { … }`), so
+        // the shape has to be evaluated here rather than fall through to the
+        // wildcard — `Not { SpecificPlayer }` is "every player but that one",
+        // not "every player". Each member is judged by this same function, so a
+        // member the fallback does not describe still reads as the wildcard it
+        // reads as at top level. No printed trigger carries a `Not` or `And`
+        // in a player-axis slot, and every member of the printed `Or`s there
+        // ("a player or planeswalker", "an opponent or a battle") is a `Player`
+        // leaf, an opponent leaf or a bare type leaf that reads as the
+        // wildcard, so they match exactly as they did through the fallback
+        // (PR #8881).
+        TargetFilter::Not { filter } => !player_matches_filter(filter, state, player_id, source_context),
+        TargetFilter::Or { filters } => filters
+            .iter()
+            .any(|filter| player_matches_filter(filter, state, player_id, source_context)),
+        TargetFilter::And { filters } => filters
+            .iter()
+            .all(|filter| player_matches_filter(filter, state, player_id, source_context)),
         _ => true,
     }
 }
@@ -788,8 +817,8 @@ fn is_player_scope_damage_filter(filter: &TargetFilter) -> bool {
         // predicate ("deals damage to a player who has more life than you") is a
         // player recipient, never an object one. Decided, not defaulted: the
         // `_ => false` tail below would silently misclassify it as an object
-        // filter. Unreachable today — no printed card produces this shape — but
-        // pinned by a unit test so a future flip is deliberate.
+        // filter. Cartographer's Hawk exercises this event-time player-relative
+        // damage-recipient shape; the unit test keeps future changes deliberate.
         TargetFilter::PlayerMatching { .. } => true,
         _ => false,
     }
@@ -857,6 +886,7 @@ pub(super) fn target_filter_matches_object(
         TargetFilter::TriggeringSpellController
         | TargetFilter::TriggeringSpellOwner
         | TargetFilter::TriggeringSourceController
+        | TargetFilter::EventTargetController
         | TargetFilter::TriggeringPlayer
         | TargetFilter::TriggeringSource
         | TargetFilter::EventTarget
@@ -1020,6 +1050,7 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::TappedForMana { .. }
         | GameEvent::ManaAbilityProduced { .. }
         | GameEvent::ManaPoolEmptied { .. }
+        | GameEvent::ManaBurn { .. }
         | GameEvent::ManaRecolored { .. }
         | GameEvent::PlayerLost { .. }
         | GameEvent::MulliganStarted
@@ -1040,6 +1071,7 @@ fn count_matching_trigger_event_subjects(
         | GameEvent::SpellCountered { .. }
         | GameEvent::ObjectIntensified { .. }
         | GameEvent::CounterRemoved { .. }
+        | GameEvent::ExtraTurnCreated { .. }
         | GameEvent::ObjectConjured { .. }
         | GameEvent::EffectResolved { .. }
         | GameEvent::Unattached { .. }
@@ -1829,6 +1861,7 @@ pub(super) fn matching_attack_events(
         attacker_ids,
         defending_player,
         attacks,
+        declaration_records,
         ..
     } = event
     {
@@ -1880,6 +1913,10 @@ pub(super) fn matching_attack_events(
                         attacker_ids: vec![*id],
                         defending_player: event_defending_player,
                         attacks: vec![(*id, target)],
+                        // The trigger source is narrowed to this attacker, but
+                        // event-scoped conditions such as Pack Tactics still
+                        // refer to the full declaration batch.
+                        declaration_records: declaration_records.clone(),
                     })
                 })
                 .collect();
@@ -1940,6 +1977,10 @@ pub(super) fn matching_attack_events(
                     attacker_ids: vec![*id],
                     defending_player: event_defending_player,
                     attacks: vec![(*id, target)],
+                    // Keep the complete declaration for event-scoped
+                    // conditions; `attacker_ids` remains the per-trigger
+                    // source identity.
+                    declaration_records: declaration_records.clone(),
                 })
             })
             .collect()
@@ -2500,7 +2541,10 @@ pub(super) fn match_life_gained(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::LifeChanged { player_id, amount } = event {
+    if let GameEvent::LifeChanged {
+        player_id, amount, ..
+    } = event
+    {
         if *amount <= 0 {
             return false;
         }
@@ -2531,7 +2575,10 @@ pub(super) fn match_life_lost(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::LifeChanged { player_id, amount } = event {
+    if let GameEvent::LifeChanged {
+        player_id, amount, ..
+    } = event
+    {
         if *amount >= 0 {
             return false;
         }
@@ -2552,7 +2599,10 @@ pub(super) fn match_life_changed(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::LifeChanged { player_id, amount } = event {
+    if let GameEvent::LifeChanged {
+        player_id, amount, ..
+    } = event
+    {
         if *amount == 0 {
             return false;
         }
@@ -2679,7 +2729,37 @@ pub(super) fn match_sacrificed(
     // already be in the graveyard with its granted characteristics pruned (CR 400.7), or
     // — for a token (CR 111.7) — have ceased to exist and been removed from
     // `state.objects` by a prior SBA pass.
-    valid_card_matches_with_lki(trigger, state, *object_id, source_context)
+    if valid_card_matches_with_lki(trigger, state, *object_id, source_context) {
+        return true;
+    }
+    // CR 603.10a + CR 400.7: the sacrificed permanent's OWN "when you sacrifice
+    // ~" trigger (Carrot Cake). The source context is the departed battlefield
+    // incarnation, while the live object is already a new graveyard object, so a
+    // `SelfRef` filter answered against the live object can never hold. When the
+    // trigger's source IS the sacrificed object, answer the filter against its
+    // battlefield departure record — the same look-back authority the ceased
+    // (token) arm of `subject_filter_matches_with_lki` uses.
+    if source_event_subject_id(source_context) != *object_id {
+        return false;
+    }
+    // Bind to the departure row of THIS incarnation (the one the source context
+    // was latched from), not merely the latest move of the id: the graveyard card
+    // may already have moved again within the same batch.
+    let Some(filter) = trigger.valid_card.as_ref() else {
+        return false;
+    };
+    let Some(record) = state.zone_changes_this_turn.iter().rev().find(|change| {
+        change.object_id == *object_id
+            && change.from_zone == Some(Zone::Battlefield)
+            && change
+                .trigger_source_context
+                .as_ref()
+                .is_some_and(|ctx| ctx.identity.reference == source_context.identity.reference)
+    }) else {
+        return false;
+    };
+    let ctx = super::filter::FilterContext::from_trigger_source(source_context);
+    super::filter::matches_target_filter_on_zone_change_record(state, record, filter, &ctx)
 }
 
 pub(super) fn match_destroyed(
@@ -3371,10 +3451,15 @@ pub(super) fn match_taps_for_mana(
 /// CR 603.2 + CR 613.1b: ChangesController — fires on the `ControllerChanged`
 /// event a Layer-2 control change (or its end) emits. Every control-change path
 /// now emits this event (targeted `GainControl`, `GainControlAll`, `GiveControl`,
-/// `apply_permanent_control_change`, and the until-EOT expiry in
-/// `layers::prune_end_of_turn_effects`), so the redundant
-/// `EffectResolved { GainControl }` arm was dropped — matching both would have
-/// double-fired now that the gain also emits `ControllerChanged`.
+/// `apply_permanent_control_change`, `exchange_control::resolve` — CR 701.12a,
+/// on its success path only — and the until-EOT control reversion in
+/// `turns::execute_cleanup`), so the redundant `EffectResolved { GainControl }`
+/// arm was dropped — matching both would have double-fired now that the gain
+/// also emits `ControllerChanged`.
+///
+/// (The until-EOT emitter is `turns::execute_cleanup`, NOT
+/// `layers::prune_end_of_turn_effects`: the latter only retains over
+/// `transient_continuous_effects` and pushes no events.)
 ///
 /// The only producers of this mode are "When you lose control of ~"
 /// abilities (Khârn the Betrayer, Duplicity, Gustha's Scepter, and the S25
@@ -3623,11 +3708,12 @@ pub(super) fn match_foretell(
     }
 }
 
-/// CR 702.110b: "exploits a creature" — fires when a creature matching the
-/// trigger's subject filter exploits. `valid_card`/`valid_source` scope the
-/// EXPLOITER: `SelfRef` ⇒ "this creature exploits", a typed/controller
-/// filter ⇒ "a creature you control exploits". With no filter, defaults to
-/// the source ("this creature exploits").
+/// CR 702.110b + CR 603.10a + CR 400.7 + CR 111.7: "exploits a creature"
+/// fires when the actor in `CreatureExploited.exploiter` matches `valid_source`
+/// and the sacrificed victim's captured battlefield appearance matches
+/// `valid_card`. The departure record remains authoritative after the victim
+/// changes zones or a token ceases to exist. With no actor filter, the actor
+/// defaults to the trigger source ("this creature exploits").
 pub(super) fn match_exploited(
     event: &GameEvent,
     trigger: &TriggerDefinition,
@@ -3635,19 +3721,25 @@ pub(super) fn match_exploited(
     state: &GameState,
 ) -> bool {
     let source_id = source_event_subject_id(source_context);
-    let GameEvent::CreatureExploited { exploiter, .. } = event else {
+    let GameEvent::CreatureExploited {
+        exploiter, record, ..
+    } = event
+    else {
         return false;
     };
-    // `valid_source`/`valid_card` scope the EXPLOITER's subject filter. With no
-    // filter, "this creature exploits" — match the source by identity.
-    match trigger
-        .valid_source
-        .as_ref()
-        .or(trigger.valid_card.as_ref())
-    {
+    let actor_matches = match trigger.valid_source.as_ref() {
         Some(filter) => exploiter_matches_subject_filter(state, *exploiter, filter, source_context),
         None => *exploiter == source_id,
-    }
+    };
+    actor_matches
+        && trigger.valid_card.as_ref().is_none_or(|filter| {
+            super::filter::matches_target_filter_on_zone_change_record(
+                state,
+                record,
+                filter,
+                &super::filter::FilterContext::from_trigger_source(source_context),
+            )
+        })
 }
 
 /// CR 603.10a + CR 400.7: Match an exploiter against the trigger's subject
@@ -3682,12 +3774,15 @@ fn exploiter_matches_subject_filter(
 ///   from `state.objects` entirely — so `filter_inner` cannot see it at all and returns
 ///   `false` for every filter.
 ///
-/// Match the live object first; when it no longer carries its battlefield appearance, fall
+/// Match the live object first; when the subject has CEASED to exist, prefer its own
+/// departure record (CR 608.2i + CR 608.2h) over the ObjectId-keyed cache; otherwise fall
 /// back to the last-known-information snapshot captured on battlefield exit
 /// (`apply_zone_exit_cleanup`, zones.rs).
 ///
-/// Single authority for the three matchers that need this fallback: `match_sacrificed`,
-/// `exploiter_matches_subject_filter`, and `match_connives`.
+/// Single authority for the four call sites that reach this fallback: `match_sacrificed`,
+/// `exploiter_matches_subject_filter`, `match_connives`, and — verdict-inert — the
+/// `match_saga_chapter_ability` observer arm, which rejects any subject absent from
+/// `state.objects` on the statement after it calls in.
 ///
 /// Note a printed card keeps its `core_types` and `controller` across a zone change, and
 /// `filter_inner` has no zone gate, so the *ceased-to-exist token* is the vector that
@@ -3701,6 +3796,63 @@ pub(super) fn subject_filter_matches_with_lki(
 ) -> bool {
     if target_filter_matches_object(state, object_id, filter, source_context) {
         return true;
+    }
+    // CR 608.2i + CR 608.2h + CR 400.7: when the subject has CEASED to exist
+    // (CR 704.5d/e), its departure record — not the ObjectId-keyed
+    // `lki_cache` — is the authority. CR 608.2i is what entitles a look-back
+    // trigger to read the recorded past state at all; CR 400.7 is why the
+    // answer must carry an incarnation, which the record's
+    // `trigger_source_context` has and an id-keyed snapshot cannot.
+    //
+    // WHICH AXES THIS ACTUALLY MOVES, measured over the whole engine suite:
+    // `matches_target_filter_on_lki_snapshot` copies name, types, keywords,
+    // P/T, base P/T, colors, mana value, controller, owner, attachments and
+    // `is_suspected` from the snapshot VERBATIM, so a typed/controller
+    // filter is answered identically by both paths and cannot change. It
+    // differs only where it SYNTHESIZES: `trigger_source_context: None`
+    // (so `SelfRef` / `OriginalSource` are unsatisfiable), `is_token` read
+    // from `state.objects` (so always FALSE for a ceased subject),
+    // `from_zone: None`, and a zeroed `combat_status`.
+    //
+    // Two production shapes are measured to reach here and flip:
+    //   * `match_exploited` — every "When this creature exploits a creature"
+    //     trigger carries `valid_card: SelfRef`; a ceased exploiter matched
+    //     none of them before this block.
+    //   * `match_sacrificed` — a Saga TOKEN sacrificed by CR 704.5s is
+    //     ceased by CR 704.5d LATER IN THE SAME SBA PASS, before that pass's
+    //     events are collected, so a `FilterProp::Token` observer
+    //     (Mirkwood Bats and nine siblings) saw `is_token == false`.
+    // An ordinary effect- or cost-driven sacrifice does NOT reach here: its
+    // `PermanentSacrificed` shares a buffer with the move and is collected
+    // before the action's SBA loop, so the subject is still present.
+    // `match_connives` CAN reach this block with a ceased subject (see
+    // `connives_typed_filter_matches_ceased_to_exist_token_conniver_via_lki`),
+    // but its verdict cannot move: all three `Connives` observers carry a
+    // copied-verbatim `Typed { Creature, controller: You }` filter, which the
+    // record and the cache path answer identically.
+    // `match_saga_chapter_ability`'s observer arm can execute this block but
+    // cannot change its verdict either — it rejects any subject absent from
+    // `state.objects` on the next statement.
+    //
+    // Strictly ADDITIVE: a record hit returns early, a record miss falls
+    // through to the unchanged cache path, so no existing verdict inverts.
+    //
+    // Residency and row authority are both shared, not re-derived here:
+    // `zones::battlefield_residency` is the single authority for "has this
+    // object left the battlefield, and does it still exist", and
+    // `game_state::terminal_battlefield_departure_row` is the single authority
+    // for which ledger row answers for a ceased one (CR 704.5d/e).
+    let ceased_departure_row = matches!(
+        super::zones::battlefield_residency(state, object_id),
+        super::zones::BattlefieldResidency::DepartedCeased
+    )
+    .then(|| crate::types::game_state::terminal_battlefield_departure_row(state, object_id))
+    .flatten();
+    if let Some(record) = ceased_departure_row {
+        let ctx = super::filter::FilterContext::from_trigger_source(source_context);
+        if super::filter::matches_target_filter_on_zone_change_record(state, record, filter, &ctx) {
+            return true;
+        }
     }
     if state
         .objects
@@ -4369,7 +4521,9 @@ pub(super) fn matching_you_attack_events_by_attacked_player(
     state: &GameState,
 ) -> Vec<GameEvent> {
     let GameEvent::AttackersDeclared {
-        defending_player, ..
+        defending_player,
+        declaration_records,
+        ..
     } = event
     else {
         return Vec::new();
@@ -4378,7 +4532,7 @@ pub(super) fn matching_you_attack_events_by_attacked_player(
     let mut groups: Vec<(PlayerId, Vec<(ObjectId, crate::game::combat::AttackTarget)>)> =
         Vec::new();
     for (attacker, target) in matching_you_attack_pairs(event, trigger, source_context, state) {
-        // CR 508.5a + CR 310.8d: resolve the attacked object to the one player
+        // CR 508.5a + CR 310.9d: resolve the attacked object to the one player
         // it answers for (planeswalker → controller, battle → protector) so a
         // mixed declaration still groups by player identity.
         let attacked =
@@ -4395,6 +4549,7 @@ pub(super) fn matching_you_attack_events_by_attacked_player(
             attacker_ids: attacks.iter().map(|(id, _)| *id).collect(),
             defending_player: attacked,
             attacks,
+            declaration_records: declaration_records.clone(),
         })
         .collect()
 }
@@ -5449,8 +5604,8 @@ mod tests {
     /// predicate as a PLAYER recipient. Decided, not defaulted: the match ends
     /// in `_ => false`, so nothing but this pin records the decision.
     ///
-    /// Unreachable today (no printed card produces a `PlayerMatching` damage
-    /// recipient), which is precisely why it is pinned — a future flip must be
+    /// Cartographer's Hawk produces a `PlayerMatching` damage recipient for its
+    /// event-time player-relative trigger; this pin keeps future changes
     /// deliberate.
     #[test]
     fn player_matching_is_a_player_scope_damage_recipient() {
@@ -7655,6 +7810,7 @@ mod tests {
                     crate::game::combat::AttackTarget::Player(PlayerId(1)),
                 ),
             ],
+            declaration_records: Vec::new(),
         };
 
         let matched = matching_attack_events(
@@ -7709,6 +7865,7 @@ mod tests {
                 attacker,
                 crate::game::combat::AttackTarget::Player(PlayerId(1)),
             )],
+            declaration_records: Vec::new(),
         };
         assert!(match_attacks(
             &enchanted_player_event,
@@ -7724,6 +7881,7 @@ mod tests {
                 attacker,
                 crate::game::combat::AttackTarget::Player(PlayerId(0)),
             )],
+            declaration_records: Vec::new(),
         };
         assert!(!match_attacks(
             &other_player_event,
@@ -7778,6 +7936,7 @@ mod tests {
                 attacker,
                 crate::game::combat::AttackTarget::Player(PlayerId(1)),
             )],
+            declaration_records: Vec::new(),
         };
         assert!(match_attacks(
             &enchanted_player_event,
@@ -7794,6 +7953,7 @@ mod tests {
                 attacker,
                 crate::game::combat::AttackTarget::Player(PlayerId(0)),
             )],
+            declaration_records: Vec::new(),
         };
         assert!(!match_attacks(
             &other_player_event,
@@ -7831,6 +7991,7 @@ mod tests {
                     crate::game::combat::AttackTarget::Player(PlayerId(1)),
                 ),
             ],
+            declaration_records: Vec::new(),
         };
         let events = matching_attack_events(
             &two_attackers_event,
@@ -7860,6 +8021,7 @@ mod tests {
                 attacker,
                 crate::game::combat::AttackTarget::Planeswalker(pw),
             )],
+            declaration_records: Vec::new(),
         };
         assert!(
             !match_attacks(
@@ -10508,6 +10670,7 @@ mod tests {
         let event = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(match_life_gained(
             &event,
@@ -10519,6 +10682,7 @@ mod tests {
         let loss_event = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(!match_life_gained(
             &loss_event,
@@ -10535,6 +10699,7 @@ mod tests {
         let event = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(match_life_lost(
             &event,
@@ -10546,6 +10711,7 @@ mod tests {
         let gain_event = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: 3,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(!match_life_lost(
             &gain_event,
@@ -10566,6 +10732,7 @@ mod tests {
         let loss_one = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -1,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(match_life_lost(
             &loss_one,
@@ -10577,6 +10744,7 @@ mod tests {
         let loss_two = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -2,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(!match_life_lost(
             &loss_two,
@@ -10596,6 +10764,7 @@ mod tests {
         let loss_two = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -2,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(!match_life_lost(
             &loss_two,
@@ -10607,6 +10776,7 @@ mod tests {
         let loss_four = GameEvent::LifeChanged {
             player_id: PlayerId(0),
             amount: -4,
+            new_total: crate::types::events::LifeTotalReading::default(),
         };
         assert!(match_life_lost(
             &loss_four,
@@ -15143,6 +15313,104 @@ mod tests {
         assert_eq!(result, None);
     }
 
+    /// CR 608.2b + CR 608.2c: the player-axis leaves a delayed condition's
+    /// slot binder can write into `valid_target` — `SpecificPlayer` for a bound
+    /// player slot, `None` for a slot with no referent. The match ends in
+    /// `_ => true`, so without their arms a dead slot would admit every player.
+    ///
+    /// Revert-failing: delete either arm and its negative assertion flips.
+    #[test]
+    fn player_axis_specific_player_and_none_leaves_do_not_fall_open() {
+        let mut state = setup();
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Graveyard,
+        );
+        let context = test_trigger_source_context(&state, source_id);
+        let mut specific = TriggerDefinition::new(TriggerMode::ChangesController);
+        specific.valid_target = Some(TargetFilter::SpecificPlayer { id: PlayerId(1) });
+        assert!(
+            valid_player_matches(&specific, &state, PlayerId(1), &context),
+            "a bound player slot matches that player"
+        );
+        assert!(
+            !valid_player_matches(&specific, &state, PlayerId(0), &context),
+            "a bound player slot matches no other player"
+        );
+        let mut dead = TriggerDefinition::new(TriggerMode::ChangesController);
+        dead.valid_target = Some(TargetFilter::None);
+        assert!(
+            !valid_player_matches(&dead, &state, PlayerId(0), &context)
+                && !valid_player_matches(&dead, &state, PlayerId(1), &context),
+            "a slot with no referent matches no player"
+        );
+    }
+
+    /// CR 608.2c ("read the whole text"): the slot binder keeps a bound leaf
+    /// under the boolean shape the condition was written in, so `Not`, `Or`
+    /// and `And` over bound leaves must be evaluated on the player axis — a
+    /// `Not { SpecificPlayer }` that fell through to the wildcard would admit
+    /// the one player it names. Three players, so a multi-live `Or` has a
+    /// player outside it.
+    ///
+    /// Revert-failing: drop any of the three arms and that shape's negative
+    /// assertion flips.
+    #[test]
+    fn player_axis_bound_leaves_keep_their_boolean_shape() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::free_for_all(), 3, 42);
+        let source_id = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Source".to_string(),
+            Zone::Graveyard,
+        );
+        let context = test_trigger_source_context(&state, source_id);
+        let matches = |filter: TargetFilter, player: PlayerId| {
+            let mut trigger = TriggerDefinition::new(TriggerMode::ChangesController);
+            trigger.valid_target = Some(filter);
+            valid_player_matches(&trigger, &state, player, &context)
+        };
+        let bound = |id: PlayerId| TargetFilter::SpecificPlayer { id };
+        let not_bound = TargetFilter::Not {
+            filter: Box::new(bound(PlayerId(1))),
+        };
+        assert!(
+            !matches(not_bound.clone(), PlayerId(1)),
+            "`Not` over a bound player slot excludes that player"
+        );
+        assert!(
+            matches(not_bound, PlayerId(0)),
+            "`Not` over a bound player slot admits every other player"
+        );
+        let either_bound = TargetFilter::Or {
+            filters: vec![bound(PlayerId(1)), bound(PlayerId(2))],
+        };
+        assert!(
+            matches(either_bound.clone(), PlayerId(1))
+                && matches(either_bound.clone(), PlayerId(2)),
+            "`Or` over two live bound slots admits both players"
+        );
+        assert!(
+            !matches(either_bound, PlayerId(0)),
+            "`Or` over two live bound slots admits no third player"
+        );
+        let bound_and_any_player = TargetFilter::And {
+            filters: vec![bound(PlayerId(1)), TargetFilter::Player],
+        };
+        assert!(
+            !matches(bound_and_any_player.clone(), PlayerId(0)),
+            "`And` over a bound slot excludes a player the slot does not name"
+        );
+        assert!(
+            matches(bound_and_any_player, PlayerId(1)),
+            "`And` over a bound slot admits the player every member admits"
+        );
+    }
+
     #[test]
     fn player_matches_target_filter_you() {
         let filter = TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::You));
@@ -16934,6 +17202,7 @@ mod tests {
             attacker_ids: vec![source, d2, d3, non],
             defending_player: PlayerId(1),
             attacks: vec![],
+            declaration_records: Vec::new(),
         };
         let filter = TargetFilter::Typed(
             TypedFilter::card()
@@ -16958,6 +17227,7 @@ mod tests {
             attacker_ids: vec![ObjectId(1), ObjectId(2)],
             defending_player: PlayerId(1),
             attacks: vec![],
+            declaration_records: Vec::new(),
         };
         let count = count_trigger_subjects_in_batch(
             &state,
@@ -16979,6 +17249,7 @@ mod tests {
             attacker_ids: vec![ObjectId(1)],
             defending_player: PlayerId(1),
             attacks: vec![],
+            declaration_records: Vec::new(),
         };
         let count = count_trigger_subjects_in_batch(
             &state,
@@ -16989,8 +17260,40 @@ mod tests {
         assert_eq!(count, None);
     }
 
-    // CR 702.110b: `match_exploited` scopes the exploiter via `valid_card` /
-    // `valid_source` rather than hard-coding `exploiter == source`.
+    // CR 702.110b: `match_exploited` scopes the actor via `valid_source` and
+    // the sacrificed victim via `valid_card`.
+
+    fn exploit_event_from_real_departure(
+        state: &GameState,
+        exploiter: ObjectId,
+        sacrificed: ObjectId,
+    ) -> GameEvent {
+        let mut departure_state = state.clone();
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(
+            &mut departure_state,
+            sacrificed,
+            Zone::Graveyard,
+            &mut events,
+        );
+        let record = events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    object_id,
+                    from: Some(Zone::Battlefield),
+                    record,
+                    ..
+                } if *object_id == sacrificed => Some(record.clone()),
+                _ => None,
+            })
+            .expect("the fixture's real battlefield departure emits a record");
+        GameEvent::CreatureExploited {
+            exploiter,
+            sacrificed,
+            record,
+        }
+    }
 
     #[test]
     fn exploited_self_ref_matches_self_exploit() {
@@ -17003,12 +17306,9 @@ mod tests {
             Zone::Battlefield,
         );
         let mut trigger = make_trigger(TriggerMode::Exploited);
-        trigger.valid_card = Some(TargetFilter::SelfRef);
+        trigger.valid_source = Some(TargetFilter::SelfRef);
 
-        let event = GameEvent::CreatureExploited {
-            exploiter: source,
-            sacrificed: source,
-        };
+        let event = exploit_event_from_real_departure(&state, source, source);
 
         assert!(match_exploited(
             &event,
@@ -17036,12 +17336,9 @@ mod tests {
             Zone::Battlefield,
         );
         let mut trigger = make_trigger(TriggerMode::Exploited);
-        trigger.valid_card = Some(TargetFilter::SelfRef);
+        trigger.valid_source = Some(TargetFilter::SelfRef);
 
-        let event = GameEvent::CreatureExploited {
-            exploiter: other,
-            sacrificed: other,
-        };
+        let event = exploit_event_from_real_departure(&state, other, other);
 
         assert!(!match_exploited(
             &event,
@@ -17079,14 +17376,11 @@ mod tests {
             .push(CoreType::Creature);
 
         let mut trigger = make_trigger(TriggerMode::Exploited);
-        trigger.valid_card = Some(TargetFilter::Typed(
+        trigger.valid_source = Some(TargetFilter::Typed(
             TypedFilter::creature().controller(ControllerRef::You),
         ));
 
-        let event = GameEvent::CreatureExploited {
-            exploiter: other,
-            sacrificed: other,
-        };
+        let event = exploit_event_from_real_departure(&state, other, other);
 
         assert!(match_exploited(
             &event,
@@ -17094,6 +17388,147 @@ mod tests {
             &test_trigger_source_context(&state, source),
             &state
         ));
+    }
+
+    #[test]
+    fn exploited_victim_filter_uses_departure_record_after_live_identity_changes() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Exploit Payoff".to_string(),
+            Zone::Battlefield,
+        );
+        let actor = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Exploiter".to_string(),
+            Zone::Battlefield,
+        );
+        let victim = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Victim Token".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [actor, victim] {
+            let object = state.objects.get_mut(&id).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.base_card_types = object.card_types.clone();
+        }
+        state.objects.get_mut(&victim).unwrap().is_token = true;
+
+        let event = exploit_event_from_real_departure(&state, actor, victim);
+        let GameEvent::CreatureExploited { record, .. } = &event else {
+            unreachable!()
+        };
+        assert!(record.is_token);
+
+        let mut creature = make_trigger(TriggerMode::Exploited);
+        creature.valid_source = Some(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You),
+        ));
+        creature.valid_card = Some(TargetFilter::Typed(TypedFilter::creature()));
+        let context = test_trigger_source_context(&state, source);
+        assert!(match_exploited(&event, &creature, &context, &state));
+
+        let mut nontoken = creature.clone();
+        nontoken.valid_card = Some(TargetFilter::Typed(
+            TypedFilter::creature().properties(vec![crate::types::ability::FilterProp::NonToken]),
+        ));
+        assert!(!match_exploited(&event, &nontoken, &context, &state));
+
+        state.objects.remove(&victim);
+        let replacement = create_object(
+            &mut state,
+            CardId(4),
+            PlayerId(0),
+            "Contradictory Live Object".to_string(),
+            Zone::Battlefield,
+        );
+        let mut replacement_object = state.objects.remove(&replacement).unwrap();
+        replacement_object.id = victim;
+        replacement_object
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        replacement_object.is_token = false;
+        state.objects.insert(victim, replacement_object);
+
+        assert!(match_exploited(&event, &creature, &context, &state));
+        assert!(!match_exploited(&event, &nontoken, &context, &state));
+    }
+
+    #[test]
+    fn exploited_victim_filter_composes_subtype_negation_and_controller() {
+        let mut state = setup();
+        let source = create_object(
+            &mut state,
+            CardId(10),
+            PlayerId(0),
+            "Henry Wu".to_string(),
+            Zone::Battlefield,
+        );
+        let actor = create_object(
+            &mut state,
+            CardId(11),
+            PlayerId(0),
+            "Exploiter".to_string(),
+            Zone::Battlefield,
+        );
+        let human = create_object(
+            &mut state,
+            CardId(12),
+            PlayerId(1),
+            "Human Victim".to_string(),
+            Zone::Battlefield,
+        );
+        let zombie = create_object(
+            &mut state,
+            CardId(13),
+            PlayerId(1),
+            "Non-Human Victim".to_string(),
+            Zone::Battlefield,
+        );
+        for id in [actor, human, zombie] {
+            let object = state.objects.get_mut(&id).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.base_card_types = object.card_types.clone();
+        }
+        state
+            .objects
+            .get_mut(&human)
+            .unwrap()
+            .card_types
+            .subtypes
+            .push("Human".to_string());
+        state
+            .objects
+            .get_mut(&zombie)
+            .unwrap()
+            .card_types
+            .subtypes
+            .push("Zombie".to_string());
+
+        let mut trigger = make_trigger(TriggerMode::Exploited);
+        trigger.valid_source = Some(TargetFilter::Typed(
+            TypedFilter::creature().controller(ControllerRef::You),
+        ));
+        trigger.valid_card = Some(TargetFilter::Typed(
+            TypedFilter::creature()
+                .with_type(crate::types::ability::TypeFilter::Non(Box::new(
+                    crate::types::ability::TypeFilter::Subtype("Human".to_string()),
+                )))
+                .controller(ControllerRef::Opponent),
+        ));
+        let context = test_trigger_source_context(&state, source);
+        let nonhuman_event = exploit_event_from_real_departure(&state, actor, zombie);
+        let human_event = exploit_event_from_real_departure(&state, actor, human);
+        assert!(match_exploited(&nonhuman_event, &trigger, &context, &state));
+        assert!(!match_exploited(&human_event, &trigger, &context, &state));
     }
 
     #[test]
@@ -17110,10 +17545,7 @@ mod tests {
         assert!(trigger.valid_card.is_none());
         assert!(trigger.valid_source.is_none());
 
-        let event = GameEvent::CreatureExploited {
-            exploiter: source,
-            sacrificed: source,
-        };
+        let event = exploit_event_from_real_departure(&state, source, source);
 
         assert!(match_exploited(
             &event,
@@ -17162,16 +17594,30 @@ mod tests {
             .push(CoreType::Creature);
 
         // Real zone-change pipeline: snapshots LKI and strips the graveyard object.
-        crate::game::zones::move_to_zone(&mut state, source, Zone::Graveyard, &mut Vec::new());
+        let mut departure_events = Vec::new();
+        crate::game::zones::move_to_zone(
+            &mut state,
+            source,
+            Zone::Graveyard,
+            &mut departure_events,
+        );
         assert!(state.lki_cache.contains_key(&source));
 
+        let record = departure_events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::ZoneChanged { record, .. } => Some(record.clone()),
+                _ => None,
+            })
+            .expect("the self-sacrifice fixture emits a departure record");
         let event = GameEvent::CreatureExploited {
             exploiter: source,
             sacrificed: source,
+            record,
         };
 
         let mut you = make_trigger(TriggerMode::Exploited);
-        you.valid_card = Some(TargetFilter::Typed(
+        you.valid_source = Some(TargetFilter::Typed(
             TypedFilter::creature().controller(ControllerRef::You),
         ));
         assert!(
@@ -17185,7 +17631,7 @@ mod tests {
         );
 
         let mut opponent = make_trigger(TriggerMode::Exploited);
-        opponent.valid_card = Some(TargetFilter::Typed(
+        opponent.valid_source = Some(TargetFilter::Typed(
             TypedFilter::creature().controller(ControllerRef::Opponent),
         ));
         assert!(
@@ -17229,7 +17675,8 @@ mod tests {
         }
 
         // Real zone-change pipeline: snapshots LKI on battlefield exit.
-        crate::game::zones::move_to_zone(&mut state, token, Zone::Graveyard, &mut Vec::new());
+        let mut departure_events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, token, Zone::Graveyard, &mut departure_events);
         assert!(state.lki_cache.contains_key(&token));
         // CR 111.7: the token ceases to exist — purged from `state.objects` before the
         // exploit trigger's filter is evaluated.
@@ -17242,13 +17689,21 @@ mod tests {
 
         // The token exploited ITSELF: it is both the exploiter (subject) and the trigger's
         // own source (context).
+        let record = departure_events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::ZoneChanged { record, .. } => Some(record.clone()),
+                _ => None,
+            })
+            .expect("the token self-sacrifice fixture emits a departure record");
         let event = GameEvent::CreatureExploited {
             exploiter: token,
             sacrificed: token,
+            record,
         };
 
         let mut you = make_trigger(TriggerMode::Exploited);
-        you.valid_card = Some(TargetFilter::Typed(
+        you.valid_source = Some(TargetFilter::Typed(
             TypedFilter::creature().controller(ControllerRef::You),
         ));
         assert!(
@@ -17263,7 +17718,7 @@ mod tests {
         );
 
         let mut opponent = make_trigger(TriggerMode::Exploited);
-        opponent.valid_card = Some(TargetFilter::Typed(
+        opponent.valid_source = Some(TargetFilter::Typed(
             TypedFilter::creature().controller(ControllerRef::Opponent),
         ));
         assert!(

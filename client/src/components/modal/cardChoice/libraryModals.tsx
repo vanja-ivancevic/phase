@@ -18,9 +18,11 @@ type ArrangePlanarDeckTopChoice = Extract<
   { type: "ArrangePlanarDeckTopChoice" }
 >;
 type CoinFlipKeepChoice = Extract<WaitingFor, { type: "CoinFlipKeepChoice" }>;
+type DieKeepChoice = Extract<WaitingFor, { type: "DieKeepChoice" }>;
 type DigChoice = Extract<WaitingFor, { type: "DigChoice" }>;
 type SurveilChoice = Extract<WaitingFor, { type: "SurveilChoice" }>;
 type RevealChoice = Extract<WaitingFor, { type: "RevealChoice" }>;
+type RippleBottomOrder = Extract<WaitingFor, { type: "RippleBottomOrder" }>;
 
 export function ReorderableTopChoice({
   cards,
@@ -201,6 +203,84 @@ export function SurveilModal({ data }: { data: SurveilChoice["data"] }) {
   );
 }
 
+/**
+ * CR 702.60a + CR 608.2d: Ripple — "put all revealed cards not cast this way on
+ * the bottom of your library in any order." The controller drags the uncast
+ * pile into their chosen bottom order and confirms; every card goes to the
+ * bottom in that sequence (`SelectCards` carrying the full permutation).
+ */
+export function RippleBottomOrderModal({
+  data,
+}: {
+  data: RippleBottomOrder["data"];
+}) {
+  const { t } = useTranslation("game");
+  const dispatch = useGameDispatch();
+  const objects = useGameStore((s) => s.gameState?.objects);
+  const hoverProps = useInspectHoverProps();
+  const scrollRef = useHorizontalScroll<HTMLDivElement>({ drag: false });
+  const [order, setOrder] = useState<ObjectId[]>(data.cards);
+
+  if (!objects) return null;
+
+  return (
+    <ChoiceOverlay
+      title={t("cardChoice.rippleBottom.title")}
+      subtitle={t("cardChoice.rippleBottom.subtitle", { count: data.cards.length })}
+      maxWidthClassName="max-w-[38rem] sm:max-w-[48rem] lg:max-w-[58rem]"
+      footer={
+        <ConfirmButton
+          onClick={() =>
+            dispatch({ type: "SelectCards", data: { cards: order } })
+          }
+        />
+      }
+    >
+      <div ref={scrollRef} className="flex min-h-0 flex-1 overflow-x-auto">
+        <Reorder.Group
+          as="div"
+          axis="x"
+          values={order}
+          onReorder={setOrder}
+          layoutScroll
+          className="mx-auto flex w-max items-center gap-2 px-1 py-2 lg:gap-3"
+        >
+          {order.map((id, index) => {
+            const obj = objects[id];
+            if (!obj) return null;
+            return (
+              <Reorder.Item
+                key={id}
+                as="div"
+                value={id}
+                className="relative flex shrink-0 cursor-grab flex-col items-center gap-2 active:cursor-grabbing"
+                whileDrag={{ scale: 1.05, zIndex: 20 }}
+              >
+                <div
+                  className="relative rounded-lg ring-2 ring-amber-400/70 transition hover:shadow-[0_0_16px_rgba(245,180,80,0.3)]"
+                  {...hoverProps(id)}
+                >
+                  <CardImage
+                    {...objectImageProps(obj)}
+                    size="normal"
+                    className={CHOICE_CARD_IMAGE_CLASS}
+                  />
+                  <div className="pointer-events-none absolute left-1 top-1 flex h-6 w-6 items-center justify-center rounded-full bg-amber-500/90 text-xs font-bold text-white">
+                    {index + 1}
+                  </div>
+                </div>
+              </Reorder.Item>
+            );
+          })}
+        </Reorder.Group>
+      </div>
+      <p className="mt-1 shrink-0 text-center text-xs text-slate-400">
+        {t("cardChoice.rippleBottom.hint")}
+      </p>
+    </ChoiceOverlay>
+  );
+}
+
 export function CoinFlipKeepModal({ data }: { data: CoinFlipKeepChoice["data"] }) {
   const { t } = useTranslation("game");
   const dispatch = useGameDispatch();
@@ -242,6 +322,114 @@ export function CoinFlipKeepModal({ data }: { data: CoinFlipKeepChoice["data"] }
             </span>
           </motion.button>
         ))}
+      </div>
+    </ChoiceOverlay>
+  );
+}
+
+/**
+ * CR 706.6: "If a player is instructed to ignore a roll, that roll is considered
+ * to have never happened... If that player was instructed to ignore the lowest
+ * roll and multiple results are tied for the lowest, the player chooses one of
+ * those rolls to be ignored."
+ *
+ * Display only. The engine decides which rolls may be ignored and sends them in
+ * `ignorable_indices`; this renders every roll for context but enables only
+ * those. It must NOT compute which roll is lowest.
+ *
+ * CR 706.6 applies once per INSTRUCTING effect, so N stacked replacements
+ * (Barbarian Class + Wyll) make `ignore_count` N. The engine rejects any
+ * submission whose length is not exactly `ignore_count`, so the picks are
+ * accumulated locally and dispatched once — a single-index dispatch would make
+ * every stacked prompt unresolvable.
+ */
+export function DieKeepModal({ data }: { data: DieKeepChoice["data"] }) {
+  const { t } = useTranslation("game");
+  const dispatch = useGameDispatch();
+  const [selected, setSelected] = useState<number[]>([]);
+
+  // CR 706.6 applies once per instructing effect, so with N stacked
+  // replacements (Barbarian Class + Wyll) the roller picks N rolls to ignore.
+  // The engine rejects any submission whose length is not exactly
+  // `ignore_count`, so selections accumulate until that many are chosen.
+  const ignoreCount = data.ignore_count;
+
+  const toggleRoll = useCallback(
+    (index: number) => {
+      setSelected((prev) => {
+        if (prev.includes(index)) return prev.filter((i) => i !== index);
+        if (prev.length >= ignoreCount) return prev;
+        return [...prev, index];
+      });
+    },
+    [ignoreCount],
+  );
+
+  const handleConfirm = useCallback(() => {
+    dispatch({
+      type: "SelectDieRolls",
+      data: { ignore_indices: selected },
+    });
+  }, [dispatch, selected]);
+
+  const isReady = selected.length === ignoreCount;
+
+  return (
+    <ChoiceOverlay
+      title={t("dieRoll.ignore.title")}
+      subtitle={t("dieRoll.ignore.subtitle", { count: ignoreCount })}
+      footer={
+        <ConfirmButton
+          onClick={handleConfirm}
+          disabled={!isReady}
+          label={t("cardChoice.buttons.confirmCount", {
+            selected: selected.length,
+            count: ignoreCount,
+          })}
+        />
+      }
+    >
+      <div className="flex flex-wrap justify-center gap-4">
+        {data.results.map((result, index) => {
+          const selectable = data.ignorable_indices.includes(index);
+          const isSelected = selected.includes(index);
+          return (
+            <motion.button
+              key={index}
+              type="button"
+              disabled={!selectable}
+              onClick={() => selectable && toggleRoll(index)}
+              className={`flex flex-col items-center gap-2 rounded-xl border px-6 py-4 ${
+                isSelected
+                  ? "border-rose-400/80 bg-rose-500/20 ring-2 ring-rose-400/80"
+                  : selectable
+                    ? "border-white/10 bg-white/5"
+                    : "cursor-not-allowed border-white/10 bg-white/5 opacity-40"
+              }`}
+              whileHover={selectable ? { scale: 1.05 } : undefined}
+              whileTap={selectable ? { scale: 0.98 } : undefined}
+            >
+              <span className="flex h-16 w-16 items-center justify-center rounded-lg bg-slate-200 text-2xl font-bold text-slate-900">
+                {result}
+              </span>
+              {selectable ? (
+                <span
+                  className={`rounded-full px-3 py-1 text-xs font-bold text-white ${
+                    isSelected ? "bg-rose-500/90" : "bg-slate-600/70"
+                  }`}
+                >
+                  {isSelected
+                    ? t("dieRoll.buttons.ignoring")
+                    : t("dieRoll.buttons.ignore")}
+                </span>
+              ) : (
+                <span className="rounded-full bg-slate-600/70 px-3 py-1 text-xs font-bold text-slate-200">
+                  {t("dieRoll.buttons.keep")}
+                </span>
+              )}
+            </motion.button>
+          );
+        })}
       </div>
     </ChoiceOverlay>
   );

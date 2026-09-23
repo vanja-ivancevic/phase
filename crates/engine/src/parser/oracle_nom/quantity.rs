@@ -22,14 +22,14 @@ use super::primitives::{
 use super::target::parse_type_filter_word;
 use crate::parser::oracle_target::{
     parse_counter_suffix, parse_shared_quality, parse_shared_quality_clause,
-    parse_target_with_syntax, parse_type_phrase, TargetSyntax,
+    parse_target_with_syntax, parse_type_phrase_folding, TargetSyntax,
 };
 use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
-    AggregateFunction, CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric, ControllerRef,
-    CountScope, DamageChannel, DamageKindFilter, DevotionColors, FilterProp, ObjectProperty,
-    ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PropertyAggregate, PtStat,
-    QuantityExpr, QuantityRef, RoundingMode, SharedQuality, SubtypeExclusion, TargetFilter,
+    AggregateFunction, CardTypeSetSource, CastManaObjectScope, CastManaSpentMetric, Comparator,
+    ControllerRef, CountScope, DamageChannel, DamageKindFilter, DevotionColors, FilterProp,
+    ObjectProperty, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PropertyAggregate,
+    PtStat, QuantityExpr, QuantityRef, RoundingMode, SharedQuality, SubtypeExclusion, TargetFilter,
     ThisWayCause, TrackedAnaphorSource, TurnJournalKind, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
@@ -104,6 +104,107 @@ fn parse_pt_stat(input: &str) -> OracleResult<'_, PtStat> {
         value(PtStat::Toughness, tag("toughness")),
     ))
     .parse(input)
+}
+
+/// CR 702.179f (speed) / CR 119.3 (life total as a changing quantity) / CR
+/// 402.3 (a player may count the cards in their hand at any time): which
+/// per-player scalar a superlative or comparative player predicate reads.
+/// Parser-internal — selects which `QuantityRef` to build, never stored in
+/// the AST. The engine's own cross-section reader for exactly this set is
+/// `effects::candidate_player_scalar` (annotated CR 402.1 / 119.1 / 119.3 /
+/// 122.1f / 404.1); this selector is its parse-side counterpart. A further
+/// property (graveyard size CR 404.1, poison CR 122.1f, cards drawn CR
+/// 121.1) is one `alt` arm plus two `match` arms, not a new grammar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::parser) enum PlayerProperty {
+    /// CR 702.179f: a player's speed.
+    Speed,
+    /// CR 119.3: a player's life total.
+    Life,
+    /// CR 402.3: the number of cards in a player's hand.
+    HandSize,
+}
+
+/// CR 702.179f / CR 119.3 / CR 402.3: parse a player-property keyword.
+pub(in crate::parser) fn parse_player_property_keyword(
+    input: &str,
+) -> OracleResult<'_, PlayerProperty> {
+    alt((
+        value(PlayerProperty::Speed, tag("speed")),
+        value(PlayerProperty::Life, tag("life")),
+        value(PlayerProperty::HandSize, tag("cards in hand")),
+    ))
+    .parse(input)
+}
+
+/// Build the `QuantityRef` for a player-property of the given player scope.
+/// Infallible — every arm has a runtime resolver, but NOT a single shared one:
+/// `Speed` and `HandSize` resolve through
+/// `game/quantity.rs::resolve_per_player_scalar` (`Speed` is Spikeshell
+/// Harrier's live path), while `LifeTotal`'s arm never reaches that function —
+/// it resolves single-player scopes through `players::team_life_total` and
+/// aggregate scopes through `resolve_per_team_life` (CR 810.9a team folding).
+/// A guard added to one path is not on the other.
+pub(in crate::parser) fn player_property_quantity(
+    property: PlayerProperty,
+    player: PlayerScope,
+) -> QuantityRef {
+    match property {
+        PlayerProperty::Speed => QuantityRef::Speed { player },
+        PlayerProperty::Life => QuantityRef::LifeTotal { player },
+        PlayerProperty::HandSize => QuantityRef::HandSize { player },
+    }
+}
+
+/// CR 102.1 (the player population) + CR 102.2 (two-player opponent) / CR
+/// 102.3 (multiplayer opponent): "the player[s] with the most `<property>`"
+/// as a LIVE PER-CANDIDATE predicate — candidate property `>=` the
+/// population maximum. `relation` selects the population and, with it, the
+/// aggregate scope: `All` -> `AllPlayers { Max, exclude: None }`,
+/// `Opponent` -> `Opponent { Max }`.
+///
+/// Returns `None` for `Speed`: `PlayerFilter::PlayerAttribute` reads `attr`
+/// through `effects::candidate_player_scalar{,_with_state}`, which has no
+/// `QuantityRef::Speed` arm and fails a candidate CLOSED. A silently
+/// never-matching filter is worse than a declined parse, so this fails at
+/// the constructor. Adding a `Speed` arm to `candidate_player_scalar` is the
+/// one edit that flips this on.
+pub(in crate::parser) fn player_property_leader_filter(
+    property: PlayerProperty,
+    relation: PlayerRelation,
+) -> Option<PlayerFilter> {
+    match property {
+        PlayerProperty::Speed => None,
+        PlayerProperty::Life | PlayerProperty::HandSize => {
+            // Exhaustive on `relation`, no wildcard: `Controller` is a
+            // single-player "population" that a leader-comparison grammar
+            // never printed (the corpus's superlative forms are always
+            // `All` — "each other player" — or `Opponent` — "among your
+            // opponents"), so it is refused rather than emitting a
+            // vacuously-true filter for an unmodelled reading.
+            let population_scope = match relation {
+                PlayerRelation::All => PlayerScope::AllPlayers {
+                    aggregate: AggregateFunction::Max,
+                    exclude: None,
+                },
+                PlayerRelation::Opponent => PlayerScope::Opponent {
+                    aggregate: AggregateFunction::Max,
+                },
+                PlayerRelation::Controller => return None,
+            };
+            Some(PlayerFilter::PlayerAttribute {
+                relation,
+                attr: Box::new(player_property_quantity(
+                    property,
+                    PlayerScope::ScopedPlayer,
+                )),
+                comparator: Comparator::GE,
+                value: Box::new(QuantityExpr::Ref {
+                    qty: player_property_quantity(property, population_scope),
+                }),
+            })
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -484,7 +585,7 @@ fn parse_possessive_objects_they_control(input: &str) -> OracleResult<'_, Quanti
         ),
     ))
     .parse(rest)?;
-    let (mut filter, type_rest) = parse_type_phrase(type_phrase);
+    let (mut filter, type_rest) = parse_type_phrase_folding(type_phrase);
     if !type_rest.trim().is_empty() || !quantity_filter_has_meaningful_content(&filter) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -1090,10 +1191,17 @@ pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
         // CR 105.1 + CR 105.2: bare "colors among <filter>" — reached after a
         // parent has consumed "there are N " (Puca's Eye: "there are five colors
         // among permanents you control"). The tail combinator (`tag("colors
-        // among ") + parse_type_phrase`) is shared with the "the number of
+        // among ") + parse_type_phrase_folding`) is shared with the "the number of
         // colors among ..." path; registering it here makes it reachable in the
         // bare-suffix context too.
         parse_distinct_colors_among_tail,
+        // CR 202.3: bare "mana value[s] among <filter>" — reached
+        // after a parent has consumed "there are N [or more] " (Aven
+        // Heartstabber and the SNC graveyard-mana-value-diversity class:
+        // "there are five or more mana values among cards in your
+        // graveyard"). Mana-value sibling of `parse_distinct_colors_among_tail`
+        // immediately above.
+        parse_bare_mana_values_among_tail,
         // CR 122.1: bare "different kind[s] of counters {on|among} <filter>" —
         // reached after a parent has consumed "there are N [or more] " (Hundred-
         // Battle Veteran: "as long as there are three or more different kinds of
@@ -1103,7 +1211,7 @@ pub fn parse_quantity_ref(input: &str) -> OracleResult<'_, QuantityRef> {
         // against the threshold. Counter-side counterpart to
         // `parse_distinct_colors_among_tail` immediately above: the tail
         // combinator (`tag("different kind") + tag(" of counter") + "on"/"among"
-        // + parse_type_phrase`) is shared with the "the number of different kinds
+        // + parse_type_phrase_folding`) is shared with the "the number of different kinds
         // of counters among ..." path (`parse_number_of_inner`, used by Perrie,
         // the Pulverizer); registering it here makes it reachable in the
         // bare-suffix context too, so `parse_there_are_conditions` can build a
@@ -1177,7 +1285,7 @@ fn parse_type_count_on_battlefield_with_boundary(
             }
         }
     };
-    let (filter, type_rest) = parse_type_phrase(type_text);
+    let (filter, type_rest) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) || !type_rest.trim().is_empty() {
         return Err(oracle_err(input));
     }
@@ -1213,7 +1321,7 @@ fn parse_object_count_by_shared_quality(input: &str) -> OracleResult<'_, Quantit
     let (rest, quality) = parse_shared_quality(rest)?;
     let (rest, _) = tag(" in common").parse(rest)?;
 
-    let (filter, type_remainder) = parse_type_phrase(type_text.trim());
+    let (filter, type_remainder) = parse_type_phrase_folding(type_text.trim());
     if !type_remainder.trim().is_empty()
         || matches!(filter, TargetFilter::Any)
         || !quantity_filter_has_meaningful_content(&filter)
@@ -1271,7 +1379,9 @@ fn parse_linked_exile_mana_value_ref(input: &str) -> OracleResult<'_, QuantityRe
 /// source's linked-exile pool (which includes `ExileLinkKind::CraftMaterial`);
 /// `Owned { You }` rebinds per owner under player-scope iteration, matching the
 /// existing Skyclave linked-exile precedent (`parse_linked_exile_mana_value_ref`).
-fn linked_exile_owned_filter() -> TargetFilter {
+/// Also the cast target of "the exiled card's owner may cast that card" (Spell
+/// Queller), rebound in `oracle_effect::rewrite_player_scope_refs`.
+pub(crate) fn linked_exile_owned_filter() -> TargetFilter {
     TargetFilter::And {
         filters: vec![
             TargetFilter::ExiledBySource,
@@ -1452,14 +1562,14 @@ fn parse_counters_among_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     ))
     .parse(input)?;
     let type_text = rest.trim_end_matches('.').trim_end_matches(',');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
             nom::error::ErrorKind::Fail,
         )));
     }
-    // Map remainder back to original input slice — parse_type_phrase may have
+    // Map remainder back to original input slice — parse_type_phrase_folding may have
     // consumed from a trimmed copy, so use pointer arithmetic for the correct
     // byte offset.
     let consumed = remainder.as_ptr() as usize - input.as_ptr() as usize;
@@ -1865,7 +1975,7 @@ fn parse_object_property_aggregate_ref(input: &str) -> OracleResult<'_, Quantity
             ),
         ));
     }
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     let final_remainder = parse_cast_snapshot_suffix(remainder.trim_start())
         .ok()
         .and_then(|(snapshot_rest, _)| snapshot_rest.trim().is_empty().then_some(snapshot_rest))
@@ -1978,8 +2088,22 @@ fn parse_number_of_inner(input: &str) -> OracleResult<'_, QuantityRef> {
         // CR 604.3: "<type> on the battlefield with <keyword>" — global CDA
         // count restricted to a keyword; must precede
         // `parse_number_of_controlled_type`, whose " you control" suffix does
-        // not match the battlefield-wide form.
-        parse_number_of_type_on_battlefield_with_keyword,
+        // not match the battlefield-wide form. Nested with the attachment-count
+        // sibling below to stay within nom's top-level `alt` arity (nom 8.0 max:
+        // 21 items).
+        //
+        // CR 301.5 + CR 303.4: "<type> attached to <referent>" (Curse of
+        // Thirst's "the number of Curses attached to them", Curse of
+        // Surveillance's "... attached to that player") — must precede
+        // `parse_number_of_controlled_type`, whose bare controller suffix does
+        // not recognize an "attached to" tail and would otherwise strand it as
+        // an unconsumed remainder. Shares `parse_for_each_attached_to_source`
+        // with the "for each" prefix path so both surface phrasings of the
+        // same count resolve identically.
+        alt((
+            parse_number_of_type_on_battlefield_with_keyword,
+            parse_for_each_attached_to_source,
+        )),
         // CR 121.1 + CR 701.9 + CR 603.4: "cards you've drawn this turn" and
         // "cards you've discarded this turn" — must precede generic
         // controlled-type arms whose type words could overlap. Nested together
@@ -2075,6 +2199,44 @@ fn parse_distinct_colors_among_tail(input: &str) -> OracleResult<'_, QuantityRef
     Ok(("", QuantityRef::DistinctColorsAmong { source }))
 }
 
+/// CR 202.3: Parse bare "mana value\[s\] among
+/// \<population\>" → `QuantityRef::ObjectCountDistinct { filter, qualities:
+/// [ManaValue] }`.
+///
+/// Reached from the bare-suffix context after a parent combinator (typically
+/// `parse_there_are_conditions`) has consumed "there are N \[or more\] " — the
+/// mana-value sibling of `parse_distinct_colors_among_tail` immediately above.
+/// No "different" qualifier precedes the plural noun: the plural itself
+/// supplies the distinct-value reading, exactly as "there are five colors
+/// among permanents you control" (Puca's Eye) does for colors. Covers the
+/// Streets of New Capenna "graveyard mana-value diversity" class: "there are
+/// five or more mana values among cards in your graveyard" (Aven Heartstabber,
+/// Snooping Newsie, Syndicate Infiltrator, Graveyard Shift, and their Alchemy
+/// variants). Uses the Legacy type-phrase grammar (a single zone/type
+/// population, not a union) to mirror `parse_distinct_quality_among_objects`'s
+/// "different \<quality\> among \<type-phrase\>" sibling, which already reads
+/// the singular "different mana value among …" form (Sudden Insight, Lunar
+/// Insight) — this bare arm is the plural, "different"-less counterpart.
+fn parse_bare_mana_values_among_tail(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, _) = tag("mana value").parse(input)?;
+    let (rest, _) = opt(tag("s")).parse(rest)?;
+    let (rest, _) = tag(" among ").parse(rest)?;
+    let (filter, remainder) = parse_type_phrase_folding(rest);
+    if !remainder.trim().is_empty() || !quantity_filter_has_meaningful_content(&filter) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+    Ok((
+        "",
+        QuantityRef::ObjectCountDistinct {
+            filter,
+            qualities: vec![SharedQuality::ManaValue],
+        },
+    ))
+}
+
 /// CR 122.1: Parse the iteration source "kind of counter on/among <filter>" →
 /// `QuantityRef::DistinctCounterKindsAmong { filter }`. Counter-side analogue of
 /// `parse_distinct_colors_among_tail`. Used by Bribe
@@ -2084,7 +2246,7 @@ fn parse_distinct_colors_among_tail(input: &str) -> OracleResult<'_, QuantityRef
 fn parse_for_each_distinct_counter_kinds_among(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = tag("kind of counter ").parse(input)?;
     let (rest, _) = alt((tag("on "), tag("among "))).parse(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if !remainder.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -2098,7 +2260,7 @@ fn parse_for_each_distinct_counter_kinds_among(input: &str) -> OracleResult<'_, 
 /// "the number of" → `QuantityRef::ObjectCountDistinct { filter, qualities: [Name] }`.
 ///
 /// Composes by delegating the inner type phrase to the shared
-/// `oracle_target::parse_type_phrase` so any combination of supertype, color,
+/// `oracle_target::parse_type_phrase_folding` so any combination of supertype, color,
 /// negation, type words, "tokens" property suffix, and controller suffix
 /// ("you control", "an opponent controls", etc.) flows through one parser —
 /// no per-card phrasing arms. The remainder must be empty (or only trailing
@@ -2117,7 +2279,7 @@ fn parse_for_each_distinct_counter_kinds_among(input: &str) -> OracleResult<'_, 
 fn parse_distinct_named_objects(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = tag("differently named ").parse(input)?;
     let type_text = rest.trim_end_matches('.').trim_end_matches(',');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if !remainder.trim().is_empty() || !quantity_filter_has_meaningful_content(&filter) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -2196,7 +2358,7 @@ fn parse_controlled_object_count_extremum(input: &str) -> OracleResult<'_, Quant
         ),
     ))
     .parse(input)?;
-    let (filter, filter_remainder) = parse_type_phrase(type_text);
+    let (filter, filter_remainder) = parse_type_phrase_folding(type_text);
     if !filter_remainder.trim().is_empty() || !quantity_filter_has_meaningful_content(&filter) {
         return Err(oracle_err(input));
     }
@@ -2343,14 +2505,14 @@ fn parse_number_of_controlled_type(input: &str) -> OracleResult<'_, QuantityRef>
 
 /// CR 201.2 + CR 109.2: Parse qualified controlled object counts like
 /// "permanents named Food Fight you control" or "other creature named Seven
-/// Dwarves you control". The named/card-quality parser (`parse_type_phrase`)
+/// Dwarves you control". The named/card-quality parser (`parse_type_phrase_folding`)
 /// owns the object description — type word plus any `other`/`named X`
 /// qualifier — and this quantity parser owns the trailing controller scope.
 /// Shared by the "the number of … you control" and "for each … you control"
 /// paths: a `named X` qualifier sits between the type word and the controller
 /// suffix, which the bare-`parse_type_filter_word` arms cannot reach.
 fn parse_qualified_controlled_type(input: &str) -> OracleResult<'_, QuantityRef> {
-    let (mut filter, rest) = parse_type_phrase(input);
+    let (mut filter, rest) = parse_type_phrase_folding(input);
     if !quantity_filter_has_meaningful_content(&filter) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -2615,7 +2777,7 @@ enum TypePhraseGrammar {
     /// type lists (`parse_type_list`), no ownership / token / combat-relation
     /// grammar, fails with `Err`. The colours head reads with this.
     Strict,
-    /// [`crate::parser::oracle_target::parse_type_phrase`] — folds
+    /// [`crate::parser::oracle_target::parse_type_phrase_folding`] — folds
     /// `" and "` / `" and/or "` into type unions (`TYPE_SEPARATORS`) and carries
     /// ownership / token / combat-relation grammar. INFALLIBLE: on failure it
     /// yields an EMPTY `TypedFilter` plus the whole input — NOT
@@ -2702,6 +2864,7 @@ fn filter_is_population_anchored(filter: &TargetFilter) -> bool {
         | TargetFilter::TriggeringSource
         | TargetFilter::EventTarget
         | TargetFilter::TriggeringSourceController
+        | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
         | TargetFilter::ParentTargetController
@@ -2837,6 +3000,7 @@ pub(crate) fn objects_filter_zone_is_unambiguous(filter: &TargetFilter) -> bool 
         | TargetFilter::TriggeringSource
         | TargetFilter::EventTarget
         | TargetFilter::TriggeringSourceController
+        | TargetFilter::EventTargetController
         | TargetFilter::ParentTarget
         | TargetFilter::ParentTargetSlot { .. }
         | TargetFilter::ParentTargetController
@@ -2965,7 +3129,7 @@ fn parse_objects_source(
     let type_text = input.trim_end_matches('.').trim_end_matches(',');
     let (filter, remainder) = match grammar {
         // `(filter, remainder)`, INFALLIBLE — never transpose with the Strict arm.
-        TypePhraseGrammar::Legacy => parse_type_phrase(type_text),
+        TypePhraseGrammar::Legacy => parse_type_phrase_folding(type_text),
         // `OracleResult` = `(remainder, filter)`.
         TypePhraseGrammar::Strict => {
             let (rem, filter) = super::target::parse_type_phrase(type_text)?;
@@ -3207,7 +3371,7 @@ fn parse_distinct_counter_kinds_among_tail(input: &str) -> OracleResult<'_, Quan
     let (rest, _) = opt(tag("s")).parse(rest)?;
     let (rest, _) = tag(" ").parse(rest)?;
     let (rest, _) = alt((tag("on "), tag("among "))).parse(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -3430,8 +3594,8 @@ pub(crate) fn parse_card_word(input: &str) -> OracleResult<'_, ()> {
 /// CR 604.3: In zone-count contexts ("two or more instant and/or sorcery cards
 /// in your graveyard"), the joining conjunction is semantically a disjunction
 /// — a card matches if it has any of the listed types. The result
-/// `Vec<TypeFilter>` is consumed by `matches_zone_card_filter`
-/// (`game/quantity.rs:1151`), which uses `.iter().any(...)` (logical OR).
+/// `Vec<TypeFilter>` is consumed by `game::quantity::matches_zone_card_filter`,
+/// which uses `.iter().any(...)` (logical OR).
 ///
 /// All three separators (`and`, `or`, `and/or`) are accepted so the combinator
 /// covers the grammatical variants Wizards uses across templating eras
@@ -4705,7 +4869,7 @@ pub fn parse_for_each_clause_ref(input: &str) -> OracleResult<'_, QuantityRef> {
 fn parse_for_each_differently_named(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = tag("differently named ").parse(input)?;
     let type_text = rest.trim_end_matches('.').trim_end_matches(',');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if !remainder.trim().is_empty() || !quantity_filter_has_meaningful_content(&filter) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4735,7 +4899,7 @@ fn parse_distinct_quality_among_objects(input: &str) -> OracleResult<'_, Quantit
     let (rest, quality) = parse_shared_quality(rest)?;
     let (rest, _) = tag(" among ").parse(rest)?;
     let type_text = rest.trim_end_matches('.').trim_end_matches(',');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if !remainder.trim().is_empty() || !quantity_filter_has_meaningful_content(&filter) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4763,7 +4927,7 @@ fn parse_distinct_quality_among_objects(input: &str) -> OracleResult<'_, Quantit
 // color among", so widening it would be an untested grammar change.
 fn parse_for_each_distinct_colors_among_permanents(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, _) = tag("color among ").parse(input)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if !remainder.trim().is_empty()
         || matches!(filter, TargetFilter::Any)
         || !quantity_filter_has_meaningful_content(&filter)
@@ -5135,7 +5299,7 @@ enum EnteredControlBinding {
 /// selects — see [`EnteredControlBinding`].
 fn parse_entered_this_turn_ref(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, (type_text, binding)) = parse_entered_this_turn_clause(input)?;
-    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    let (filter, remainder) = parse_type_phrase_folding(type_text.trim());
     if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -5222,7 +5386,7 @@ fn parse_entry_event_controller(input: &str) -> OracleResult<'_, PlayerScope> {
 fn parse_tokens_created_this_turn_tail(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, type_text) = take_until(" you created this turn").parse(input)?;
     let (rest, _) = tag(" you created this turn").parse(rest)?;
-    let (filter, remainder) = parse_type_phrase(type_text.trim());
+    let (filter, remainder) = parse_type_phrase_folding(type_text.trim());
     if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -5325,7 +5489,7 @@ pub(crate) fn parse_mana_from_source_spent_to_cast(input: &str) -> OracleResult<
 }
 
 pub(crate) fn parse_mana_source_filter(input: &str) -> OracleResult<'_, TargetFilter> {
-    let (source_filter, rest) = parse_type_phrase(input);
+    let (source_filter, rest) = parse_type_phrase_folding(input);
     if rest.len() == input.len() {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -5948,7 +6112,7 @@ fn parse_number_of_creatures_died_this_turn(input: &str) -> OracleResult<'_, Qua
 fn parse_sacrificed_this_turn_filter(input: &str) -> OracleResult<'_, TargetFilter> {
     // CR 701.21a: sacrifice moves the permanent directly to its owner's graveyard
     // (not destroyed — bypasses indestructible and regeneration).
-    let (filter, rest) = parse_type_phrase(input);
+    let (filter, rest) = parse_type_phrase_folding(input);
     if !quantity_filter_has_meaningful_content(&filter) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -6025,7 +6189,7 @@ fn parse_number_of_cards_put_into_graveyard_from_anywhere_this_turn(
         terminated(take_until(singular), tag(singular)),
     ))
     .parse(input)?;
-    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
     if !leftover.trim().is_empty() {
         return Err(nom::Err::Error(nom::error::Error::new(
             leftover,
@@ -6159,16 +6323,17 @@ fn creatures_died_this_turn_ref(controller: Option<ControllerRef>, nontoken: boo
     }
 }
 
-/// CR 301.5 + CR 303.4: Parse "<type> [and <type>]* attached to ~" — counts
-/// objects whose `attached_to` field references the source object. Used by
-/// "for each Aura and Equipment attached to ~" (Kellan, the Fae-Blooded) and
-/// any analogous boost that scales with attachments on the source.
+/// CR 301.5 + CR 303.4: the type-list head of an attachment noun phrase —
+/// `"<type> [and <type>]*"`. Lifted VERBATIM out of
+/// `parse_for_each_attached_to_source` so the threshold-condition grammar
+/// (`oracle_nom::condition::parse_attached_to_referent_count_ge`) parses the
+/// SAME type list instead of re-deriving one.
 ///
-/// Composes `parse_type_filter_word` for each type term, joined by " and ",
-/// then matches `" attached to ~"`. Returns a `QuantityRef::ObjectCount` over
-/// a `TypedFilter` whose type filters are the matched types and whose only
-/// property is `FilterProp::AttachedToSource`.
-fn parse_for_each_attached_to_source(input: &str) -> OracleResult<'_, QuantityRef> {
+/// Returns the RAW list. The single-vs-`AnyOf` collapse is a filter
+/// REPRESENTATION decision, not part of this grammar, and lives in
+/// [`attachment_object_count`]. Keeping them apart is what stops this function
+/// from sometimes returning a parsed list and sometimes a wrapper.
+pub(crate) fn parse_attachment_type_list(input: &str) -> OracleResult<'_, Vec<TypeFilter>> {
     let (mut rest, first) = parse_type_filter_word(input)?;
     let mut types = vec![first];
     while let Ok((after_and, _)) = tag::<_, _, OracleError<'_>>(" and ").parse(rest) {
@@ -6176,21 +6341,40 @@ fn parse_for_each_attached_to_source(input: &str) -> OracleResult<'_, QuantityRe
         types.push(next);
         rest = after_type;
     }
-    // CR 301.5 + CR 303.4 + CR 613.4c: Two referents share the "<type>
-    // [and <type>]* attached to <referent>" shape. The static parser already
-    // normalizes the source's printed name to `~`, so a literal `~` referent
-    // means "attached to the static's source object" (Kellan, the
-    // Fae-Blooded — `AttachedToSource`). The pronoun/noun phrase
-    // `it` / `that creature` is anaphoric on the affected subject of the
-    // surrounding effect — for
-    // "Enchanted creature gets +N/+M for each Aura and Equipment attached to
-    // it", "it" refers to the enchanted creature, the per-recipient host of
-    // the layer-evaluated boost (`AttachedToRecipient`). Baki's Curse uses the
-    // same recipient-relative grammar for damage: "each creature for each Aura
-    // attached to that creature." These literals are single-token leaves of
-    // the same combinator, so we dispatch with `alt` and select the matching
-    // `FilterProp` from a typed pair.
-    let (rest, prop) = alt((
+    Ok((rest, types))
+}
+
+/// CR 301.5 + CR 303.4 + CR 613.4c + CR 613.1f: SINGLE AUTHORITY for the
+/// `" attached to <referent>"` tail and its referent -> [`FilterProp`] map.
+/// Relocated here out of `parse_for_each_attached_to_source` so the
+/// noun-phrase form and the threshold-condition form share one map rather than
+/// two that can drift.
+///
+/// Two layers are named because this combinator's CONSUMERS land in two of
+/// them: layer 7c (CR 613.4c) for the `"for each ... attached to <referent>"` /
+/// `"the number of ... attached to <referent>"` power/toughness boosts that
+/// have always used it, and layer 6 (CR 613.1f) for
+/// `condition::parse_attached_to_referent_count_ge`, whose consumers are
+/// keyword GRANTS gated on an attachment threshold (Brass Knuckles; Balan,
+/// Wandering Knight). This function itself applies no effect in any layer — it
+/// only names WHICH OBJECT the count is taken against; the two citations record
+/// where its callers' effects land, not where it acts.
+///
+/// CR 301.5 + CR 303.4: Three referents share the `"<type> [and <type>]*
+/// attached to <referent>"` shape. The static parser already normalizes the
+/// source's printed name to `~`, so a literal `~` referent means "attached to
+/// the static's source object" (Kellan, the Fae-Blooded — `AttachedToSource`).
+/// The pronoun/noun phrase `it` / `that creature` is anaphoric on the affected
+/// subject of the surrounding effect — for "Enchanted creature gets +N/+M for
+/// each Aura and Equipment attached to it", "it" refers to the enchanted
+/// creature, the per-recipient host of the layer-evaluated boost
+/// (`AttachedToRecipient`). Baki's Curse uses the same recipient-relative
+/// grammar for damage: "each creature for each Aura attached to that
+/// creature." These literals are single-token leaves of the same combinator,
+/// so we dispatch with `alt` and select the matching `FilterProp` from a typed
+/// pair.
+pub(crate) fn parse_attachment_referent_prop(input: &str) -> OracleResult<'_, FilterProp> {
+    alt((
         value(FilterProp::AttachedToSource, tag(" attached to ~")),
         // CR 301.5a + CR 303.4: source-anaphoric gendered pronoun denotes the
         // ability source (same id as `~`) — Winter Soldier, Captain America
@@ -6209,23 +6393,73 @@ fn parse_for_each_attached_to_source(input: &str) -> OracleResult<'_, QuantityRe
             FilterProp::AttachedToRecipient,
             alt((tag(" attached to it"), tag(" attached to that creature"))),
         ),
+        // CR 303.4 + CR 301.5: player-referent pronoun/noun phrase — the
+        // singular-they "them" and the demonstrative "that player" both
+        // anaphor the ENCHANTED PLAYER already established by the surrounding
+        // trigger ("at the beginning of enchanted player's upkeep, ... equal
+        // to the number of Curses attached to them/that player"). The Curse
+        // itself is the counting ability's source and is attached to that
+        // same player, so `ControllerRef::EnchantedPlayer` resolved against
+        // the source is the correct referent (Curse of Thirst, Curse of
+        // Surveillance).
+        value(
+            FilterProp::AttachedToPlayer {
+                player: ControllerRef::EnchantedPlayer,
+            },
+            alt((tag(" attached to them"), tag(" attached to that player"))),
+        ),
     ))
-    .parse(rest)?;
+    .parse(input)
+}
+
+/// Builds the attachment count from a parsed type list and a referent property.
+/// SINGLE CONSTRUCTOR shared by [`parse_for_each_attached_to_source`] and
+/// `condition::parse_attached_to_referent_count_ge`.
+///
+/// GUARANTEE: the two surface phrasings CANNOT produce divergent `TypedFilter`s
+/// — the single-type vs [`TypeFilter::AnyOf`] collapse, `controller: None`, and
+/// the one-element `properties` vec are decided here once, enforced by
+/// construction rather than by convention. No CR annotation: this is a
+/// representation constructor, not a rule implementation. The rule-bearing
+/// sites are [`parse_attachment_referent_prop`] (which object the count is
+/// taken against) and `game::quantity`'s `QuantityRef::ObjectCount` arm (which
+/// zone, and the count itself).
+pub(crate) fn attachment_object_count(types: Vec<TypeFilter>, prop: FilterProp) -> QuantityRef {
     let type_filters = if types.len() == 1 {
         types
     } else {
         vec![TypeFilter::AnyOf(types)]
     };
-    Ok((
-        rest,
-        QuantityRef::ObjectCount {
-            filter: TargetFilter::Typed(TypedFilter {
-                type_filters,
-                controller: None,
-                properties: vec![prop],
-            }),
-        },
-    ))
+    QuantityRef::ObjectCount {
+        filter: TargetFilter::Typed(TypedFilter {
+            type_filters,
+            controller: None,
+            properties: vec![prop],
+        }),
+    }
+}
+
+/// CR 301.5 + CR 303.4: Parse "<type> [and <type>]* attached to <referent>" —
+/// counts objects whose `attached_to` field references the referent. Used by
+/// "for each Aura and Equipment attached to ~" (Kellan, the Fae-Blooded) and
+/// any analogous boost that scales with attachments on the source. Also
+/// handles the PLAYER-referent pronouns "them"/"that player" (Curse of
+/// Thirst, Curse of Surveillance), reached both from the "for each" prefix
+/// and — via the same function — from the "the number of" prefix in
+/// `parse_number_of_inner`, so the two surface phrasings of an identical
+/// count share one authority instead of drifting apart.
+///
+/// Composed from [`parse_attachment_type_list`] +
+/// [`parse_attachment_referent_prop`] + [`attachment_object_count`]. Those three
+/// are `pub(crate)` because the count-threshold STATIC CONDITION form —
+/// "two or more Equipment are attached to it" — must interleave a required
+/// copula between the type list and the referent tail, which a single combined
+/// combinator could not express. Splitting them keeps ONE referent -> filter
+/// map for both surface forms; this function's accepted language is unchanged.
+fn parse_for_each_attached_to_source(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest, types) = parse_attachment_type_list(input)?;
+    let (rest, prop) = parse_attachment_referent_prop(rest)?;
+    Ok((rest, attachment_object_count(types, prop)))
 }
 
 fn parse_for_each_attacking_controller_type(input: &str) -> OracleResult<'_, QuantityRef> {
@@ -6745,6 +6979,101 @@ mod tests {
     };
     use crate::types::mana::ManaColor;
 
+    // ── U1.1 building-block tests: `PlayerProperty` / `parse_player_property_keyword`
+    // / `player_property_quantity` / `player_property_leader_filter`. Test the
+    // block across its input range, not one card (CLAUDE.md).
+
+    #[test]
+    fn parse_player_property_keyword_accepts_all_three_and_rejects_subfamily_b_nouns() {
+        assert_eq!(
+            parse_player_property_keyword("speed"),
+            Ok(("", PlayerProperty::Speed))
+        );
+        assert_eq!(
+            parse_player_property_keyword("life"),
+            Ok(("", PlayerProperty::Life))
+        );
+        assert_eq!(
+            parse_player_property_keyword("cards in hand"),
+            Ok(("", PlayerProperty::HandSize))
+        );
+        // Subfamily B (object-count) nouns must keep declining at the property
+        // axis so those 8 cards stay honestly red.
+        for rejected in ["lands", "creatures", "permanents", "Wizards"] {
+            assert!(
+                parse_player_property_keyword(rejected).is_err(),
+                "{rejected:?} must NOT parse as a PlayerProperty"
+            );
+        }
+    }
+
+    #[test]
+    fn player_property_leader_filter_life_opponent_matches_incumbent_shape() {
+        // U2.1's behavior-preservation proof: this must be `assert_eq!`-identical
+        // to the `PlayerFilter` `parse_opponent_most_life_restriction` built
+        // BEFORE this diff (the literal pre-existing shape, reproduced here).
+        let expected = PlayerFilter::PlayerAttribute {
+            relation: PlayerRelation::Opponent,
+            attr: Box::new(QuantityRef::LifeTotal {
+                player: PlayerScope::ScopedPlayer,
+            }),
+            comparator: crate::types::ability::Comparator::GE,
+            value: Box::new(QuantityExpr::Ref {
+                qty: QuantityRef::LifeTotal {
+                    player: PlayerScope::Opponent {
+                        aggregate: AggregateFunction::Max,
+                    },
+                },
+            }),
+        };
+        assert_eq!(
+            player_property_leader_filter(PlayerProperty::Life, PlayerRelation::Opponent),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn player_property_leader_filter_speed_fails_closed() {
+        // Pins the fail-closed contract: `candidate_player_scalar{,_with_state}`
+        // has no `QuantityRef::Speed` arm, so a `Speed` leader filter would
+        // silently match nobody. A future `Speed` arm there must flip this
+        // test deliberately.
+        assert_eq!(
+            player_property_leader_filter(PlayerProperty::Speed, PlayerRelation::All),
+            None
+        );
+        assert_eq!(
+            player_property_leader_filter(PlayerProperty::Speed, PlayerRelation::Opponent),
+            None
+        );
+    }
+
+    #[test]
+    fn player_property_leader_filter_controller_relation_declines() {
+        // Exhaustive-match follow-through: a leader-comparison grammar never
+        // printed the `Controller` relation (always `All` or `Opponent`), so
+        // it is refused rather than emitting a vacuously-true filter.
+        assert_eq!(
+            player_property_leader_filter(PlayerProperty::Life, PlayerRelation::Controller),
+            None
+        );
+    }
+
+    #[test]
+    fn player_property_quantity_speed_unchanged_from_pre_move_helper() {
+        // Spikeshell Harrier preservation: the pre-move helper's Speed arm is
+        // byte-identical after the U1.1 relocation + widening.
+        assert_eq!(
+            player_property_quantity(
+                PlayerProperty::Speed,
+                PlayerScope::ParentObjectTargetController
+            ),
+            QuantityRef::Speed {
+                player: PlayerScope::ParentObjectTargetController
+            }
+        );
+    }
+
     fn assert_pt_difference(parsed: QuantityExpr, scope: ObjectScope, left: PtStat, right: PtStat) {
         assert_eq!(
             parsed,
@@ -7020,7 +7349,7 @@ mod tests {
     /// Tazri) must stay an HONEST GAP, never a confident count over an
     /// unrebindable sentinel.
     ///
-    /// MEASURED CORRECTION to the plan: neither `parse_type_phrase` carries the
+    /// MEASURED CORRECTION to the plan: neither `parse_type_phrase_folding` carries the
     /// anaphor grammar — that lives in `parse_target`, not in either type-phrase
     /// reader. Strict `Err`s on "those creatures"; Legacy returns an EMPTY
     /// `TypedFilter` plus the whole input. So both refuse, but by different
@@ -7045,7 +7374,7 @@ mod tests {
             super::super::target::parse_type_phrase("those creatures").is_err(),
             "Strict rejects an anaphor outright"
         );
-        let (legacy_filter, legacy_rest) = parse_type_phrase("those creatures");
+        let (legacy_filter, legacy_rest) = parse_type_phrase_folding("those creatures");
         assert_eq!(
             legacy_rest, "those creatures",
             "Legacy's infallible failure consumes nothing"
@@ -11037,9 +11366,44 @@ mod tests {
                     Some(crate::types::zones::Zone::Graveyard),
                     "graveyard zone must survive into the filter: {filter:?}"
                 );
+                let TargetFilter::Typed(filter) = filter else {
+                    panic!("expected Typed graveyard filter");
+                };
+                assert_eq!(filter.controller, Some(ControllerRef::You));
             }
             other => panic!("expected ObjectCountDistinct, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bare_mana_values_among_graveyard_cards() {
+        // Aven Heartstabber / Syndicate Infiltrator / Snooping Newsie /
+        // Graveyard Shift (SNC): "there are five or more mana values among
+        // cards in your graveyard" — reached in the bare-suffix context after
+        // a parent has already stripped "there are five or more ". No
+        // "different" qualifier precedes the plural noun.
+        let (rest, q) = parse_quantity_ref("mana values among cards in your graveyard").unwrap();
+        assert_eq!(rest, "");
+        match q {
+            QuantityRef::ObjectCountDistinct { filter, qualities } => {
+                assert_eq!(qualities, vec![SharedQuality::ManaValue]);
+                assert_eq!(
+                    filter.extract_in_zone(),
+                    Some(crate::types::zones::Zone::Graveyard),
+                    "graveyard zone must survive into the filter: {filter:?}"
+                );
+            }
+            other => panic!("expected ObjectCountDistinct, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bare_mana_value_singular_among_graveyard_cards() {
+        // Singular "mana value" must also parse (grammatically only correct at
+        // N=1, but the combinator does not gate on the outer threshold).
+        let (rest, q) = parse_quantity_ref("mana value among cards in your graveyard").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(distinct_qualities(&q), vec![SharedQuality::ManaValue]);
     }
 
     #[test]

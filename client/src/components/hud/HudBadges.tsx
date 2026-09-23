@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 
+import { DungeonMapPopover } from "./DungeonMapPopover.tsx";
 import { RingBenefitsPopover } from "./RingBenefitsPopover.tsx";
 import { ManaFontIcon } from "../icons/ManaFontIcon.tsx";
 import { GameplayTooltip } from "../ui/GameplayTooltip.tsx";
@@ -17,6 +18,7 @@ import type {
   UnboundedFamily,
 } from "../../adapter/types.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
+import { useBoundedLoopRepetitions } from "../../hooks/usePlayerDesignations.ts";
 import { usePlayerId } from "../../hooks/usePlayerId.ts";
 import { useSpectatorMode } from "../../hooks/useSpectatorMode.ts";
 import { getKeywordDisplayText } from "../../viewmodel/keywordProps.ts";
@@ -135,6 +137,64 @@ interface DungeonBadgeProps {
 
 export function DungeonBadge({ room }: DungeonBadgeProps) {
   const { t } = useTranslation("game");
+  const chipRef = useRef<HTMLButtonElement>(null);
+  // The panel portals to `document.body`, so containment has to be tested
+  // against its own root as well as the chip — see the pointerdown handler.
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [hoverOpen, setHoverOpen] = useState(false);
+  // Click latches the panel open so it survives the pointer leaving, and so
+  // touch devices — which never fire hover — can open it at all.
+  const [pinned, setPinned] = useState(false);
+  const closeTimerRef = useRef<number | null>(null);
+
+  const cancelClose = useCallback(() => {
+    if (closeTimerRef.current != null) {
+      window.clearTimeout(closeTimerRef.current);
+      closeTimerRef.current = null;
+    }
+  }, []);
+  const onEnter = useCallback(() => {
+    cancelClose();
+    setHoverOpen(true);
+  }, [cancelClose]);
+  const onLeave = useCallback(() => {
+    cancelClose();
+    closeTimerRef.current = window.setTimeout(() => {
+      setHoverOpen(false);
+      closeTimerRef.current = null;
+    }, DUNGEON_HOVER_CLOSE_DELAY_MS);
+  }, [cancelClose]);
+  useEffect(() => () => cancelClose(), [cancelClose]);
+
+  // Dismiss a pinned panel on the next outside click or on Escape — the two
+  // gestures a latched overlay has to answer to.
+  useEffect(() => {
+    if (!pinned) return undefined;
+    const onPointerDown = (event: PointerEvent) => {
+      // Both roots, not just the chip: the panel is portaled out of this
+      // subtree, so testing the chip alone dismisses on a tap INSIDE the
+      // panel. Desktop hides that (the wrapper span still receives the
+      // bubbled synthetic event, keeping `hoverOpen` true), but touch has no
+      // hover — the panel would close the moment it was touched.
+      if (
+        event.target instanceof Node
+        && chipRef.current?.contains(event.target) !== true
+        && panelRef.current?.contains(event.target) !== true
+      ) {
+        setPinned(false);
+      }
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setPinned(false);
+    };
+    window.addEventListener("pointerdown", onPointerDown);
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.removeEventListener("pointerdown", onPointerDown);
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [pinned]);
+
   // CR 309.4a: the marker starts on room index 0; players count from 1.
   const position = room.room.index + 1;
   const labelArgs = {
@@ -143,28 +203,32 @@ export function DungeonBadge({ room }: DungeonBadgeProps) {
     room: position,
     total: room.room_count,
   };
-  // CR 309.4b-c: name the room and say what its room ability did. The chip has
-  // no space for either, and most rooms are entered without a prompt, so the
-  // tooltip is where a player reads them back.
-  const tooltip = [
-    t("badges.dungeonTooltip", labelArgs),
-    t("badges.dungeonRoomTooltip", labelArgs),
-    room.room.text,
-  ]
-    .filter(Boolean)
-    .join("\n");
+  const open = hoverOpen || pinned;
   return (
-    <BadgeTip text={tooltip}>
-      <span
-        role="img"
+    <>
+      <button
+        type="button"
+        ref={chipRef}
         aria-label={t("badges.dungeonAriaLabel", labelArgs)}
-        className="relative inline-flex h-6 shrink-0 items-center gap-1 overflow-hidden rounded-full bg-violet-500/85 px-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-violet-50 ring-1 ring-violet-300/70 shadow-[0_0_12px_rgba(139,92,246,0.45)]"
+        aria-expanded={open}
+        title={t("badges.dungeonTooltip", labelArgs)}
+        onMouseEnter={onEnter}
+        onMouseLeave={onLeave}
+        onFocus={onEnter}
+        onBlur={onLeave}
+        onClick={() => setPinned((wasPinned) => !wasPinned)}
+        className="relative inline-flex h-6 shrink-0 cursor-pointer items-center gap-1 overflow-hidden rounded-full bg-violet-500/85 px-2 text-[10px] font-semibold uppercase tracking-[0.12em] text-violet-50 ring-1 ring-violet-300/70 shadow-[0_0_12px_rgba(139,92,246,0.45)] transition hover:bg-violet-400/90 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-violet-200"
       >
         <span aria-hidden className="text-[12px] leading-none drop-shadow-[0_1px_1px_rgba(0,0,0,0.5)]">🏰</span>
         <span className="relative truncate">{room.dungeon_name}</span>
         <span className="relative tabular-nums text-white">{position}/{room.room_count}</span>
-      </span>
-    </BadgeTip>
+      </button>
+      {open && chipRef.current ? (
+        <span onMouseEnter={onEnter} onMouseLeave={onLeave}>
+          <DungeonMapPopover anchorEl={chipRef.current} view={room} panelRef={panelRef} />
+        </span>
+      ) : null}
+    </>
   );
 }
 
@@ -471,36 +535,32 @@ export const UNBOUNDED_FAMILY_LABEL_KEY: Record<UnboundedFamily, string> = {
   triggers: "badges.unboundedTriggers",
 };
 
-/**
- * CR 732.2a: an `∞` badge for one unbounded-resource display family. Rendered
- * once per distinct family per player. The HUD callers pass the engine's
- * `unbounded_families` rows straight through — the engine decides which families
- * are present, on which HUD, and what each one may promise; `LoopShortcutModal`
- * still de-dups a bare axis list with a `Set` and passes no state. This badge only
- * formats the family to a glyph + label.
- */
-// `state` is OPTIONAL and defaults to `Unscheduled` so a caller with no family row in hand renders
-// today's bare-`∞` badge unchanged. `LoopShortcutModal`'s FamilyBadges is exactly that caller and
-// stays that way on purpose: it renders at OFFER time, before any player has accepted, so nothing
-// can be scheduled.
+/** CR 732.2a: a badge for one unbounded-resource display family. */
 export function UnboundedBadge({
   family,
-  state = { type: "Unscheduled" },
+  state,
 }: {
   family: UnboundedFamily;
+  /** The engine's published `unbounded_families` row behind this badge. ABSENT means this badge
+   *  is not backed by a published `∞` row. */
   state?: FamilyCollapseState;
 }) {
   const { t } = useTranslation("game");
   const resource = t(UNBOUNDED_FAMILY_LABEL_KEY[family]);
-  // Both hooks are called UNCONDITIONALLY, before any branch — rules of hooks. No render site
+  // The hooks are called UNCONDITIONALLY, before any branch — rules of hooks. No render site
   // changed: the badge resolves the viewer itself rather than taking it as a prop.
   const viewer = usePlayerId();
   const spectating = useSpectatorMode();
+  const boundedRepetitions = useBoundedLoopRepetitions();
+  // CR 732.2a: a badge with no published `∞` row behind it, while the engine states a repetition
+  // ceiling for the open window, names that ceiling instead of an unbounded glyph.
+  const bound = state === undefined ? boundedRepetitions : null;
+  const collapse: FamilyCollapseState = state ?? { type: "Unscheduled" };
   // A `Committed` scheduled collapse is an accepted-but-unapplied bound, and N is named at the
   // next step/phase end by the loop's CONTROLLER — who is NOT necessarily the seat this badge sits
   // on: the row is keyed by the engine's attribution player, which for `Life`/`DamageDealt`/
   // `LibraryDelta`/`Poison` axes is the victim, and the badge also renders on opponent HUDs. The
-  // engine now publishes that controller as `state.data.prompted`, so the copy can address the
+  // engine now publishes that controller as `collapse.data.prompted`, so the copy can address the
   // seat that will actually be asked, and falls back to the passive voice for everyone else.
   // `Conditional` promises no bound at all, which is why it keeps its own copy in both voices.
   // The window itself is CR 732.2c's advance to the shortcut's ending point; this only reports
@@ -524,15 +584,16 @@ export function UnboundedBadge({
   // read "you'll name the count" to every spectator. `useSpectatorMode()`'s predicate is exactly
   // the union of `useCanActForWaitingState`'s two spectator gates, so this badge is never more
   // permissive than the submit authority it is describing.
-  const you = !spectating && state.type === "Scheduled" && state.data.prompted === viewer;
+  const you = !spectating && collapse.type === "Scheduled" && collapse.data.prompted === viewer;
   const title = ((): string => {
-    switch (state.type) {
+    if (bound !== null) return t("badges.boundedLoopTooltip", { resource, bound });
+    switch (collapse.type) {
       case "Unscheduled":
         return t("badges.unboundedTooltip", { resource });
       case "Mixed":
         return t("badges.unboundedMixedTooltip", { resource });
       case "Scheduled":
-        return state.data.certainty === "Committed"
+        return collapse.data.certainty === "Committed"
           ? t(you ? "badges.unboundedScheduledYouTooltip" : "badges.unboundedScheduledTooltip", {
               resource,
             })
@@ -558,7 +619,8 @@ export function UnboundedBadge({
             the same reason its tooltip is. */}
         <span className="relative drop-shadow-[0_1px_1px_rgba(0,0,0,0.5)]">
           {((): string => {
-            switch (state.type) {
+            if (bound !== null) return t("badges.boundedLoopGlyph", { bound });
+            switch (collapse.type) {
               // `Mixed` renders a BARE `∞`: part of this family has a pending collapse and part
               // does not, and one glyph cannot say two things, so it says the weaker true one.
               case "Unscheduled":
@@ -567,7 +629,7 @@ export function UnboundedBadge({
               // The GLYPH is not person-dependent: `∞→N` / `∞→?` says what will land, not who is
               // asked. Only the tooltip changes voice.
               case "Scheduled":
-                return state.data.certainty === "Committed"
+                return collapse.data.certainty === "Committed"
                   ? t("badges.unboundedScheduledGlyph")
                   : t("badges.unboundedConditionalGlyph");
             }
@@ -675,6 +737,10 @@ function RingChip({
 // Brief dismiss delay smoothing cursor jitter on the chip edge (mirrors
 // EnchantmentsBadge's HOVER_CLOSE_DELAY_MS).
 const RING_HOVER_CLOSE_DELAY_MS = 80;
+
+/** Matches the Ring popover's grace period, so the pointer can cross the gap
+ *  between the dungeon chip and its panel without the panel closing. */
+const DUNGEON_HOVER_CLOSE_DELAY_MS = 80;
 
 /**
  * The player's OWN Ring badge: the gold level chip plus a hover popover

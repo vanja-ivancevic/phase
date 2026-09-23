@@ -42,6 +42,7 @@ fn spell_meta(types: &[&str], cost: &ManaCost) -> SpellMeta {
         is_face_down: false,
         cant_spend_mana: false,
         object: None,
+        ..Default::default()
     }
 }
 

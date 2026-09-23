@@ -19,6 +19,7 @@ import {
   clearActiveDraftPod,
   clearActiveDraftPodIfCurrent,
   clearActiveDraftGuest,
+  clearActiveDraftGuestIfCurrent,
   clearDraftGuestRecovery,
   clearDraftGuestSession,
   clearDraftDeckSubmission,
@@ -26,6 +27,7 @@ import {
   loadActiveDraftPod,
   loadActiveDraftGuest,
   inspectActiveDraftPod,
+  inspectActiveDraftGuest,
   loadDraftGuestSession,
   loadDraftDeckSubmission,
   loadDraftHostSession,
@@ -42,6 +44,7 @@ import {
 } from "../draftPersistence";
 import { draftIntergameDigest } from "../intergameCommandLedger";
 import type { PersistedDraftHostSession } from "../draftPersistence";
+import { DRAFT_KINDS } from "../../adapter/draft-adapter";
 import {
   MAX_MATERIALIZED_VIRTUAL_BASICS,
   validateWorkspaceState,
@@ -110,6 +113,56 @@ describe("draftPersistence", () => {
       });
 
       await expect(loadDraftHostSession("bad-deadline")).resolves.toBeNull();
+    });
+
+    // V33. The guard that decides this is `isDraftKind`, and a hand-written
+    // enumeration inside it would compile unchanged after `DRAFT_KINDS` grew —
+    // TypeScript never checks a type-guard BODY against the union in its
+    // `value is` clause. The failure is silent: the snapshot is classified
+    // corrupt and discarded, and the host resumes into nothing. Pairing the
+    // new kind with Premier is what makes this discriminate a narrow guard
+    // from a broken loader.
+    it.each([["Winston"], ["Premier"]] as const)(
+      "survives load for a persisted %s host session",
+      async (kind) => {
+        const session: PersistedDraftHostSession = {
+          ...testSession,
+          persistenceId: `kind-${kind}`,
+          kind,
+          podSize: kind === "Winston" ? 2 : 8,
+        };
+        await saveDraftHostSession(session.persistenceId, session);
+
+        await expect(loadDraftHostSession(session.persistenceId)).resolves.toEqual({
+          ...session,
+          perSeatWorkspaceSnapshots: {},
+        });
+      },
+    );
+
+    // The derivation sibling of V33: the guard folds `DRAFT_KINDS`, so every
+    // kind the union admits EXCEPT the deliberately excluded `"Quick"` must
+    // load, and a kind the union does not admit must not. Asserting over the
+    // tuple rather than over a copied list is the point — a list here would
+    // reintroduce exactly the enumeration the repair removed.
+    it("admits every persistable kind the DraftKind tuple names, and nothing else", async () => {
+      for (const kind of DRAFT_KINDS) {
+        const persistenceId = `derived-${kind}`;
+        mockStore.set(`phase-draft-host:${persistenceId}`, { ...testSession, persistenceId, kind });
+        const loaded = await loadDraftHostSession(persistenceId);
+        if (kind === "Quick") {
+          expect(loaded, "Quick is the solo path and is never a persisted pod").toBeNull();
+        } else {
+          expect(loaded?.kind, `${kind} must survive resume`).toBe(kind);
+        }
+      }
+
+      mockStore.set("phase-draft-host:not-a-kind", {
+        ...testSession,
+        persistenceId: "not-a-kind",
+        kind: "Winstonian",
+      });
+      await expect(loadDraftHostSession("not-a-kind")).resolves.toBeNull();
     });
 
     it("returns null for non-existent session", async () => {
@@ -374,6 +427,30 @@ describe("draftPersistence", () => {
       expect(loaded?.roomCode).toBe("ABCDE");
       expect(loaded?.phase).toBe("drafting");
       expect(loaded?.pickCount).toBe(12);
+    });
+
+    // The SECOND site of C.1's class: `isActiveDraftPodMeta` used to repeat
+    // the kind chain inline instead of calling `isDraftKind`. Its silent
+    // failure is the resume banner disappearing for a Winston pod, which no
+    // type error would have named.
+    it("keeps active resume metadata for every kind the DraftKind tuple names", () => {
+      for (const kind of DRAFT_KINDS) {
+        if (kind === "Quick") continue;
+        saveActiveDraftPod({
+          id: `active-${kind}`,
+          roomCode: "ABCDE",
+          kind,
+          podSize: kind === "Winston" ? 2 : 8,
+          hostDisplayName: "Alice",
+          tournamentFormat: "Swiss",
+          podPolicy: "Competitive",
+          phase: "drafting",
+          pickCount: 1,
+          updatedAt: Date.now(),
+        });
+
+        expect(loadActiveDraftPod()?.kind, `${kind} must survive resume`).toBe(kind);
+      }
     });
 
     it("clears active host resume metadata", () => {
@@ -725,6 +802,72 @@ describe("draftPersistence", () => {
       expect(loadActiveDraftGuest()).toBeNull();
       await expect(loadDraftGuestSession("phase2-HOST1")).resolves.toBeNull();
       clearActiveDraftGuest();
+    });
+
+    it("inspects guest locators without mutation and only clears the exact captured locator", () => {
+      saveActiveDraftGuest({ roomCode: "ABCDE", displayName: "Alice", hostPeerId: "phase2-HOST1" });
+      const active = inspectActiveDraftGuest();
+      expect(active.type).toBe("present");
+      expect(localStorage.getItem("phase-active-draft-guest")).not.toBeNull();
+      if (active.type !== "present") throw new Error("expected guest locator");
+
+      saveActiveDraftGuest({ roomCode: "FGHJK", displayName: "Bob", hostPeerId: "phase2-HOST2" });
+      clearActiveDraftGuestIfCurrent(active.capture);
+
+      expect(inspectActiveDraftGuest()).toMatchObject({
+        type: "present",
+        meta: { roomCode: "FGHJK", hostPeerId: "phase2-HOST2" },
+      });
+    });
+
+    it.each([
+      ["malformed", "{not-json"],
+      ["expired", JSON.stringify({
+        roomCode: "ABCDE",
+        displayName: "Alice",
+        hostPeerId: "phase2-HOST1",
+        timestamp: Date.now() - 5 * 60 * 60 * 1000,
+      })],
+    ])("keeps a %s guest locator intact during inspection, then load performs ordinary cleanup", (_label, raw) => {
+      const removeItem = vi.spyOn(localStorage, "removeItem");
+      localStorage.setItem("phase-active-draft-guest", raw);
+
+      const inspected = inspectActiveDraftGuest();
+
+      expect(inspected.type).toBe("invalid");
+      expect(localStorage.getItem("phase-active-draft-guest")).toBe(raw);
+      expect(removeItem).not.toHaveBeenCalledWith("phase-active-draft-guest");
+
+      expect(loadActiveDraftGuest()).toBeNull();
+      expect(removeItem).toHaveBeenCalledWith("phase-active-draft-guest");
+      expect(localStorage.getItem("phase-active-draft-guest")).toBeNull();
+
+      removeItem.mockRestore();
+    });
+
+    it("does not clear a same-timestamp locator whose display identity changed", () => {
+      const timestamp = Date.now();
+      localStorage.setItem("phase-active-draft-guest", JSON.stringify({
+        roomCode: "ABCDE",
+        displayName: "Alice",
+        hostPeerId: "phase2-HOST1",
+        timestamp,
+      }));
+      const active = inspectActiveDraftGuest();
+      if (active.type !== "present") throw new Error("expected guest locator");
+
+      localStorage.setItem("phase-active-draft-guest", JSON.stringify({
+        roomCode: "ABCDE",
+        displayName: "Alicia",
+        hostPeerId: "phase2-HOST1",
+        timestamp,
+      }));
+      clearActiveDraftGuestIfCurrent(active.capture);
+
+      expect(inspectActiveDraftGuest()).toMatchObject({
+        type: "present",
+        meta: { displayName: "Alicia", timestamp },
+      });
     });
   });
 });

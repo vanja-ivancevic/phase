@@ -31,7 +31,9 @@ use crate::types::player::PlayerId;
 use crate::types::resolution::ChildStackDepth;
 
 use super::resolve_ability_chain;
+#[cfg(test)]
 use crate::game::ability_utils::build_resolved_from_def;
+use crate::game::ability_utils::build_resolved_from_def_with_chain_root;
 
 /// CR 701.38a + CR 101.4: Initiate a vote. Builds the APNAP voter queue
 /// starting from `starting_with` (resolved against the ability controller),
@@ -242,6 +244,10 @@ pub fn resolve(
         candidate_objects,
         outcome_template,
         visibility,
+        // CR 608.2h: propagate so a counter-gated "that many" nested in a
+        // per-choice/outcome sub-effect still resolves against the live
+        // chain-root target once the tally fans out.
+        chain_root_targets: ability.context.chain_root_targets.clone(),
     };
 
     // Stash the parent's sub_ability tail so it resumes after the tally fans
@@ -280,6 +286,7 @@ pub fn resolve_tally(
     tally_mode: VoteTally,
     candidate_objects: &[ObjectId],
     outcome_template: Option<&AbilityDefinition>,
+    chain_root_targets: &[TargetRef],
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
     // For named votes the per-choice slots are parallel to `options`; object
@@ -308,6 +315,7 @@ pub fn resolve_tally(
                 tie,
                 candidate_objects,
                 outcome_template,
+                chain_root_targets,
                 events,
             );
         }
@@ -355,7 +363,12 @@ pub fn resolve_tally(
         if per_choice_player_scope.is_some() {
             // player_scope path — single dispatch, fan-out handled by
             // resolve_ability_chain's player_scope driver.
-            let chain = build_resolved_from_def(&per_choice_effect[idx], source_id, controller);
+            let chain = build_resolved_from_def_with_chain_root(
+                &per_choice_effect[idx],
+                source_id,
+                controller,
+                chain_root_targets.to_vec(),
+            );
             resolve_ability_chain(state, &chain, events, 1)?;
         } else if per_choice_effect[idx]
             .effect
@@ -367,7 +380,12 @@ pub fn resolve_tally(
             // `QuantityRef::VoteCount`, so the effect resolves as ONE aggregate
             // event whose `resolve_ref` sums the full tally — do NOT repeat it
             // per ballot, which would multiply the tally by itself.
-            let chain = build_resolved_from_def(&per_choice_effect[idx], source_id, controller);
+            let chain = build_resolved_from_def_with_chain_root(
+                &per_choice_effect[idx],
+                source_id,
+                controller,
+                chain_root_targets.to_vec(),
+            );
             resolve_ability_chain(state, &chain, events, 1)?;
         } else {
             // CR 701.38d + CR 608.2c: Per-ballot iteration. Each ballot that
@@ -392,8 +410,13 @@ pub fn resolve_tally(
 
             while let Some(voter) = remaining_voters.first().copied() {
                 remaining_voters.remove(0);
-                let ballot_ability =
-                    build_per_ballot_ability(&per_choice_effect[idx], voter, source_id, controller);
+                let ballot_ability = build_per_ballot_ability(
+                    &per_choice_effect[idx],
+                    voter,
+                    source_id,
+                    controller,
+                    chain_root_targets,
+                );
                 resolve_ability_chain(state, &ballot_ability, events, 1)?;
 
                 // If the inner effect parked an interactive choice, suspend.
@@ -405,6 +428,7 @@ pub fn resolve_tally(
                             remaining_voters,
                             source_id,
                             controller,
+                            chain_root_targets: chain_root_targets.to_vec(),
                         },
                         stack_depth_before_ballot,
                     );
@@ -452,6 +476,7 @@ fn resolve_top_votes_tally(
     tie: TieResolution,
     candidate_objects: &[ObjectId],
     outcome_template: Option<&AbilityDefinition>,
+    chain_root_targets: &[TargetRef],
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
     state.last_vote_ballots = ballots.clone();
@@ -486,7 +511,12 @@ fn resolve_top_votes_tally(
                 // winner is exiled (not a battlefield rescan).
                 Some(template) => {
                     if let Some(&winner_obj) = candidate_objects.get(winner as usize) {
-                        let mut chain = build_resolved_from_def(template, source_id, controller);
+                        let mut chain = build_resolved_from_def_with_chain_root(
+                            template,
+                            source_id,
+                            controller,
+                            chain_root_targets.to_vec(),
+                        );
                         chain.targets = vec![TargetRef::Object(winner_obj)];
                         resolve_ability_chain(state, &chain, events, 1)?;
                     }
@@ -494,7 +524,12 @@ fn resolve_top_votes_tally(
                 // Named vote: `per_choice_effect` is populated.
                 None => {
                     if let Some(winning_effect) = per_choice_effect.get(winner as usize) {
-                        let chain = build_resolved_from_def(winning_effect, source_id, controller);
+                        let chain = build_resolved_from_def_with_chain_root(
+                            winning_effect,
+                            source_id,
+                            controller,
+                            chain_root_targets.to_vec(),
+                        );
                         resolve_ability_chain(state, &chain, events, 1)?;
                     }
                 }
@@ -519,8 +554,12 @@ fn resolve_top_votes_tally(
                         // rescan).
                         Some(template) => {
                             if let Some(&winner_obj) = candidate_objects.get(idx) {
-                                let mut chain =
-                                    build_resolved_from_def(template, source_id, controller);
+                                let mut chain = build_resolved_from_def_with_chain_root(
+                                    template,
+                                    source_id,
+                                    controller,
+                                    chain_root_targets.to_vec(),
+                                );
                                 chain.targets = vec![TargetRef::Object(winner_obj)];
                                 resolve_ability_chain(state, &chain, events, 1)?;
                             }
@@ -528,8 +567,12 @@ fn resolve_top_votes_tally(
                         // Named vote: `per_choice_effect` is populated.
                         None => {
                             if let Some(winning_effect) = per_choice_effect.get(idx) {
-                                let chain =
-                                    build_resolved_from_def(winning_effect, source_id, controller);
+                                let chain = build_resolved_from_def_with_chain_root(
+                                    winning_effect,
+                                    source_id,
+                                    controller,
+                                    chain_root_targets.to_vec(),
+                                );
                                 resolve_ability_chain(state, &chain, events, 1)?;
                             }
                         }
@@ -636,8 +679,14 @@ fn build_per_ballot_ability(
     voter: PlayerId,
     source_id: crate::types::identifiers::ObjectId,
     controller: PlayerId,
+    chain_root_targets: &[TargetRef],
 ) -> ResolvedAbility {
-    let mut ability = build_resolved_from_def(template, source_id, controller);
+    let mut ability = build_resolved_from_def_with_chain_root(
+        template,
+        source_id,
+        controller,
+        chain_root_targets.to_vec(),
+    );
     ability.scoped_player = Some(voter);
     ability.original_controller = Some(controller);
     ability
@@ -660,11 +709,13 @@ pub(crate) fn drain_active_vote_ballot(state: &mut GameState, events: &mut Vec<G
     let source_id = pending.source_id;
     let controller = pending.controller;
     let template = pending.ability_template;
+    let chain_root_targets = pending.chain_root_targets;
     let stack_depth_before_ballot = state.resolution_stack.capture_child_boundary();
 
     while let Some(voter) = remaining_voters.first().copied() {
         remaining_voters.remove(0);
-        let ballot_ability = build_per_ballot_ability(&template, voter, source_id, controller);
+        let ballot_ability =
+            build_per_ballot_ability(&template, voter, source_id, controller, &chain_root_targets);
         if resolve_ability_chain(state, &ballot_ability, events, 1).is_err() {
             // On error, drop remaining ballots (matches existing error handling).
             return;
@@ -679,6 +730,7 @@ pub(crate) fn drain_active_vote_ballot(state: &mut GameState, events: &mut Vec<G
                     remaining_voters,
                     source_id,
                     controller,
+                    chain_root_targets,
                 },
                 stack_depth_before_ballot,
             );
@@ -757,7 +809,7 @@ mod tests {
             "charge".to_string(),
         ));
         let per_ballot_runtime =
-            build_per_ballot_ability(&per_ballot, PlayerId(1), source_id, controller);
+            build_per_ballot_ability(&per_ballot, PlayerId(1), source_id, controller, &[]);
 
         assert_eq!(player_scope_runtime.distribute, player_scope.distribute);
         assert_eq!(aggregate_runtime.distribute, aggregate.distribute);
@@ -802,6 +854,7 @@ mod tests {
             force_block_attacker: None,
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
+            illegal_target_slots: Vec::new(),
             controller,
             original_controller: None,
             scoped_player: None,
@@ -919,6 +972,7 @@ mod tests {
             force_block_attacker: None,
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
+            illegal_target_slots: Vec::new(),
             controller,
             original_controller: None,
             scoped_player: None,
@@ -1124,6 +1178,7 @@ mod tests {
             VoteTally::PerVote,
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("tally resolves");
@@ -1175,7 +1230,9 @@ mod tests {
                     additional_zones: Vec::new(),
                     zone_owner: ZoneOwner::Each(PerPlayerScope::AllPlayers),
                     filter: None,
-                    chooser: Chooser::Controller,
+                    chooser: Chooser::Controller.into(),
+                    candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+                    reciprocal_role: None,
                     up_to: false,
                     constraint: None,
                     selection: CardSelectionMode::Chosen,
@@ -1204,6 +1261,7 @@ mod tests {
             VoteTally::PerVote,
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("first ballot pauses on the first player choice");
@@ -1361,6 +1419,7 @@ mod tests {
             force_block_attacker: None,
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
+            illegal_target_slots: Vec::new(),
             controller,
             original_controller: None,
             scoped_player: None,
@@ -1535,6 +1594,7 @@ mod tests {
             force_block_attacker: None,
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
+            illegal_target_slots: Vec::new(),
             controller,
             original_controller: None,
             scoped_player: None,
@@ -1661,6 +1721,7 @@ mod tests {
             candidate_objects: crate::im::Vector::new(),
             outcome_template: None,
             visibility: VoteVisibility::Open,
+            chain_root_targets: Vec::new(),
         };
         let err = apply(
             &mut state,
@@ -1704,6 +1765,7 @@ mod tests {
             candidate_objects: crate::im::Vector::new(),
             outcome_template: None,
             visibility: VoteVisibility::Open,
+            chain_root_targets: Vec::new(),
         };
         assert_eq!(state.waiting_for.acting_player(), Some(controller));
     }
@@ -1814,6 +1876,7 @@ mod tests {
             VoteTally::PerVote,
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("resolve_tally succeeds");
@@ -1924,6 +1987,7 @@ mod tests {
             },
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("threshold tally resolves");
@@ -1972,6 +2036,7 @@ mod tests {
             },
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("threshold tally resolves");
@@ -2153,6 +2218,7 @@ mod tests {
             },
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("all-tied tally resolves");
@@ -2190,6 +2256,7 @@ mod tests {
             },
             &[],
             None,
+            &[],
             &mut events,
         )
         .expect("zero-tally tally resolves");

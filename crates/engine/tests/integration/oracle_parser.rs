@@ -1329,3 +1329,105 @@ fn ice_cauldron_notes_amount_and_reads_back_full_payment() {
         result.abilities
     );
 }
+
+/* The upstream snapshot for this grammar predates the fork's noted type-and-
+ * amount implementation. Its negative regression is intentionally not kept:
+ * the fork's parser support is the behavior being merged. */
+/*
+    // The gap is identified by the clause it RECORDS plus the parser's verdict on that
+    // clause, not by the clause's first word. `note` is a known clause head, so the
+    // refusal is `VerbArguments`. This venue is a separate crate, so it asserts the
+    // wire-name half (`ClauseGapKind`, `pub`) and the fragment half through the `pub`
+    // accessor; the phrase half of the verdict is covered in-crate by the
+    // `gap_diagnosis` table, which tests the same function over its input range.
+    const NOTE_CLAUSE: &str = "note the type and amount of mana spent to pay this activation cost";
+    let Effect::Unimplemented { name, .. } = &*note_sub.effect else {
+        panic!(
+            "Ice Cauldron's 'type AND amount' noted-mana subject must stay \
+             Unimplemented, not be swallowed by parse_note_mana_spent_clause's \
+             singular-type grammar; got {:#?}",
+            note_sub.effect
+        );
+    };
+    assert_eq!(
+        ClauseGapKind::from_unimplemented_name(name),
+        Some(ClauseGapKind::VerbArguments),
+        "the recorded name must decode to the verdict this clause earns, got {name}"
+    );
+    assert_eq!(
+        note_sub.effect.unimplemented_description(),
+        Some(NOTE_CLAUSE),
+        "the recorded fragment names the exact clause that gapped"
+    );
+
+    // Second ability: the mana-producing "add ... last noted type and amount
+    // of mana" must not be matched by `ManaProduction::NotedType`'s
+    // singular-type pattern. Same identification: the recorded clause, not its
+    // first word.
+    // The recorded fragment is the clause as printed (self-reference normalized to
+    // `~`), measured from the parser rather than assumed.
+    const ADD_CLAUSE: &str = "Add ~'s last noted type and amount of mana";
+    let mana_ability = result
+        .abilities
+        .iter()
+        .find(|a| a.effect.unimplemented_description() == Some(ADD_CLAUSE))
+        .unwrap_or_else(|| {
+            panic!(
+                "Ice Cauldron's 'last noted type and amount of mana' must stay \
+                 Unimplemented, not be matched by ManaProduction::NotedType's \
+                 singular-type pattern; got {:#?}",
+                result.abilities
+            )
+        });
+    // `unimplemented_description` is `None` for every other effect shape, so matching
+    // `ADD_CLAUSE` above already established both the variant and the recorded
+    // fragment — the selector IS the "names the exact clause that gapped" assertion,
+    // and it is order-independent where a "first Unimplemented" scan was not.
+    let Effect::Unimplemented { name, .. } = &*mana_ability.effect else {
+        unreachable!("only Effect::Unimplemented has an unimplemented_description")
+    };
+    assert_eq!(
+        ClauseGapKind::from_unimplemented_name(name),
+        Some(ClauseGapKind::VerbArguments),
+        "the recorded name must decode to the verdict this clause earns, got {name}"
+    );
+}
+*/
+
+/// Havi's historic graveyard threshold must lower as a typed static condition
+/// without disturbing Sage Project's supported `ChangeZone` return.
+#[test]
+fn havi_the_all_father_full_card_parser_snapshot() {
+    let parsed = parse(
+        "Havi has indestructible as long as there are four or more historic cards in your graveyard. (Artifacts, legendaries, and Sagas are historic.)\nSage Project — Whenever Havi or another legendary creature you control dies, return target legendary creature card with lesser mana value from your graveyard to the battlefield tapped.",
+        "Havi, the All-Father",
+        &[],
+        &["Legendary", "Creature"],
+        &["God"],
+    );
+    assert!(
+        parsed.statics.iter().any(|static_def| {
+            matches!(
+                &static_def.condition,
+                Some(StaticCondition::QuantityComparison { .. })
+            )
+        }),
+        "Havi's first line must produce its conditional static: {parsed:#?}"
+    );
+    fn contains_change_zone(def: &engine::types::ability::AbilityDefinition) -> bool {
+        matches!(def.effect.as_ref(), Effect::ChangeZone { .. })
+            || def.sub_ability.as_deref().is_some_and(contains_change_zone)
+            || def
+                .else_ability
+                .as_deref()
+                .is_some_and(contains_change_zone)
+    }
+    assert!(
+        parsed
+            .triggers
+            .iter()
+            .any(|trigger| trigger.execute.as_deref().is_some_and(contains_change_zone)),
+        "Sage Project's supported return must remain a ChangeZone effect: {parsed:#?}"
+    );
+    insta::assert_json_snapshot!("havi_the_all_father_full_card", &parsed);
+}

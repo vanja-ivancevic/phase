@@ -5,6 +5,7 @@ import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { DraftPodPage } from "../DraftPodPage";
+import { ShellProvider } from "../../components/chrome/ShellContext";
 
 const { captured, draftState, intergameWorkspace, playerView, sideboardPrompt } = vi.hoisted(() => {
   const pool = [
@@ -32,7 +33,7 @@ const { captured, draftState, intergameWorkspace, playerView, sideboardPrompt } 
     loserSeat: 1,
     timerMs: 60_000,
   };
-  return { captured: { shellMode: "", menuShell: null as null | { compactTopPadding?: boolean }, builderProps: null as null | {
+  return { captured: { shellMode: "", menuShell: null as null | { compactTopPadding?: boolean; fillEmbeddedHeight?: boolean }, builderProps: null as null | {
     responsiveLayout?: string;
     responsiveHeightMode?: string;
   } }, intergameWorkspace, playerView, sideboardPrompt, draftState: {
@@ -51,6 +52,7 @@ const { captured, draftState, intergameWorkspace, playerView, sideboardPrompt } 
     intergameWorkspaceState: intergameWorkspace as typeof intergameWorkspace | null,
     setIntergameWorkspaceState: vi.fn(),
     submitSideboard: vi.fn(),
+    submitDeck: vi.fn(),
     choosePlayDraw: vi.fn(),
     leave: vi.fn(),
   } };
@@ -76,10 +78,11 @@ vi.mock("../../stores/draftPodStore", async (importOriginal) => ({
 }));
 
 vi.mock("../../components/chrome/ScreenChrome", () => ({ ScreenChrome: () => null }));
-vi.mock("../../components/chrome/ShellContext", () => ({
+vi.mock("../../components/chrome/ShellContext", async (importOriginal) => ({
+  ...await importOriginal<typeof import("../../components/chrome/ShellContext")>(),
   useDraftShellChrome: (mode: string) => { captured.shellMode = mode; },
 }));
-vi.mock("../../components/menu/MenuShell", () => ({ MenuShell: (props: { children: ReactNode; compactTopPadding?: boolean }) => {
+vi.mock("../../components/menu/MenuShell", () => ({ MenuShell: (props: { children: ReactNode; compactTopPadding?: boolean; fillEmbeddedHeight?: boolean }) => {
   captured.menuShell = props;
   return <>{props.children}</>;
 } }));
@@ -92,13 +95,20 @@ vi.mock("../../components/draft/HostControls", () => {
 });
 vi.mock("../../components/draft/LimitedDeckBuilder", () => ({
   LimitedDeckBuilder: (props: {
-    local: { capabilities?: { kind: string }; onSubmitDeck: () => void };
+    local: { capabilities?: { kind: string }; onSubmitDeck: (commanders: string[]) => void };
     responsiveLayout?: string;
     responsiveHeightMode?: string;
   }) => {
     captured.builderProps = props;
     return (
-      <button data-testid="limited-builder" data-capability={props.local.capabilities?.kind} onClick={props.local.onSubmitDeck}>
+      <button
+        data-testid="limited-builder"
+        data-capability={props.local.capabilities?.kind}
+        onClick={() => props.local.onSubmitDeck([
+          "The Prismatic Piper",
+          "The Prismatic Piper",
+        ])}
+      >
         Submit Sideboard
       </button>
     );
@@ -132,6 +142,7 @@ describe("DraftPodPage betweenGames", () => {
     draftState.view = playerView;
     draftState.intergameWorkspaceState = intergameWorkspace;
     draftState.submitSideboard.mockClear();
+    draftState.submitDeck.mockClear();
     captured.shellMode = "";
     captured.menuShell = null;
     captured.builderProps = null;
@@ -151,6 +162,8 @@ describe("DraftPodPage betweenGames", () => {
       ["Twin", "Island"],
       [{ name: "Twin", count: 1 }, { name: "Forest", count: 1 }],
     );
+    expect(draftState.submitSideboard).toHaveBeenCalledOnce();
+    expect(draftState.submitDeck).not.toHaveBeenCalled();
   });
 
   it("shows the submitted deck read-only while waiting for the opponent", () => {
@@ -183,6 +196,19 @@ describe("DraftPodPage betweenGames", () => {
       "max-w-none",
       "overflow-hidden",
     );
+  });
+
+  it("uses embedded height for the tablet Bo3 editor", () => {
+    setViewport(768, 1024);
+    render(
+      <ShellProvider value>
+        <MemoryRouter><DraftPodPage /></MemoryRouter>
+      </ShellProvider>,
+    );
+
+    expect(captured.menuShell).toMatchObject({ fillEmbeddedHeight: true });
+    expect(screen.getByTestId("limited-builder").parentElement?.parentElement)
+      .toHaveClass("h-full", "min-h-0", "flex-1", "max-w-none", "overflow-hidden");
   });
 
   it.each([

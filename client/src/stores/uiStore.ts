@@ -15,6 +15,7 @@ import type { FilterKey } from "../components/modal/cardChoice/gridSelection";
  */
 export type BlockerAssignments = Map<ObjectId, Set<ObjectId>>;
 export type PreviewPlacement = "cursor" | "side";
+export type PreviewSource = "playerHand";
 export type DebugContextMenuSurface =
   | "game"
   | "zone-viewer"
@@ -194,9 +195,15 @@ interface UiStoreState {
   selectedObjectId: ObjectId | null;
   hoveredObjectId: ObjectId | null;
   inspectedObjectId: ObjectId | null;
+  /** Public printed-card name retained by a historical log entry when its live
+   * object is no longer in the current game state. */
+  inspectedCardName: string | null;
   inspectedFaceIndex: number;
   /** Presentation requested by the element that opened the current preview. */
   previewPlacement: PreviewPlacement;
+  /** UI surface that owns the active or pending preview, when cleanup must be
+   * scoped more narrowly than the inspected object's current zone. */
+  previewSource: PreviewSource | null;
   altHeld: boolean;
   /** Whether the Shift key is currently held. Drives the "shift" card-preview
    *  mode (preview shows only while Shift is down). Tracked as held-state via
@@ -311,10 +318,17 @@ interface UiStoreActions {
     faceIndex?: number,
     timing?: "hover" | "immediate",
     placement?: PreviewPlacement,
+    source?: PreviewSource,
   ) => void;
   /** Open a preview from an explicit interaction and keep it visible until a
    * later outside interaction dismisses it. */
-  inspectObjectSticky: (id: ObjectId, faceIndex?: number, placement?: PreviewPlacement) => void;
+  inspectObjectSticky: (
+    id: ObjectId,
+    faceIndex?: number,
+    placement?: PreviewPlacement,
+    fallbackCardName?: string,
+    source?: PreviewSource,
+  ) => void;
   dismissPreview: () => void;
   setAltHeld: (held: boolean) => void;
   setShiftHeld: (held: boolean) => void;
@@ -381,7 +395,11 @@ interface UiStoreActions {
   setDebugHighlightedObjectId: (id: ObjectId | null) => void;
   /** Set or clear the debug-panel preview highlight for a player. */
   setDebugHighlightedPlayerId: (id: number | null) => void;
+  /** Engine-initiated visibility change. Does NOT remember the value. */
   setLogPanelOpen: (open: boolean) => void;
+  /** User-initiated visibility change. Remembers the value for the next game. */
+  setLogPanelOpenByUser: (open: boolean) => void;
+  /** User-initiated visibility change. Remembers the value for the next game. */
   toggleLogPanel: () => void;
   setFlexEditMode: (active: boolean) => void;
   toggleFlexEditMode: () => void;
@@ -395,8 +413,10 @@ export const useUiStore = create<UiStore>()((set, get) => ({
   selectedObjectId: null,
   hoveredObjectId: null,
   inspectedObjectId: null,
+  inspectedCardName: null,
   inspectedFaceIndex: 0,
   previewPlacement: "cursor",
+  previewSource: null,
   altHeld: false,
   shiftHeld: false,
   selectedCardIds: [],
@@ -444,7 +464,7 @@ export const useUiStore = create<UiStore>()((set, get) => ({
   setDebugHighlightedPlayerId: (id) => set({ debugHighlightedPlayerId: id }),
   setAltHeld: (held) => set({ altHeld: held }),
   setShiftHeld: (held) => set({ shiftHeld: held }),
-  inspectObject: (id, faceIndex, timing = "hover", placement = "cursor") => {
+  inspectObject: (id, faceIndex, timing = "hover", placement = "cursor", source) => {
     if (id != null) {
       // Setting a new inspection target: cancel any pending clear, and drop a
       // pending delayed-show for a previous target before scheduling this one.
@@ -456,8 +476,10 @@ export const useUiStore = create<UiStore>()((set, get) => ({
       const applyInspect = () =>
         set((s) => ({
           inspectedObjectId: id,
+          inspectedCardName: null,
           inspectedFaceIndex: faceIndex ?? 0,
           previewPlacement: placement,
+          previewSource: source ?? null,
           // Inspecting a DIFFERENT object replaces (dismisses) the previous
           // preview, so a pinned Alt state must not leak onto the new card —
           // Alt has to be pressed again to expand it. Re-inspecting the SAME
@@ -483,6 +505,7 @@ export const useUiStore = create<UiStore>()((set, get) => ({
           ? prefs.cardPreviewHoverDelayMs
           : 0;
       if (delay > 0) {
+        set({ previewSource: source ?? null });
         const show: PendingPreviewShow = {
           timer: null,
           ready: false,
@@ -536,8 +559,10 @@ export const useUiStore = create<UiStore>()((set, get) => ({
         cancelPendingShow();
         set({
           inspectedObjectId: null,
+          inspectedCardName: null,
           inspectedFaceIndex: 0,
           previewPlacement: "cursor",
+          previewSource: null,
           previewSticky: false,
           altHeld: false,
         });
@@ -545,7 +570,7 @@ export const useUiStore = create<UiStore>()((set, get) => ({
     }
   },
 
-  inspectObjectSticky: (id, faceIndex = 0, placement = "cursor") => {
+  inspectObjectSticky: (id, faceIndex = 0, placement = "cursor", fallbackCardName, source) => {
     if (pendingClearTimer != null) {
       clearTimeout(pendingClearTimer);
       pendingClearTimer = null;
@@ -553,8 +578,10 @@ export const useUiStore = create<UiStore>()((set, get) => ({
     cancelPendingShow();
     set({
       inspectedObjectId: id,
+      inspectedCardName: fallbackCardName ?? null,
       inspectedFaceIndex: faceIndex,
       previewPlacement: placement,
+      previewSource: source ?? null,
       previewSticky: true,
       altHeld: false,
     });
@@ -568,8 +595,10 @@ export const useUiStore = create<UiStore>()((set, get) => ({
     cancelPendingShow();
     set({
       inspectedObjectId: null,
+      inspectedCardName: null,
       inspectedFaceIndex: 0,
       previewPlacement: "cursor",
+      previewSource: null,
       previewSticky: false,
       altHeld: false,
       mobileHandGesture: null,
@@ -780,8 +809,20 @@ export const useUiStore = create<UiStore>()((set, get) => ({
   toggleHelpSheet: () => set((state) => ({ helpSheetOpen: !state.helpSheetOpen })),
   openCardReportDialog: () => set({ cardReportDialogOpen: true }),
   closeCardReportDialog: () => set({ cardReportDialogOpen: false }),
+  // Engine-initiated visibility. Deliberately does NOT remember: the mount
+  // seed and the game-over reveal both open the panel without the user asking,
+  // and remembering those would re-open the log at the start of every game for
+  // a player who keeps it closed.
   setLogPanelOpen: (open) => set({ logPanelOpen: open }),
-  toggleLogPanel: () => set((state) => ({ logPanelOpen: !state.logPanelOpen })),
+  // The single authority for a USER-initiated visibility change — it updates
+  // the live panel and remembers the choice for the next game. Every user entry
+  // point (game menu, board context menu, the panel's own ×) routes here, so no
+  // call site has to remember to persist.
+  setLogPanelOpenByUser: (open) => {
+    set({ logPanelOpen: open });
+    usePreferencesStore.getState().setLogPanelLastChoice(open ? "open" : "closed");
+  },
+  toggleLogPanel: () => get().setLogPanelOpenByUser(!get().logPanelOpen),
   setFlexEditMode: (active) => set({ flexEditMode: active }),
   toggleFlexEditMode: () => set((state) => ({ flexEditMode: !state.flexEditMode })),
   setManualManaOverride: (on) => set({ manualManaOverride: on }),

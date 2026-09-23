@@ -3,18 +3,56 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const EXPECTED_PROTOCOL_VERSION = 55;
-// The LOBBY message-set version. Deliberately separate from the full-game
-// number above and deliberately NOT derived from it: a GameState-only bump must
-// not move the lobby's compatibility window. See the assertions at the bottom.
-const EXPECTED_LOBBY_PROTOCOL_VERSION = 4;
+// Upstream's Winston draft frames are v71. This branch's v72 combines the
+// independent policy carrier with upstream's paid graveyard cast offer; v73
+// adds face-qualified variants and preserves a paid addition while a resolution
+// modal-face prompt is paused; v74 carries exact delayed-trigger receipts;
+// v75 carries producer-owned paid-offer cleanup authority.
+// Keep the measured base so a future merge cannot collapse independent wire
+// changes onto one number.
+const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
+// +5: CR 601.2f caster-elected cost-reduction ordering adds a parse bump on top.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 5;
+// The LOBBY message-set version, not derived from the full-game number above.
+// The classifier below refuses an expression only on the SOURCE constants; this
+// script never reads itself, so its own EXPECTED_* must stay literals.
+const EXPECTED_LOBBY_PROTOCOL_VERSION = 9;
+// The capability FLOOR for correlated tournament settlement — a different kind
+// of number from the other version constants here, and the reason it is pinned
+// separately. Those track a surface's current version; this one is frozen at the
+// version that INTRODUCED the ack and must never be bumped alongside
+// EXPECTED_LOBBY_PROTOCOL_VERSION. Raising it would refuse every newer broker
+// that answers the ack perfectly well, silently disabling all four organizer
+// actions.
+const EXPECTED_MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK = 5;
+// The capability FLOOR for broker-owned default scoring — a second frozen
+// floor, pinned for the same reason as the ack floor above and never bumped
+// alongside EXPECTED_LOBBY_PROTOCOL_VERSION. It is frozen at the version that
+// RELAXED CreateTournament.scoring to optional. Raising it would push every
+// newer broker below the floor and pin this client to sending an explicit
+// policy forever; lowering it is worse, because omitting `scoring` against a
+// pre-6 broker is a hard `missing field` parse error rather than a degrade.
+const EXPECTED_MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING = 6;
 // The P2P wire version. A THIRD independent surface: host/guest first-contact
 // frames carry it, and the same GameState shape change that moves
 // EXPECTED_PROTOCOL_VERSION must move this one too. It was previously ungated
 // here, so a full-game bump could ship with an unbumped P2P version and CI
 // stayed green — a v(n-1) host and a v(n) guest would then complete a
 // handshake and only fail when the incompatible payload arrived.
-const EXPECTED_WIRE_PROTOCOL_VERSION = 40;
+const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 4;
+// The P2P DRAFT wire version. A FIFTH independent surface, and the one this
+// script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
+// EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse
+// a mismatched peer before allocating a seat or consuming reconnect grace) —
+// the most consequential kind of version number to leave ungated, because the
+// dangerous direction is the one that stays GREEN. Adding a draft message or a
+// player-view field without bumping this number left `draftProtocol.test.ts`
+// pinning the old value, nothing compared the two, and two mismatched peers
+// would pair successfully and silently drop every frame of the new shape. The
+// leg below closes that: the source constant, the test's `toBe(...)` and the
+// test's TITLE now all move with this expectation or the gate reds.
+const EXPECTED_DRAFT_PROTOCOL_VERSION = 30;
 
 function extractVersion(source, pattern, label) {
   const match = source.match(pattern);
@@ -26,7 +64,13 @@ function extractVersion(source, pattern, label) {
 
 function requirePattern(source, pattern, label) {
   if (!pattern.test(source)) {
-    throw new Error(`Protocol floor does not match expectation in ${label}`);
+    throw new Error(`Required protocol form not found in ${label}`);
+  }
+}
+
+function refusePattern(source, pattern, label) {
+  if (pattern.test(source)) {
+    throw new Error(`Superseded protocol version still named in ${label}`);
   }
 }
 
@@ -48,6 +92,26 @@ const workerHelloGateSource = readFileSync(
 );
 const p2pProtocolSource = readFileSync(
   resolve(root, "client/src/network/protocol.ts"),
+  "utf8",
+);
+const p2pProtocolTestSource = readFileSync(
+  resolve(root, "client/src/network/__tests__/protocol.test.ts"),
+  "utf8",
+);
+const draftProtocolSource = readFileSync(
+  resolve(root, "client/src/network/draftProtocol.ts"),
+  "utf8",
+);
+const draftProtocolTestSource = readFileSync(
+  resolve(root, "client/src/network/__tests__/draftProtocol.test.ts"),
+  "utf8",
+);
+const draftCoreTypesSource = readFileSync(
+  resolve(root, "crates/draft-core/src/types.rs"),
+  "utf8",
+);
+const p2pAdapterTestSource = readFileSync(
+  resolve(root, "client/src/adapter/__tests__/p2p-adapter-multiplayer.test.ts"),
   "utf8",
 );
 
@@ -83,6 +147,79 @@ requirePattern(
   "lobby-worker/src/hello-gate.ts",
 );
 
+// ── Authored vs derived: which constants may carry a bare integer ──────────
+//
+// Of the protocol constants declared in the files below, only the names listed
+// here may carry an integer. A derived constant replaced by its correct current
+// value passes every other check in this file and every relational assertion in
+// the Rust and vitest suites, and reds only at the next bump. Ceilings: a
+// right-hand side that is constant but not a decimal integer (hex, arithmetic,
+// a block expression) reads as derived, and so does a decimal integer whose
+// type suffix falls outside INTEGER_RHS's `[iu]<digits>` alphabet — `<n>usize`,
+// `<n>isize` and TypeScript's `<n>n`; the name filter below lets a helper named
+// neither PROTOCOL nor MIN_SUPPORTED hold the literal while a protocol
+// constant derives from it; and the declaration regex sees one binding per
+// `const` and ends the right-hand side at the first `;`, comment or not.
+const AUTHORED_LITERALS = [
+  [rustSource, "crates/lobby-broker/src/protocol.rs", [
+    "LOBBY_PROTOCOL_VERSION",
+    "MIN_SUPPORTED_LOBBY_PROTOCOL",
+    "PROTOCOL_VERSION",
+  ]],
+  [serverCoreSource, "crates/server-core/src/protocol.rs", []],
+  [clientSource, "client/src/adapter/ws-adapter.ts", [
+    "LOBBY_PROTOCOL_VERSION",
+    // Authored for the opposite reason to the others: it is frozen, not
+    // current. Deriving it would silently disable the organizer actions at the
+    // next lobby bump, so the classifier has to insist on the literal.
+    "MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK",
+    // Same frozen-floor reasoning as the ack floor above: the default-scoring
+    // floor must stay a literal so re-deriving it from the current version
+    // fails this check instead of silently pinning the client forever.
+    "MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING",
+    // The client-only send-path floor for per-event `match_type`. Frozen at the
+    // version that introduced it, for the same reason as the two floors above:
+    // deriving it from the current version would, at the next lobby bump,
+    // silently start refusing v8 brokers that honor `match_type` perfectly. It
+    // has no shared Rust constant to mirror, so unlike the ack/scoring floors it
+    // is not additionally value-pinned by an EXPECTED_* assertion below.
+    "MIN_LOBBY_PROTOCOL_FOR_MATCH_TYPE",
+    // The client-only behavioral floor for recoverable (bounded-overlap)
+    // credential rotation. Same frozen-literal reasoning as the match-type floor
+    // above: it gates proactive rotation on the broker honoring the overlap, has
+    // no shared Rust constant to mirror, and must stay a bare literal so a future
+    // bump cannot re-derive it and start refusing v9 brokers that recover.
+    "MIN_LOBBY_PROTOCOL_FOR_RECOVERABLE_ROTATION",
+    "MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL",
+    "PROTOCOL_VERSION",
+  ]],
+  [p2pProtocolSource, "client/src/network/protocol.ts", [
+    "WIRE_PROTOCOL_VERSION",
+  ]],
+];
+
+const CONST_DECL =
+  /(?:pub(?:\([^)]+\))?\s+|export\s+)?(?:const|static)\s+([A-Z][A-Z0-9_]*)\s*(?::\s*[^=;]+)?\s*=\s*([^;]+);/g;
+const INTEGER_RHS = /^\d[\d_]*(_?[iu]\d+)?(\s+(as|satisfies)\s+[^=;]+)?$/;
+
+for (const [source, label, authored] of AUTHORED_LITERALS) {
+  const found = [...source.matchAll(CONST_DECL)]
+    .filter(([, name]) => /PROTOCOL|MIN_SUPPORTED/.test(name))
+    .filter(([, , rhs]) =>
+      INTEGER_RHS.test(rhs.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, " ").trim()),
+    )
+    .map(([, name]) => name)
+    .sort();
+  const expected = [...authored].sort();
+  if (found.join(" ") !== expected.join(" ")) {
+    console.error(
+      `Protocol constants with a bare-integer right-hand side in ${label} must be exactly [${expected.join(", ")}], found [${found.join(", ")}]. ` +
+        `Every other protocol constant there derives from one of these and must stay an expression.`,
+    );
+    process.exit(1);
+  }
+}
+
 if (rustVersion !== clientVersion) {
   console.error(
     `Protocol version mismatch: Rust=${rustVersion}, client=${clientVersion}`,
@@ -104,9 +241,12 @@ if (
 //
 // Pinned here for the same reason the full-game number is: a `GameState` shape
 // change crosses BOTH the WebSocket full-game wire and the P2P host/guest wire,
-// and bumping only one leaves the other pairing to fail at payload-decode time
-// instead of at the handshake. Gating both in one place makes "I bumped the
-// protocol" mean all of it.
+// and the decoder on each of those wires reads whatever arrives. The P2P peer's
+// `validateMessage` (client/src/network/protocol.ts) checks the `type` tag and
+// nothing else, and the WebSocket client hands server frames straight to
+// `JSON.parse` (client/src/adapter/ws-adapter.ts). First-contact version
+// equality is the only place either skew is refusable, and bumping one number
+// without the other leaves the unbumped surface with nothing that can refuse.
 
 const wireProtocolVersion = extractVersion(
   p2pProtocolSource,
@@ -122,13 +262,88 @@ if (wireProtocolVersion !== EXPECTED_WIRE_PROTOCOL_VERSION) {
   process.exit(1);
 }
 
+// ── P2P draft wire: the FIFTH surface ──────────────────────────────────
+//
+// Independent of all four numbers above: the draft host/guest pair versions its
+// own message set and its own player-view shape, and refuses a mismatch at
+// first contact rather than at the frame that would have broken. The regex
+// requires a bare integer right-hand side, so a future
+// `DRAFT_PROTOCOL_VERSION = SOMETHING + 1` trips "Could not find protocol
+// version" instead of silently un-pinning the surface.
+
+const draftProtocolVersion = extractVersion(
+  draftProtocolSource,
+  /export\s+const\s+DRAFT_PROTOCOL_VERSION\s*=\s*(\d+)\s*as\s+const\s*;/,
+  "client/src/network/draftProtocol.ts",
+);
+
+if (draftProtocolVersion !== EXPECTED_DRAFT_PROTOCOL_VERSION) {
+  console.error(
+    `P2P draft protocol version must remain ${EXPECTED_DRAFT_PROTOCOL_VERSION}: got ${draftProtocolVersion}. ` +
+      `A new draft message type or player-view field must bump this number, and the test that pins it moves in the same commit.`,
+  );
+  process.exit(1);
+}
+
+
+// ── Draft payload BOUNDS: a sixth surface, and a different kind of number ──
+//
+// `draftProtocol.ts` mirrors three engine constants that bound what a draft
+// message may STATE, so the transport can refuse an over-long payload without a
+// session. Each carried a `@sync-with` comment and nothing that reads it, and
+// the pile bound additionally CLAIMED to be "pinned by this module's test
+// against the engine constant's published figure" — which it was not: that test
+// asserts pile 3 rejected and pile 2 accepted, which pins the constant against
+// itself and passes for any value the two sides happen to share.
+//
+// The dangerous direction is the silent one. Each Rust constant is DERIVED and
+// already pinned on its own side (`max_shared_stack_piles_matches_procedure_table`
+// folds `DraftKind::ALL`), so a future 4-pile procedure row moves the Rust value
+// and every Rust test stays green, while the unmoved TypeScript mirror rejects
+// legal pile-3 decisions at the transport — a rules-correct engine reachable
+// only by a message the client refuses to send. Comparing the two literals is
+// the only thing that reds on that edit, and this is the script that already
+// reads Rust constants for exactly this purpose.
+const DRAFT_PAYLOAD_BOUNDS = [
+  "MAX_CARDS_PER_PICK",
+  "MAX_COMMANDER_DESIGNATIONS",
+  "MAX_SHARED_STACK_PILES",
+];
+
+for (const name of DRAFT_PAYLOAD_BOUNDS) {
+  // Both sides require a bare integer right-hand side, for the same reason the
+  // version regexes do: re-deriving either mirror from the other would defeat
+  // the comparison, and an expression trips "Could not find" instead.
+  const rustBound = extractVersion(
+    draftCoreTypesSource,
+    new RegExp(`pub\\s+const\\s+${name}\\s*:\\s*usize\\s*=\\s*(\\d+)\\s*;`),
+    `crates/draft-core/src/types.rs ${name}`,
+  );
+  const clientBound = extractVersion(
+    draftProtocolSource,
+    new RegExp(`const\\s+${name}\\s*=\\s*(\\d+)\\s*;`),
+    `client/src/network/draftProtocol.ts ${name}`,
+  );
+  if (rustBound !== clientBound) {
+    console.error(
+      `Draft payload bound mismatch for ${name}: Rust=${rustBound}, client=${clientBound}. ` +
+        "The engine constant is derived from the procedure table; the transport mirror must move with it, " +
+        "or the client will refuse payloads the reducer accepts.",
+    );
+    process.exit(1);
+  }
+}
+
 // ── Lobby protocol: a SEPARATE surface with its own version ────────────────
 //
 // `PROTOCOL_VERSION` versions the full-game GameState/GameAction wire surface.
-// The lobby broker parses none of that, yet its accept-window used to be
-// derived from that same number — so a GameState-only bump slid the lobby
-// window and stranded every already-deployed client. These assertions keep the
-// two surfaces genuinely independent.
+// The lobby broker carries neither type, so most full-game bumps leave it
+// alone. It is not disjoint from them, though: its messages embed
+// `FormatConfig` and `MatchConfig`, which `GameState` also carries as fields,
+// so retyping one of those breaks lobby messages too and has to move BOTH
+// numbers. What is wrong is deriving one number from the other — the
+// accept-window used to come from the full-game number, so a GameState-only
+// bump slid the lobby window and stranded every already-deployed client.
 
 const rustLobbyVersion = extractVersion(
   rustSource,
@@ -150,12 +365,31 @@ const clientLobbyFloor = extractVersion(
   /export\s+const\s+MIN_SUPPORTED_SERVER_LOBBY_PROTOCOL\s*=\s*(\d+)\s*;/,
   "client/src/adapter/ws-adapter.ts",
 );
+const clientTournamentAckFloor = extractVersion(
+  clientSource,
+  /export\s+const\s+MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK\s*=\s*(\d+)\s*;/,
+  "client/src/adapter/ws-adapter.ts",
+);
+const clientDefaultScoringFloor = extractVersion(
+  clientSource,
+  /export\s+const\s+MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING\s*=\s*(\d+)\s*;/,
+  "client/src/adapter/ws-adapter.ts",
+);
 
-// The structural invariant, and the reason this block exists. Each of the four
+// The structural invariant, and the reason this block exists. Each of the six
 // regexes above requires a bare integer literal on the right-hand side, so a
 // future edit to `LOBBY_PROTOCOL_VERSION = PROTOCOL_VERSION - 1` (or any other
 // expression) fails to match and trips "Could not find protocol version"
 // rather than silently re-coupling the two surfaces.
+//
+// That device is doing MORE work for the two FROZEN floors — the ack floor and
+// the default-scoring floor — than for the four current-version pins. The
+// plausible "improvement" to a frozen floor is to re-derive it from the current
+// version — `= LOBBY_PROTOCOL_VERSION` — which reads like removing a magic
+// number and is in fact a latent bug: at the next lobby bump every v5 broker,
+// which does mint the ack, would be refused as unsupported, and every v6
+// broker, which does apply the scoring default, likewise. The bare-integer
+// regex is what turns that edit into a failed check here instead.
 
 if (rustLobbyVersion !== clientLobbyVersion) {
   console.error(
@@ -179,9 +413,184 @@ if (rustLobbyVersion !== EXPECTED_LOBBY_PROTOCOL_VERSION) {
   process.exit(1);
 }
 
-if (rustLobbyFloor > rustLobbyVersion) {
+if (
+  clientTournamentAckFloor !== EXPECTED_MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK
+) {
   console.error(
-    `Lobby floor ${rustLobbyFloor} exceeds the lobby version ${rustLobbyVersion}: no client could connect.`,
+    `MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK must remain ${EXPECTED_MIN_LOBBY_PROTOCOL_FOR_TOURNAMENT_ACK}: got ${clientTournamentAckFloor}. ` +
+      `It is FROZEN at the lobby version that introduced TournamentActionAck — not a moving target. ` +
+      `Do NOT bump it with LOBBY_PROTOCOL_VERSION: a newer broker still answers the ack, and raising this ` +
+      `floor would refuse every one of them and silently disable all four organizer actions.`,
   );
   process.exit(1);
 }
+
+if (clientDefaultScoringFloor !== EXPECTED_MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING) {
+  console.error(
+    `MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING must remain ${EXPECTED_MIN_LOBBY_PROTOCOL_FOR_DEFAULT_SCORING}: got ${clientDefaultScoringFloor}. ` +
+      `It is FROZEN at the lobby version that relaxed CreateTournament.scoring to optional — not a moving target. ` +
+      `Do NOT bump it with LOBBY_PROTOCOL_VERSION: a newer broker still applies the arity default, and raising this ` +
+      `floor would pin this client to sending an explicit scoring policy against every broker that can default one.`,
+  );
+  process.exit(1);
+}
+
+if (clientDefaultScoringFloor > rustLobbyVersion) {
+  console.error(
+    `The default-scoring floor ${clientDefaultScoringFloor} exceeds the lobby version ${rustLobbyVersion}: ` +
+      `no broker could ever accept a CreateTournament with scoring omitted.`,
+  );
+  process.exit(1);
+}
+
+if (clientTournamentAckFloor > rustLobbyVersion) {
+  console.error(
+    `The tournament-ack floor ${clientTournamentAckFloor} exceeds the lobby version ${rustLobbyVersion}: ` +
+      `no broker could ever answer a gated tournament action.`,
+  );
+  process.exit(1);
+}
+
+if (rustLobbyFloor > rustLobbyVersion) {
+  console.error(
+    `Lobby floor ${rustLobbyFloor} exceeds the lobby version ${rustLobbyVersion}: no client that advertises a lobby version could connect.`,
+  );
+  process.exit(1);
+}
+
+// ── Directory announcement shape: a FOURTH constant surface ────────────────
+//
+// `DIRECTORY_VERSION` versions the ANNOUNCEMENT shape — the `POST /announce`
+// body Rust sends and the `GET /servers` envelope the client reads. It is
+// unrelated to all three wire protocols above: none of the lobby, full-game or
+// P2P message sets appears in a directory row. It moves only when
+// `RawAnnouncement` / `DirectoryRow` change shape, and both sides must move
+// together or a client silently ignores every listing.
+
+const EXPECTED_DIRECTORY_VERSION = 1;
+
+const directorySource = readFileSync(
+  resolve(root, "crates/lobby-broker/src/directory.rs"),
+  "utf8",
+);
+const clientDirectorySource = readFileSync(
+  resolve(root, "client/src/services/serverDirectory.ts"),
+  "utf8",
+);
+
+// Both regexes require a bare integer literal on the right-hand side, so a
+// future `DIRECTORY_VERSION = SOMETHING + 1` trips "Could not find protocol
+// version" rather than silently un-pinning the surface.
+const rustDirectoryVersion = extractVersion(
+  directorySource,
+  /pub\s+const\s+DIRECTORY_VERSION\s*:\s*u32\s*=\s*(\d+)\s*;/,
+  "crates/lobby-broker/src/directory.rs",
+);
+const clientDirectoryVersion = extractVersion(
+  clientDirectorySource,
+  /export\s+const\s+DIRECTORY_VERSION\s*=\s*(\d+)\s*;/,
+  "client/src/services/serverDirectory.ts",
+);
+
+if (rustDirectoryVersion !== clientDirectoryVersion) {
+  console.error(
+    `Directory version mismatch: Rust=${rustDirectoryVersion}, client=${clientDirectoryVersion}`,
+  );
+  process.exit(1);
+}
+
+// Not redundant with the mismatch check above. A COORDINATED bump of both
+// sides — exactly what an auto-merge of two branches can produce silently —
+// passes consistency and fails here.
+if (rustDirectoryVersion !== EXPECTED_DIRECTORY_VERSION) {
+  console.error(
+    `Directory version must remain ${EXPECTED_DIRECTORY_VERSION}: got ${rustDirectoryVersion}. ` +
+      `Bump it ONLY for a RawAnnouncement/DirectoryRow shape change.`,
+  );
+  process.exit(1);
+}
+// ── Names that embed a version number ─────────────────────────────────────
+//
+// A name carrying a version goes stale silently: `assert_eq!(PROTOCOL_VERSION,
+// <n>)` under `fn protocol_version_is_<n-1>` is green. The two sites below
+// require the CURRENT number and refuse the SUPERSEDED one; the handshake pair
+// after them requires both numerals and has no refuse leg. Every number here
+// derives from the EXPECTED_* constants above, so a later bump edits the
+// sources and those constants, never the patterns themselves. Ceiling: a
+// refuse leg catches leftover text from the previous version, which is the
+// defect a bump produces. Prose rewritten to some other wrong number is not a
+// bump leftover and is not guarded here.
+const P = EXPECTED_PROTOCOL_VERSION;
+const W = EXPECTED_WIRE_PROTOCOL_VERSION;
+const D = EXPECTED_DRAFT_PROTOCOL_VERSION;
+
+requirePattern(serverCoreSource, new RegExp(`fn protocol_version_is_${P}(?![0-9])`),
+  `crates/server-core/src/protocol.rs fn protocol_version_is_${P}`);
+refusePattern(serverCoreSource, new RegExp(`protocol_version_is_${P - 1}(?![0-9])`),
+  "crates/server-core/src/protocol.rs");
+
+// The draft wire's title pin, mirroring the device above. `toBe(<n>)` under
+// `it("is version <n-1>")` is green and misleading, and the title is the half
+// no type system and no assertion can check. Whole-file, not a title slice:
+// that test file holds exactly one `is version` phrase, so the narrowing the
+// p2p title legs need to stay admit-only buys nothing here, while reading the
+// whole file also catches the numeral in a nearby comment.
+requirePattern(draftProtocolTestSource, new RegExp(`is version ${D}(?![0-9])`),
+  `client/src/network/__tests__/draftProtocol.test.ts it("is version ${D}")`);
+refusePattern(draftProtocolTestSource, new RegExp(`is version ${D - 1}(?![0-9])`),
+  "client/src/network/__tests__/draftProtocol.test.ts");
+// And the assertion's own literal, so all three sites in the draft bump — the
+// source constant, this value and the title above — red THIS gate rather than
+// only the vitest run, which CI schedules separately from `type-check` and
+// `build`. Anchored on `expect(DRAFT_PROTOCOL_VERSION)` rather than on a bare
+// `toBe(<n>)`, so the refuse leg can never fire on an unrelated assertion that
+// happens to expect the superseded numeral.
+requirePattern(draftProtocolTestSource,
+  new RegExp(`expect\\(DRAFT_PROTOCOL_VERSION\\)\\.toBe\\(${D}\\)`),
+  `client/src/network/__tests__/draftProtocol.test.ts expect(DRAFT_PROTOCOL_VERSION).toBe(${D})`);
+refusePattern(draftProtocolTestSource,
+  new RegExp(`expect\\(DRAFT_PROTOCOL_VERSION\\)\\.toBe\\(${D - 1}\\)`),
+  "client/src/network/__tests__/draftProtocol.test.ts");
+
+// Both legs read the file's test TITLES, not its whole source, so coverage that legitimately
+// drives the superseded version in a body is not a bump leftover. Ceiling: double-quoted titles
+// only, so a backtick or single-quoted title falls out of the slice — admit-only, never a false
+// refusal, which is what makes the narrowing safe.
+const p2pProtocolTestTitles = [
+  ...p2pProtocolTestSource.matchAll(/\b(?:describe|it|test)\(\s*"([^"]*)"/g),
+]
+  .map((match) => match[1])
+  .join("\n");
+
+requirePattern(p2pProtocolTestTitles, new RegExp(`\\bv${W}\\b`),
+  `client/src/network/__tests__/protocol.test.ts titles v${W}`);
+refusePattern(p2pProtocolTestTitles, new RegExp(`\\bv${W - 1}\\b`),
+  "client/src/network/__tests__/protocol.test.ts titles");
+
+const P2P_GATE = 'describe("P2P wire-protocol version gate"';
+if (!p2pAdapterTestSource.includes(P2P_GATE)) {
+  console.error(
+    `Could not find ${P2P_GATE} in client/src/adapter/__tests__/p2p-adapter-multiplayer.test.ts: ` +
+      "that block holds the only instrument that tells a bumped client from an unbumped one.",
+  );
+  process.exit(1);
+}
+const gateLabel = "client/src/adapter/__tests__/p2p-adapter-multiplayer.test.ts";
+// Scoped to the gate block: the anchor above to the next top-level `describe(`,
+// or EOF if this is the last one. The slice starts AT the anchor, so it can
+// never widen back to the whole file.
+const gateBlockStart = p2pAdapterTestSource.indexOf(P2P_GATE);
+const gateBlockEnd = p2pAdapterTestSource.indexOf("\ndescribe(", gateBlockStart);
+const gateBlock = p2pAdapterTestSource.slice(
+  gateBlockStart,
+  gateBlockEnd === -1 ? undefined : gateBlockEnd,
+);
+
+// Order binds each numeral to its role: refused named and sent before admitted.
+// Raw-source match: a comment in the block quoting an it(...) title passes the title leg.
+requirePattern(gateBlock,
+  new RegExp(`\\bit\\("[^"]*\\bv${W - 1}\\b[^"]*\\bv${W}\\b[^"]*"`),
+  `${gateLabel} an it(...) title naming refused v${W - 1} before admitted v${W}`);
+requirePattern(gateBlock,
+  new RegExp(`setupFrameAt\\(${W - 1}\\)[\\s\\S]*setupFrameAt\\(${W}\\)`),
+  `${gateLabel} refused setupFrameAt(${W - 1}) before admitted setupFrameAt(${W})`);

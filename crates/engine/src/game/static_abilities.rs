@@ -7,9 +7,10 @@ use crate::game::functioning_abilities::{
     battlefield_active_statics, game_active_statics, game_functioning_statics, static_kind_present,
 };
 use crate::game::game_object::GameObject;
-use crate::game::layers::{evaluate_condition, evaluate_condition_with_recipient};
+use crate::game::layers::{evaluate_condition, evaluate_condition_with_context, ConditionContext};
 use crate::types::ability::{
-    ContinuousModification, ControllerRef, StaticDefinition, TargetFilter, TypedFilter,
+    ContinuousModification, ControllerRef, CostCategory, StaticCondition, StaticDefinition,
+    TargetFilter, TypedFilter,
 };
 use crate::types::game_state::GameState;
 use crate::types::identifiers::ObjectId;
@@ -40,7 +41,7 @@ pub struct StaticCheckContext {
     pub target_id: Option<ObjectId>,
     pub player_id: Option<PlayerId>,
     pub card_name: Option<String>,
-    /// CR 508.1d: When checking scoped `CantAttack` statics (`attack_defended`),
+    /// CR 508.1c: When checking scoped `CantAttack` statics (`attack_defended`),
     /// the declared attack target for the creature in `target_id`.
     pub attack_target: Option<AttackTarget>,
 }
@@ -91,6 +92,10 @@ pub fn build_static_registry() -> HashMap<StaticMode, StaticAbilityHandler> {
     // runtime enforcement is in effects/sacrifice.rs and effects/change_zone.rs via
     // triggered_cause_sacrifice_or_exile_muzzled(). Coverage support is via
     // is_data_carrying_static().
+    //
+    // CR 701.9a + CR 701.21a + CR 609.3: CantCauseForcedAction is a data-carrying
+    // variant — runtime enforcement is in effects/sacrifice.rs and effects/discard.rs
+    // via forced_action_muzzled(). Coverage support is via is_data_carrying_static().
     //
     // CR 603.2g + CR 603.6a + CR 700.4: SuppressTriggers is a data-carrying variant —
     // runtime enforcement is in triggers.rs via event_is_suppressed_by_static_triggers().
@@ -496,6 +501,60 @@ pub(crate) fn triggered_cause_sacrifice_or_exile_muzzled(
     false
 }
 
+/// CR 701.9a (discard) + CR 701.21a (sacrifice) + CR 609.3 + CR 109.5: True
+/// when `acting_player` is protected from being forced to perform `action` by
+/// the spell or ability controlled by `cause_controller`, per an active
+/// `CantCauseForcedAction` static whose `cause` scope matches
+/// `cause_controller` relative to the static's own controller (CR 109.5: the
+/// "you"/"your" a static ability protects is its own controller). If muzzled,
+/// `action` is treated as an impossible action for `acting_player` and
+/// produces no game-state change for them (CR 609.3: an effect that can't do
+/// something does only as much as possible) — other players a multi-player
+/// instruction also affects are untouched.
+///
+/// E.g., Sigarda, Host of Herons / Tajuru Preserver: "Spells and abilities
+/// your opponents control can't cause you to sacrifice permanents." Tamiyo,
+/// Collector of Tales additionally lists `Discards`.
+///
+/// Unlike `triggered_cause_sacrifice_or_exile_muzzled` (The Master, Multiplied
+/// — triggered abilities ONLY, filtered to a specific affected-object
+/// subset), this protects the player wholesale against ANY spell or ability
+/// (not just triggered abilities), and is not filtered by which
+/// permanent/card would be affected — there is no `affected` filter to
+/// consult.
+pub(crate) fn forced_action_muzzled(
+    state: &GameState,
+    cause_controller: PlayerId,
+    acting_player: PlayerId,
+    action: CostCategory,
+) -> bool {
+    // CR 604.1: O(1) presence gate — no CantCauseForcedAction static means no muzzle.
+    if !static_kind_present(state, StaticModeKind::CantCauseForcedAction) {
+        return false;
+    }
+    crate::game::perf_counters::record_static_full_scan();
+    for (bf_obj, def) in crate::game::functioning_abilities::battlefield_active_statics(state) {
+        let StaticMode::CantCauseForcedAction {
+            ref cause,
+            ref actions,
+        } = def.mode
+        else {
+            continue;
+        };
+        // CR 109.5: "you" binds to the static's own controller — only THEY are protected.
+        if bf_obj.controller != acting_player {
+            continue;
+        }
+        if !actions.contains(&action) {
+            continue;
+        }
+        if prohibition_scope_matches_player(cause, cause_controller, bf_obj.id, state) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Handler for the Continuous mode -- layers.rs handles the actual evaluation.
 /// CR 604.2: Continuous effects from static abilities apply via the layer system.
 fn handle_continuous(
@@ -753,11 +812,29 @@ fn static_ability_match_applies(
         }
     }
 
+    // CR 506.2 + CR 508.1c + CR 508.5: a `CantAttack` restriction gated on the
+    // DEFENDING PLAYER's board cannot be answered without an attack target. An
+    // eligibility query (`combat::creature_cant_attack_gated`, display badges)
+    // carries none, so skip the static here and let the per-pairing authority
+    // `combat::attacker_can_attack_target` — which DOES carry one — decide. Same
+    // deferral the CR 508.1c (+ CR 508.1d for the cost form) `attack_defended`
+    // block below performs for target-SCOPED prohibitions, generalized to
+    // condition-CARRIED ones.
+    if matches!(mode, StaticMode::CantAttack | StaticMode::CantAttackOrBlock)
+        && context.attack_target.is_none()
+        && def
+            .condition
+            .as_ref()
+            .is_some_and(StaticCondition::needs_defending_player_anchor)
+    {
+        return false;
+    }
+
     if !static_condition_matches_context(state, obj.id, obj.controller, def, context) {
         return false;
     }
 
-    // CR 508.1d: Scoped attack prohibitions (Eriette, Propaganda-family flat
+    // CR 508.1c: Scoped attack prohibitions (Eriette, Propaganda-family flat
     // restrictions) only apply when the declared target matches `attack_defended`.
     // When no target is in context (eligibility queries), skip scoped statics so
     // the creature remains able to attack other players.
@@ -767,7 +844,7 @@ fn static_ability_match_applies(
                 state,
                 context.attack_target.as_ref(),
                 defended,
-                obj.controller,
+                def.source_controller.unwrap_or(obj.controller),
                 obj.owner,
             ) {
                 return false;
@@ -1833,22 +1910,26 @@ fn static_condition_matches_context(
     context: &StaticCheckContext,
 ) -> bool {
     def.condition.as_ref().is_none_or(|condition| {
-        // CR 508.1b / CR 508.5: during attacker declaration, "defending
-        // player" means the player defended by THIS proposed attack target,
-        // not a creature already recorded in CombatState (there is none yet).
-        // Bind the otherwise normal typed quantity AST just for this legality
-        // check; every non-combat evaluation retains its existing semantics.
-        let bound_condition = context.attack_target.map(|target| {
-            let defending =
-                crate::game::combat::defending_player_for_target_or(state, target, controller);
-            bind_proposed_defending_player(condition, defending)
-        });
-        let condition = bound_condition.as_ref().unwrap_or(condition);
-        if let Some(recipient_id) = context.target_id {
-            evaluate_condition_with_recipient(state, condition, controller, source_id, recipient_id)
-        } else {
-            evaluate_condition(state, condition, controller, source_id)
+        // CR 508.1b: a proposed player defender does not yet have a combat
+        // entry, so `DefendingPlayer` quantities cannot be resolved through
+        // the ordinary combat context. Rebind them to the declaration-time
+        // player before evaluating the condition.
+        let condition = match context.attack_target {
+            Some(AttackTarget::Player(defending_player)) => {
+                bind_proposed_defending_player(condition, defending_player)
+            }
+            _ => condition.clone(),
+        };
+        // CR 611.3a: the affected object is the recipient anchor.
+        // CR 508.1c: the attack target under validation is the declaration-time
+        // defending-player anchor — carried here so a condition needing it can
+        // answer BEFORE CR 508.1k records the attacker in `state.combat`.
+        let anchors = match context.target_id {
+            Some(recipient) => ConditionContext::recipient(recipient),
+            None => ConditionContext::NONE,
         }
+        .with_declared_attack(context.attack_target);
+        evaluate_condition_with_context(state, &condition, controller, source_id, anchors)
     })
 }
 
@@ -1899,11 +1980,11 @@ fn bind_proposed_defending_player(
             // controller to the proposed defender. Keep an unexpected manual
             // non-typed filter intact rather than inventing a broader match.
             filter: Some(match filter {
-                TargetFilter::Typed(typed) => TargetFilter::Typed(
-                    typed.clone().controller(ControllerRef::SpecificPlayer {
+                TargetFilter::Typed(typed) => {
+                    TargetFilter::Typed(typed.clone().controller(ControllerRef::SpecificPlayer {
                         id: defending_player,
-                    }),
-                ),
+                    }))
+                }
                 other => other.clone(),
             }),
         },
@@ -2074,6 +2155,10 @@ pub(crate) fn static_filter_matches(
                         crate::types::ability::ControllerRef::TargetPlayer
                         | crate::types::ability::ControllerRef::TargetOpponent => false,
                         crate::types::ability::ControllerRef::ParentTargetController => false,
+                        // Engine constraint: a static ability has no trigger
+                        // event window, so the damage recipient's controller is
+                        // unresolvable here. Fail closed, as above.
+                        crate::types::ability::ControllerRef::EventTargetController => false,
                         crate::types::ability::ControllerRef::ParentTargetOwner => false,
                         crate::types::ability::ControllerRef::DefendingPlayer => false,
                         // CR 613.1: chosen-player scope has no static context here.
@@ -2415,9 +2500,7 @@ mod tests {
         );
         let def = StaticDefinition::new(StaticMode::CantAttack).condition(
             StaticCondition::DefendingPlayerControls {
-                filter: TargetFilter::Typed(
-                    TypedFilter::new(TypeFilter::Artifact),
-                ),
+                filter: TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact)),
             },
         );
         let context = StaticCheckContext {
@@ -2450,6 +2533,122 @@ mod tests {
             static_condition_matches_context(&state, attacker, PlayerId(0), &def, &context),
             "the restriction must apply when the proposed defender controls an artifact"
         );
+    }
+
+    /// Controller-relative defended scopes may use a snapshotted installing
+    /// player, while owner-relative scopes remain anchored to the carrier's
+    /// owner and intrinsic definitions still fall back to its current controller.
+    #[test]
+    fn defended_attack_scope_preserves_owner_and_intrinsic_anchors() {
+        let mut state = GameState::new(crate::types::format::FormatConfig::standard(), 3, 42);
+        let carrier = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(1),
+            "Restricted Creature".to_string(),
+            Zone::Battlefield,
+        );
+        state.objects.get_mut(&carrier).unwrap().controller = PlayerId(2);
+        let owner_walker = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(1),
+            "Owner Walker".to_string(),
+            Zone::Battlefield,
+        );
+        let installer_walker = create_object(
+            &mut state,
+            CardId(3),
+            PlayerId(0),
+            "Installer Walker".to_string(),
+            Zone::Battlefield,
+        );
+        for walker in [owner_walker, installer_walker] {
+            state
+                .objects
+                .get_mut(&walker)
+                .unwrap()
+                .card_types
+                .core_types
+                .push(CoreType::Planeswalker);
+        }
+        let obj = state.objects.get(&carrier).unwrap();
+
+        let owner_scoped = StaticDefinition::new(StaticMode::CantAttack)
+            .affected(TargetFilter::SelfRef)
+            .attack_defended(Some(
+                crate::types::triggers::AttackTargetFilter::OwnerOrPlaneswalker,
+            ))
+            .source_controller(PlayerId(0));
+        let owner_context = StaticCheckContext {
+            target_id: Some(carrier),
+            attack_target: Some(AttackTarget::Player(PlayerId(1))),
+            ..Default::default()
+        };
+        assert!(static_ability_match_applies(
+            &state,
+            &StaticMode::CantAttack,
+            &owner_context,
+            obj,
+            &owner_scoped,
+        ));
+        let installer_context = StaticCheckContext {
+            attack_target: Some(AttackTarget::Player(PlayerId(0))),
+            ..owner_context.clone()
+        };
+        assert!(!static_ability_match_applies(
+            &state,
+            &StaticMode::CantAttack,
+            &installer_context,
+            obj,
+            &owner_scoped,
+        ));
+        let owner_walker_context = StaticCheckContext {
+            attack_target: Some(AttackTarget::Planeswalker(owner_walker)),
+            ..owner_context.clone()
+        };
+        assert!(static_ability_match_applies(
+            &state,
+            &StaticMode::CantAttack,
+            &owner_walker_context,
+            obj,
+            &owner_scoped,
+        ));
+        let installer_walker_context = StaticCheckContext {
+            attack_target: Some(AttackTarget::Planeswalker(installer_walker)),
+            ..owner_context.clone()
+        };
+        assert!(!static_ability_match_applies(
+            &state,
+            &StaticMode::CantAttack,
+            &installer_walker_context,
+            obj,
+            &owner_scoped,
+        ));
+
+        let intrinsic = StaticDefinition::new(StaticMode::CantAttack)
+            .affected(TargetFilter::SelfRef)
+            .attack_defended(Some(
+                crate::types::triggers::AttackTargetFilter::PlayerOrPlaneswalker,
+            ));
+        let controller_context = StaticCheckContext {
+            attack_target: Some(AttackTarget::Player(PlayerId(2))),
+            ..owner_context.clone()
+        };
+        assert!(static_ability_match_applies(
+            &state,
+            &StaticMode::CantAttack,
+            &controller_context,
+            obj,
+            &intrinsic,
+        ));
+        assert!(!static_ability_match_applies(
+            &state,
+            &StaticMode::CantAttack,
+            &installer_context,
+            obj,
+            &intrinsic,
+        ));
     }
 
     /// Unit 2, site #1: `check_static_ability` gates its O(N) whole-battlefield

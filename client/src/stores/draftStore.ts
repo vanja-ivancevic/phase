@@ -18,11 +18,15 @@ import {
   normalizeVirtualBasicCount,
 } from "../components/draft/workspace/workspaceMigration";
 import {
+  appendWorkspaceInstanceToResolvedDestination,
   createDraftWorkspaceState,
   makeInteractiveVirtualBasicInstanceId,
+  placeArrivingPoolCards,
   reconcileWorkspaceState,
+  unplacedPoolIds,
   updateWorkspacePlacement,
 } from "../components/draft/workspace/workspacePlacement";
+import { getArrivingCardBoardPreferences } from "../components/draft/workspace/workspacePreferences";
 import {
   addVirtualBasic,
   projectDeckNames,
@@ -45,6 +49,7 @@ import {
   publishInitialDraftMatch,
   publishStagedDraftMatch,
   recordDraftMatchResult,
+  saveDraftRun,
   runLimits,
   type ActiveQuickDraftMeta,
   type DraftMatchPayload,
@@ -389,10 +394,71 @@ type WorkspaceInstallOperation =
       readonly persistence: "schedule";
     };
 
+/**
+ * Ids this operation resolves a placement for ITSELF, which the arriving pass
+ * must leave alone.
+ *
+ * A `sideboard` destination, because the pass is deck-only: the card still
+ * carries reconcile's `"deck"` default when the pass runs, so the pass would
+ * stamp a deck-geometry column that `applyDestination` then carries into the
+ * sideboard, to be clamped by `normalizeWorkspaceForBoardGeometry` to that
+ * zone's last column once it overflows the narrower sideboard.
+ *
+ * A `placementHint`, because `applyDestination` falls back per FIELD:
+ * `placementHint?.row ?? placement.row`. `DraftPickPlacementHint.row` is
+ * optional, and `useDraftWorkspaceDrag` omits it whenever the drop hit a column
+ * but no row band. On a two-row board the pass would then decide that card's
+ * row through the engine classification, where the hint path has always fallen
+ * back to reconcile's default — a drag-behaviour change this change has no
+ * business making. That card's own COLUMN is unaffected either way, since a
+ * hint always wins there — `row` is the whole of what this arm protects.
+ *
+ * `acknowledged-auto-pick` installs to `"deck"` unconditionally below, so only
+ * its hint can exclude it.
+ */
+function operationResolvesOwnPlacement(operation: WorkspaceInstallOperation): readonly string[] {
+  switch (operation.kind) {
+    case "state":
+      return [];
+    case "acknowledged-pick":
+      return operation.placementHint !== undefined || operation.destination !== "deck"
+        ? operation.placeInstanceIds
+        : [];
+    case "acknowledged-auto-pick":
+      return operation.placementHint !== undefined ? [operation.addedInstanceId] : [];
+  }
+}
+
 function installWorkspace(operation: WorkspaceInstallOperation): void {
-  let workspace = reconcileWorkspaceState(
-    operation.baseWorkspace,
+  const ownPlacement = operationResolvesOwnPlacement(operation);
+  // Against `operation.baseWorkspace`, the PRE-reconcile workspace, so a card
+  // that entered the pool on this install still counts as arriving. Asked after
+  // the reconcile below it would already hold the column-0 default and be
+  // filtered out, which is why the id list is computed here and not inside the
+  // placement call.
+  const arriving = unplacedPoolIds(operation.baseWorkspace, operation.authoritativeView.pool)
+    .filter((instanceId) => !ownPlacement.includes(instanceId));
+  // Sorted placement for cards that reach the pool with no hint resolved for
+  // them: the `kind: "state"` installs `startLocalDraft` and `resumeDraft` make,
+  // plus the hint-less deck picks `PackDisplay.request` dispatches through
+  // `pickCard`, `pickCardStep` and `pickCardWithDraftEffect`. Without this they
+  // stack in the board's first column whatever the sort says.
+  // BEFORE the switch, and the order is load-bearing — do not move this below
+  // it. For a multi-id hint-less DECK pick (`pickCardWithDraftEffect` from
+  // `PackDisplay.request`) both calls write the same two ids' placements: this
+  // pass appends them in POOL order, `applyDestination` appends them in REQUEST
+  // order and re-appends an id it finds already placed (`if (!placement)
+  // continue` is its only skip). Whichever runs last decides the stack order.
+  // Pinned by `appends_a_hint_less_deck_draft_effect_pick_in_request_order`,
+  // which was the single placement failure of a full `npx vitest run` with this
+  // call moved below the switch — it failed there on `second.order`, expecting
+  // 0 and getting 1, the pool-order result.
+  let workspace = placeArrivingPoolCards(
+    reconcileWorkspaceState(operation.baseWorkspace, operation.authoritativeView.pool),
+    arriving,
     operation.authoritativeView.pool,
+    operation.authoritativeView.pool_groups,
+    getArrivingCardBoardPreferences(),
   );
   switch (operation.kind) {
     case "state":
@@ -491,8 +557,7 @@ function applyDestination(
   for (const instanceId of instanceIds) {
     const placement = next.placements[instanceId];
     if (!placement) continue;
-    next = updateWorkspacePlacement(next, pool, instanceId, {
-      ...placement,
+    next = appendWorkspaceInstanceToResolvedDestination(next, pool, instanceId, {
       zone: destination,
       column: placementHint?.column ?? placement.column,
       row: placementHint?.row ?? placement.row,
@@ -803,11 +868,18 @@ function unresolvedStageMatches(
     && stage.resultCountAtLaunch === run.results.length;
 }
 
-function matchPayload(playerDeck: string[], opponentDeck: string[]): DraftMatchPayload {
+function withBoosterPackPool(run: DraftRunState, boosterPackPool: string[] | null | undefined): DraftRunState {
+  return run.booster_pack_pool === undefined && boosterPackPool !== undefined
+    ? { ...run, booster_pack_pool: boosterPackPool }
+    : run;
+}
+
+function matchPayload(run: DraftRunState): DraftMatchPayload {
   return {
-    player: { main_deck: playerDeck, sideboard: [], commander: [] },
-    opponent: { main_deck: opponentDeck, sideboard: [], commander: [] },
+    player: { main_deck: run.playerDeck, sideboard: [], commander: [] },
+    opponent: { main_deck: run.opponentDeck, sideboard: [], commander: [] },
     ai_decks: [],
+    booster_pack_pool: run.booster_pack_pool,
   };
 }
 
@@ -905,20 +977,33 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
       const meta = await inspectActiveQuickDraftLifecycle("inspect");
       if (!meta || lifecycle !== lifecycleGeneration) return;
       resumeId = meta.id;
-      const [saved, run] = await Promise.all([loadQuickDraftSession(meta.id), loadDraftRun(meta.id)]);
+      const [saved, savedRun] = await Promise.all([loadQuickDraftSession(meta.id), loadDraftRun(meta.id)]);
+      let run = savedRun;
       if (!saved || ((meta.phase === "playing" || meta.phase === "complete") && !run)) {
         await cleanupQuickDraftLifecycle(meta.id);
         return;
       }
       const database = await prepareCardDatabase(meta.difficulty >= 3 || meta.kind === "Sealed");
       const adapter = new DraftAdapter();
-      const view = await withDraftEngineOperation((lease) => {
+      const restored = await withDraftEngineOperation((lease) => {
         if (lifecycle !== lifecycleGeneration) throw new Error("Stale draft resume");
         if (database !== null) lease.loadCardDatabase(database);
         if (lifecycle !== lifecycleGeneration) throw new Error("Stale draft resume");
-        return lease.importSession(saved.sessionJson, meta.difficulty);
+        return {
+          view: lease.importSession(saved.sessionJson, meta.difficulty),
+          boosterPackPool: lease.boosterPackPoolForGame(),
+        };
       });
       if (lifecycle !== lifecycleGeneration) return;
+      const { view } = restored;
+      if (run) {
+        const upgraded = withBoosterPackPool(run, restored.boosterPackPool);
+        if (upgraded !== run) {
+          await saveDraftRun(meta.id, upgraded);
+          if (lifecycle !== lifecycleGeneration) return;
+          run = upgraded;
+        }
+      }
       // The durable run is authoritative for run phases: the run and the meta
       // are persisted as separate writes (publishInitialDraftMatch /
       // recordDraftMatchResult save the run first), so a crash between them
@@ -1037,7 +1122,10 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
     });
   },
 
-  selectCard: (selectedCard) => set({ selectedCard }),
+  selectCard: (selectedCard) => {
+    if (get().pickInteractionLocked) return;
+    set({ selectedCard });
+  },
 
   addBasicLand: (name) => {
     const state = get();
@@ -1218,20 +1306,27 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
       if (durableRun) {
         if (!unresolvedStageMatches(durableRun, state.draftId, state.runFormat, playerDeck)
           || durableRun.results.length !== 0) throw new Error("Conflicting staged draft match");
-        run = durableRun;
+        const boosterPackPool = await withDraftEngineOperation((lease) => lease.boosterPackPoolForGame());
+        if (!isExclusive(token, "launch") || lifecycle !== lifecycleGeneration || revision !== workspaceRevision) return;
+        run = withBoosterPackPool(durableRun, boosterPackPool);
       } else {
         const botSeat = pickBotSeat([], state.view);
         const prepared = await withDraftEngineOperation((lease) => {
           if (!isExclusive(token, "launch") || lifecycle !== lifecycleGeneration || revision !== workspaceRevision) {
             throw new Error("Stale draft match launch");
           }
-          return { sessionJson: lease.exportSession(), botDeck: lease.getBotDeck(botSeat) };
+          return {
+            sessionJson: lease.exportSession(),
+            botDeck: lease.getBotDeck(botSeat),
+            boosterPackPool: lease.boosterPackPoolForGame(),
+          };
         });
         sessionJson = prepared.sessionJson;
         const opponentDeck = expandSuggestedDeck(prepared.botDeck);
         const gameId = crypto.randomUUID();
         run = {
           format: state.runFormat,
+          booster_pack_pool: prepared.boosterPackPool,
           results: [],
           playerDeck,
           opponentDeck,
@@ -1262,14 +1357,15 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
           },
           run,
           gameId,
-          payload: matchPayload(run.playerDeck, run.opponentDeck),
+          payload: matchPayload(run),
           meta,
         });
       } else {
         await publishStagedDraftMatch({
           draftId: state.draftId,
+          run: run !== durableRun ? run : undefined,
           gameId,
-          payload: matchPayload(run.playerDeck, run.opponentDeck),
+          payload: matchPayload(run),
           meta,
         });
       }
@@ -1326,12 +1422,15 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
     const lifecycle = lifecycleGeneration;
     const revision = workspaceRevision;
     try {
-      const durableRun = await loadDraftRun(state.draftId);
-      if (!durableRun) throw new Error("Missing durable draft run");
+      const savedRun = await loadDraftRun(state.draftId);
+      if (!savedRun) throw new Error("Missing durable draft run");
+      const boosterPackPool = await withDraftEngineOperation((lease) => lease.boosterPackPoolForGame());
+      if (!isExclusive(token, "launch") || lifecycle !== lifecycleGeneration || revision !== workspaceRevision) return;
+      const durableRun = withBoosterPackPool(savedRun, boosterPackPool);
       const playerDeck = projectDeckNames(state.workspaceState, state.view.pool);
       if (draftRunPhase(durableRun) === "complete") throw new Error("Draft run is complete");
       let run = durableRun;
-      let saveRun = false;
+      let saveRun = durableRun !== savedRun;
       if (durableRun.activeMatch) {
         if (!unresolvedStageMatches(durableRun, state.draftId, state.runFormat, playerDeck)) {
           throw new Error("Conflicting staged draft match");
@@ -1370,7 +1469,7 @@ export const useDraftStore = create<DraftStoreState & DraftStoreActions>()((set,
         draftId: state.draftId,
         run: saveRun ? run : undefined,
         gameId,
-        payload: matchPayload(run.playerDeck, run.opponentDeck),
+        payload: matchPayload(run),
         meta,
       });
       if (!isExclusive(token, "launch") || lifecycle !== lifecycleGeneration || revision !== workspaceRevision) return;

@@ -7,9 +7,9 @@ use nom::branch::alt;
 use nom::bytes::complete::tag;
 use nom::bytes::complete::take_until;
 use nom::character::complete::multispace1;
-use nom::combinator::{cut, eof, map, opt, peek, value, verify};
+use nom::combinator::{cut, eof, map, not, opt, peek, recognize, value, verify};
 use nom::multi::many0;
-use nom::sequence::{preceded, terminated};
+use nom::sequence::{delimited, preceded, terminated};
 use nom::Parser;
 
 use super::bridge::nom_on_lower;
@@ -22,8 +22,9 @@ use super::primitives::{
 use super::quantity as nom_quantity;
 use super::target as nom_target;
 use crate::parser::oracle_target::{
-    cast_capable_zones_except, parse_shared_quality, parse_type_phrase, parse_zone_suffix,
-    parse_zone_word, peek_zone_boundary, superlative_property_filter_prop,
+    cast_capable_zones_except, parse_shared_quality, parse_type_phrase_folding,
+    parse_type_phrase_folding as parse_type_phrase, parse_zone_suffix, parse_zone_word,
+    peek_zone_boundary, superlative_property_filter_prop,
 };
 use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
@@ -31,13 +32,146 @@ use crate::types::ability::{
     CastManaSpentMetric, CommanderOwnership, Comparator, ControllerRef, CountScope, DamageChannel,
     DamageGroupKey, DamageKindFilter, FilterProp, ObjectProperty, ObjectScope, PlayerFilter,
     PlayerRelation, PlayerScope, PropertyAggregate, QuantityExpr, QuantityRef, SharedQuality,
-    SharedQualityRelation, StaticCondition, TargetFilter, TypeFilter, TypedFilter, ZoneRef,
+    SharedQualityRelation, StaticCondition, TargetFilter, TrackedAnaphorSource, TypeFilter,
+    TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::PlayerActionKind;
 use crate::types::game_state::DayNight;
 use crate::types::keywords::Keyword;
 use crate::types::zones::Zone;
+
+// =========================================================================
+// Contraction & Apostrophe Combinators
+// =========================================================================
+// MTGJSON and Scryfall English Oracle texts use both
+// ASCII straight apostrophes (`'`, U+0027) and typographic right single
+// quotation marks (`’`, U+2019). The combinators below provide composable,
+// parameterized building blocks across the condition grammar so individual
+// rules do not duplicate string literals or leave typographic forms unhandled.
+
+/// Matches either ASCII straight apostrophe (`'`) or typographic curly apostrophe (`’`).
+pub(crate) fn parse_apostrophe(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("'"), tag("\u{2019}"))).parse(input)
+}
+
+/// Matches `'s` or `’s` possessive / contraction suffix.
+pub(crate) fn parse_apostrophe_s(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("'s"), tag("\u{2019}s"))).parse(input)
+}
+
+/// Matches `'re` or `’re` contraction suffix (e.g. "they're").
+pub(crate) fn parse_apostrophe_re(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("'re"), tag("\u{2019}re"))).parse(input)
+}
+
+/// Matches `"isn't"` or `"isn’t"`.
+pub(crate) fn parse_isnt(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("isn't"), tag("isn\u{2019}t"))).parse(input)
+}
+
+/// Matches `"wasn't"` or `"wasn’t"`.
+pub(crate) fn parse_wasnt(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("wasn't"), tag("wasn\u{2019}t"))).parse(input)
+}
+
+/// Matches `"weren't"` or `"weren’t"`.
+pub(crate) fn parse_werent(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("weren't"), tag("weren\u{2019}t"))).parse(input)
+}
+
+/// Matches `"doesn't"` or `"doesn’t"`.
+pub(crate) fn parse_doesnt(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("doesn't"), tag("doesn\u{2019}t"))).parse(input)
+}
+
+/// Matches `"don't"` or `"don’t"`.
+pub(crate) fn parse_dont(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("don't"), tag("don\u{2019}t"))).parse(input)
+}
+
+/// Matches `"hasn't"` or `"hasn’t"`.
+pub(crate) fn parse_hasnt(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("hasn't"), tag("hasn\u{2019}t"))).parse(input)
+}
+
+/// Matches `"you've"` or `"you’ve"`.
+pub(crate) fn parse_youve(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("you've"), tag("you\u{2019}ve"))).parse(input)
+}
+
+/// Matches `"haven't"` or `"haven’t"`.
+pub(crate) fn parse_havent(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("haven't"), tag("haven\u{2019}t"))).parse(input)
+}
+
+/// Matches `"didn't"` or `"didn’t"`.
+pub(crate) fn parse_didnt(input: &str) -> OracleResult<'_, &str> {
+    alt((tag("didn't"), tag("didn\u{2019}t"))).parse(input)
+}
+
+/// Matches `"you're"` / `"you’re"` or `"you are"`.
+pub(crate) fn parse_you_are(input: &str) -> OracleResult<'_, &str> {
+    alt((recognize((tag("you"), parse_apostrophe_re)), tag("you are"))).parse(input)
+}
+
+/// Matches `"there's"` / `"there’s"` or `"there is"`.
+pub(crate) fn parse_theres(input: &str) -> OracleResult<'_, &str> {
+    alt((
+        recognize((tag("there"), parse_apostrophe_s)),
+        tag("there is"),
+    ))
+    .parse(input)
+}
+
+/// Matches `"it's"` / `"it’s"` / `"it is"`.
+pub(crate) fn parse_it_is(input: &str) -> OracleResult<'_, &str> {
+    alt((recognize((tag("it"), parse_apostrophe_s)), tag("it is"))).parse(input)
+}
+
+/// Matches the copula following "it" (e.g. "it's blue", "it is blue", "it isn't blue", "it is not blue").
+/// Returns `(rest, negated: bool)`.
+pub(crate) fn parse_it_copula(input: &str) -> OracleResult<'_, bool> {
+    // Negated copulae (" isn't ", " is not ") MUST be tried before affirmative
+    // ("'s ", " is ") so " is not " is not greedily split into " is " + "not …".
+    alt((
+        value(
+            true,
+            alt((recognize((tag(" "), parse_isnt, tag(" "))), tag(" is not "))),
+        ),
+        value(
+            false,
+            alt((recognize((parse_apostrophe_s, tag(" "))), tag(" is "))),
+        ),
+    ))
+    .parse(input)
+}
+
+/// Matches standard affirmative or negated copula following an explicit noun phrase
+/// ("is " -> false, "isn't " / "isn’t " / "is not " -> true).
+pub(crate) fn parse_copula_is_or_isnt(input: &str) -> OracleResult<'_, bool> {
+    // Negated MUST be tried before affirmative so "is not " is not greedily split into "is ".
+    alt((
+        value(
+            true,
+            alt((recognize((parse_isnt, tag(" "))), tag("is not "))),
+        ),
+        value(false, tag("is ")),
+    ))
+    .parse(input)
+}
+
+/// Matches pronoun contraction subjects: `"he's "` / `"he’s "` / `"she's "` / `"she’s "` / `"they're "` / `"they’re "`.
+pub(crate) fn parse_pronoun_copula_contraction_prefix(input: &str) -> OracleResult<'_, ()> {
+    alt((
+        value(
+            (),
+            (alt((tag("he"), tag("she"))), parse_apostrophe_s, tag(" ")),
+        ),
+        value((), (tag("they"), parse_apostrophe_re, tag(" "))),
+    ))
+    .parse(input)
+}
 
 /// Parse a condition phrase from Oracle text.
 ///
@@ -120,6 +254,7 @@ fn parse_condition_connector(input: &str) -> OracleResult<'_, ConditionConnectiv
 
 fn parse_single_inner_condition(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
+        parse_you_attacked_with_total_power_this_combat,
         // CR 601.2h + CR 608.2c: whole-phrase "it wasn't cast or no mana was spent
         // to cast <self>" gate. MUST precede the event-history arm's
         // `parse_was_cast_condition`, which would otherwise claim the bare "it
@@ -134,6 +269,48 @@ fn parse_single_inner_condition(input: &str) -> OracleResult<'_, StaticCondition
     .parse(input)
 }
 
+/// CR 508.1a + CR 603.4: "you attacked with creatures with total power N or
+/// greater this combat" compares declaration-time power from this trigger's
+/// attacker batch rather than the current battlefield or turn history.
+fn parse_you_attacked_with_total_power_this_combat(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("you attacked with ").parse(input)?;
+    let (rest, condition) = parse_creatures_with_total_power_or_greater(rest)?;
+    let (rest, _) = tag(" this combat").parse(rest)?;
+    Ok((rest, condition))
+}
+
+/// Parse the shared attacker-total threshold phrase after its grammatical
+/// subject: "creatures with total power N or greater".
+fn parse_creatures_with_total_power_or_greater(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("creatures with total power ").parse(input)?;
+    let (rest, threshold) = parse_number(rest)?;
+    let (rest, comparator) = value(Comparator::GE, tag(" or greater")).parse(rest)?;
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::PropertyAggregate(
+                    PropertyAggregate::new(
+                        AggregateFunction::Sum,
+                        ObjectProperty::Power,
+                        CardTypeSetSource::TrackedSet {
+                            set: TrackedAnaphorSource::TriggeringBatch,
+                            caused_by: None,
+                        },
+                    )
+                    .expect("object property aggregate is valid"),
+                ),
+            },
+            comparator,
+            rhs: QuantityExpr::Fixed {
+                value: threshold as i32,
+            },
+        },
+    ))
+}
+
 /// CR 601.2h + CR 608.2c: "it wasn't cast or no mana was spent to cast <self>" —
 /// the disjunctive enters-with gate on Freestrider Commando. Both disjuncts hold
 /// exactly when zero mana was spent to cast this object (a never-cast object and
@@ -145,11 +322,12 @@ fn parse_single_inner_condition(input: &str) -> OracleResult<'_, StaticCondition
 /// matches the incumbent `parse_no_mana_spent_to_cast_target_condition`
 /// (`oracle_effect/conditions.rs`) for cross-parser consistency.
 fn parse_it_wasnt_cast_or_no_mana_spent(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((
-        tag::<_, _, OracleError<'_>>("it wasn't cast or no mana was spent to cast "),
-        tag("it wasn\u{2019}t cast or no mana was spent to cast "),
-    ))
-    .parse(input)?;
+    let (rest, _) = (
+        tag("it "),
+        parse_wasnt,
+        tag(" cast or no mana was spent to cast "),
+    )
+        .parse(input)?;
     let (rest, scope) = nom_quantity::parse_mana_spent_self_subject(rest)?;
     Ok((
         rest,
@@ -200,8 +378,10 @@ fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondit
         parse_at_least_one_creature_blocking_source,
         parse_source_state_conditions,
         parse_player_state_conditions,
-        // CR 402.1 + CR 602.5: existential "a player has <hand-size predicate>".
-        parse_a_player_has_hand_predicate,
+        // CR 402.1 + CR 602.5 + CR 603.4 + CR 102.1: existential "a player has
+        // <hand-size predicate>" OR "a player has more <property> than each
+        // other player" (the unique-leader tail).
+        parse_a_player_has_property_condition,
         parse_you_have_conditions,
         parse_parent_target_controller_more_life_than_you,
         parse_that_player_has_conditions,
@@ -217,6 +397,15 @@ fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondit
 
 /// Keeps the top-level state-condition grammar below nom's tuple-arity limit
 /// while preserving the precedence of its control-related productions.
+///
+/// The group is an ARITY-MANAGEMENT device first. Besides the control-related
+/// productions it also hosts the THRESHOLD-COUNT family — the
+/// `parse_ge_threshold`-headed arms that compare an object count against a
+/// fixed number (`parse_creatures_are_attacking_count_ge`,
+/// `parse_attached_to_referent_count_ge`). The attacking-count arm lives here
+/// because it MUST precede `parse_control_conditions` (see its comment below);
+/// the attachment-threshold arm lives here for family proximity and to leave
+/// the parent `alt`'s remaining tuple headroom free.
 fn parse_control_presence_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
         // CR 201.2: Named-control clauses MUST precede the generic compound
@@ -229,6 +418,14 @@ fn parse_control_presence_conditions(input: &str) -> OracleResult<'_, StaticCond
         // `parse_control_conditions` so the bare count phrase is not mis-read as
         // "you control N or more creatures".
         parse_creatures_are_attacking_count_ge,
+        // CR 301.5 + CR 303.4 + CR 611.3a: "N or more <type> are attached to
+        // <referent>" — the attachment-threshold sibling of the attacking-count
+        // arm above. Ordering relative to that arm is NOT load-bearing (its
+        // `tag("creatures are attacking")` and this arm's required
+        // `" attached to "` referent are mutually exclusive after the shared
+        // `parse_ge_threshold` head); they are adjacent so the threshold-count
+        // family is discoverable in one place.
+        parse_attached_to_referent_count_ge,
         parse_source_controlled_or_your_commander,
         parse_you_control_more_than_combat_player,
         parse_you_control_more_than_each_opponent,
@@ -335,7 +532,7 @@ fn parse_you_control_more_than_each_opponent(input: &str) -> OracleResult<'_, St
 /// a noncommander source controlled by you satisfies the first arm.
 fn parse_source_controlled_or_your_commander(input: &str) -> OracleResult<'_, StaticCondition> {
     let (input, _) = tag("you control ~ or ").parse(input)?;
-    let (input, _) = alt((tag("it's your commander"), tag("it is your commander"))).parse(input)?;
+    let (input, _) = (parse_it_is, tag(" your commander")).parse(input)?;
 
     Ok((
         input,
@@ -376,9 +573,98 @@ fn parse_remaining_state_presence_conditions(input: &str) -> OracleResult<'_, St
         parse_quantity_quantity_comparison,
         parse_zone_conditions,
         parse_there_are_counters_on_source,
+        // CR 105.2 + CR 611.3a: "<color> is the most common color among all
+        // permanents [or is tied for most common]" (Invasion Djinn cycle).
+        parse_color_is_most_common_among_permanents_condition,
         parse_remaining_state_presence_conditions_tail,
     ))
     .parse(input)
+}
+
+/// CR 105.2 + CR 611.3a: "<color> is the most common color among all
+/// permanents[ or is tied for most common]" — the Invasion Djinn cycle (Sulam
+/// Djinn, Goham Djinn, Ruham Djinn, Zanam Djinn, Halam Djinn): "This creature
+/// gets -2/-2 as long as [color] is the most common color among all
+/// permanents or is tied for most common."
+///
+/// Maps to a `StaticCondition::And` of two `QuantityComparison`s over the
+/// battlefield-wide count of permanents with the named color
+/// (`QuantityRef::ObjectCount`) and the largest per-color count across every
+/// color (`QuantityRef::ObjectCountBySharedQuality` grouped by
+/// `SharedQuality::Color`). `Comparator::GE` already admits ties, so the
+/// optional "or is tied for most common" tail is redundant text discarded
+/// here — both phrasings collapse to the same comparison, mirroring how
+/// `parse_shares_most_common_color_condition` treats Heroic Defiance's
+/// analogous "or a color tied for most common" tail.
+///
+/// The second conjunct (`max_bucket >= 1`) is required for correctness, not
+/// stylistic symmetry: when every battlefield permanent is colorless, no
+/// color bucket exists and `ObjectCountBySharedQuality`'s `Max` aggregate
+/// (CR 109.3 defines color as a characteristic, but does not itself define
+/// this grouped aggregate or its empty-population behavior) returns `0` for
+/// an empty bucket set — coinciding with the named color's own `0` count and
+/// making a bare `named_count >= max_bucket` comparison vacuously true. That
+/// would wrongly treat "no color exists" as "this color is most common".
+/// Requiring `max_bucket >= 1` alongside `named_count >= max_bucket` forces
+/// `named_count >= 1` too, so the pair is only satisfiable when a real
+/// colored population exists and the named color is (tied for) its largest
+/// bucket — matching how `eval_shares_color_with_most_common_color`
+/// (`game::conditions`) explicitly returns `false` when there is no colored
+/// permanent for the analogous Heroic Defiance condition.
+/// Deliberately composed from existing generic `QuantityRef` building blocks
+/// rather than a new `StaticCondition` variant — the named-color population
+/// and the "most common among all colors" aggregate are both already-typed
+/// axes, so no new leaf is needed.
+fn parse_color_is_most_common_among_permanents_condition(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, color) = parse_color(input)?;
+    let (rest, _) = tag(" is the most common color among all permanents").parse(rest)?;
+    let (rest, _) = opt(tag(" or is tied for most common")).parse(rest)?;
+
+    let all_permanents = TargetFilter::Typed(TypedFilter {
+        type_filters: vec![TypeFilter::Permanent],
+        controller: None,
+        properties: Vec::new(),
+    });
+    let colored_permanents = TargetFilter::Typed(TypedFilter {
+        type_filters: vec![TypeFilter::Permanent],
+        controller: None,
+        properties: vec![FilterProp::HasColor { color }],
+    });
+    let max_color_bucket = || QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCountBySharedQuality {
+            filter: all_permanents.clone(),
+            quality: SharedQuality::Color,
+            aggregate: AggregateFunction::Max,
+        },
+    };
+
+    Ok((
+        rest,
+        StaticCondition::And {
+            conditions: vec![
+                // A most-common-color bucket must actually exist — false when
+                // every permanent is colorless (no bucket reaches size 1).
+                StaticCondition::QuantityComparison {
+                    lhs: max_color_bucket(),
+                    comparator: Comparator::GE,
+                    rhs: QuantityExpr::Fixed { value: 1 },
+                },
+                // The named color's count must be at least as large as the
+                // largest bucket — i.e. it leads or ties for most common.
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCount {
+                            filter: colored_permanents,
+                        },
+                    },
+                    comparator: Comparator::GE,
+                    rhs: max_color_bucket(),
+                },
+            ],
+        },
+    ))
 }
 
 /// Keeps the remaining state-presence grammar below nom's tuple-arity limit
@@ -420,6 +706,13 @@ fn parse_event_history_conditions(input: &str) -> OracleResult<'_, StaticConditi
         parse_damage_dealt_this_turn_conditions,
         parse_source_damage_threshold_this_turn,
         parse_source_was_blocked_this_turn,
+        // CR 508.1a: affirmative "<source> attacked this turn" — placed directly
+        // beside its negation twin below. No earlier arm can consume a
+        // "<self-subject> attacked" prefix (the state-group arms all require
+        // "is "/"isn't "/"has "/"hasn't "/"'s "/"entered ", and the two
+        // damage-history arms require a damage predicate), so the placement is
+        // order-independent.
+        parse_source_attacked_this_turn,
         parse_source_didnt_this_turn,
         parse_was_cast_condition,
         parse_entered_this_turn,
@@ -467,16 +760,17 @@ fn parse_was_cast_condition(input: &str) -> OracleResult<'_, StaticCondition> {
         // pronoun subjects (he/she/they) join "it" for ETB "if {he|she|they}
         // {wasn't|weren't} cast" cards; "they" takes the plural verb.
         map(
-            alt((
-                tag::<_, _, OracleError<'_>>("it wasn't cast"),
-                tag("it wasn\u{2019}t cast"),
-                tag("he wasn't cast"),
-                tag("he wasn\u{2019}t cast"),
-                tag("she wasn't cast"),
-                tag("she wasn\u{2019}t cast"),
-                tag("they weren't cast"),
-                tag("they weren\u{2019}t cast"),
-            )),
+            (
+                alt((
+                    (
+                        alt((tag("it"), tag("he"), tag("she"))),
+                        tag(" "),
+                        parse_wasnt,
+                    ),
+                    (tag("they"), tag(" "), parse_werent),
+                )),
+                tag(" cast"),
+            ),
             |_| StaticCondition::Not {
                 condition: Box::new(StaticCondition::WasCast { zone: None }),
             },
@@ -528,10 +822,10 @@ fn parse_damage_dealt_this_turn_conditions(input: &str) -> OracleResult<'_, Stat
     .parse(input)
 }
 
-/// Wrapper around `parse_type_phrase` that fails (nom error) when the result is
+/// Wrapper around `parse_type_phrase_folding` that fails (nom error) when the result is
 /// `TargetFilter::Any`, used as a nom-compatible parser combinator.
 fn parse_type_phrase_nonempty(input: &str) -> OracleResult<'_, TargetFilter> {
-    let (filter, rest) = parse_type_phrase(input);
+    let (filter, rest) = parse_type_phrase_folding(input);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -554,7 +848,7 @@ fn parse_type_phrase_nonempty(input: &str) -> OracleResult<'_, TargetFilter> {
 ///     to the one creature/permanent this trigger's damage went to.
 ///   - "a creature", "a permanent", etc. — bare indefinite references that stay
 ///     a generic type-phrase filter (the demonstrative binding does not apply).
-///   - Any `parse_type_phrase` result (e.g. "a creature or planeswalker an
+///   - Any `parse_type_phrase_folding` result (e.g. "a creature or planeswalker an
 ///     opponent controlled" from Rith, Liberated Primeval).
 ///
 /// All forms map to `DamageDealtThisTurn { source: Any, target: <filter>,
@@ -578,7 +872,7 @@ fn parse_subject_was_dealt_excess_damage_this_turn(
         ),
         value(TargetFilter::EventTarget, tag("that permanent")),
         // Bare article form: "a creature or planeswalker an opponent controlled"
-        // (Rith), "a creature", "a permanent", etc. Delegate to parse_type_phrase
+        // (Rith), "a creature", "a permanent", etc. Delegate to parse_type_phrase_folding
         // which handles "a/an <type>", "a/an <type> <controller-suffix>",
         // and compound "a <type> or <type>" forms.
         parse_type_phrase_nonempty,
@@ -654,7 +948,7 @@ fn parse_player_was_dealt_damage_threshold_this_turn(
 /// satisfied when at least one recipient matching the subject was dealt combat
 /// damage this turn by a source matching the `by` filter.
 ///
-/// Builds for the class — the source is parsed by `parse_type_phrase`, so any
+/// Builds for the class — the source is parsed by `parse_type_phrase_folding`, so any
 /// "by a <creature type / creature / permanent>" qualifier is covered, and the
 /// subject covers both "a player" and "an opponent" recipients. The resulting
 /// `QuantityRef::DamageDealtThisTurn` carries `damage_kind: CombatOnly`
@@ -676,7 +970,7 @@ fn parse_player_dealt_combat_damage_by_source_this_turn(
     .parse(input)?;
     let (rest, _) = tag(" was dealt combat damage by ").parse(rest)?;
     // CR 608.2i: the `by` source qualifier — "a Zombie", "a creature", etc.
-    let (source, after_source) = parse_type_phrase(rest);
+    let (source, after_source) = parse_type_phrase_folding(rest);
     if matches!(source, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -931,7 +1225,7 @@ fn parse_control_named_pair(input: &str) -> OracleResult<'_, StaticCondition> {
     let (after_named, type_text) = take_until(" named ").parse(rest)?;
     let (after_named, _) = tag(" named ").parse(after_named)?;
     let filter_base = parse_control_named_type_filter(type_text, input)?;
-    // Strip any FilterProp::Named that parse_type_phrase may have attached so the
+    // Strip any FilterProp::Named that parse_type_phrase_folding may have attached so the
     // synthesized per-name conjuncts carry exactly one Named property each.
     let filter_base = strip_filter_named_property(filter_base);
     let (rest_after_pair, (filters, connector)) =
@@ -961,7 +1255,7 @@ fn parse_control_named_type_filter<'a>(
     type_text: &'a str,
     error_input: &'a str,
 ) -> Result<TargetFilter, nom::Err<OracleError<'a>>> {
-    let (filter, type_remainder) = parse_type_phrase(type_text);
+    let (filter, type_remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) || !type_remainder.trim().is_empty() {
         return Err(nom::Err::Error(nom::error::Error::new(
             error_input,
@@ -1319,7 +1613,7 @@ fn strip_filter_named_property(filter: TargetFilter) -> TargetFilter {
 fn parse_control_presence_tail(input: &str) -> OracleResult<'_, StaticCondition> {
     let _ = alt((parse_article, value((), tag("another ")))).parse(input)?;
 
-    let (filter, remainder) = parse_type_phrase(input);
+    let (filter, remainder) = parse_type_phrase_folding(input);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -1344,24 +1638,26 @@ fn tuple_ws_tag(t: &str) -> impl FnMut(&str) -> OracleResult<'_, &str> + '_ {
 /// Parse turn-based conditions.
 fn parse_turn_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
-        value(StaticCondition::DuringYourTurn, tag("it's your turn")),
-        value(StaticCondition::DuringYourTurn, tag("it is your turn")),
+        value(
+            StaticCondition::DuringYourTurn,
+            (parse_it_is, tag(" your turn")),
+        ),
         // "it's not your turn" → Not(DuringYourTurn)
-        map(tag("it's not your turn"), |_| StaticCondition::Not {
-            condition: Box::new(StaticCondition::DuringYourTurn),
+        map((parse_it_is, tag(" not your turn")), |_| {
+            StaticCondition::Not {
+                condition: Box::new(StaticCondition::DuringYourTurn),
+            }
         }),
         // CR 102.3 + CR 805.4a: "it's an opponent's turn" names an opponent
         // relation, not merely a non-controller active seat. In team games a
         // teammate can be active while the controller's team still has the turn.
         // Both apostrophe forms are accepted at each position (U+0027 straight
         // and U+2019 curly — Scryfall English oracle text uses the curly form).
-        // The surface permutations are composed from two small `alt`s rather than
-        // enumerated as full strings (compose combinators, don't enumerate).
         map(
             (
-                alt((tag("it's"), tag("it\u{2019}s"), tag("it is"))),
+                parse_it_is,
                 tag(" an opponent"),
-                alt((tag("'s"), tag("\u{2019}s"))),
+                parse_apostrophe_s,
                 tag(" turn"),
             ),
             |_| StaticCondition::DuringOpponentsTurn,
@@ -1408,12 +1704,19 @@ fn parse_player_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
         // CR 725.1: "there is no monarch" — no player holds the designation.
         value(
             StaticCondition::NoMonarch,
-            alt((tag("there is no monarch"), tag("there's no monarch"))),
+            alt((
+                tag("there is no monarch"),
+                recognize((tag("there"), parse_apostrophe_s, tag(" no monarch"))),
+            )),
         ),
         // CR 702.131a: Ascend / City's Blessing
         value(
             StaticCondition::HasCityBlessing,
-            tag("you have the city's blessing"),
+            recognize((
+                tag("you have the city"),
+                parse_apostrophe_s,
+                tag(" blessing"),
+            )),
         ),
         // CR 702.195a-b: Storied grants the enduring story player designation.
         value(
@@ -1426,7 +1729,7 @@ fn parse_player_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
             alt((tag("you have max speed"), tag("have max speed"))),
         ),
         map(
-            alt((tag("you don't have max speed"), tag("don't have max speed"))),
+            (opt(tag("you ")), parse_dont, tag(" have max speed")),
             |_| StaticCondition::Not {
                 condition: Box::new(StaticCondition::HasMaxSpeed),
             },
@@ -1435,7 +1738,7 @@ fn parse_player_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
         // CR 309.7: Dungeon completion
         value(
             StaticCondition::CompletedADungeon,
-            tag("you've completed a dungeon"),
+            (parse_youve, tag(" completed a dungeon")),
         ),
         // CR 103.1: Starting-player status. "you weren't the starting player"
         // (Radiant Smite, Cindercone Smite, Sylvan Smite) is the dominant
@@ -1443,7 +1746,7 @@ fn parse_player_state_conditions(input: &str) -> OracleResult<'_, StaticConditio
         // tried first so the longer "weren't" tag wins over "were".
         map(
             alt((
-                tag("you weren't the starting player"),
+                recognize((tag("you "), parse_werent, tag(" the starting player"))),
                 tag("you were not the starting player"),
             )),
             |_| StaticCondition::Not {
@@ -1492,7 +1795,7 @@ fn parse_monarch_identity_subject(input: &str) -> OracleResult<'_, PlayerScope> 
     alt((
         value(
             PlayerScope::Controller,
-            alt((tag("you're "), tag("you are "))),
+            recognize((parse_you_are, tag(" "))),
         ),
         value(
             PlayerScope::ScopedPlayer,
@@ -1668,7 +1971,7 @@ fn merge_attached_predicate_filter(
 /// the result into the subject filter) and the anaphoric "it" recipient path
 /// (`parse_recipient_is_filter_condition`, which uses the bare filter directly as
 /// the recipient match). Uses the same color / legendary-basic supertype /
-/// `parse_type_phrase` recognition the attached path historically used, so the
+/// `parse_type_phrase_folding` recognition the attached path historically used, so the
 /// downstream merged output is preserved byte-for-byte.
 fn parse_bare_predicate_tail(input: &str) -> OracleResult<'_, TargetFilter> {
     let (rest, _) = opt(parse_article).parse(input)?;
@@ -1729,7 +2032,7 @@ fn parse_bare_predicate_tail(input: &str) -> OracleResult<'_, TargetFilter> {
         }
     }
 
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if remainder.len() == rest.len() {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -1829,7 +2132,7 @@ fn parse_top_of_library_condition(input: &str) -> OracleResult<'_, StaticConditi
     }
     // Fold any disjunction into a single gate over an `Or` *filter* (the runtime
     // `matches_target_filter` handles `TargetFilter::Or`). The common "X or Y
-    // card" form is already one `Or` filter (parse_type_phrase folds it); an
+    // card" form is already one `Or` filter (parse_type_phrase_folding folds it); an
     // article-delimited "a X or a Y" would yield multiple filters, which we wrap
     // here so the result is always one `TopOfLibraryMatches`.
     let filter = if filters.len() > 1 {
@@ -1872,13 +2175,7 @@ fn parse_recipient_is_filter_condition(input: &str) -> OracleResult<'_, StaticCo
             },
         ));
     }
-    // Negated copulae (" isn't ", " is not ") MUST be tried before the affirmative
-    // " is " so " is not " is not greedily split into " is " + "not …".
-    let (rest, negated) = alt((
-        value(true, alt((tag(" isn't "), tag(" is not ")))),
-        value(false, alt((tag("'s "), tag(" is ")))),
-    ))
-    .parse(rest)?;
+    let (rest, negated) = parse_it_copula(rest)?;
     let (rest, filters) = parse_bare_predicate_disjunction(rest)?;
 
     // Pronoun-form boundary guard: the predicate must end at a clause boundary
@@ -1916,11 +2213,7 @@ fn parse_recipient_is_filter_condition(input: &str) -> OracleResult<'_, StaticCo
 
 fn parse_attached_object_is_filter_condition(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, subject) = parse_attached_condition_subject(input)?;
-    let (rest, negated) = alt((
-        value(true, alt((tag("isn't "), tag("is not ")))),
-        value(false, tag("is ")),
-    ))
-    .parse(rest)?;
+    let (rest, negated) = parse_copula_is_or_isnt(rest)?;
     let (rest, filter) = parse_attached_predicate_filter(rest, &subject)?;
     let condition = attached_filter_condition(filter);
     let condition = if negated {
@@ -1938,6 +2231,26 @@ fn parse_attached_object_is_filter_condition(input: &str) -> OracleResult<'_, St
         condition
     };
     Ok((rest, condition))
+}
+
+/// CR 201.5 + CR 611.3a: explicit self-subject vocabulary shared by
+/// [`parse_source_subject`], [`parse_self_source_subject`] and the did/didn't
+/// attacked-this-turn history pair. Excludes the attached-subject prefixes (an
+/// Aura/Equipment is never itself an attacker) and the bare pronoun, which is
+/// target-anaphoric in effect bodies (Berserk:
+/// `parse_target_attacked_this_turn_condition`) and recipient-bound in
+/// attached-subject statics; the SelfRef static path binds it via
+/// `rewrite_self_pronoun_subject`.
+fn parse_explicit_self_source_subject(input: &str) -> OracleResult<'_, &str> {
+    alt((
+        tag("~ "),
+        tag("this creature "),
+        tag("this permanent "),
+        tag("this land "),
+        tag("this artifact "),
+        tag("this enchantment "),
+    ))
+    .parse(input)
 }
 
 /// Shared subject dispatcher for source-referential predicates.
@@ -1958,12 +2271,7 @@ fn parse_attached_object_is_filter_condition(input: &str) -> OracleResult<'_, St
 /// the attached prefixes, because an Equipment/Aura is never an attacker.
 fn parse_source_subject(input: &str) -> OracleResult<'_, &str> {
     alt((
-        tag("~ "),
-        tag("this creature "),
-        tag("this permanent "),
-        tag("this land "),
-        tag("this artifact "),
-        tag("this enchantment "),
+        parse_explicit_self_source_subject,
         tag("equipped creature "),
         tag("enchanted creature "),
     ))
@@ -1981,12 +2289,7 @@ fn parse_source_subject(input: &str) -> OracleResult<'_, &str> {
 /// `parse_attached_subject_combat_state`).
 fn parse_self_source_subject(input: &str) -> OracleResult<'_, &str> {
     alt((
-        tag("~ "),
-        tag("this creature "),
-        tag("this permanent "),
-        tag("this land "),
-        tag("this artifact "),
-        tag("this enchantment "),
+        parse_explicit_self_source_subject,
         // CR 611.3a: bound "it" in a self-referential static binds to the source
         // permanent (Intrepid Ace "as long as it isn't attacking or blocking").
         tag("it "),
@@ -2032,8 +2335,7 @@ fn parse_combat_state_predicate(input: &str) -> OracleResult<'_, StaticCondition
     // attacker); the attached-subject combat form is owned by the inverted-grant
     // path via `parse_attached_subject_combat_state`.
     let (rest, _) = parse_self_source_subject(input)?;
-    let (rest, negated) =
-        alt((value(false, tag("is ")), value(true, tag("isn't ")))).parse(rest)?;
+    let (rest, negated) = parse_copula_is_or_isnt(rest)?;
     let (rest, predicate) = alt((
         // Longest-match first — nom's `alt` is first-match.
         map(tag("attacking or blocking"), |_| StaticCondition::Or {
@@ -2119,11 +2421,8 @@ fn parse_source_is_monstrous(input: &str) -> OracleResult<'_, StaticCondition> {
 /// normalizes to ~).
 fn parse_source_is_saddled(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = parse_source_subject(input)?;
-    let (rest, negated) = alt((
-        value(true, alt((tag("isn't saddled"), tag("is not saddled")))),
-        value(false, tag("is saddled")),
-    ))
-    .parse(rest)?;
+    let (rest, negated) = parse_copula_is_or_isnt(rest)?;
+    let (rest, _) = tag("saddled").parse(rest)?;
     let condition = if negated {
         StaticCondition::Not {
             condition: Box::new(StaticCondition::SourceIsSaddled),
@@ -2187,7 +2486,7 @@ fn parse_source_hasnt_dealt_damage(input: &str) -> OracleResult<'_, StaticCondit
         StaticCondition::Not {
             condition: Box::new(StaticCondition::SourceHasDealtDamage),
         },
-        tag("hasn't dealt damage yet"),
+        (parse_hasnt, tag(" dealt damage yet")),
     )
     .parse(rest)
 }
@@ -2201,13 +2500,9 @@ fn parse_source_hasnt_dealt_damage(input: &str) -> OracleResult<'_, StaticCondit
 /// paired to its pronoun so the ungrammatical cross-products ("they's"/"he're")
 /// cannot parse. Bare "it's" is deliberately excluded (target-anaphoric in spell
 /// bodies — Awaken the Sleeper); source "it's" is handled by the context-gated
-/// SelfRef rewrite. Straight ASCII apostrophe (0x27) only.
+/// SelfRef rewrite. Supports both ASCII (0x27) and typographic (U+2019) apostrophes.
 fn parse_contraction_source_state_condition(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((
-        preceded(alt((tag("he"), tag("she"))), tag("'s ")),
-        preceded(tag("they"), tag("'re ")),
-    ))
-    .parse(input)?;
+    let (rest, _) = parse_pronoun_copula_contraction_prefix(input)?;
     alt((
         value(StaticCondition::SourceIsEquipped, tag("equipped")),
         value(StaticCondition::SourceIsEnchanted, tag("enchanted")),
@@ -2358,15 +2653,16 @@ fn parse_source_enchanted_by_aura_count(input: &str) -> OracleResult<'_, StaticC
 pub(crate) fn parse_source_has_counters(input: &str) -> OracleResult<'_, StaticCondition> {
     // The shared condition path (intervening-"if" triggers and static gates that
     // delegate to `parse_inner_condition`) reads the subject as
-    // source-referential: "whenever ~ attacks, if it has three +1/+1 counters on
-    // it" (Ayara's Oathsworn) means the triggering source itself. The
-    // recipient-bound "for as long as it has a counter" reading is the duration
-    // grammar's job — see `parse_recipient_has_counters`.
+    // source-referential: "whenever ~ deals combat damage to a player, if it has
+    // fewer than four +1/+1 counters on it" (Ayara's Oathsworn) means the
+    // triggering source itself. The recipient-bound "for as long as it has a
+    // counter" reading is the duration grammar's job — see
+    // `parse_recipient_has_counters`.
     let (rest, (subject, counters, minimum, maximum)) = parse_has_counters_axes(input)?;
     match subject {
         // "~"/"this creature" and the bound pronoun "it" are both
         // source-referential in this path (the intervening-"if" trigger /
-        // static-gate reading — #3084 Ayara's Oathsworn).
+        // static-gate reading — Ayara's Oathsworn "fewer than four").
         CounterConditionSubject::Source | CounterConditionSubject::RecipientPronoun => Ok((
             rest,
             StaticCondition::HasCounters {
@@ -2556,6 +2852,8 @@ fn parse_counter_condition_subject(input: &str) -> OracleResult<'_, CounterCondi
 /// - `"N or more"` → `(N, None)`
 /// - `"exactly N"` → `(N, Some(N))`
 /// - `"N or fewer"` → `(0, Some(N))`
+/// - `"fewer than N"` → `(0, Some(N-1))`
+/// - `"more than N"` → `(N+1, None)`
 fn parse_has_counters_quantity(input: &str) -> OracleResult<'_, (u32, Option<u32>)> {
     alt((
         value((1u32, None), tag("a ")),
@@ -2564,6 +2862,7 @@ fn parse_has_counters_quantity(input: &str) -> OracleResult<'_, (u32, Option<u32
         parse_exactly_n_counters,
         parse_n_or_more_counters,
         parse_n_or_fewer_counters,
+        parse_strict_n_counters,
         // CR 122.1: a bare "counter(s)" with no quantifier word means "at least
         // one" — "if ~ has counters on it" (The Ozolith, Denry Klin). `peek` so
         // the counter-type axis still consumes the noun, and gate on the bare
@@ -2594,6 +2893,38 @@ fn parse_exactly_n_counters(input: &str) -> OracleResult<'_, (u32, Option<u32>)>
     let (rest, n) = parse_number(rest)?;
     let (rest, _) = tag(" ").parse(rest)?;
     Ok((rest, (n, Some(n))))
+}
+
+/// CR 107.1 + CR 122.1: "fewer than N" / "more than N" are strict integer
+/// inequalities on the source's matching counters. Encoded as inclusive
+/// HasCounters bounds: LT N → (0, Some(N-1)); GT N → (N+1, None).
+/// CR 603.4: the resulting HasCounters is the intervening-if predicate.
+fn parse_strict_n_counters(input: &str) -> OracleResult<'_, (u32, Option<u32>)> {
+    let (rest, comparator) = parse_strict_comparator_prefix(input)?;
+    let (rest, n) = parse_number(rest)?;
+    let (rest, _) = tag(" ").parse(rest)?;
+    // Refuse mixed "fewer than N or more" (same refuse as parse_there_are_conditions).
+    let (rest, _) = peek(not(alt((
+        tag("or more "),
+        tag("or fewer "),
+        tag("at least "),
+    ))))
+    .parse(rest)?;
+    match comparator {
+        Comparator::LT => {
+            let Some(max) = n.checked_sub(1) else {
+                return Err(oracle_err(input));
+            };
+            Ok((rest, (0, Some(max))))
+        }
+        Comparator::GT => {
+            let Some(min) = n.checked_add(1) else {
+                return Err(oracle_err(input));
+            };
+            Ok((rest, (min, None)))
+        }
+        Comparator::GE | Comparator::LE | Comparator::EQ | Comparator::NE => Err(oracle_err(input)),
+    }
 }
 
 /// Consume `"<type> counter"` / `"<type> counters"` and return
@@ -2638,13 +2969,9 @@ fn parse_typed_counter_noun(input: &str) -> OracleResult<'_, CounterMatch> {
 /// activation level gates on the source's current subtype.
 fn parse_source_is_type(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = parse_source_subject(input)?;
-    let (rest, negated) = alt((
-        value(false, tag("is ")),
-        value(true, alt((tag("isn't "), tag("is not ")))),
-    ))
-    .parse(rest)?;
+    let (rest, negated) = parse_copula_is_or_isnt(rest)?;
     let (rest, _) = parse_article(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     let condition = StaticCondition::SourceMatchesFilter { filter };
     let condition = if negated {
         StaticCondition::Not {
@@ -2725,7 +3052,8 @@ pub(crate) fn parse_source_power_toughness_condition(
 /// the object referenced by the trigger event (the creature that died); "had"
 /// is past tense because CR 603.10a's look-back reads the dying creature's
 /// last-known power from the graveyard at resolution. "~'s power" is the ability
-/// source's current power.
+/// source's current power. The present-tense possessive sibling ("its power is
+/// less than ~'s power") is [`parse_its_pt_vs_source_comparison`].
 ///
 /// Distinct from [`parse_source_power_toughness_condition`] ("its power is N",
 /// which compares the *source's* stat against a fixed threshold): here BOTH
@@ -2739,6 +3067,34 @@ fn parse_event_object_pt_vs_source_comparison(input: &str) -> OracleResult<'_, S
     // Subject: "it had " — the triggering-event object, past tense (LKI look-back).
     let (rest, _) = tag("it had ").parse(input)?;
     let (rest, lhs) = parse_pt_ref_scoped(rest, ObjectScope::EventSource)?;
+    parse_pt_vs_source_comparison_tail(rest, lhs)
+}
+
+/// CR 208.1: Present-tense possessive form "its <stat> is <comparator> ~'s
+/// <stat>" (Shelinda, Yevon Acolyte: "…on that creature if its power is less
+/// than ~'s power").
+///
+/// Deliberately NOT registered in [`parse_inner_condition`]: "its" is an
+/// anaphor with no fixed referent. In Shelinda it is the trigger's entering
+/// creature, but in Sage-Eye Avengers ("return target creature to its owner's
+/// hand if its power is less than this creature's power") it is the spell's
+/// target. Only a caller that knows the antecedent may bind it, which is why
+/// the subject scope is a parameter rather than a guess.
+pub(crate) fn parse_its_pt_vs_source_comparison(
+    input: &str,
+    subject: ObjectScope,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, lhs) =
+        delimited(tag("its "), |i| parse_pt_ref_scoped(i, subject), tag(" is")).parse(input)?;
+    parse_pt_vs_source_comparison_tail(rest, lhs)
+}
+
+/// CR 208.1: The shared "<comparator> ~'s <stat>" tail of an object-vs-source
+/// P/T comparison, applied to an already-parsed left-hand stat.
+fn parse_pt_vs_source_comparison_tail(
+    rest: &str,
+    lhs: QuantityRef,
+) -> OracleResult<'_, StaticCondition> {
     // Comparator between the two stats. Longer phrases precede their prefixes so
     // "greater than or equal to" wins over "greater than".
     let (rest, comparator) = alt((
@@ -2749,7 +3105,7 @@ fn parse_event_object_pt_vs_source_comparison(input: &str) -> OracleResult<'_, S
     ))
     .parse(rest)?;
     // RHS: "~'s <stat>" — the ability source's stat.
-    let (rest, _) = tag("~'s ").parse(rest)?;
+    let (rest, _) = (tag("~"), parse_apostrophe_s, tag(" ")).parse(rest)?;
     let (rest, rhs) = parse_pt_ref_scoped(rest, ObjectScope::Source)?;
     Ok((
         rest,
@@ -2790,8 +3146,11 @@ fn parse_possessive_property(input: &str) -> OracleResult<'_, QuantityRef> {
         // ambiguous between a singular-they object and a player possessive.)
         tag("her "),
         tag("his "),
-        tag("enchanted creature's "),
-        tag("equipped creature's "),
+        recognize((
+            alt((tag("enchanted creature"), tag("equipped creature"))),
+            parse_apostrophe_s,
+            tag(" "),
+        )),
     ))
     .parse(input)?;
     // CR 208.1: decouple the property axis (power/toughness) from the linking-
@@ -3039,20 +3398,44 @@ fn parse_hand_size_predicate(rest: &str, player: PlayerScope) -> Option<(&str, S
     None
 }
 
-/// CR 402.1 + CR 602.5: "a player has <hand-size predicate>" — an existential
-/// over ALL players (`PlayerRelation::All`) whose per-player hand size satisfies
-/// the predicate. Powers "Activate only if a player has one or fewer cards in
+/// CR 603.4 + CR 102.1: "a player has <property-predicate>" — an existential
+/// over ALL players. Two tails, longest-phrase-first:
+///   1. the unique-leader tail ("more <property> than each other player"),
+///      and
+///   2. the incumbent hand-size threshold lift (Temple of the Dead /
+///      Aclazotz), byte-for-byte unchanged behind an `OracleResult`
+///      wrapper.
+fn parse_a_player_has_property_condition(input: &str) -> OracleResult<'_, StaticCondition> {
+    preceded(
+        tag("a player has "),
+        alt((
+            parse_unique_property_lead_tail,
+            parse_hand_size_threshold_existential,
+        )),
+    )
+    .parse(input)
+}
+
+/// Thin `OracleResult` adapter so the incumbent `Option`-returning predicate
+/// helper can be an `alt` arm. Behavior-identical to the pre-split body,
+/// including its `PlayerScope::Controller` inert scope (see the module note
+/// on the codebase's Controller/ScopedPlayer split — deliberately NOT
+/// changed here, to avoid churning a shipped AST shape for zero runtime
+/// gain).
+///
+/// CR 402.1 + CR 602.5: "<hand-size predicate>" — an existential over ALL
+/// players (`PlayerRelation::All`) whose per-player hand size satisfies the
+/// predicate. Powers "Activate only if a player has one or fewer cards in
 /// hand" (Temple of the Dead / Aclazotz). The predicate's comparator and
 /// threshold are delegated to the shared `parse_hand_size_predicate`; its
-/// per-player `QuantityComparison` (lhs `HandSize`, rhs the threshold) is lifted
-/// into a `PlayerAttribute` counted existentially (`PlayerCount(..) >= 1`), so
-/// ANY player — including an opponent — satisfying the predicate gates the
-/// ability. The embedded `PlayerScope::Controller` on `HandSize` carries no
-/// game-state meaning under `PlayerAttribute`: the runtime reads the scalar off
-/// each candidate player (see `resolve_player_count`).
-fn parse_a_player_has_hand_predicate(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = tag("a player has ").parse(input)?;
-    let Some((rest, predicate)) = parse_hand_size_predicate(rest, PlayerScope::Controller) else {
+/// per-player `QuantityComparison` (lhs `HandSize`, rhs the threshold) is
+/// lifted into a `PlayerAttribute` counted existentially (`PlayerCount(..)
+/// >= 1`), so ANY player — including an opponent — satisfying the predicate
+/// gates the ability. The embedded `PlayerScope::Controller` on `HandSize`
+/// carries no game-state meaning under `PlayerAttribute`: the runtime reads
+/// the scalar off each candidate player (see `resolve_player_count`).
+fn parse_hand_size_threshold_existential(input: &str) -> OracleResult<'_, StaticCondition> {
+    let Some((rest, predicate)) = parse_hand_size_predicate(input, PlayerScope::Controller) else {
         return Err(oracle_err(input));
     };
     let StaticCondition::QuantityComparison {
@@ -3076,6 +3459,47 @@ fn parse_a_player_has_hand_predicate(input: &str) -> OracleResult<'_, StaticCond
             },
             1,
         ),
+    ))
+}
+
+/// CR 603.4 (the intervening-if consumer), CR 102.1 (the player population),
+/// CR 119.3 / CR 402.3 (the readable per-player scalars): "more `<property>`
+/// than each other player" with an EXISTENTIAL subject.
+///
+/// ∃p ∀q≠p : s(p) > s(q)  ⟺  exactly ONE player attains max(s).
+/// The uniqueness count is what carries strictness, which is why this needs
+/// no `exclude` anchor: with an existential subject there is no anchor to
+/// exclude.
+///
+/// The comparator/aggregate coupling (a "greater than" reading pairs with
+/// `Max`) is owned by `parse_superlative_comparator_phrase` in this module,
+/// which documents it as grammatical coupling rather than a CR rule.
+/// Literal reuse is impossible — that combinator parses the phrases
+/// "greater than " / "less than ", and "more … than" is not one of them —
+/// so the coupling is CITED here, not re-derived.
+///
+/// The existing generic lift (`PlayerAttribute` with a threshold in
+/// `value`) must NOT be reused for an ANCHORED form: `value` is resolved
+/// ONCE per evaluation, candidate-independently
+/// (`resolve_quantity(state, value, controller, source_id)` sits outside
+/// `resolve_player_count`'s candidate loop), so an `exclude: Some(anchor)`
+/// nested there would compare every candidate against one fixed excluded
+/// population.
+fn parse_unique_property_lead_tail(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, property) =
+        preceded(tag("more "), nom_quantity::parse_player_property_keyword).parse(input)?;
+    let (rest, _) = tag(" than each other player").parse(rest)?;
+    let filter = nom_quantity::player_property_leader_filter(property, PlayerRelation::All)
+        .ok_or_else(|| oracle_err(input))?;
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::PlayerCount { filter },
+            },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Fixed { value: 1 },
+        },
     ))
 }
 
@@ -3143,10 +3567,10 @@ fn parse_subject_property_inequality_form(input: &str) -> OracleResult<'_, Stati
     let (rest, (comparator, aggregate)) = parse_superlative_comparator_phrase(rest)?;
     // Aggregate scope: "each other <type>'s <prop>" / "every other <type>'s <prop>".
     let (rest, _) = alt((tag("each other "), tag("every other "))).parse(rest)?;
-    // <type> phrase. parse_type_phrase consumes "creature", "creature you
+    // <type> phrase. parse_type_phrase_folding consumes "creature", "creature you
     // control", etc. — without the "other" prefix (already stripped above so
     // we control the exclusion semantics through OtherThanTriggerObject).
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -3156,7 +3580,7 @@ fn parse_subject_property_inequality_form(input: &str) -> OracleResult<'_, Stati
     let consumed = rest.len() - remainder.len();
     let rest = &rest[consumed..];
     // Possessive "'s " + property keyword (must match LHS property).
-    let (rest, _) = tag("'s ").parse(rest)?;
+    let (rest, _) = (parse_apostrophe_s, tag(" ")).parse(rest)?;
     let (rest, rhs_property) = parse_property_keyword(rest)?;
     if lhs_property != rhs_property {
         return Err(nom::Err::Error(nom::error::Error::new(
@@ -3189,7 +3613,7 @@ fn parse_subject_has_superlative_form(input: &str) -> OracleResult<'_, StaticCon
     let (rest, comparator) = parse_optional_tied_for_tail(rest, aggregate, property)?;
     // " among <filter>".
     let (rest, _) = tag(" among ").parse(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -3314,7 +3738,7 @@ fn parse_you_control_superlative_object_condition(
     // reinterpret a partially consumed superlative as a weaker condition.
     let (rest, (object_filter, population_filter)) = cut(|rest| {
         // CR 109.2 + CR 109.4: `you control` describes a battlefield permanent,
-        // not an off-battlefield "card" or a stack "spell". `parse_type_phrase`
+        // not an off-battlefield "card" or a stack "spell". `parse_type_phrase_folding`
         // intentionally consumes those terminal nouns in other contexts, so
         // reject them before delegating the candidate noun phrase.
         if scan_at_word_boundaries(candidate_text, |word| {
@@ -3328,7 +3752,7 @@ fn parse_you_control_superlative_object_condition(
             return Err(oracle_err(candidate_text));
         }
 
-        let (object_filter, candidate_remainder) = parse_type_phrase(candidate_text);
+        let (object_filter, candidate_remainder) = parse_type_phrase_folding(candidate_text);
         if matches!(object_filter, TargetFilter::Any) || !candidate_remainder.is_empty() {
             return Err(oracle_err(candidate_remainder));
         }
@@ -3343,7 +3767,7 @@ fn parse_you_control_superlative_object_condition(
         let (rest, _) = parse_optional_tied_for_tail(rest, aggregate, property)?;
         let (rest, population_filter) =
             if let Ok((among_rest, _)) = tag::<_, _, OracleError<'_>>(" among ").parse(rest) {
-                let (filter, remainder) = parse_type_phrase(among_rest);
+                let (filter, remainder) = parse_type_phrase_folding(among_rest);
                 if matches!(filter, TargetFilter::Any) {
                     return Err(oracle_err(remainder));
                 }
@@ -3440,7 +3864,7 @@ pub(crate) fn parse_spell_target_has_superlative(
     // property with the leading clause is enforced by the shared combinator.
     let (rest, _) = parse_optional_tied_for_tail(rest, aggregate, property)?;
     let (rest, _) = tag::<_, _, OracleError<'_>>(" among ").parse(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(oracle_err(remainder));
     }
@@ -3774,7 +4198,7 @@ fn parse_they_control_count_ge(input: &str) -> OracleResult<'_, StaticCondition>
     let (rest, _) = tag("they control ").parse(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
     let type_text = rest.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -3918,7 +4342,10 @@ fn parse_parent_target_referent(input: &str) -> OracleResult<'_, ParentTargetRef
             value(ParentTargetReferent::Player, tag("player")),
             value(
                 ParentTargetReferent::PlaneswalkerController,
-                terminated(tag("planeswalker"), tag("'s controller")),
+                terminated(
+                    tag("planeswalker"),
+                    (parse_apostrophe_s, tag(" controller")),
+                ),
             ),
         )),
     )
@@ -4179,14 +4606,46 @@ fn parse_ge_threshold(input: &str) -> OracleResult<'_, u32> {
 /// are the strict-inequality prefix idioms (LT / GT), in contrast to the
 /// "N or more" (GE) / "N or fewer" (LE) suffix idioms. Single authority for
 /// the comparator-prefix family — shared by `parse_put_onto_battlefield_this_way`
-/// ("you put fewer than two lands onto the battlefield this way") and
+/// ("you put fewer than two lands onto the battlefield this way"),
 /// `parse_there_are_conditions` ("there are fewer than six creature cards in
-/// your graveyard").
-fn parse_strict_comparator_prefix(input: &str) -> OracleResult<'_, Comparator> {
+/// your graveyard"), and `parse_strict_n_counters` ("has fewer than three
+/// +1/+1 counters on it" / "has more than two +1/+1 counters on it").
+pub(crate) fn parse_strict_comparator_prefix(input: &str) -> OracleResult<'_, Comparator> {
     alt((
         value(Comparator::LT, tag("fewer than ")),
         value(Comparator::GT, tag("more than ")),
     ))
+    .parse(input)
+}
+
+/// CR 608.2c: the connectors that open the ELSE branch of a written-order
+/// if/else pair ("Otherwise, …", "If not, …", "If no one does, …").
+///
+/// SINGLE AUTHORITY for this grammar axis, shared by the two sides that must
+/// agree about it:
+///
+/// * `oracle_trigger`'s hoist gate, which declines to lift a trailing `if` onto
+///   the trigger envelope (CR 603.4) when one of these connectors follows; and
+/// * `oracle_effect`'s chain binder, which turns the clause they introduce into
+///   a `ClauseDisposition::BranchOtherwise`.
+///
+/// Those two decisions are one decision: the trigger side must decline to hoist
+/// exactly the antecedents the effect side is able to bind. Two hand-maintained
+/// `alt()` lists would drift the first time a phrasing is added to only one of
+/// them, and the failure is silent — the trigger keeps hoisting, the clause
+/// loses its antecedent, and the else branch degrades to an
+/// `Effect::unimplemented` marker with nothing pointing at the cause.
+pub(crate) fn parse_otherwise_branch_connector(input: &str) -> OracleResult<'_, ()> {
+    value(
+        (),
+        alt((
+            tag("otherwise, "),
+            tag("otherwise "),
+            tag("if not, "),
+            tag("if no player does, "),
+            tag("if no one does, "),
+        )),
+    )
     .parse(input)
 }
 
@@ -4202,7 +4661,7 @@ fn parse_control_count_ge_distinct_quality(input: &str) -> OracleResult<'_, Stat
     let (rest, _) = tag("you control ").parse(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
     let type_text = rest.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4236,7 +4695,7 @@ fn parse_control_count_ge_distinct_quality(input: &str) -> OracleResult<'_, Stat
 }
 
 /// Lift a GROUP shared-quality marker out of a filter produced by
-/// `parse_type_phrase`, returning its quality and removing the property.
+/// `parse_type_phrase_folding`, returning its quality and removing the property.
 ///
 /// `FilterProp::SharesQuality { reference: None }` is a GROUP-SELECTION
 /// constraint on a chosen candidate set: CR 601.2c is where the player
@@ -4335,7 +4794,7 @@ fn take_group_shared_quality(filter: &mut TargetFilter) -> Option<SharedQuality>
 /// Eternal Glory, Mechanized Production, Chrome Replicator). The two reach this
 /// function differently and so are two branches, not two parsers:
 ///
-///   * **Branch A (relative clause)** — `parse_type_phrase` has ALREADY consumed
+///   * **Branch A (relative clause)** — `parse_type_phrase_folding` has ALREADY consumed
 ///     the clause through `oracle_target::parse_that_clause_suffix`, leaving a
 ///     `FilterProp::SharesQuality` group marker on the filter and an empty
 ///     remainder. `take_group_shared_quality` lifts the marker onto this
@@ -4343,7 +4802,7 @@ fn take_group_shared_quality(filter: &mut TargetFilter) -> Option<SharedQuality>
 ///     `oracle_target::parse_shared_quality_clause` stays the single authority
 ///     for that vocabulary.
 ///   * **Branch B (postmodifier)** — not a `that …` clause, so
-///     `parse_type_phrase` leaves it in the remainder and the quality noun is
+///     `parse_type_phrase_folding` leaves it in the remainder and the quality noun is
 ///     delegated to the same shared authority, `parse_shared_quality`.
 ///
 /// The controller scope is parameterized on `parse_control_scope_prefix`, so
@@ -4366,7 +4825,7 @@ fn parse_control_count_ge_shared_quality(input: &str) -> OracleResult<'_, Static
     let (rest, ctrl) = parse_control_scope_prefix(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
     let type_text = rest.trim_end_matches('.');
-    let (mut filter, remainder) = parse_type_phrase(type_text);
+    let (mut filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4423,7 +4882,7 @@ fn parse_control_count_ge_toughness_gt_power(input: &str) -> OracleResult<'_, St
     let (rest, _) = tag("you control ").parse(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
     let type_text = rest.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4549,7 +5008,7 @@ pub fn parse_control_count_ge(input: &str) -> OracleResult<'_, StaticCondition> 
     let (rest, ctrl) = parse_control_scope_prefix(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
     let type_text = rest.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4557,7 +5016,7 @@ pub fn parse_control_count_ge(input: &str) -> OracleResult<'_, StaticCondition> 
         )));
     }
     let filter = inject_controller(filter, ctrl);
-    // Map remainder back to original input slice — parse_type_phrase consumed
+    // Map remainder back to original input slice — parse_type_phrase_folding consumed
     // from a potentially trimmed copy, so use pointer arithmetic to get the
     // correct byte offset (remainder.len() would be wrong if trailing chars
     // were stripped by trim_end_matches).
@@ -4580,7 +5039,7 @@ pub fn parse_control_count_ge(input: &str) -> OracleResult<'_, StaticCondition> 
 /// cost reductions (bare "a creature is attacking you"), and the filtered Trap
 /// cycle's alternative costs — Nemesis Trap ("a white creature is attacking"),
 /// Slingbow Trap ("a black creature with flying is attacking"). The qualifier
-/// is delegated to `parse_type_phrase` (mirrors `parse_creature_has_keyword`)
+/// is delegated to `parse_type_phrase_folding` (mirrors `parse_creature_has_keyword`)
 /// so the whole class of attacker filters is covered by one combinator rather
 /// than the former bare-only literal. Lowers to `IsPresent` over the filter
 /// with `FilterProp::Attacking { defender }` appended — the same property
@@ -4591,7 +5050,7 @@ fn parse_filtered_creature_is_attacking(input: &str) -> OracleResult<'_, StaticC
     // "enchanted creature", "enchanted artifact", "enchanted land", "equipped
     // creature" (see `parse_attached_condition_subject_core`) — is
     // self-referential: the host of THIS Aura/Equipment, not a generic
-    // board-wide filter. `parse_type_phrase` would otherwise happily match
+    // board-wide filter. `parse_type_phrase_folding` would otherwise happily match
     // any of these as a permanent/creature/artifact/land with
     // `FilterProp::EnchantedBy`/`EquippedBy`, silently swapping "is the
     // specific permanent this Aura/Equipment is attached to attacking" for
@@ -4606,7 +5065,7 @@ fn parse_filtered_creature_is_attacking(input: &str) -> OracleResult<'_, StaticC
         return Err(oracle_err(input));
     }
     let (rest, _) = opt(parse_article).parse(input)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(oracle_err(input));
     }
@@ -4632,7 +5091,7 @@ fn parse_filtered_creature_is_attacking(input: &str) -> OracleResult<'_, StaticC
 /// state (Charging Hooligan: "If a Rat is attacking, ..."). Complements
 /// `parse_filtered_creature_is_attacking` (which owns the attacking / "attacking
 /// you" defender form): this arm uniquely adds the `is blocking` predicate over
-/// the same type axis (via `parse_type_phrase`, so any subtype/core type works).
+/// the same type axis (via `parse_type_phrase_folding`, so any subtype/core type works).
 /// The attacking case overlaps that combinator and yields the identical
 /// `IsPresent`; it is registered first, so this arm is reached for the blocking form.
 /// No controller restriction — a matching attacker/blocker controlled by any
@@ -4640,9 +5099,9 @@ fn parse_filtered_creature_is_attacking(input: &str) -> OracleResult<'_, StaticC
 /// form ("creatures are attacking"), which `parse_creatures_are_attacking_count_ge`
 /// owns.
 fn parse_a_type_is_in_combat(input: &str) -> OracleResult<'_, StaticCondition> {
-    // Require a singular article; `parse_type_phrase` strips it itself.
+    // Require a singular article; `parse_type_phrase_folding` strips it itself.
     nom::combinator::peek(alt((tag("a "), tag("an "))).map(|_| ())).parse(input)?;
-    let (filter, remainder) = parse_type_phrase(input);
+    let (filter, remainder) = parse_type_phrase_folding(input);
     let TargetFilter::Typed(mut typed) = filter else {
         return Err(oracle_err(input));
     };
@@ -4687,6 +5146,68 @@ fn parse_creatures_are_attacking_count_ge(input: &str) -> OracleResult<'_, Stati
     ))
 }
 
+/// CR 301.5 + CR 303.4 + CR 611.3a: Parse
+/// "<N or more | at least N> <type>[ and <type>]* are attached to <referent>" →
+/// `QuantityComparison(ObjectCount(<types> + Attached*) >= N)`.
+///
+/// Brass Knuckles: "Equipped creature has double strike as long as two or more
+/// Equipment are attached to it." Here "it" is the EQUIPPED CREATURE — the
+/// static's per-recipient subject (CR 301.5a: "the creature an Equipment is
+/// attached to is called the equipped creature").
+/// Balan, Wandering Knight: "~ has double strike as long as two or more
+/// Equipment are attached to it." Here the static is `SelfRef`, so the
+/// recipient and the source are the same object and both bindings agree.
+///
+/// CR 611.3a is the AUTHORIZING rule: a continuous effect generated by a static
+/// ability isn't "locked in"; it applies at any given moment to whatever its
+/// text indicates. So the count is read live on every layer pass, never
+/// captured — attaching or unattaching an Equipment flips the grant with no
+/// event. The grant itself lands in layer 6 (CR 613.1f). CR 109.3 is why this
+/// is a GAME-STATE read rather than a characteristic read: characteristics
+/// "don't include ... what an Aura enchants".
+///
+/// NO CR 613.4c annotation appears here on purpose: 613.4c is layer 7c and
+/// governs the `"for each ... attached to"` POWER/TOUGHNESS consumers of the
+/// shared noun-phrase combinators, not this keyword-grant gate.
+///
+/// COMPOSITION, NOT DUPLICATION. The noun phrase is parsed by exactly the two
+/// combinators the "for each" / "the number of" forms use
+/// (`parse_attachment_type_list` + `parse_attachment_referent_prop`), and the
+/// count is built by their shared constructor (`attachment_object_count`), so
+/// all four referents (`~`, him/her, it/that creature, them/that player) and
+/// every multi-type list work here on day one. The ONLY things this combinator
+/// adds are the threshold head (`parse_ge_threshold`, shared with
+/// `parse_creatures_are_attacking_count_ge`) and the copula.
+///
+/// THE COPULA IS REQUIRED, NOT OPTIONAL. "two or more Equipment attached to it"
+/// is a NOUN PHRASE, not a condition; admitting it would let a bare noun phrase
+/// parse as a complete `StaticCondition`. `tag(" are")` lives here and ONLY
+/// here — the shared noun-phrase combinators accept no copula at all, exactly
+/// as before this change. The required copula also rejects the negated form:
+/// " aren't attached to it" leaves "n't attached to it", which no referent arm
+/// accepts, so negation fails closed instead of parsing as positive.
+///
+/// Singular "is" is deliberately not accepted: a `>= N` threshold with N >= 2
+/// always takes the plural, and no printed card uses the singular form
+/// (measured over `data/mtgjson/AtomicCards.json`: 0 cards). If one ever
+/// prints, this becomes a one-token `alt`.
+fn parse_attached_to_referent_count_ge(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, n) = parse_ge_threshold(input)?;
+    let (rest, types) = nom_quantity::parse_attachment_type_list(rest.trim_start())?;
+    let (rest, _) = tag(" are").parse(rest)?;
+    let (rest, prop) = nom_quantity::parse_attachment_referent_prop(rest)?;
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: nom_quantity::attachment_object_count(types, prop),
+            },
+            comparator: Comparator::GE,
+            rhs: QuantityExpr::Fixed { value: n as i32 },
+        },
+    ))
+}
+
 /// CR 109.5 (you = the controller of the object the ability is on) +
 /// CR 102.2 / CR 102.3 (an opponent of that player) + CR 109.4 (any player).
 /// Parse "you control a/an/another [type]", "an opponent controls a/an/another
@@ -4697,7 +5218,7 @@ fn parse_creatures_are_attacking_count_ge(input: &str) -> OracleResult<'_, Stati
 /// The verb is parameterized over the controller axis: the leading verb phrase
 /// selects `Some(ControllerRef::You)`, `Some(ControllerRef::Opponent)`, or
 /// `None` (any player), and the SAME downstream parse (required article,
-/// `parse_type_phrase`, full-consume) runs for all three. CR 611.3a: this is a
+/// `parse_type_phrase_folding`, full-consume) runs for all three. CR 611.3a: this is a
 /// static "as long as" gate, so the condition is re-evaluated continuously
 /// rather than locked in. CR 109.4: the injected `InZone { Battlefield }`
 /// reflects that only the battlefield (and stack) has a controller, so the
@@ -4722,11 +5243,11 @@ fn parse_you_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
     // count, handled elsewhere). A required combinator (not opt) preserves the
     // hard rejection the previous starts_with guard enforced. `peek` requires
     // the article without consuming it, so the article-inclusive `rest` still
-    // flows to `parse_type_phrase` (which strips "a "/"an " itself and maps
+    // flows to `parse_type_phrase_folding` (which strips "a "/"an " itself and maps
     // "another " to `FilterProp::Another`).
     let (rest, _article) =
         nom::combinator::peek(alt((tag("a "), tag("an "), tag("another ")))).parse(rest)?;
-    let (filter, mut remainder) = parse_type_phrase(rest);
+    let (filter, mut remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4740,7 +5261,7 @@ fn parse_you_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
     // ("or a Plan") is NOT a standalone control condition, so the top-level
     // `parse_condition_connective` cannot split it; instead a single shared
     // verb governs both type filters. Each additional " or <article> <type>"
-    // segment is folded into a disjunction of presence filters. `parse_type_phrase`
+    // segment is folded into a disjunction of presence filters. `parse_type_phrase_folding`
     // (unchanged) parses each article-led segment; this loop only adds the
     // elided-verb continuation specific to the control-condition grammar, so the
     // recipient/attached `it's X or Y` paths (which DO repeat a parseable RHS)
@@ -4757,7 +5278,7 @@ fn parse_you_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
         else {
             break;
         };
-        let (next_filter, next_remainder) = parse_type_phrase(after_or);
+        let (next_filter, next_remainder) = parse_type_phrase_folding(after_or);
         if matches!(next_filter, TargetFilter::Any) {
             break;
         }
@@ -4794,17 +5315,17 @@ fn parse_you_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
 /// type phrase leads ("a creature you control") and is followed by a `has
 /// <keyword>` predicate, rather than the verb leading ("you control a
 /// creature"). Generalized over every evergreen keyword in the `KEYWORDS`
-/// table and every type phrase `parse_type_phrase` recognizes, so it covers
+/// table and every type phrase `parse_type_phrase_folding` recognizes, so it covers
 /// the whole class of "a/an <permanent> <controller-clause> has <keyword>"
 /// conditions, not one card.
 fn parse_creature_has_keyword(input: &str) -> OracleResult<'_, StaticCondition> {
-    // Optional leading article — `parse_type_phrase` also strips it, but the
+    // Optional leading article — `parse_type_phrase_folding` also strips it, but the
     // article may precede a non-type word, so guard it explicitly first.
     let (rest, _) = opt(parse_article).parse(input)?;
-    // `parse_type_phrase` consumes the type word AND any "you control" /
+    // `parse_type_phrase_folding` consumes the type word AND any "you control" /
     // "an opponent controls" controller suffix, setting `controller` on the
     // returned filter. The remainder begins at the `has <keyword>` predicate.
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4839,7 +5360,7 @@ fn parse_creature_has_keyword(input: &str) -> OracleResult<'_, StaticCondition> 
 ///     `this card`; "this card" is a parse-only self-reference not yet
 ///     normalized to `~`, so the literal `tag("this card")` arm in that
 ///     combinator is required here).
-///   - `parse_type_phrase` — folds the informational " card" qualifier and the
+///   - `parse_type_phrase_folding` — folds the informational " card" qualifier and the
 ///     attached "in your <zone>" clause into one `TargetFilter` (the same
 ///     grammar shape `parse_card_in_graveyard` relies on).
 ///   - `make_quantity_comparison` — the shared `ObjectCount == N` shape.
@@ -4858,7 +5379,7 @@ fn parse_creature_has_keyword(input: &str) -> OracleResult<'_, StaticCondition> 
 fn parse_source_is_only_type_in_zone(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, ()) = parse_source_self_token(input)?;
     let (rest, _) = tag(" is the only ").parse(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4890,26 +5411,26 @@ fn parse_source_is_only_type_in_zone(input: &str) -> OracleResult<'_, StaticCond
 /// <keyword>" battlefield predicate, the subject's presence is checked in a
 /// graveyard. This is the gate half of a conditional continuous static (CR
 /// 611.3a) whose grant is a keyword ability (CR 702). Generalized over every
-/// type phrase `parse_type_phrase` recognizes and every keyword its "with
+/// type phrase `parse_type_phrase_folding` recognizes and every keyword its "with
 /// <keyword>" suffix folds in, so it covers the whole class, not one card:
 ///   - Tarmogoyf: "a land card is in a graveyard" (bare card-type gate)
 ///   - Cairn Wanderer: "a creature card with flying is in a graveyard"
 ///     (card-type + `WithKeyword { Flying }` gate)
 ///
 /// In a graveyard every object is a card, so "creature card" / "land card" is the
-/// card-type filter — `parse_type_phrase` folds the informational " card" suffix
+/// card-type filter — `parse_type_phrase_folding` folds the informational " card" suffix
 /// and the "with <keyword>" suffix, so no bespoke keyword parsing is needed here.
 /// "in a graveyard" is controller-agnostic (any graveyard); no controller is
 /// injected. The `is in a graveyard` suffix is required, so this never mis-claims
 /// a bare "a creature card ..." presence phrase handled elsewhere.
 pub(crate) fn parse_card_in_graveyard(input: &str) -> OracleResult<'_, StaticCondition> {
-    // Optional leading article — `parse_type_phrase` also strips it, but guard it
+    // Optional leading article — `parse_type_phrase_folding` also strips it, but guard it
     // explicitly first to mirror `parse_creature_has_keyword`.
     let (rest, _) = opt(parse_article).parse(input)?;
-    // `parse_type_phrase` consumes the type word, the informational " card"
+    // `parse_type_phrase_folding` consumes the type word, the informational " card"
     // suffix, and any "with <keyword>" clause (folded into the filter as
     // `FilterProp::WithKeyword`). The remainder begins at the presence predicate.
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -4999,11 +5520,11 @@ fn parse_control_count_le(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("or fewer ").parse(rest)?;
     // A named-count condition may be followed by an execute clause. Preserve
     // the comma-prefixed clause as the condition remainder before handing the
-    // typed, named phrase to `parse_type_phrase`; otherwise that parser treats
+    // typed, named phrase to `parse_type_phrase_folding`; otherwise that parser treats
     // the effect text as part of the literal card name.
     let (condition_remainder, type_text) = parse_control_named_final_name(rest)?;
     let type_text = type_text.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -5029,7 +5550,7 @@ fn parse_control_count_eq(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, n) = parse_number(rest)?;
     let rest = rest.trim_start();
     let type_text = rest.trim_end_matches('.');
-    let (filter, remainder) = parse_type_phrase(type_text);
+    let (filter, remainder) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -5047,7 +5568,7 @@ fn parse_control_count_eq(input: &str) -> OracleResult<'_, StaticCondition> {
 /// Parse "you control no [type]" → Not(IsPresent { filter }).
 fn parse_you_control_no(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("you control no ").parse(input)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -5077,7 +5598,7 @@ fn parse_no_opponent_controls_a(input: &str) -> OracleResult<'_, StaticCondition
     // Require an article — reject the bare-plural count form ("no opponent
     // controls creatures") exactly as the affirmative control arms do.
     let (rest, _) = parse_article(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -5113,7 +5634,7 @@ fn parse_no_opponent_controls_a(input: &str) -> OracleResult<'_, StaticCondition
 /// control" semantics per iterated player (CR 109.5).
 fn parse_a_player_controls_no(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("a player controls no ").parse(input)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -5145,7 +5666,7 @@ fn parse_a_player_controls_no(input: &str) -> OracleResult<'_, StaticCondition> 
 /// Kezzerdrix (creatures).
 fn parse_your_opponents_control_no(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("your opponents control no ").parse(input)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -5167,9 +5688,9 @@ fn parse_your_opponents_control_no(input: &str) -> OracleResult<'_, StaticCondit
 
 /// Parse "you don't control a/an [type]" → Not(IsPresent).
 fn parse_you_dont_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = tag("you don't control ").parse(input)?;
+    let (rest, _) = (tag("you "), parse_dont, tag(" control ")).parse(input)?;
     let (rest, _) = parse_article(rest)?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -5200,7 +5721,7 @@ fn parse_you_dont_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
 /// the building block extends to any "<filter> have total <property> N or X"
 /// phrase.
 ///
-/// The `filter` subject reuses `parse_type_phrase`, so any subject-controller
+/// The `filter` subject reuses `parse_type_phrase_folding`, so any subject-controller
 /// combination it understands ("creatures you control", "creatures an opponent
 /// controls", etc.) flows through automatically.
 ///
@@ -5211,11 +5732,11 @@ fn parse_you_dont_control_a(input: &str) -> OracleResult<'_, StaticCondition> {
 ///   (`oracle_effect::conditions::strip_leading_general_conditional` →
 ///   `static_condition_to_ability_condition`).
 fn parse_filter_have_total_property(input: &str) -> OracleResult<'_, StaticCondition> {
-    // 1. Filter subject. parse_type_phrase consumes the noun phrase plus its
+    // 1. Filter subject. parse_type_phrase_folding consumes the noun phrase plus its
     //    trailing controller suffix ("creatures you control") and returns the
     //    typed filter with controller already injected. Reject `Any` so a bare
     //    "have total ..." prefix cannot accidentally match without a subject.
-    let (filter, remainder) = parse_type_phrase(input);
+    let (filter, remainder) = parse_type_phrase_folding(input);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -5268,7 +5789,7 @@ fn parse_filter_have_total_property(input: &str) -> OracleResult<'_, StaticCondi
 }
 
 /// Inject a controller (CR 109.5 You / CR 102.2 Opponent) into a TargetFilter
-/// produced by `parse_type_phrase`, and ensure the filter is battlefield-scoped
+/// produced by `parse_type_phrase_folding`, and ensure the filter is battlefield-scoped
 /// (CR 109.4: only the battlefield and stack have a controller).
 /// CR 109.4: Add `InZone { Battlefield }` to a Typed filter (and each `Or`/`And`
 /// leg) if absent, WITHOUT constraining the controller. Used for "any player
@@ -5331,7 +5852,7 @@ pub(crate) fn inject_controller(filter: TargetFilter, ctrl: ControllerRef) -> Ta
     }
 }
 
-/// Inject `ControllerRef::You` into a TargetFilter produced by `parse_type_phrase`.
+/// Inject `ControllerRef::You` into a TargetFilter produced by `parse_type_phrase_folding`.
 /// Thin wrapper over `inject_controller` for the many "you control" call sites.
 pub(crate) fn inject_controller_you(filter: TargetFilter) -> TargetFilter {
     inject_controller(filter, ControllerRef::You)
@@ -5343,11 +5864,13 @@ fn parse_opponent_possessive(input: &str) -> OracleResult<'_, ()> {
     value(
         (),
         alt((
-            tag::<_, _, OracleError<'_>>("an opponent's "),
-            tag("opponent's "),
-            tag("opponents' "),
+            recognize((
+                alt((tag("an opponent"), tag("opponent"), tag("each opponent"))),
+                parse_apostrophe_s,
+                tag(" "),
+            )),
+            recognize((tag("opponents"), parse_apostrophe, tag(" "))),
             tag("opponents "),
-            tag("each opponent's "),
         )),
     )
     .parse(input)
@@ -5374,7 +5897,10 @@ fn parse_life_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
             tag::<_, _, OracleError<'_>>("your life total is "),
         ),
         // CR 119 + CR 102.1: Life total comparison across all players (existential).
-        value(LifeTotalScope::AllPlayers, tag("a player's life total is ")),
+        value(
+            LifeTotalScope::AllPlayers,
+            recognize((tag("a player"), parse_apostrophe_s, tag(" life total is "))),
+        ),
         // CR 119 + CR 102.2: Life total comparison across opponents (existential).
         |i| {
             let (rest, _) = parse_opponent_possessive(i)?;
@@ -5493,11 +6019,14 @@ fn parse_life_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
 /// Splitting condition-false vs optional-decline is class-wide engine debt (the
 /// routing lives in the runtime chain resolver, not here).
 fn parse_offered_card_mana_value_comparison(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((
-        tag("the spell's"),
-        tag("that spell's"),
-        tag("that card's"),
-        tag("the card's"),
+    let (rest, _) = recognize((
+        alt((
+            tag("the spell"),
+            tag("that spell"),
+            tag("that card"),
+            tag("the card"),
+        )),
+        parse_apostrophe_s,
     ))
     .parse(input)?;
     let (rest, _) = alt((tag(" mana value"), tag(" converted mana cost"))).parse(rest)?;
@@ -5669,7 +6198,10 @@ fn parse_source_in_zone_condition(input: &str) -> OracleResult<'_, StaticConditi
     // so " is not " is not greedily split into " is " + "not …" (mirrors the
     // polarity alternation in `parse_recipient_is_filter_condition`).
     let (rest, negated) = alt((
-        value(true, alt((tag(" isn't"), tag(" is not")))),
+        value(
+            true,
+            alt((recognize((tag(" "), parse_isnt)), tag(" is not"))),
+        ),
         value(false, tag(" is")),
     ))
     .parse(rest)?;
@@ -5776,7 +6308,7 @@ fn parse_library_empty_condition(input: &str) -> OracleResult<'_, StaticConditio
 }
 
 fn parse_day_night_condition(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((tag("it's "), tag("it is "))).parse(input)?;
+    let (rest, _) = (parse_it_is, tag(" ")).parse(input)?;
     let (rest, state) = alt((
         value(DayNight::Night, tag("night")),
         value(DayNight::Day, tag("day")),
@@ -5796,7 +6328,7 @@ fn parse_day_night_condition(input: &str) -> OracleResult<'_, StaticCondition> {
 /// `AbilityCondition::QuantityCheck` in instead-clause assembly.
 fn parse_first_spell_this_game_condition(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = alt((tag("this is "), tag("this spell is "))).parse(input)?;
-    let (rest, _) = tag("the first spell you've cast this game").parse(rest)?;
+    let (rest, _) = (tag("the first spell "), parse_youve, tag(" cast this game")).parse(rest)?;
     Ok((
         rest,
         StaticCondition::QuantityComparison {
@@ -5817,7 +6349,7 @@ fn parse_first_spell_this_game_condition(input: &str) -> OracleResult<'_, Static
 /// CR 119: Life gain/loss event conditions.
 /// CR 700.13: Crime tracking.
 fn parse_youve_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = tag("you've ").parse(input)?;
+    let (rest, _) = (parse_youve, tag(" ")).parse(input)?;
     if let Ok(parsed) = parse_youve_played_land_or_cast_spell_this_turn(rest) {
         return Ok(parsed);
     }
@@ -6114,7 +6646,7 @@ fn parse_card_left_your_graveyard_this_turn(input: &str) -> OracleResult<'_, Sta
 /// or greater/more" — an additive two-term count threshold. Cavernous Maw:
 /// "the number of other Caves you control plus the number of Cave cards in your
 /// graveyard is three or greater". Term A is a live battlefield object count
-/// ("other Caves you control" → `parse_type_phrase` yields `Typed(Cave, You,
+/// ("other Caves you control" → `parse_type_phrase_folding` yields `Typed(Cave, You,
 /// [Another])` outright); term B is a subtype-filtered graveyard card count. The
 /// zone-/controlled-count combinators key on core card types, not land subtypes
 /// (CR 205.3i: Cave is a land type), so both terms are built explicitly. The two
@@ -6122,11 +6654,11 @@ fn parse_card_left_your_graveyard_this_turn(input: &str) -> OracleResult<'_, Sta
 fn parse_additive_two_term_count_threshold(input: &str) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("the number of ").parse(input)?;
     // Term A: the controlled-object subject up to the " plus the number of "
-    // joiner. `parse_type_phrase` owns the whole subject including the "other"
+    // joiner. `parse_type_phrase_folding` owns the whole subject including the "other"
     // (→ Another) qualifier and the "you control" controller suffix.
     let (rest, term_a_text) = take_until(" plus the number of ").parse(rest)?;
     let (rest, _) = tag(" plus the number of ").parse(rest)?;
-    let (a_filter, a_leftover) = parse_type_phrase(term_a_text.trim());
+    let (a_filter, a_leftover) = parse_type_phrase_folding(term_a_text.trim());
     if !a_leftover.trim().is_empty() || matches!(a_filter, TargetFilter::Any) {
         return Err(oracle_err(input));
     }
@@ -6153,12 +6685,12 @@ fn parse_additive_two_term_count_threshold(input: &str) -> OracleResult<'_, Stat
 /// CR 205.3i + CR 404.1: "<subtype> cards in your graveyard" → a subtype-filtered
 /// controller-graveyard card count. `parse_zone_card_count` keys on core card
 /// types, so the subtype filter (e.g. Cave) is built explicitly via
-/// `parse_type_phrase`; the count stays a `ZoneCardCount` with the filter set
+/// `parse_type_phrase_folding`; the count stays a `ZoneCardCount` with the filter set
 /// and scope `Controller` (your graveyard only).
 fn parse_subtype_cards_in_your_graveyard(input: &str) -> OracleResult<'_, QuantityRef> {
     let (rest, subtype_text) = take_until(" cards in your graveyard").parse(input)?;
     let (rest, _) = tag(" cards in your graveyard").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(subtype_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(subtype_text.trim());
     if !leftover.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return Err(oracle_err(input));
     }
@@ -6180,7 +6712,7 @@ fn parse_permanent_put_into_your_hand_from_battlefield_this_turn(
     let (rest, type_text) =
         take_until(" was put into your hand from the battlefield this turn").parse(rest)?;
     let (rest, _) = tag(" was put into your hand from the battlefield this turn").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -6218,7 +6750,7 @@ fn parse_card_put_into_your_graveyard_from_anywhere_this_turn(
 /// count uses the shared "N or more"/"a(n)" (→ 1) threshold idiom. The bare
 /// "cards" noun carries no type, so `TargetFilter::Any` is accepted here (the
 /// owner + non-token tags still narrow it); a preceding type word
-/// ("artifact cards") narrows via `parse_type_phrase`.
+/// ("artifact cards") narrows via `parse_type_phrase_folding`.
 fn parse_opponent_cards_put_into_their_graveyard_from_anywhere_this_turn(
     input: &str,
 ) -> OracleResult<'_, StaticCondition> {
@@ -6263,7 +6795,7 @@ fn parse_opponent_cards_put_into_their_graveyard_from_anywhere_this_turn(
         // still bound the set.
         TargetFilter::Any
     } else {
-        let (filter, leftover) = parse_type_phrase(type_text);
+        let (filter, leftover) = parse_type_phrase_folding(type_text);
         if !leftover.trim().is_empty() || filter == TargetFilter::Any {
             return Err(nom::Err::Error(nom::error::Error::new(
                 input,
@@ -6297,7 +6829,7 @@ fn parse_your_card_put_into_your_graveyard_from_anywhere_this_turn(
     let suffix = " card was put into your graveyard from anywhere this turn";
     let (rest, type_text) = take_until(suffix).parse(rest)?;
     let (rest, _) = tag(suffix).parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -6325,7 +6857,7 @@ fn parse_object_put_into_graveyard_from_battlefield_this_turn(
     let suffix = " was put into a graveyard from the battlefield this turn";
     let (rest, type_text) = take_until(suffix).parse(rest)?;
     let (rest, _) = tag(suffix).parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -6673,7 +7205,7 @@ fn parse_attacked_with_creature_count(input: &str) -> OracleResult<'_, StaticCon
 }
 
 /// CR 508.1a: "a/an <type>[ this turn]" — the typed-attacker surface. The qualifier
-/// is delegated to `parse_type_phrase` so the whole class of attacker types
+/// is delegated to `parse_type_phrase_folding` so the whole class of attacker types
 /// (Spacecraft, Vehicle, any creature type) is covered by the shared combinator
 /// rather than a per-card literal. An unrecognized qualifier yields
 /// `TargetFilter::Any`, which is REJECTED so the phrase stays an honest gap
@@ -6685,7 +7217,7 @@ fn parse_attacked_with_creature_count(input: &str) -> OracleResult<'_, StaticCon
 /// phrase must otherwise be consumed in full, so an unabsorbed qualifying clause
 /// stays an honest gap rather than being silently truncated.
 fn parse_attacked_with_typed_filter(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (filter, leftover) = parse_type_phrase(input);
+    let (filter, leftover) = parse_type_phrase_folding(input);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -6721,7 +7253,7 @@ fn parse_no_attacked_this_turn(input: &str) -> OracleResult<'_, StaticCondition>
     let (rest, _) = tag("no ").parse(input)?;
     let (rest, type_text) = take_until(" attacked this turn").parse(rest)?;
     let (rest, _) = tag(" attacked this turn").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
     if !leftover.trim().is_empty() || matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -6787,7 +7319,10 @@ fn parse_you_activated_loyalty_this_turn(input: &str) -> OracleResult<'_, Static
             1,
         ),
         (
-            alt((tag("you activated "), tag("you've activated "))),
+            alt((
+                value((), tag("you activated ")),
+                value((), (parse_youve, tag(" activated "))),
+            )),
             tag("a loyalty ability"),
             opt(tag(" of a planeswalker")),
             tag(" this turn"),
@@ -6856,9 +7391,14 @@ fn parse_player_action_this_turn_body(
 fn parse_player_action_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
         parse_opponent_action_this_turn,
-        preceded(alt((tag("you've "), tag("you have "), tag("you "))), |i| {
-            parse_player_action_this_turn_body(i, PlayerScope::Controller)
-        }),
+        preceded(
+            alt((
+                value((), (parse_youve, tag(" "))),
+                value((), tag("you have ")),
+                value((), tag("you ")),
+            )),
+            |i| parse_player_action_this_turn_body(i, PlayerScope::Controller),
+        ),
     ))
     .parse(input)
 }
@@ -6949,7 +7489,7 @@ fn parse_filtered_creature_died_this_turn(input: &str) -> OracleResult<'_, Stati
     let (rest, _) = parse_article(input)?;
     let (rest, type_text) = take_until(" died this turn").parse(rest)?;
     let (rest, _) = tag(" died this turn").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text);
+    let (filter, leftover) = parse_type_phrase_folding(type_text);
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -7051,19 +7591,79 @@ fn parse_source_qualified_mana_spent_threshold(input: &str) -> OracleResult<'_, 
     ))
 }
 
-/// CR 601.2h + CR 603.4: Intervening-if comparing mana spent on the triggering
-/// spell against this creature's power and/or toughness.
+/// CR 601.2h + CR 603.4: Intervening-if comparing the mana spent on a cast
+/// spell against the source's own power and/or toughness. Which spell that is
+/// comes from the subject's anaphora, not from a default.
 ///
-/// Recognizes "the amount of mana you spent is [comparator] this creature's
-/// power or toughness" (SOS Increment reminder text). The natural-language
+/// Two surface forms of the same sentence:
+///   * "the amount of mana you spent is …" — the SOS Increment reminder text,
+///     whose subject is always the triggering spell.
+///   * "the amount of mana spent to cast <anaphora> is …" — the printed
+///     wording that predates the keyword (Liberator, Urza's Battlethopter).
+///     Which spell that names is read through the shared
+///     `parse_mana_spent_self_subject` authority every mana-spent sibling in
+///     this module already consults, so "that spell" is not re-decided here.
+///     CR 400.7d is what
+///     licenses the self-anaphora arm of that authority: a permanent's ability
+///     may reference "what mana was spent to pay" the costs of the spell it
+///     was.
+///
+/// The object is "[comparator] <subject>'s power or toughness". The natural-language
 /// "or" means *either* threshold — `A > (P or T)` is satisfied when `A > P`
-/// **or** `A > T`. The "this creature's" subject, including the normalized
-/// "~'s" self-reference form, carries Increment's implicit source-is-creature
-/// intervening-if; "this permanent's" stays as a plain P/T comparison for
-/// non-Increment siblings.
+/// **or** `A > T`.
+///
+/// Whether a source-is-creature conjunct is added is decided by the SUBJECT,
+/// because the object phrase cannot decide it. `oracle_util::normalize_card_name_refs`
+/// rewrites BOTH a card's own printed name and "this creature" to `~` — the
+/// name via `replace_all_words`, the phrase via `SELF_REF_TYPE_PHRASES` — so
+/// `~'s` arrives from Increment's reminder and from Liberator, Urza's
+/// Battlethopter alike. The subject keeps them apart:
+///
+///   * "the amount of mana you spent" is the printed REMINDER of Increment. The
+///     reminder drops the clause CR 702.191a's rules text carries ("'Increment'
+///     means 'Whenever you cast a spell, IF THIS PERMANENT IS A CREATURE AND the
+///     amount of mana spent to cast that spell is greater than this creature's
+///     power …'"), so reinstating it here is that keyword clause. It gates.
+///   * "the amount of mana spent to cast &lt;anaphora&gt;" is a card spelling the
+///     sentence out itself. Liberator prints no creature clause and must not be
+///     given one. CR 208.3 ("A noncreature permanent has no power or
+///     toughness…") with CR 107.2 ("If anything needs to use a number that can't
+///     be determined … it uses 0 instead") says such a permanent compares
+///     against 0 — the ability still triggers. This engine reports a
+///     noncreature's power as its printed value instead, an engine-level CR
+///     208.3 gap tracked separately, not a parser one.
+///
+/// The explicit "this creature's" / "this permanent's" object arms are kept and
+/// stay pinned, but no production path was found that reaches this parser with
+/// either phrase intact — normalization rewrites both unconditionally.
+///
+/// One divergence, deliberate and unreachable today: the subject anaphora is
+/// read by `parse_mana_spent_self_subject`, which maps "this spell"/"it" to
+/// `SelfObject`, while `try_extract_mana_spent_comparison_condition`
+/// (`oracle_trigger.rs`) states the opposite for its own sentence in the same
+/// position. Neither ever ACCEPTS the other's input — that one requires a
+/// `" its mana value"` tail this one cannot produce, and it already sees and
+/// rejects Liberator's clause — and no corpus face writes this sentence with a
+/// self-anaphora. Consulting the shared authority is still the right call:
+/// re-deciding the mapping here is exactly the hand-typed list this parser
+/// avoids elsewhere.
 fn parse_mana_spent_vs_source_pt(input: &str) -> OracleResult<'_, StaticCondition> {
-    // Subject: "the amount of mana you spent is "
-    let (rest, _) = tag("the amount of mana you spent is ").parse(input)?;
+    // Subject, and with it the spell whose payment is measured.
+    let (rest, (scope, is_increment_reminder)) = alt((
+        value(
+            (CastManaObjectScope::TriggeringSpell, true),
+            tag("the amount of mana you spent is "),
+        ),
+        map(
+            delimited(
+                tag("the amount of mana spent to cast "),
+                nom_quantity::parse_mana_spent_self_subject,
+                tag(" is "),
+            ),
+            |scope| (scope, false),
+        ),
+    ))
+    .parse(input)?;
     // Comparator: "greater than " / "less than " / "equal to "
     let (rest, comparator) = alt((
         value(Comparator::GT, tag("greater than ")),
@@ -7073,9 +7673,24 @@ fn parse_mana_spent_vs_source_pt(input: &str) -> OracleResult<'_, StaticConditio
     .parse(rest)?;
     // Object: subject × property, with optional "or [other property]" disjunction.
     let (rest, requires_creature_source) = alt((
-        value(true, tag("this creature's ")),
-        value(false, tag("this permanent's ")),
-        value(true, tag("~'s ")),
+        value(
+            true,
+            recognize((tag("this creature"), parse_apostrophe_s, tag(" "))),
+        ),
+        value(
+            false,
+            recognize((tag("this permanent"), parse_apostrophe_s, tag(" "))),
+        ),
+        // `oracle_util::normalize_card_name_refs` collapses BOTH "this creature"
+        // and the card's own printed name to `~`, so this arm alone cannot tell
+        // Increment's reminder from a card that writes its own name. The subject
+        // can: the reminder's subject reaches a card only from the Increment
+        // keyword, a spelled-out subject is the card writing its own sentence,
+        // and only the keyword carries CR 702.191a's creature clause.
+        value(
+            is_increment_reminder,
+            recognize((tag("~"), parse_apostrophe_s, tag(" "))),
+        ),
     ))
     .parse(rest)?;
     let (rest, first) = alt((
@@ -7115,9 +7730,10 @@ fn parse_mana_spent_vs_source_pt(input: &str) -> OracleResult<'_, StaticConditio
 
     let lhs = QuantityExpr::Ref {
         qty: QuantityRef::ManaSpentToCast {
-            // "the amount of mana you spent" is the triggering-spell intervening-if
-            // (SOS Increment); the trigger event is in scope at evaluation time.
-            scope: CastManaObjectScope::TriggeringSpell,
+            // The subject above already decided this: the reminder text's
+            // "you spent" is the triggering spell, the printed form's anaphora
+            // says so itself. The trigger event is in scope at evaluation time.
+            scope,
             metric: crate::types::ability::CastManaSpentMetric::Total,
         },
     };
@@ -7269,7 +7885,7 @@ fn parse_combat_context_conditions(input: &str) -> OracleResult<'_, StaticCondit
         parse_defending_player_controls,
         value(
             StaticCondition::SourceAttackingAlone,
-            tag("it's attacking alone"),
+            (parse_it_is, tag(" attacking alone")),
         ),
     ))
     .parse(input)
@@ -7300,8 +7916,8 @@ fn parse_defending_player_controls(input: &str) -> OracleResult<'_, StaticCondit
         ));
     }
     let (rest, _) = parse_article(rest)?;
-    // parse_type_phrase returns (filter, remaining_str) — bridge to nom remainder
-    let (filter, type_rest) = parse_type_phrase(rest);
+    // parse_type_phrase_folding returns (filter, remaining_str) — bridge to nom remainder
+    let (filter, type_rest) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -7345,7 +7961,8 @@ fn parse_compound_verb_condition(input: &str) -> OracleResult<'_, StaticConditio
         .parse(i)
     }
 
-    let (rest, _) = alt((tag("you "), tag("you've "))).parse(input)?;
+    let (rest, _) =
+        alt((value((), tag("you ")), value((), (parse_youve, tag(" "))))).parse(input)?;
     let (rest, lhs) = life_verb(rest)?;
     // CR 119: the connective selects the boolean shape — "and" requires both
     // life changes, "or" requires either — over the shared LifeGained/LifeLost
@@ -7365,7 +7982,11 @@ fn parse_compound_verb_condition(input: &str) -> OracleResult<'_, StaticConditio
 
 /// Parse "you gained [N or more] life this turn".
 fn parse_you_gained_life_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((tag("you gained "), tag("you've gained "))).parse(input)?;
+    let (rest, _) = alt((
+        value((), tag("you gained ")),
+        value((), (parse_youve, tag(" gained "))),
+    ))
+    .parse(input)?;
     // Try "N or more life this turn"
     if let Ok((after_n, n)) = parse_number(rest) {
         let after_n = after_n.trim_start();
@@ -7405,7 +8026,11 @@ fn parse_you_gained_life_this_turn(input: &str) -> OracleResult<'_, StaticCondit
 /// create a 2/2 black Zombie") silently dropped their condition. Resolves via
 /// the existing `LifeLostThisTurn { Controller }` QuantityRef — no new variants.
 fn parse_you_lost_life_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((tag("you lost "), tag("you've lost "))).parse(input)?;
+    let (rest, _) = alt((
+        value((), tag("you lost ")),
+        value((), (parse_youve, tag(" lost "))),
+    ))
+    .parse(input)?;
     // Try "N or more life this turn".
     if let Ok((after_n, n)) = parse_number(rest) {
         let after_n = after_n.trim_start();
@@ -7502,7 +8127,11 @@ fn parse_drawn_cards_this_turn(input: &str) -> OracleResult<'_, StaticCondition>
 }
 
 fn parse_you_drew_cards_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((tag("you drew "), tag("you've drawn "))).parse(input)?;
+    let (rest, _) = alt((
+        value((), tag("you drew ")),
+        value((), (parse_youve, tag(" drawn "))),
+    ))
+    .parse(input)?;
     parse_drawn_cards_this_turn(rest)
 }
 
@@ -7510,7 +8139,7 @@ fn parse_opponent_drew_cards_this_turn(input: &str) -> OracleResult<'_, StaticCo
     let (rest, _) = alt((
         tag("an opponent drew "),
         tag("an opponent has drawn "),
-        tag("an opponent's drawn "),
+        recognize((tag("an opponent"), parse_apostrophe_s, tag(" drawn "))),
     ))
     .parse(input)?;
     let (rest, n) = parse_ge_threshold(rest)?;
@@ -7530,7 +8159,11 @@ fn parse_opponent_drew_cards_this_turn(input: &str) -> OracleResult<'_, StaticCo
 
 /// Parse "you cast another spell this turn" / "you cast a [type] spell this turn".
 fn parse_you_cast_spell_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((tag("you cast "), tag("you've cast "))).parse(input)?;
+    let (rest, _) = alt((
+        value((), tag("you cast ")),
+        value((), (parse_youve, tag(" cast "))),
+    ))
+    .parse(input)?;
     if let Ok((rest, condition)) = parse_spell_count_this_turn(rest) {
         return Ok((rest, condition));
     }
@@ -7693,7 +8326,11 @@ fn parse_one_spell_this_turn_filter(input: &str) -> OracleResult<'_, Option<Targ
 }
 
 fn parse_you_cast_both_spell_kinds_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((tag("you've cast both "), tag("you cast both "))).parse(input)?;
+    let (rest, _) = alt((
+        value((), (parse_youve, tag(" cast both "))),
+        value((), tag("you cast both ")),
+    ))
+    .parse(input)?;
     let (rest, first_text) = take_until(" and ").parse(rest)?;
     let (rest, _) = tag(" and ").parse(rest)?;
     let (rest, second_text) = take_until(" this turn").parse(rest)?;
@@ -7783,7 +8420,7 @@ fn parse_sacrificed_this_turn_tail(input: &str) -> OracleResult<'_, StaticCondit
     if let Ok((rest, n)) = parse_ge_threshold(input) {
         let (rest, type_text) = take_until(" this turn").parse(rest)?;
         let (rest, _) = tag(" this turn").parse(rest)?;
-        let (filter, leftover) = parse_type_phrase(type_text.trim());
+        let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
         if leftover.trim().is_empty() && filter != TargetFilter::Any {
             return Ok((
                 rest,
@@ -7801,7 +8438,7 @@ fn parse_sacrificed_this_turn_tail(input: &str) -> OracleResult<'_, StaticCondit
     let (rest, _) = parse_article(input)?;
     let (rest, type_text) = take_until(" this turn").parse(rest)?;
     let (rest, _) = tag(" this turn").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text.trim());
+    let (filter, leftover) = parse_type_phrase_folding(type_text.trim());
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -7824,7 +8461,7 @@ fn parse_died_under_your_control_this_turn(input: &str) -> OracleResult<'_, Stat
     let (rest, _) = parse_article(input)?;
     let (rest, type_text) = take_until(" died under your control this turn").parse(rest)?;
     let (rest, _) = tag(" died under your control this turn").parse(rest)?;
-    let (filter, leftover) = parse_type_phrase(type_text);
+    let (filter, leftover) = parse_type_phrase_folding(type_text);
     if !leftover.trim().is_empty() || filter == TargetFilter::Any {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -7973,7 +8610,10 @@ pub(crate) fn parse_you_cast_another_spell_filter_this_turn(
     input: &str,
 ) -> OracleResult<'_, Option<TargetFilter>> {
     preceded(
-        alt((tag("you cast another "), tag("you've cast another "))),
+        alt((
+            value((), tag("you cast another ")),
+            value((), (parse_youve, tag(" cast another "))),
+        )),
         parse_another_spell_tail,
     )
     .parse(input)
@@ -8002,7 +8642,7 @@ pub(crate) fn parse_spell_history_filter(type_text: &str) -> Option<TargetFilter
             return Some(filter);
         }
     }
-    let (filter, leftover) = parse_type_phrase(type_text);
+    let (filter, leftover) = parse_type_phrase_folding(type_text);
     if leftover.trim().is_empty() && filter != TargetFilter::Any {
         return Some(filter);
     }
@@ -8176,7 +8816,7 @@ fn parse_counter_added_this_turn(input: &str) -> OracleResult<'_, StaticConditio
 /// CR 603.4: These gate triggers on the absence of an event this turn.
 /// Composed as `QuantityComparison(ref EQ 0)` rather than `Not(ref >= 1)`.
 fn parse_you_didnt_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
-    if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("you haven't ").parse(input) {
+    if let Ok((rest, _)) = (tag("you "), parse_havent, tag(" ")).parse(input) {
         let (rest, _) = tag("cast ").parse(rest)?;
         let (rest, filter) = parse_one_spell_this_turn_filter(rest)?;
         return Ok((
@@ -8194,7 +8834,7 @@ fn parse_you_didnt_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
         ));
     }
 
-    let (rest, _) = tag("you didn't ").parse(input)?;
+    let (rest, _) = (tag("you "), parse_didnt, tag(" ")).parse(input)?;
     if let Ok((rest, _)) = tag::<_, _, OracleError<'_>>("cast ").parse(rest) {
         let (rest, filter) = parse_one_spell_this_turn_filter(rest)?;
         return Ok((
@@ -8265,8 +8905,47 @@ fn parse_you_didnt_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
     .parse(rest)
 }
 
+/// CR 508.1a + CR 611.3a: "<source> attacked this turn" — the source object was
+/// declared as an attacker this turn (Agent Frank Horrigan's indestructible
+/// gate, The Lunar Whale's play-from-top gate).
+///
+/// Composed from the already-evaluated `FilterProp::AttackedThisTurn`
+/// (`game/filter.rs`, checked against `state.creatures_attacked_this_turn`) via
+/// `SourceMatchesFilter` — the same composition the trigger intervening-if table
+/// and the target-anaphoric effect gate use, but type-free like its negation
+/// twin `make_source_history_absence` (those two carry a creature type filter;
+/// the fact is about the object regardless of its current type, so a crewed
+/// Vehicle or animated land that attacked and later stopped being a creature
+/// still matches) — so no new `StaticCondition` variant.
+///
+/// Affirmative twin of [`parse_source_didnt_this_turn`] (turn-scoped history
+/// ledger, hence the event-history group). Turn-scoped only; "this combat" is
+/// intentionally not accepted (no combat-scoped tracking).
+fn parse_source_attacked_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = parse_explicit_self_source_subject(input)?;
+    value(
+        StaticCondition::SourceMatchesFilter {
+            filter: attacked_this_turn_source_filter(),
+        },
+        tag("attacked this turn"),
+    )
+    .parse(rest)
+}
+
+/// CR 508.1a: the type-free "this object attacked this turn" runtime filter —
+/// the same `FilterProp` its negation twin counts (see
+/// [`make_source_history_absence`]).
+fn attacked_this_turn_source_filter() -> TargetFilter {
+    TargetFilter::Typed(
+        TypedFilter::default().properties(vec![FilterProp::AttackedThisTurn { defender: None }]),
+    )
+}
+
 fn parse_source_didnt_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((tag("~ didn't "), tag("this creature didn't "))).parse(input)?;
+    // Shares the explicit self-subject vocabulary with its affirmative twin
+    // [`parse_source_attacked_this_turn`] (CR 201.5 + CR 611.3a).
+    let (rest, _) = parse_explicit_self_source_subject(input)?;
+    let (rest, _) = (parse_didnt, tag(" ")).parse(rest)?;
     alt((
         // CR 302.6 + CR 508.1a: Mad Dog's intervening-if checks two
         // independent histories. Keep this longer arm before the bare attack
@@ -8348,7 +9027,7 @@ pub(crate) fn source_controlled_continuously_this_turn_condition() -> StaticCond
 /// subject-first form already lowered to, so both forms share one
 /// `QuantityComparison(ObjectCount == 0)` output and no controller restriction
 /// ("no creatures" / "no Zombies" / "no lands" counts *any* player's matching
-/// permanents). The `<type>` reuses `parse_type_phrase`, so a subtype
+/// permanents). The `<type>` reuses `parse_type_phrase_folding`, so a subtype
 /// ("Zombies"), a card type ("lands"), or a token phrase ("Reflection tokens")
 /// scopes the emptiness check exactly, and the trailing anchor is a bounded
 /// `tag` so the recognizer never runs into the effect clause.
@@ -8363,7 +9042,7 @@ fn parse_no_on_battlefield(input: &str) -> OracleResult<'_, StaticCondition> {
     .parse(input)?;
     let (rest, type_text) = take_until(anchor).parse(rest)?;
     let (rest, _) = tag(anchor).parse(rest)?;
-    let (filter, _) = parse_type_phrase(type_text);
+    let (filter, _) = parse_type_phrase_folding(type_text);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -8431,7 +9110,7 @@ fn parse_entered_this_turn(input: &str) -> OracleResult<'_, StaticCondition> {
     {
         let (rest, type_text) = take_until(entered_suffix).parse(rest)?;
         let (rest, _) = tag(entered_suffix).parse(rest)?;
-        let (filter, _) = parse_type_phrase(type_text.trim());
+        let (filter, _) = parse_type_phrase_folding(type_text.trim());
         return Ok((
             rest,
             make_quantity_ge(
@@ -8481,7 +9160,7 @@ fn parse_or_more_entered_count<'a>(
     let (type_and_rest, _) = tag("or more ").parse(after_n.trim_start())?;
     let (rest, type_text) = take_until(suffix).parse(type_and_rest)?;
     let (rest, _) = tag(suffix).parse(rest)?;
-    let (filter, _) = parse_type_phrase(type_text.trim());
+    let (filter, _) = parse_type_phrase_folding(type_text.trim());
     Ok((
         rest,
         make_quantity_ge(
@@ -8501,7 +9180,7 @@ fn parse_entered_this_turn_subject<'a>(
     let (rest, _) = tag(suffix).parse(rest)?;
     let type_text = type_text.trim();
     let _ = alt((parse_article, value((), tag("another ")))).parse(type_text)?;
-    let (filter, _) = parse_type_phrase(type_text.trim());
+    let (filter, _) = parse_type_phrase_folding(type_text.trim());
     Ok((
         rest,
         make_quantity_ge(
@@ -8579,21 +9258,30 @@ fn parse_opponent_had_entered_this_turn(input: &str) -> OracleResult<'_, StaticC
 fn parse_entered_this_turn_under_opponent_control(
     input: &str,
 ) -> OracleResult<'_, StaticCondition> {
-    let suffix = "entered the battlefield under an opponent's control this turn";
     let player = PlayerScope::Opponent {
         aggregate: AggregateFunction::Max,
     };
-    if let Ok(result) = parse_or_more_entered_count(input, suffix, player.clone()) {
-        return Ok(result);
+    for suffix in [
+        "entered the battlefield under an opponent's control this turn",
+        "entered the battlefield under an opponent\u{2019}s control this turn",
+    ] {
+        if let Ok(result) = parse_or_more_entered_count(input, suffix, player.clone()) {
+            return Ok(result);
+        }
+        if let Ok(result) = parse_entered_this_turn_subject(input, suffix, 1, player.clone()) {
+            return Ok(result);
+        }
     }
-    parse_entered_this_turn_subject(input, suffix, 1, player)
+    Err(oracle_err(input))
 }
 
-/// Parse "there are [fewer than/more than] N [or more] [things] ..." conditions.
+/// Parse "there are [fewer than/more than] N [or more / at least N] [things] ..."
+/// conditions.
 ///
-/// Covers threshold ("seven or more cards"), delirium ("four or more card types"),
-/// mana values ("five or more mana values"), and typed cards ("creature cards",
-/// "instant and/or sorcery cards", "land cards", "historic cards", etc.).
+/// Covers threshold ("seven or more cards" / "at least three Lesson cards"),
+/// delirium ("four or more card types"), mana values ("five or more mana
+/// values"), and typed cards ("creature cards", "instant and/or sorcery cards",
+/// "land cards", "historic cards", "Zombie creature cards", etc.).
 ///
 /// Two comparator axes exist and they are mutually exclusive:
 /// - a strict-inequality **prefix** before N — "fewer than" (LT) / "more than"
@@ -8601,19 +9289,23 @@ fn parse_entered_this_turn_under_opponent_control(
 ///   (Shadowborn Demon) and "there are fewer than eight cards in your graveyard"
 ///   (The Warring Triad, where subtype/graveyard canonicalization composes with
 ///   the prefix);
-/// - a threshold **suffix** after N — "or more" (GE), e.g. "there are seven or
-///   more lands on the battlefield" (Impending Disaster).
+/// - a GE **threshold** via `parse_ge_threshold` — "N or more" or "at least N",
+///   e.g. "there are seven or more lands on the battlefield" (Impending Disaster)
+///   and "there are at least three Zombie creature cards in your graveyard".
 ///
 /// When neither is present — e.g. "there are five basic land types among lands
 /// you control" (A-Nael, Avizoa Aeronaut) — English grammar reads as "exactly
-/// N", so the comparator is EQ. A prefix and an "or more" suffix together
-/// ("fewer than N or more") is not English and is refused rather than guessed.
+/// N", so the comparator is EQ. A prefix and a GE threshold together
+/// ("fewer than N or more" / "fewer than at least N") is not English and is
+/// refused rather than guessed.
 ///
 /// CR 107.1: Magic numbers are integers; exact-value checks are distinct
-/// from threshold checks. Consumers evaluate the resulting comparison under
-/// CR 603.4 (intervening-"if" triggered abilities) and CR 611.3a (static
-/// continuous "as long as" gates), both of which re-read the condition against
-/// live game state at check time.
+/// from threshold checks (>= N vs exactly N). Consumers evaluate the resulting
+/// comparison under CR 603.4 (intervening-"if" triggered abilities) and
+/// CR 611.3a (static continuous "as long as" gates), both of which re-read the
+/// condition against live game state at check time. Activation-restriction
+/// consumers (CR 602.1b / CR 602.5) share this grammar; those rules are not
+/// this combinator's authority.
 fn parse_there_are_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     parse_there_are_conditions_with_quantity(input, nom_quantity::parse_quantity_ref)
 }
@@ -8637,16 +9329,28 @@ fn parse_there_are_conditions_with_quantity(
 ) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = tag("there are ").parse(input)?;
     let (rest, prefix) = opt(parse_strict_comparator_prefix).parse(rest)?;
-    let (rest, n) = parse_number(rest)?;
-    let (rest, _) = tag(" ").parse(rest)?;
-    let (rest, or_more) = opt(tag("or more ")).parse(rest)?;
-    let comparator = match (prefix, or_more) {
-        // "fewer than N or more" is not English — refuse to guess.
-        (Some(_), Some(_)) => return Err(oracle_err(input)),
-        (Some(c), None) => c,
-        (None, Some(_)) => Comparator::GE,
-        (None, None) => Comparator::EQ,
+    // CR 107.1: GE is `"N or more "` / `"at least N "` via `parse_ge_threshold`;
+    // a following space is already consumed there, so do not `tag(" ")` after a
+    // GE hit. Bare N (EQ / strict-prefix remainder) is `parse_number` + space
+    // only when GE fails.
+    let (rest, (n, ge)) = alt((
+        map(parse_ge_threshold, |n| (n, true)),
+        map(terminated(parse_number, tag(" ")), |n| (n, false)),
+    ))
+    .parse(rest)?;
+    let comparator = match (prefix, ge) {
+        // "fewer than N or more" / "fewer than at least N" is not English —
+        // refuse to guess.
+        (Some(_), true) => return Err(oracle_err(input)),
+        (Some(c), false) => c,
+        (None, true) => Comparator::GE,
+        (None, false) => Comparator::EQ,
     };
+    match parse_filtered_zone_card_count(rest) {
+        Ok((rest, qty)) => return Ok((rest, make_quantity_comparison(qty, comparator, n))),
+        Err(nom::Err::Error(_)) => {}
+        Err(error @ (nom::Err::Failure(_) | nom::Err::Incomplete(_))) => return Err(error),
+    }
     if let Ok((rest_after_type, type_text)) =
         take_until::<_, _, OracleError<'_>>(" cards total in ").parse(rest)
     {
@@ -8675,6 +9379,147 @@ fn parse_there_are_conditions_with_quantity(
             n,
         ),
     ))
+}
+
+/// CR 109.2a + CR 400.1: A card description with a named zone counts matching
+/// cards in that zone, so this preserves the parsed filter rather than flattening
+/// it into a lexical noun or a card-type list.
+///
+/// The type phrase and locative zone are deliberately parsed by their separate
+/// authorities. `parse_type_phrase_folding` owns the complete noun phrase, while
+/// `parse_scoped_zone_count_ref` owns the player/zone scope after `in `.
+fn parse_filtered_zone_card_count(input: &str) -> OracleResult<'_, QuantityRef> {
+    let (rest_after_noun, noun) = take_until(" in ").parse(input)?;
+    let (after_cards, _) = terminated(take_until("cards"), tag("cards")).parse(noun)?;
+    if !after_cards.is_empty() {
+        return Err(oracle_err(input));
+    }
+    let (filter, remainder) = parse_type_phrase_folding(noun);
+    if !remainder.trim().is_empty() || !is_admissible_zone_card_count_filter(&filter) {
+        return Err(oracle_err(input));
+    }
+    let (rest, _) = tag(" in ").parse(rest_after_noun)?;
+    let (rest, (zone, scope)) = cut(preceded(
+        peek(alt((tag("your "), tag("all graveyards")))),
+        parse_scoped_zone_count_ref,
+    ))
+    .parse(rest)?;
+    Ok((
+        rest,
+        QuantityRef::ZoneCardCount {
+            zone,
+            card_types: Vec::new(),
+            filter: Some(filter),
+            scope,
+        },
+    ))
+}
+
+/// Limits the filtered zone-count bridge to card descriptions whose semantics
+/// remain valid in every counted zone. All other filter forms deliberately fall
+/// through to the legacy quantity grammar instead of being partially accepted.
+///
+/// CR 109.2a + CR 404.1: a card description that names a zone counts matching
+/// cards in that zone.
+/// CR 205.1 + CR 205.2a + CR 205.3m: juxtaposed subtype + non-`Card` core type
+/// ("Zombie creature cards") is a type-line conjunction (creature AND the
+/// Zombie creature type). Empty-`properties` nouns are admitted only in that
+/// shape, encoded as `filter: Some(Typed { .. })` so `matches_target_filter`
+/// ANDs the type filters. Property-free core-only ("creature cards") or
+/// subtype-only ("Lesson cards" / "Zombie cards") nouns stay on the legacy
+/// `card_types` path.
+fn is_admissible_zone_card_count_filter(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::Typed(TypedFilter {
+            type_filters,
+            controller,
+            properties,
+        }) => {
+            controller.is_none()
+                && !type_filters.is_empty()
+                && !type_filters.iter().any(type_filter_contains_any)
+                && if properties.is_empty() {
+                    type_filters_are_juxtaposed_subtype_and_core(type_filters)
+                } else {
+                    properties
+                        .iter()
+                        .all(is_admissible_zone_card_count_property)
+                }
+        }
+        TargetFilter::Or { filters } => {
+            !filters.is_empty() && filters.iter().all(is_admissible_zone_card_count_filter)
+        }
+        _ => false,
+    }
+}
+
+/// `TypeFilter::Any` would make this bridge a broad unfiltered count. Descend
+/// through its recursive variants so nested `Any` filters cannot bypass that
+/// boundary.
+fn type_filter_contains_any(filter: &TypeFilter) -> bool {
+    match filter {
+        TypeFilter::Any => true,
+        TypeFilter::Non(filter) => type_filter_contains_any(filter),
+        TypeFilter::AnyOf(filters) => filters.iter().any(type_filter_contains_any),
+        TypeFilter::Creature
+        | TypeFilter::Land
+        | TypeFilter::Artifact
+        | TypeFilter::Enchantment
+        | TypeFilter::Instant
+        | TypeFilter::Sorcery
+        | TypeFilter::Planeswalker
+        | TypeFilter::Battle
+        | TypeFilter::Kindred
+        | TypeFilter::Permanent
+        | TypeFilter::Card
+        | TypeFilter::Subtype(_) => false,
+    }
+}
+
+/// CR 205.2a: non-`Card` core types that can juxtapose with a subtype in a
+/// zone-card description. `Card` / `Any` / `Subtype` / `Non` / `AnyOf` are not
+/// cores for this gate — admitting them would steal `"creature cards"` /
+/// `"Lesson cards"` / `"instant or sorcery cards"` onto the filtered bridge.
+fn type_filter_is_non_card_core(filter: &TypeFilter) -> bool {
+    match filter {
+        TypeFilter::Creature
+        | TypeFilter::Land
+        | TypeFilter::Artifact
+        | TypeFilter::Enchantment
+        | TypeFilter::Instant
+        | TypeFilter::Sorcery
+        | TypeFilter::Planeswalker
+        | TypeFilter::Battle
+        | TypeFilter::Kindred
+        | TypeFilter::Permanent => true,
+        TypeFilter::Card
+        | TypeFilter::Any
+        | TypeFilter::Subtype(_)
+        | TypeFilter::Non(_)
+        | TypeFilter::AnyOf(_) => false,
+    }
+}
+
+/// CR 205.1 + CR 205.3m: a juxtaposed subtype + non-`Card` core type
+/// ("Zombie creature") is a type-line conjunction, not a disjunction.
+fn type_filters_are_juxtaposed_subtype_and_core(type_filters: &[TypeFilter]) -> bool {
+    type_filters
+        .iter()
+        .any(|filter| matches!(filter, TypeFilter::Subtype(_)))
+        && type_filters.iter().any(type_filter_is_non_card_core)
+}
+
+/// Only static card-description properties can be evaluated meaningfully in a
+/// named card zone. The default is intentionally reject-by-default so a future
+/// property cannot widen this parser without an explicit admissibility decision.
+fn is_admissible_zone_card_count_property(property: &FilterProp) -> bool {
+    matches!(
+        property,
+        FilterProp::Historic
+            | FilterProp::NotHistoric
+            | FilterProp::HasSupertype { .. }
+            | FilterProp::NotSupertype { .. }
+    )
 }
 
 /// Self-referential source alternatives shared by the "exiled with [source]"
@@ -8711,7 +9556,7 @@ fn parse_no_cards_in_your_zone(input: &str) -> OracleResult<'_, StaticCondition>
     let filter = if type_text.is_empty() {
         None
     } else {
-        let (filter, remainder) = parse_type_phrase(type_text.trim());
+        let (filter, remainder) = parse_type_phrase_folding(type_text.trim());
         if matches!(filter, TargetFilter::Any) || !remainder.trim().is_empty() {
             return Err(oracle_err(input));
         }
@@ -8806,7 +9651,7 @@ fn parse_cards_distinct_quality_exiled_with_source_condition(
 /// Parse "there is a/an X card and a/an Y card in your <zone>" as two
 /// independent zone-count predicates sharing the same zone/scope suffix.
 fn parse_there_exists_compound_zone_condition(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((tag("there's "), tag("there is "))).parse(input)?;
+    let (rest, _) = (parse_theres, tag(" ")).parse(input)?;
     let (rest, _) = parse_article(rest)?;
     let (rest, first_card_types) = parse_single_card_type_before_and(rest)?;
     let (rest, _) = tag(" and ").parse(rest)?;
@@ -8870,7 +9715,7 @@ fn parse_zone_card_type_text(type_text: &str) -> Vec<TypeFilter> {
             _ => {}
         }
     }
-    let (filter, _) = parse_type_phrase(type_text.trim());
+    let (filter, _) = parse_type_phrase_folding(type_text.trim());
     let mut card_types = Vec::new();
     collect_type_filters(filter, &mut card_types);
     card_types.retain(|type_filter| *type_filter != TypeFilter::Card);
@@ -8925,7 +9770,7 @@ fn parse_subject_first_card_subject(input: &str) -> OracleResult<'_, Vec<TypeFil
         },
     ))
     .parse(input)?;
-    let (filter, _) = parse_type_phrase(type_text.trim());
+    let (filter, _) = parse_type_phrase_folding(type_text.trim());
     let mut card_types = match filter {
         TargetFilter::Typed(TypedFilter { type_filters, .. }) => type_filters,
         _ => vec![],
@@ -8947,7 +9792,12 @@ fn parse_scoped_zone_count_ref(input: &str) -> OracleResult<'_, (ZoneRef, CountS
             Ok((rest, (zone, CountScope::Opponents)))
         },
         |i| {
-            let (rest, _) = alt((tag("all "), tag("each player's "), tag("players' "))).parse(i)?;
+            let (rest, _) = alt((
+                tag("all "),
+                recognize((tag("each player"), parse_apostrophe_s, tag(" "))),
+                recognize((tag("players"), parse_apostrophe, tag(" "))),
+            ))
+            .parse(i)?;
             let (rest, zone) = parse_zone_count_ref(rest)?;
             Ok((rest, (zone, CountScope::All)))
         },
@@ -8985,7 +9835,8 @@ fn parse_zone_count_ref(input: &str) -> OracleResult<'_, ZoneRef> {
 ///
 /// Composes the same axes as `parse_source_has_counters`:
 /// - Quantity axis (`parse_has_counters_quantity`): "no" / "a" / "N or more"
-///   / "N or fewer" / "exactly N" / "one or more".
+///   / "N or fewer" / "exactly N" / "one or more" / "fewer than N"
+///   (`(0, Some(N-1))`) / "more than N" (`(N+1, None)`).
 /// - Counter type axis (`parse_typed_counter_noun` then `Any` fallback).
 /// - Source subject: any pronoun / `~` form accepted by
 ///   `parse_counter_on_source_subject`.
@@ -9040,7 +9891,7 @@ fn parse_counter_on_source_subject(input: &str) -> OracleResult<'_, &str> {
 /// Unlocks the full class of "has <keyword> as long as there's a <filter> card
 /// in your <zone>" static abilities (e.g. Aang, A Lot to Learn).
 fn parse_there_exists_condition(input: &str) -> OracleResult<'_, StaticCondition> {
-    let (rest, _) = alt((tag("there's "), tag("there is "))).parse(input)?;
+    let (rest, _) = (parse_theres, tag(" ")).parse(input)?;
     let (rest, _) = parse_article(rest)?;
     let (rest, qty) = nom_quantity::parse_quantity_ref.parse(rest)?;
     Ok((
@@ -9101,12 +9952,12 @@ fn parse_that_player_controls_more_comparison(input: &str) -> OracleResult<'_, S
     let (rest, type_text) = take_until::<_, _, OracleError<'_>>(" than you").parse(rest)?;
     let (rest, _) = tag(" than you").parse(rest)?;
 
-    let (filter, _) = parse_type_phrase(type_text.trim());
+    let (filter, _) = parse_type_phrase_folding(type_text.trim());
     let scoped_filter = match filter {
         TargetFilter::Typed(tf) => TargetFilter::Typed(tf.controller(ControllerRef::ScopedPlayer)),
         other => other,
     };
-    let you_filter = match parse_type_phrase(type_text.trim()) {
+    let you_filter = match parse_type_phrase_folding(type_text.trim()) {
         (TargetFilter::Typed(tf), _) => TargetFilter::Typed(tf.controller(ControllerRef::You)),
         (other, _) => other,
     };
@@ -9216,14 +10067,14 @@ fn parse_defending_player_comparison_conditions(input: &str) -> OracleResult<'_,
     let (rest, type_text) = take_until::<_, _, OracleError<'_>>(" than you").parse(rest)?;
     let (rest, _) = tag(" than you").parse(rest)?;
 
-    let (filter, _) = parse_type_phrase(type_text.trim());
+    let (filter, _) = parse_type_phrase_folding(type_text.trim());
     let defending_filter = match filter {
         TargetFilter::Typed(tf) => {
             TargetFilter::Typed(tf.controller(ControllerRef::DefendingPlayer))
         }
         other => other,
     };
-    let you_filter = match parse_type_phrase(type_text.trim()) {
+    let you_filter = match parse_type_phrase_folding(type_text.trim()) {
         (TargetFilter::Typed(tf), _) => TargetFilter::Typed(tf.controller(ControllerRef::You)),
         (other, _) => other,
     };
@@ -9288,8 +10139,12 @@ fn parse_triggering_player_has_unattacked_opponent(
     input: &str,
 ) -> OracleResult<'_, StaticCondition> {
     let (rest, _) = alt((tag("that player "), tag("that opponent "))).parse(input)?;
-    let (rest, _) = tag("has another opponent who isn").parse(rest)?;
-    let (rest, _) = alt((tag("'t being attacked"), tag("\u{2019}t being attacked"))).parse(rest)?;
+    let (rest, _) = (
+        tag("has another opponent who "),
+        parse_isnt,
+        tag(" being attacked"),
+    )
+        .parse(rest)?;
     Ok((
         rest,
         StaticCondition::QuantityComparison {
@@ -9357,7 +10212,7 @@ fn parse_opponent_comparison_conditions(input: &str) -> OracleResult<'_, StaticC
                 return Err(oracle_err(rest3));
             }
             let type_text = rest3.trim_end_matches('.');
-            let (filter, remainder) = parse_type_phrase(type_text);
+            let (filter, remainder) = parse_type_phrase_folding(type_text);
             if !matches!(filter, TargetFilter::Any) {
                 let filter = match filter {
                     TargetFilter::Typed(tf) => {
@@ -9634,7 +10489,7 @@ fn parse_opponent_controls_more_than_you(input: &str) -> OracleResult<'_, Static
 }
 
 fn player_count_comparison_filters(type_text: &str) -> Option<(TargetFilter, TargetFilter)> {
-    let (type_filter, remainder) = parse_type_phrase(type_text.trim());
+    let (type_filter, remainder) = parse_type_phrase_folding(type_text.trim());
     if !remainder.trim().is_empty() || matches!(type_filter, TargetFilter::Any | TargetFilter::None)
     {
         return None;
@@ -9686,16 +10541,14 @@ fn parse_unless_pay_condition(input: &str) -> OracleResult<'_, StaticCondition> 
     ))
     .parse(input)?;
     let (rest, cost) = parse_mana_cost(rest)?;
-    let (rest, scaling) = opt(alt((
-        value(
-            UnlessPayScaling::PerAffectedCreature,
-            tag(" for each creature they control that's blocking it"),
+    let (rest, scaling) = opt(value(
+        UnlessPayScaling::PerAffectedCreature,
+        (
+            tag(" for each creature they control that"),
+            alt((recognize(parse_apostrophe_s), tag(" is"))),
+            tag(" blocking it"),
         ),
-        value(
-            UnlessPayScaling::PerAffectedCreature,
-            tag(" for each creature they control that is blocking it"),
-        ),
-    )))
+    ))
     .parse(rest)?;
     Ok((
         rest,
@@ -9800,7 +10653,7 @@ pub fn parse_zone_changed_this_way_clause_scoped(
         value((), tag::<_, _, OracleError<'_>>("at least one ")),
         value((), tag("one or more ")),
         // CR 608.2c: "another <type> … this way" (Arid Archway) — do NOT consume
-        // "another "; `parse_type_phrase` maps it to `FilterProp::Another` so the
+        // "another "; `parse_type_phrase_folding` maps it to `FilterProp::Another` so the
         // returned-this-way subject excludes the source.
         value((), nom::combinator::peek(tag("another "))),
         // CR 608.2c: "that <type> … this way" (Saw in Half, Tuktuk Scrapper) —
@@ -9815,7 +10668,7 @@ pub fn parse_zone_changed_this_way_clause_scoped(
     // type phrase — handled by the shared helper which already covers
     // top-level types (creature, artifact, enchantment, …) and subtypes
     // (Aura, Equipment, …) via the lowercase oracle subtype dictionary.
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -9831,7 +10684,7 @@ pub fn parse_zone_changed_this_way_clause_scoped(
     // `parse_you_control_a`.
     let (filter, after_filter) = fold_this_way_subject_disjunction(filter, after_filter);
 
-    // `parse_type_phrase` returns a slice of `rest`; trim any leading whitespace
+    // `parse_type_phrase_folding` returns a slice of `rest`; trim any leading whitespace
     // it left between the type phrase and the tense verb so the next `tag`
     // matches cleanly.
     let after_filter = after_filter.trim_start();
@@ -9867,8 +10720,8 @@ pub fn parse_zone_changed_this_way_clause_scoped(
     // milled" produce the same existential condition. (Negations stay
     // singular-only: no card prints "aren't"/"weren't ... this way".)
     let (rest, negated) = alt((
-        value(true, tag::<_, _, OracleError<'_>>("wasn't ")),
-        value(true, tag("isn't ")),
+        value(true, (parse_wasnt, tag(" "))),
+        value(true, (parse_isnt, tag(" "))),
         value(true, tag("was not ")),
         value(true, tag("is not ")),
         value(false, tag("was ")),
@@ -9956,7 +10809,7 @@ pub enum DamagedThisWayRecipient {
 /// This is the plain-damage sibling of [`parse_zone_changed_this_way_clause`]
 /// (zone-change verbs) and of `parse_previous_effect_excess_damage_condition`
 /// (the `excess` channel). It shares the same article × subject × tense × verb
-/// axes, so a new recipient noun is a `parse_type_phrase` concern, not a new
+/// axes, so a new recipient noun is a `parse_type_phrase_folding` concern, not a new
 /// `tag` arm here.
 ///
 /// `"dealt excess damage this way"` cannot match: the `excess` token stops the
@@ -9985,7 +10838,7 @@ pub fn parse_damaged_this_way_clause(input: &str) -> OracleResult<'_, DamagedThi
     ))
     .parse(rest)?;
 
-    // `parse_type_phrase` returns a slice of its input; trim any whitespace it
+    // `parse_type_phrase_folding` returns a slice of its input; trim any whitespace it
     // left between the noun phrase and the tense verb so the next `tag` matches
     // cleanly (same normalization the zone-change sibling performs).
     let rest = rest.trim_start();
@@ -10006,14 +10859,14 @@ pub fn parse_damaged_this_way_clause(input: &str) -> OracleResult<'_, DamagedThi
 }
 
 /// CR 120.3 + CR 205: the typed-recipient arm of [`parse_damaged_this_way_clause`].
-/// Delegates the noun phrase to [`parse_type_phrase`] — the declared authority for
+/// Delegates the noun phrase to [`parse_type_phrase_folding`] — the declared authority for
 /// type/subtype phrases — and folds a `" or a [type]"` continuation through the
 /// shared [`fold_this_way_subject_disjunction`], so a disjunctive recipient sharing
 /// one verb ("a Dragon or a Wurm is dealt damage this way") stays one condition.
 fn parse_damaged_this_way_typed_recipient(
     input: &str,
 ) -> OracleResult<'_, DamagedThisWayRecipient> {
-    let (filter, after_filter) = parse_type_phrase(input);
+    let (filter, after_filter) = parse_type_phrase_folding(input);
     // Fail closed on a vacuous or non-consuming parse, mirroring the zone-change
     // sibling: `TargetFilter::Any` means the noun was not recognized at all.
     if matches!(filter, TargetFilter::Any) || after_filter.len() == input.len() {
@@ -10205,7 +11058,7 @@ pub fn parse_you_put_onto_battlefield_this_way_clause(
         parse_article,
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10214,6 +11067,47 @@ pub fn parse_you_put_onto_battlefield_this_way_clause(
     }
     let after_filter = after_filter.trim_start();
     let (rest, _) = tag("onto the battlefield this way").parse(after_filter)?;
+    Ok((rest, (filter, false)))
+}
+
+/// CR 608.2c + CR 701.25a: Parse "you put [quantifier] [type] into your
+/// graveyard this way" — the active-voice reflexive gate created by a
+/// preceding "surveil N" instruction (Chandra, Chill of Compliance prints
+/// "Surveil 1." followed by "If you put a noncreature, nonland card into
+/// your graveyard this way, put that card into your hand."; Enlightened
+/// Confidant shares the shape).
+///
+/// CR 701.25a: to surveil, each looked-at card is EITHER put into the
+/// graveyard OR left on top of the library — a genuine choice, unlike
+/// discard/sacrifice/exile, whose destination is inherent to the verb. So
+/// (like the `parse_you_put_onto_battlefield_this_way_clause` sibling right
+/// above) this clause is DESTINATION-BOUND: a redirect that sends the card
+/// elsewhere as it moves (Rest in Peace / Leyline of the Void: "would be put
+/// into a graveyard from anywhere → exile instead") defeats it — the caller
+/// must pair the returned filter with `destination: Some(Zone::Graveyard)`,
+/// not `None`. The surveil choice's library → graveyard move publishes the
+/// moved card into `state.last_zone_changed_ids`, mirroring the
+/// `parse_you_discard_this_way_clause` / `parse_you_sacrifice_this_way_clause`
+/// siblings below; only the verb and destination differ.
+pub fn parse_you_put_into_graveyard_this_way_clause(
+    input: &str,
+) -> OracleResult<'_, (TargetFilter, bool)> {
+    let (rest, _) = tag("you put ").parse(input)?;
+    let (rest, _) = alt((
+        value((), tag::<_, _, OracleError<'_>>("at least one ")),
+        value((), tag("one or more ")),
+        parse_article,
+    ))
+    .parse(rest)?;
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
+    if matches!(filter, TargetFilter::Any) {
+        return Err(nom::Err::Error(nom::error::Error::new(
+            input,
+            nom::error::ErrorKind::Fail,
+        )));
+    }
+    let after_filter = after_filter.trim_start();
+    let (rest, _) = tag("into your graveyard this way").parse(after_filter)?;
     Ok((rest, (filter, false)))
 }
 
@@ -10236,7 +11130,7 @@ pub fn parse_you_put_onto_battlefield_this_way_clause(
 /// The bare "a card" form parses to `TypeFilter::Card` (matches any card in any
 /// zone), which is the intended existential semantics — any card discarded this
 /// way. A leading type qualifier ("a creature card") narrows the filter via the
-/// shared `parse_type_phrase` helper, covering the whole class.
+/// shared `parse_type_phrase_folding` helper, covering the whole class.
 pub fn parse_you_discard_this_way_clause(input: &str) -> OracleResult<'_, (TargetFilter, bool)> {
     let (rest, _) = tag("you discard ").parse(input)?;
     let (rest, _) = alt((
@@ -10245,7 +11139,7 @@ pub fn parse_you_discard_this_way_clause(input: &str) -> OracleResult<'_, (Targe
         parse_article,
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10269,7 +11163,7 @@ pub fn parse_you_discard_this_way_clause(input: &str) -> OracleResult<'_, (Targe
 /// `parse_you_discard_this_way_clause` existential check, differing only in the
 /// active verb ("sacrifice") and its fixed-graveyard destination. The optional
 /// trailing plural "s" lets "one or more artifacts" / "an artifact" / "a creature"
-/// all narrow through the shared `parse_type_phrase` helper, covering the class.
+/// all narrow through the shared `parse_type_phrase_folding` helper, covering the class.
 pub fn parse_you_sacrifice_this_way_clause(input: &str) -> OracleResult<'_, (TargetFilter, bool)> {
     let (rest, _) = tag("you sacrifice ").parse(input)?;
     let (rest, _) = alt((
@@ -10279,7 +11173,7 @@ pub fn parse_you_sacrifice_this_way_clause(input: &str) -> OracleResult<'_, (Tar
         parse_article,
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10315,7 +11209,7 @@ pub fn parse_you_exile_this_way_clause(input: &str) -> OracleResult<'_, (TargetF
         parse_article,
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10351,7 +11245,7 @@ fn fold_this_way_subject_disjunction(first: TargetFilter, remainder: &str) -> (T
         {
             break;
         }
-        let (next_filter, next_remainder) = parse_type_phrase(after_or);
+        let (next_filter, next_remainder) = parse_type_phrase_folding(after_or);
         if matches!(next_filter, TargetFilter::Any) {
             break;
         }
@@ -10401,7 +11295,7 @@ pub fn parse_you_put_into_hand_this_way_condition(
         ),
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10446,7 +11340,7 @@ pub fn parse_you_put_counters_on_type_this_way_condition(
             )))
         }
     };
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10484,7 +11378,7 @@ pub fn parse_returned_to_hand_this_way_clause(input: &str) -> OracleResult<'_, T
         ),
     ))
     .parse(rest)?;
-    let (filter, after_filter) = parse_type_phrase(rest);
+    let (filter, after_filter) = parse_type_phrase_folding(rest);
     if matches!(filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10507,7 +11401,7 @@ pub fn parse_you_control_or_returned_this_way_condition(
 ) -> OracleResult<'_, AbilityCondition> {
     let (rest, _) = tag("you control ").parse(input)?;
     nom::combinator::peek(alt((tag("a "), tag("an "), tag("another ")))).parse(rest)?;
-    let (control_filter, after) = parse_type_phrase(rest);
+    let (control_filter, after) = parse_type_phrase_folding(rest);
     if matches!(control_filter, TargetFilter::Any) {
         return Err(nom::Err::Error(nom::error::Error::new(
             input,
@@ -10642,25 +11536,24 @@ fn parse_discard_this_way_affirmative_connector(input: &str) -> OracleResult<'_,
 /// here ends in `n't, `, so no affirmative tag (which requires `, ` immediately
 /// after the verb) can prefix-match one of these. Splitting the original single
 /// `alt` into two therefore preserves its behavior exactly.
+fn parse_negated_player_subject_verb(input: &str) -> OracleResult<'_, ()> {
+    alt((
+        value(
+            (),
+            (alt((tag("that player "), tag("the player "))), parse_doesnt),
+        ),
+        value((), (tag("they "), parse_dont)),
+    ))
+    .parse(input)
+}
+
 fn parse_negated_reflexive_connector(input: &str) -> OracleResult<'_, AbilityCondition> {
     alt((
         value(
             AbilityCondition::Not {
                 condition: Box::new(AbilityCondition::effect_performed()),
             },
-            tag("if that player doesn't, "),
-        ),
-        value(
-            AbilityCondition::Not {
-                condition: Box::new(AbilityCondition::effect_performed()),
-            },
-            tag("if the player doesn't, "),
-        ),
-        value(
-            AbilityCondition::Not {
-                condition: Box::new(AbilityCondition::effect_performed()),
-            },
-            tag("if they don't, "),
+            (tag("if "), parse_negated_player_subject_verb, tag(", ")),
         ),
         parse_discard_this_way_negated_connector,
     ))
@@ -10673,26 +11566,16 @@ fn parse_negated_reflexive_connector(input: &str) -> OracleResult<'_, AbilityCon
 /// card."). Untyped-object sibling of the affirmative echoed connector above;
 /// mirrors the same subject set already covered by the bare negated connector.
 fn parse_discard_this_way_negated_connector(input: &str) -> OracleResult<'_, AbilityCondition> {
-    alt((
-        value(
-            AbilityCondition::Not {
-                condition: Box::new(AbilityCondition::effect_performed()),
-            },
-            tag("if that player doesn't discard a card this way, "),
+    value(
+        AbilityCondition::Not {
+            condition: Box::new(AbilityCondition::effect_performed()),
+        },
+        (
+            tag("if "),
+            parse_negated_player_subject_verb,
+            tag(" discard a card this way, "),
         ),
-        value(
-            AbilityCondition::Not {
-                condition: Box::new(AbilityCondition::effect_performed()),
-            },
-            tag("if the player doesn't discard a card this way, "),
-        ),
-        value(
-            AbilityCondition::Not {
-                condition: Box::new(AbilityCondition::effect_performed()),
-            },
-            tag("if they don't discard a card this way, "),
-        ),
-    ))
+    )
     .parse(input)
 }
 
@@ -10722,7 +11605,11 @@ pub(crate) fn parse_cast_using_teamwork_phrase(input: &str) -> OracleResult<'_, 
     value(
         (),
         preceded(
-            alt((tag("this spell was "), tag("it was "), tag("it's "))),
+            alt((
+                tag("this spell was "),
+                tag("it was "),
+                recognize((parse_it_is, tag(" "))),
+            )),
             tag("cast using teamwork"),
         ),
     )
@@ -10743,11 +11630,148 @@ pub(crate) fn match_when_you_do(i: &str) -> OracleResult<'_, ()> {
 mod tests {
     use super::*;
     use crate::types::ability::{
-        CardTypeSetSource, CountScope, PtStat, PtValueScope, RoundingMode, TriggerCondition,
-        TypeFilter, TypedFilter, ZoneRef,
+        CardTypeSetSource, ControllerRef, CountScope, PtStat, PtValueScope, RoundingMode,
+        TargetFilter, TriggerCondition, TypeFilter, TypedFilter, ZoneRef,
     };
     use crate::types::card_type::Supertype;
     use crate::types::mana::{ManaColor, ManaCost};
+
+    /// CR 603.4 + CR 102.1: "a player has more `<property>` than each other
+    /// player" via the public `parse_inner_condition` seam — the exact shape,
+    /// with `rest == ""`. Covers both properties (life, hand size).
+    #[test]
+    fn parse_a_player_has_more_property_than_each_other_player_exact_shape() {
+        for (text, expected_qty) in [
+            (
+                "a player has more life than each other player",
+                QuantityRef::LifeTotal {
+                    player: PlayerScope::ScopedPlayer,
+                },
+            ),
+            (
+                "a player has more cards in hand than each other player",
+                QuantityRef::HandSize {
+                    player: PlayerScope::ScopedPlayer,
+                },
+            ),
+        ] {
+            let (rest, cond) =
+                parse_inner_condition(text).unwrap_or_else(|_| panic!("{text:?} must parse"));
+            assert_eq!(rest, "", "must fully consume {text:?}, left {rest:?}");
+            let StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref { qty },
+                comparator,
+                rhs,
+            } = cond
+            else {
+                panic!("expected QuantityComparison, got {cond:?}");
+            };
+            let QuantityRef::PlayerCount {
+                filter:
+                    PlayerFilter::PlayerAttribute {
+                        relation,
+                        attr,
+                        comparator: inner_comparator,
+                        value,
+                    },
+            } = qty
+            else {
+                panic!("expected PlayerCount(PlayerAttribute(..)), got {qty:?}");
+            };
+            assert_eq!(relation, PlayerRelation::All);
+            // B3/N1: `attr`'s embedded scope MUST be `ScopedPlayer`, not
+            // `Controller` — a copy-paste regression here would be silent
+            // (the scope is inert at runtime) without this assertion.
+            assert_eq!(*attr, expected_qty);
+            assert_eq!(inner_comparator, Comparator::GE);
+            assert_eq!(
+                *value,
+                QuantityExpr::Ref {
+                    qty: match &expected_qty {
+                        QuantityRef::LifeTotal { .. } => QuantityRef::LifeTotal {
+                            player: PlayerScope::AllPlayers {
+                                aggregate: AggregateFunction::Max,
+                                exclude: None,
+                            },
+                        },
+                        QuantityRef::HandSize { .. } => QuantityRef::HandSize {
+                            player: PlayerScope::AllPlayers {
+                                aggregate: AggregateFunction::Max,
+                                exclude: None,
+                            },
+                        },
+                        other => panic!("unexpected axis {other:?}"),
+                    }
+                }
+            );
+            // The naive-GE guard (U1-R7's parser-side mirror): the OUTER
+            // comparison is the uniqueness count, and it MUST be EQ 1, not
+            // GE 1. A `GE 1` slip is true whenever ANYONE is at the max —
+            // i.e. always — and would not be revert-discriminating.
+            assert_eq!(comparator, Comparator::EQ);
+            assert_eq!(rhs, QuantityExpr::Fixed { value: 1 });
+        }
+    }
+
+    /// Negative with a PAIRED positive reach-guard in the SAME test
+    /// (`/card-test` foot-gun 6): the subfamily-B object-count noun
+    /// "controls more lands" must NOT parse via this production, and the
+    /// positive sibling in the same test proves the dispatcher is actually
+    /// live (so the negative cannot pass through a dead dispatcher).
+    #[test]
+    fn parse_a_player_controls_more_lands_declines_with_positive_reach_guard() {
+        assert!(
+            parse_inner_condition("a player has more life than each other player").is_ok(),
+            "positive reach-guard: the dispatcher must be live"
+        );
+        assert!(
+            parse_inner_condition("a player controls more lands than each other player").is_err(),
+            "the object-count noun 'lands' must decline — subfamily B stays honestly red"
+        );
+        // The assertion above declines at the "a player has " prefix (its verb
+        // is "controls"), so on its own it never reaches the property
+        // selector. This one shares the prefix and therefore exercises the
+        // unsupported-PROPERTY rejection itself.
+        assert!(
+            parse_inner_condition("a player has more lands than each other player").is_err(),
+            "'lands' must decline at the property selector, not only at the verb"
+        );
+    }
+
+    /// Regression: "a player has one or fewer cards in hand" (Temple of the
+    /// Dead / Aclazotz) still produces its UNCHANGED `PlayerCount{..} GE 1`
+    /// shape after U1.3's rename and `alt` split — including its incumbent
+    /// `PlayerScope::Controller` inert scope, which this plan deliberately
+    /// does NOT change (N1).
+    #[test]
+    fn parse_a_player_has_one_or_fewer_cards_in_hand_unchanged_by_u1_3() {
+        let (rest, cond) = parse_inner_condition("a player has one or fewer cards in hand")
+            .expect("Temple of the Dead / Aclazotz's condition must still parse");
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref { qty },
+            comparator,
+            rhs,
+        } = cond
+        else {
+            panic!("expected QuantityComparison, got {cond:?}");
+        };
+        assert_eq!(
+            qty,
+            QuantityRef::PlayerCount {
+                filter: PlayerFilter::PlayerAttribute {
+                    relation: PlayerRelation::All,
+                    attr: Box::new(QuantityRef::HandSize {
+                        player: PlayerScope::Controller,
+                    }),
+                    comparator: Comparator::LE,
+                    value: Box::new(QuantityExpr::Fixed { value: 1 }),
+                },
+            }
+        );
+        assert_eq!(comparator, Comparator::GE);
+        assert_eq!(rhs, QuantityExpr::Fixed { value: 1 });
+    }
 
     /// CR 603.4 + CR 608.2c: Avatar Aang's intervening-if "you've done all four
     /// this turn" parses to a distinct-bend-count comparison (`>= 4`).
@@ -12631,7 +13655,7 @@ mod tests {
     /// indestructible" must lower its CONDITION to a typed
     /// `IsPresent { Or[ Typed{[Artifact,Creature],You,Battlefield},
     /// Typed{[Plan],You,Battlefield} ] }`, NOT `StaticCondition::Unrecognized`.
-    /// DISCRIMINATING: pre-fix `parse_type_phrase` left " or a Plan" unconsumed
+    /// DISCRIMINATING: pre-fix `parse_type_phrase_folding` left " or a Plan" unconsumed
     /// (Plan unknown + non-comma connector rejected an article-led RHS), so the
     /// condition fell to `Unrecognized` — which `evaluate_condition` treats as
     /// `true`, making the keyword grant always-on (coverage-unsupported).
@@ -13263,6 +14287,167 @@ mod tests {
                 }
             }
             other => panic!("expected QuantityComparison GE 3 attacking creatures, got {other:?}"),
+        }
+    }
+
+    /// Destructure an attachment-threshold condition into
+    /// `(threshold, type_filters, properties)`, or panic with the actual shape.
+    /// Shared by the `parse_attached_to_referent_count_ge` tests below.
+    fn attachment_threshold_parts(
+        input: &str,
+    ) -> (i32, Vec<TypeFilter>, Vec<crate::types::ability::FilterProp>) {
+        let (rest, c) = parse_inner_condition(input)
+            .unwrap_or_else(|e| panic!("expected {input:?} to parse, got {e:?}"));
+        assert_eq!(rest, "", "combinator must consume all of {input:?}");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::ObjectCount {
+                                filter: TargetFilter::Typed(tf),
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value },
+            } => (value, tf.type_filters, tf.properties),
+            other => {
+                panic!("expected QuantityComparison(ObjectCount GE n) for {input:?}, got {other:?}")
+            }
+        }
+    }
+
+    /// CR 301.5 + CR 303.4 + CR 611.3a: the attachment-threshold condition is a
+    /// CLASS, not a card. These pin the three axes its doc comment claims —
+    /// threshold idiom, type list, and referent — so the class claim cannot
+    /// silently regress to the one printed surface form that motivated it.
+    ///
+    /// Brass Knuckles / Balan ("two or more Equipment are attached to it") are
+    /// covered end-to-end by `tests/integration/brass_knuckles_equipment_threshold.rs`;
+    /// these are the building-block-level counterparts.
+    #[test]
+    fn attachment_threshold_covers_both_ge_idioms() {
+        // "N or more" — the printed form.
+        let (n, types, props) =
+            attachment_threshold_parts("two or more equipment are attached to it");
+        assert_eq!(n, 2);
+        assert_eq!(types, vec![TypeFilter::Subtype("Equipment".into())]);
+        assert_eq!(props, vec![FilterProp::AttachedToRecipient]);
+
+        // "at least N" — the same condition via the other `parse_ge_threshold`
+        // arm; no second combinator arm exists for it, which is the point.
+        let (n, types, props) =
+            attachment_threshold_parts("at least three equipment are attached to it");
+        assert_eq!(n, 3);
+        assert_eq!(types, vec![TypeFilter::Subtype("Equipment".into())]);
+        assert_eq!(props, vec![FilterProp::AttachedToRecipient]);
+    }
+
+    /// Every referent the shared `parse_attachment_referent_prop` map knows is
+    /// reachable from the threshold form — the payoff of extracting that map
+    /// rather than duplicating it.
+    #[test]
+    fn attachment_threshold_covers_every_referent() {
+        for (input, expected) in [
+            (
+                "two or more equipment are attached to ~",
+                FilterProp::AttachedToSource,
+            ),
+            (
+                "two or more equipment are attached to him",
+                FilterProp::AttachedToSource,
+            ),
+            (
+                "two or more equipment are attached to that creature",
+                FilterProp::AttachedToRecipient,
+            ),
+            (
+                "two or more curses are attached to that player",
+                FilterProp::AttachedToPlayer {
+                    player: ControllerRef::EnchantedPlayer,
+                },
+            ),
+        ] {
+            let (_, _, props) = attachment_threshold_parts(input);
+            assert_eq!(props, vec![expected.clone()], "referent for {input:?}");
+        }
+    }
+
+    /// A multi-type list collapses to one `TypeFilter::AnyOf`, exactly as the
+    /// "for each Aura and Equipment attached to ~" noun-phrase form does —
+    /// both go through the shared `attachment_object_count` constructor, so
+    /// they cannot diverge.
+    #[test]
+    fn attachment_threshold_collapses_multi_type_list_to_any_of() {
+        let (n, types, props) =
+            attachment_threshold_parts("two or more auras and equipment are attached to ~");
+        assert_eq!(n, 2);
+        assert_eq!(
+            types,
+            vec![TypeFilter::AnyOf(vec![
+                TypeFilter::Subtype("Aura".into()),
+                TypeFilter::Subtype("Equipment".into()),
+            ])]
+        );
+        assert_eq!(props, vec![FilterProp::AttachedToSource]);
+    }
+
+    /// The copula is REQUIRED, and these are the two ways that matters.
+    ///
+    /// Each negative is paired with the positive it differs from by one token,
+    /// so neither can pass because the input failed to reach the combinator at
+    /// all: the bare noun phrase and the negated form are rejected while the
+    /// affirmative plural is accepted on otherwise identical text.
+    #[test]
+    fn attachment_threshold_requires_the_affirmative_plural_copula() {
+        // Positive control: the only difference from the two negatives below is
+        // the copula token itself.
+        let (n, _, props) = attachment_threshold_parts("two or more equipment are attached to it");
+        assert_eq!(n, 2);
+        assert_eq!(props, vec![FilterProp::AttachedToRecipient]);
+
+        // A bare NOUN PHRASE is not a condition. Admitting it would let
+        // "two or more Equipment attached to it" stand as a complete
+        // `StaticCondition`.
+        assert!(
+            parse_inner_condition("two or more equipment attached to it").is_err(),
+            "the copula is required: a bare noun phrase must not parse as a condition"
+        );
+
+        // CR 608.2c: the NEGATED form must fail closed rather than parse as the
+        // positive. `tag(" are")` leaves "n't attached to it", which no referent
+        // arm accepts.
+        assert!(
+            parse_inner_condition("two or more equipment aren't attached to it").is_err(),
+            "the negated form must fail closed, never parse as the affirmative"
+        );
+    }
+
+    /// Registering the attachment arm beside `parse_creatures_are_attacking_count_ge`
+    /// must not shadow it. Both share the `parse_ge_threshold` head, so a future
+    /// widening of either would surface here first.
+    #[test]
+    fn attachment_threshold_does_not_shadow_the_attacking_sibling() {
+        let (rest, c) = parse_inner_condition("three or more creatures are attacking").unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty:
+                            QuantityRef::ObjectCount {
+                                filter: TargetFilter::Typed(tf),
+                            },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            } => assert!(
+                tf.properties
+                    .iter()
+                    .any(|p| matches!(p, FilterProp::Attacking { defender: None })),
+                "the attacking sibling must still win its own input, got {tf:?}"
+            ),
+            other => panic!("attacking sibling was shadowed, got {other:?}"),
         }
     }
 
@@ -14923,25 +16108,316 @@ mod tests {
             parse_inner_condition("there are fewer than six creature cards in your graveyard")
                 .unwrap();
         assert_eq!(rest, "");
-        match c {
+        assert_eq!(
+            c,
             StaticCondition::QuantityComparison {
-                lhs:
-                    QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::ZoneCardCount {
-                                zone: ZoneRef::Graveyard,
-                                card_types,
-                                filter: None,
-                                scope: CountScope::Controller,
-                            },
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Creature],
+                        filter: None,
+                        scope: CountScope::Controller,
                     },
+                },
                 comparator: Comparator::LT,
                 rhs: QuantityExpr::Fixed { value: 6 },
-            } => {
-                assert_eq!(card_types, vec![TypeFilter::Creature]);
             }
-            other => panic!("expected ZoneCardCount Creature LT 6, got {other:?}"),
+        );
+    }
+
+    #[test]
+    fn filtered_zone_card_counts_preserve_filter_scope_and_comparator_axes() {
+        let typed = |type_filters, properties| {
+            TargetFilter::Typed(TypedFilter {
+                type_filters,
+                controller: None,
+                properties,
+            })
+        };
+        let cases = [
+            (
+                "there are four or more historic cards in your graveyard",
+                Comparator::GE,
+                4,
+                typed(vec![TypeFilter::Card], vec![FilterProp::Historic]),
+                CountScope::Controller,
+            ),
+            (
+                "there are two nonhistoric cards in all graveyards",
+                Comparator::EQ,
+                2,
+                typed(vec![TypeFilter::Card], vec![FilterProp::NotHistoric]),
+                CountScope::All,
+            ),
+            (
+                "there are three legendary creature cards in your graveyard",
+                Comparator::EQ,
+                3,
+                typed(
+                    vec![TypeFilter::Creature],
+                    vec![FilterProp::HasSupertype {
+                        value: Supertype::Legendary,
+                    }],
+                ),
+                CountScope::Controller,
+            ),
+            (
+                "there are two nonbasic land cards in all graveyards",
+                Comparator::EQ,
+                2,
+                typed(
+                    vec![TypeFilter::Land],
+                    vec![FilterProp::NotSupertype {
+                        value: Supertype::Basic,
+                    }],
+                ),
+                CountScope::All,
+            ),
+            (
+                "there are three or more legendary creature or nonbasic land cards in all graveyards",
+                Comparator::GE,
+                3,
+                TargetFilter::Or {
+                    filters: vec![
+                        typed(
+                            vec![TypeFilter::Creature],
+                            vec![FilterProp::HasSupertype {
+                                value: Supertype::Legendary,
+                            }],
+                        ),
+                        typed(
+                            vec![TypeFilter::Land],
+                            vec![
+                                FilterProp::NotSupertype {
+                                    value: Supertype::Basic,
+                                },
+                                FilterProp::HasSupertype {
+                                    value: Supertype::Legendary,
+                                },
+                            ],
+                        ),
+                    ],
+                },
+                CountScope::All,
+            ),
+        ];
+
+        for (text, comparator, threshold, filter, scope) in cases {
+            let (rest, condition) = parse_inner_condition(text)
+                .unwrap_or_else(|error| panic!("must parse {text:?}: {error:?}"));
+            assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+            assert_eq!(
+                condition,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::ZoneCardCount {
+                            zone: ZoneRef::Graveyard,
+                            card_types: Vec::new(),
+                            filter: Some(filter),
+                            scope,
+                        },
+                    },
+                    comparator,
+                    rhs: QuantityExpr::Fixed { value: threshold },
+                },
+                "exact AST for {text:?}",
+            );
         }
+    }
+
+    #[test]
+    fn filtered_zone_card_count_reach_guards_preserve_legacy_and_boundaries() {
+        let (rest, cards_total) =
+            parse_inner_condition("there are three creature cards total in your graveyard")
+                .expect("cards-total legacy path must remain reachable");
+        assert_eq!(rest, "");
+        assert_eq!(
+            cards_total,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Creature],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }
+        );
+
+        let (rest, instant_or_sorcery) = parse_inner_condition(
+            "there are three or more instant or sorcery cards in your graveyard",
+        )
+        .expect("property-free type disjunction must retain its legacy count path");
+        assert_eq!(rest, "");
+        assert_eq!(
+            instant_or_sorcery,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Instant, TypeFilter::Sorcery],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }
+        );
+
+        let (rest, card_types_among) = parse_inner_condition(
+            "there are four or more card types among cards in your graveyard",
+        )
+        .expect("card-types-among legacy path must remain reachable");
+        assert_eq!(rest, "");
+        assert_eq!(
+            card_types_among,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::DistinctCardTypes {
+                        source: CardTypeSetSource::Zone {
+                            zone: ZoneRef::Graveyard,
+                            scope: CountScope::Controller,
+                        },
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            }
+        );
+
+        let (rest, bare_cards) = parse_inner_condition("there are four cards in your graveyard")
+            .expect("bare cards must retain their canonical quantity path");
+        assert_eq!(rest, "");
+        assert_eq!(
+            bare_cards,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::GraveyardSize {
+                        player: PlayerScope::Controller,
+                    },
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 4 },
+            }
+        );
+
+        let (rest, battlefield_count) =
+            parse_inner_condition("there are seven or more lands on the battlefield")
+                .expect("battlefield count fallback must remain reachable");
+        assert_eq!(rest, "");
+        assert_eq!(
+            battlefield_count,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            type_filters: vec![TypeFilter::Land],
+                            controller: None,
+                            properties: vec![FilterProp::InZone {
+                                zone: Zone::Battlefield,
+                            }],
+                        }),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 7 },
+            }
+        );
+
+        let (_, plural_historic) =
+            parse_filtered_zone_card_count("historic cards in your graveyard")
+                .expect("positive reach guard for rejected filtered-count forms");
+        assert!(matches!(plural_historic, QuantityRef::ZoneCardCount { .. }));
+        assert!(matches!(
+            parse_filtered_zone_card_count("historic card in your graveyard"),
+            Err(nom::Err::Error(_))
+        ));
+        let (rest, zombie_creature) =
+            parse_filtered_zone_card_count("Zombie creature cards in your graveyard")
+                .expect("juxtaposed subtype+core must take the filtered-count bridge");
+        assert_eq!(rest, "");
+        assert_eq!(
+            zombie_creature,
+            QuantityRef::ZoneCardCount {
+                zone: ZoneRef::Graveyard,
+                card_types: Vec::new(),
+                filter: Some(TargetFilter::Typed(TypedFilter {
+                    type_filters: vec![
+                        TypeFilter::Creature,
+                        TypeFilter::Subtype("Zombie".to_string()),
+                    ],
+                    controller: None,
+                    properties: vec![],
+                })),
+                scope: CountScope::Controller,
+            }
+        );
+        for text in [
+            "creature cards in your graveyard",
+            "Lesson cards in your graveyard",
+            "instant or sorcery cards in your graveyard",
+            "Zombie cards in your graveyard",
+        ] {
+            assert!(
+                matches!(
+                    parse_filtered_zone_card_count(text),
+                    Err(nom::Err::Error(_))
+                ),
+                "property-free filter must fall through to the legacy count parser for {text:?}"
+            );
+        }
+        let (rest, zombie_only) =
+            parse_inner_condition("there are three Zombie cards in your graveyard")
+                .expect("subtype-only nouns must retain the legacy card_types path");
+        assert_eq!(rest, "");
+        assert_eq!(
+            zombie_only,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Subtype("Zombie".to_string())],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::EQ,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }
+        );
+        assert!(matches!(
+            parse_filtered_zone_card_count("artifact cards you control in your graveyard"),
+            Err(nom::Err::Error(_))
+        ));
+        assert!(matches!(
+            parse_filtered_zone_card_count("tapped creature cards in your graveyard"),
+            Err(nom::Err::Error(_))
+        ));
+
+        for text in [
+            "there are five historic cards in an opponent's graveyard",
+            "there are five historic cards in each player's graveyard",
+            "there are five historic cards in graveyard",
+        ] {
+            assert!(
+                matches!(parse_inner_condition(text), Err(nom::Err::Failure(_))),
+                "unsupported filtered-count scope must commit as Failure for {text:?}"
+            );
+        }
+
+        let (rest, _) =
+            parse_inner_condition("there are four or more historic cards in your graveyard total")
+                .expect("unconsumed tail must remain visible to the caller");
+        assert_eq!(rest, " total");
+        let (rest, _) = parse_inner_condition(
+            "there are four or more historic cards in your graveyard, draw a card",
+        )
+        .expect("comma boundary must remain visible to the caller");
+        assert_eq!(rest, ", draw a card");
     }
 
     /// CR 107.1 + CR 611.3a: "there are fewer than N cards ..." with the plain
@@ -14977,17 +16453,21 @@ mod tests {
             parse_inner_condition("there are more than two creature cards in your graveyard")
                 .unwrap();
         assert_eq!(rest, "");
-        match c {
+        assert_eq!(
+            c,
             StaticCondition::QuantityComparison {
-                lhs:
-                    QuantityExpr::Ref {
-                        qty: QuantityRef::ZoneCardCount { .. },
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Creature],
+                        filter: None,
+                        scope: CountScope::Controller,
                     },
+                },
                 comparator: Comparator::GT,
                 rhs: QuantityExpr::Fixed { value: 2 },
-            } => {}
-            other => panic!("expected ZoneCardCount GT 2, got {other:?}"),
-        }
+            }
+        );
     }
 
     /// CR 107.1: suffix regression — the "or more" (GE) suffix axis still parses
@@ -15008,6 +16488,58 @@ mod tests {
             } => {}
             other => panic!("expected ObjectCount GE 7, got {other:?}"),
         }
+    }
+
+    /// CR 107.1: `"there are at least N"` is the GE dual of `"there are N or more"`
+    /// via `parse_ge_threshold`. Lesson-cards stay on the legacy `card_types` path.
+    #[test]
+    fn test_there_are_at_least_lesson_cards_in_graveyard_ge() {
+        let (rest, c) =
+            parse_inner_condition("there are at least three Lesson cards in your graveyard")
+                .unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            c,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Subtype("Lesson".to_string())],
+                        filter: None,
+                        scope: CountScope::Controller,
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 3 },
+            }
+        );
+    }
+
+    /// CR 107.1: `"there are at least seven lands on the battlefield"` is the GE
+    /// dual of the existing `"seven or more lands"` battlefield-count fallback.
+    #[test]
+    fn test_there_are_at_least_lands_on_battlefield_ge() {
+        let (rest, c) =
+            parse_inner_condition("there are at least seven lands on the battlefield").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(
+            c,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(TypedFilter {
+                            type_filters: vec![TypeFilter::Land],
+                            controller: None,
+                            properties: vec![FilterProp::InZone {
+                                zone: Zone::Battlefield,
+                            }],
+                        }),
+                    },
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 7 },
+            }
+        );
     }
 
     /// CR 107.1: bare-EQ regression — with neither prefix nor "or more" suffix
@@ -15055,6 +16587,24 @@ mod tests {
         );
     }
 
+    /// CR 107.1: `"there are at least"` without a numeral is not a GE threshold,
+    /// and mixed `"fewer than at least N"` is the same refuse arm as mixed
+    /// `"fewer than N or more"`.
+    #[test]
+    fn test_there_are_at_least_hostile_negatives() {
+        assert!(
+            parse_there_are_conditions("there are at least").is_err(),
+            "GE prefix without a numeral must not parse"
+        );
+        assert!(
+            parse_there_are_conditions(
+                "there are fewer than at least three cards in your graveyard"
+            )
+            .is_err(),
+            "mixed prefix + at-least GE must be refused"
+        );
+    }
+
     #[test]
     fn test_there_are_card_types_delirium() {
         let (rest, c) = parse_inner_condition(
@@ -15075,6 +16625,38 @@ mod tests {
                 rhs: QuantityExpr::Fixed { value: 4 },
             } => {}
             other => panic!("expected zone-scoped DistinctCardTypes GE 4, got {other:?}"),
+        }
+    }
+
+    /// CR 202.3 + CR 611.3a: the mana-value-diversity sibling of Delirium — SNC's
+    /// "there are five or more mana values among cards in your graveyard" (Aven
+    /// Heartstabber, Snooping Newsie, Syndicate Infiltrator, Graveyard Shift, and
+    /// their Alchemy variants). Unlike Delirium's `DistinctCardTypes`, this counts
+    /// distinct mana VALUES via the generic `ObjectCountDistinct` axis.
+    #[test]
+    fn test_there_are_mana_values_graveyard_diversity() {
+        let (rest, c) = parse_inner_condition(
+            "there are five or more mana values among cards in your graveyard",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        match c {
+            StaticCondition::QuantityComparison {
+                lhs:
+                    QuantityExpr::Ref {
+                        qty: QuantityRef::ObjectCountDistinct { filter, qualities },
+                    },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 5 },
+            } => {
+                assert_eq!(qualities, vec![SharedQuality::ManaValue]);
+                assert_eq!(filter.extract_in_zone(), Some(Zone::Graveyard));
+                let TargetFilter::Typed(filter) = filter else {
+                    panic!("expected Typed graveyard filter");
+                };
+                assert_eq!(filter.controller, Some(ControllerRef::You));
+            }
+            other => panic!("expected ObjectCountDistinct[ManaValue] GE 5, got {other:?}"),
         }
     }
 
@@ -15159,24 +16741,73 @@ mod tests {
             parse_inner_condition("there are three or more Lesson cards in your graveyard")
                 .unwrap();
         assert_eq!(rest, "");
-        match c {
+        assert_eq!(
+            c,
             StaticCondition::QuantityComparison {
-                lhs:
-                    QuantityExpr::Ref {
-                        qty:
-                            QuantityRef::ZoneCardCount {
-                                zone: crate::types::ability::ZoneRef::Graveyard,
-                                card_types,
-                                scope: crate::types::ability::CountScope::Controller,
-                                filter: None,
-                            },
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ZoneCardCount {
+                        zone: ZoneRef::Graveyard,
+                        card_types: vec![TypeFilter::Subtype("Lesson".to_string())],
+                        filter: None,
+                        scope: CountScope::Controller,
                     },
+                },
                 comparator: Comparator::GE,
                 rhs: QuantityExpr::Fixed { value: 3 },
-            } => {
-                assert_eq!(card_types, vec![TypeFilter::Subtype("Lesson".to_string())]);
             }
-            other => panic!("expected Lesson graveyard count GE 3, got {other:?}"),
+        );
+    }
+
+    /// CR 205.1 + CR 205.3m + CR 109.2a + CR 404.1: juxtaposed subtype + core
+    /// type ("Zombie creature cards") is admitted as an AND Typed filter, not
+    /// OR `card_types`. GE (`or more` / `at least`) and EQ share the noun path.
+    #[test]
+    fn test_there_are_juxtaposed_subtype_core_cards_in_graveyard() {
+        let expected_qty = QuantityRef::ZoneCardCount {
+            zone: ZoneRef::Graveyard,
+            card_types: Vec::new(),
+            filter: Some(TargetFilter::Typed(TypedFilter {
+                type_filters: vec![
+                    TypeFilter::Creature,
+                    TypeFilter::Subtype("Zombie".to_string()),
+                ],
+                controller: None,
+                properties: vec![],
+            })),
+            scope: CountScope::Controller,
+        };
+        let cases = [
+            (
+                "there are three or more Zombie creature cards in your graveyard",
+                Comparator::GE,
+                3,
+            ),
+            (
+                "there are at least three Zombie creature cards in your graveyard",
+                Comparator::GE,
+                3,
+            ),
+            (
+                "there are three Zombie creature cards in your graveyard",
+                Comparator::EQ,
+                3,
+            ),
+        ];
+        for (text, comparator, threshold) in cases {
+            let (rest, condition) = parse_inner_condition(text)
+                .unwrap_or_else(|error| panic!("must parse {text:?}: {error:?}"));
+            assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+            assert_eq!(
+                condition,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: expected_qty.clone(),
+                    },
+                    comparator,
+                    rhs: QuantityExpr::Fixed { value: threshold },
+                },
+                "exact AST for {text:?}",
+            );
         }
     }
 
@@ -15674,7 +17305,7 @@ mod tests {
 
     #[test]
     fn test_recipient_guard_backtracks_to_attacking_alone() {
-        // GUARD: "it's attacking alone" leaves "alone" after parse_type_phrase
+        // GUARD: "it's attacking alone" leaves "alone" after parse_type_phrase_folding
         // matches "attacking " — the terminal-boundary guard rejects the pronoun
         // match so the combat combinator wins.
         let (rest, c) = parse_inner_condition("it's attacking alone").unwrap();
@@ -17948,6 +19579,87 @@ mod tests {
         }
     }
 
+    /// CR 508.1a + CR 611.3a (P1): the affirmative "<source> attacked this turn"
+    /// gate types to `SourceMatchesFilter` over the type-free
+    /// `FilterProp::AttackedThisTurn` runtime property, for every explicit
+    /// self-subject in the shared vocabulary. `rest == ""` proves the arm is
+    /// placement-independent — no earlier arm in `parse_inner_condition` claims
+    /// a prefix of the phrase.
+    #[test]
+    fn source_attacked_this_turn_matches_source_with_history_filter() {
+        let expected = StaticCondition::SourceMatchesFilter {
+            filter: TargetFilter::Typed(
+                TypedFilter::default()
+                    .properties(vec![FilterProp::AttackedThisTurn { defender: None }]),
+            ),
+        };
+        for phrase in [
+            "~ attacked this turn",
+            "this creature attacked this turn",
+            "this permanent attacked this turn",
+        ] {
+            let (rest, c) = parse_inner_condition(phrase).unwrap_or_else(|e| {
+                panic!("{phrase:?} must parse as a source history condition: {e:?}")
+            });
+            assert_eq!(rest, "", "{phrase:?} must be fully consumed");
+            assert_eq!(c, expected, "{phrase:?}");
+        }
+    }
+
+    /// CR 611.3a (P2): the context-free grammar must NOT bind a bare pronoun or
+    /// an anaphor. "it attacked this turn" is target-anaphoric in effect bodies
+    /// (Berserk) and recipient-bound in attached-subject statics; only the
+    /// SelfRef static path binds it, via `rewrite_self_pronoun_subject`. An
+    /// Aura/Equipment is never itself an attacker, so the attached subjects are
+    /// refused here too.
+    #[test]
+    fn it_attacked_this_turn_is_not_bound_context_free() {
+        // Positive control FIRST: the negatives below only mean something if the
+        // grammar can type this phrase at all when the subject IS explicit. Without
+        // it, a regression that deleted the whole attacked-this-turn arm would leave
+        // every `is_err()` assertion passing vacuously.
+        let (rest, bound) = parse_inner_condition("~ attacked this turn")
+            .expect("reach guard: the explicit self-subject form must still parse");
+        assert_eq!(rest, "", "reach guard: the control phrase must be consumed");
+        assert_eq!(
+            bound,
+            StaticCondition::SourceMatchesFilter {
+                filter: TargetFilter::Typed(
+                    TypedFilter::default()
+                        .properties(vec![FilterProp::AttackedThisTurn { defender: None }]),
+                ),
+            },
+            "reach guard: the explicit self-subject form must bind the source"
+        );
+        for phrase in [
+            "it attacked this turn",
+            "that creature attacked this turn",
+            "enchanted creature attacked this turn",
+            "equipped creature attacked this turn",
+        ] {
+            assert!(
+                parse_inner_condition(phrase).is_err(),
+                "{phrase:?} must stay unbound in the context-free grammar"
+            );
+        }
+    }
+
+    /// CR 201.5 (P3b): the did/didn't pair shares one subject vocabulary, so the
+    /// negation accepts every explicit self-subject the affirmative does — and
+    /// still refuses the bare pronoun.
+    #[test]
+    fn source_didnt_attack_this_turn_accepts_explicit_self_subjects() {
+        for phrase in [
+            "this permanent didn't attack this turn",
+            "this permanent didn’t attack this turn",
+        ] {
+            let (rest, c) = parse_inner_condition(phrase).unwrap();
+            assert_eq!(rest, "");
+            assert_source_history_absence(c, FilterProp::AttackedThisTurn { defender: None });
+        }
+        assert!(parse_inner_condition("it didn't attack this turn").is_err());
+    }
+
     #[test]
     fn source_didnt_attack_this_turn_counts_self_with_history_filter() {
         let (rest, c) = parse_inner_condition("~ didn't attack this turn").unwrap();
@@ -18934,6 +20646,70 @@ mod tests {
         }
     }
 
+    /// CR 601.2h + CR 603.4: the PRINTED wording of the same sentence, which
+    /// predates the Increment keyword (Liberator, Urza's Battlethopter:
+    /// "Whenever you cast a spell, if the amount of mana spent to cast that
+    /// spell is greater than Liberator's power, ..."). Before the subject was
+    /// widened this fell through and the whole intervening-if was dropped, so
+    /// every spell cast added a counter regardless of what was paid.
+    #[test]
+    fn test_parse_condition_printed_mana_spent_vs_self_power() {
+        let (rest, c) = parse_condition(
+            "if the amount of mana spent to cast that spell is greater than ~'s power",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        // A bare comparison: single property, so no `Or`; and no
+        // source-is-creature conjunct, because the SUBJECT is not Increment's
+        // reminder wording. Its twin
+        // `test_parse_condition_mana_spent_vs_normalized_self_pt_has_creature_gate`
+        // feeds the SAME object phrase, `~'s power`, and does get the conjunct —
+        // which is the proof that the object cannot be what decides it. The
+        // scope likewise comes from "that spell", not from a default.
+        assert_eq!(
+            c,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::ManaSpentToCast {
+                        scope: crate::types::ability::CastManaObjectScope::TriggeringSpell,
+                        metric: crate::types::ability::CastManaSpentMetric::Total,
+                    },
+                },
+                comparator: Comparator::GT,
+                rhs: QuantityExpr::Ref {
+                    qty: QuantityRef::Power {
+                        scope: crate::types::ability::ObjectScope::Source,
+                    },
+                },
+            }
+        );
+    }
+
+    /// CR 400.7d: the printed form reads its scope from the anaphora — "this
+    /// spell" resolves to `CastManaObjectScope::SelfObject`, the ability's own
+    /// source object, not to the triggering spell. Pins that the shared subject
+    /// authority is consulted rather than re-decided here.
+    #[test]
+    fn test_printed_mana_spent_subject_selects_scope() {
+        let (rest, c) = parse_condition(
+            "if the amount of mana spent to cast this spell is greater than ~'s toughness",
+        )
+        .unwrap();
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison { lhs, .. } = &c else {
+            panic!("expected a bare comparison, got {c:?}");
+        };
+        assert_eq!(
+            *lhs,
+            QuantityExpr::Ref {
+                qty: QuantityRef::ManaSpentToCast {
+                    scope: crate::types::ability::CastManaObjectScope::SelfObject,
+                    metric: crate::types::ability::CastManaSpentMetric::Total,
+                },
+            }
+        );
+    }
+
     /// Single-property form ("greater than this creature's power") parses as
     /// a single `QuantityComparison`, not an `Or`.
     #[test]
@@ -19492,6 +21268,97 @@ mod tests {
         ));
     }
 
+    /// CR 208.1: the present-tense possessive comparison "its <stat> is <cmp>
+    /// ~'s <stat>" (Shelinda, Yevon Acolyte). The subject scope is the
+    /// caller's to bind, so the left operand carries exactly the scope passed in.
+    #[test]
+    fn test_parse_its_pt_vs_source_comparison_binds_the_supplied_subject() {
+        use crate::types::ability::ObjectScope;
+        for (text, comparator, lhs_expected) in [
+            (
+                "its power is less than ~'s power",
+                Comparator::LT,
+                QuantityRef::Power {
+                    scope: ObjectScope::EventSource,
+                },
+            ),
+            (
+                "its power is greater than ~'s power",
+                Comparator::GT,
+                QuantityRef::Power {
+                    scope: ObjectScope::EventSource,
+                },
+            ),
+            (
+                "its toughness is greater than or equal to ~'s toughness",
+                Comparator::GE,
+                QuantityRef::Toughness {
+                    scope: ObjectScope::EventSource,
+                },
+            ),
+        ] {
+            let (rest, c) = parse_its_pt_vs_source_comparison(text, ObjectScope::EventSource)
+                .unwrap_or_else(|e| panic!("{text}: {e:?}"));
+            assert_eq!(rest, "", "{text}");
+            let StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref { qty: lhs },
+                comparator: got,
+                rhs: QuantityExpr::Ref { qty: rhs },
+            } = c
+            else {
+                panic!("{text}: expected ref-vs-ref QuantityComparison, got {c:?}");
+            };
+            assert_eq!(got, comparator, "{text}");
+            assert_eq!(lhs, lhs_expected, "{text}");
+            assert!(
+                matches!(
+                    rhs,
+                    QuantityRef::Power {
+                        scope: ObjectScope::Source
+                    } | QuantityRef::Toughness {
+                        scope: ObjectScope::Source
+                    }
+                ),
+                "{text}: rhs must be the source's stat, got {rhs:?}"
+            );
+        }
+    }
+
+    /// CR 208.1: the shared condition grammar must NOT bind a bare possessive
+    /// "its" to the trigger event object — in Sage-Eye Avengers the "its" is the
+    /// spell's target, so a shared-grammar reading would compare the attacking
+    /// source with itself and make the ability impossible to use.
+    #[test]
+    fn test_parse_condition_does_not_bind_bare_its_to_event_object() {
+        use crate::types::ability::ObjectScope;
+        let binds_event_object = matches!(
+            parse_condition("if its power is less than ~'s power"),
+            Ok((
+                _,
+                StaticCondition::QuantityComparison {
+                    lhs: QuantityExpr::Ref {
+                        qty: QuantityRef::Power {
+                            scope: ObjectScope::EventSource
+                        }
+                    },
+                    ..
+                }
+            ))
+        );
+        assert!(
+            !binds_event_object,
+            "a bare possessive has no fixed referent in the shared grammar"
+        );
+    }
+
+    /// CR 702.191a: the reminder-text subject identifies the Increment keyword,
+    /// whose rules text prints "if this permanent is a creature and".
+    /// Normalization has already turned "this creature's" into "~'s" by the time
+    /// the parser sees it, so the gate has to survive that rewrite.
+    /// `test_parse_condition_printed_mana_spent_vs_self_power` is its twin: the
+    /// spelled-out subject gets no gate. CR 702.191a's own rules text words the
+    /// subject exactly that way — what separates the two is that no oracle face
+    /// gives that keyword any subject but its reminder's.
     #[test]
     fn test_parse_condition_mana_spent_vs_normalized_self_pt_has_creature_gate() {
         let (rest, c) =
@@ -19639,12 +21506,12 @@ mod tests {
         );
     }
 
-    /// Regression for the coverage-honesty flip (#3084): the bare pronoun "it"
-    /// in an intervening-"if" trigger condition (Ayara's Oathsworn — "whenever ~
-    /// attacks, if it has three or more +1/+1 counters on it, …") is
-    /// source-referential. It must stay `HasCounters` (evaluated against the
-    /// triggering source), not `RecipientHasCounters`, which has no recipient at
-    /// trigger-evaluation time and is silently swallowed by the coverage gate.
+    /// Generic "N or more" sibling: the bare pronoun "it" in an intervening-"if"
+    /// trigger condition is source-referential. It must stay `HasCounters`
+    /// (evaluated against the triggering source), not `RecipientHasCounters`,
+    /// which has no recipient at trigger-evaluation time and is silently
+    /// swallowed by the coverage gate. Ayara's printed Oracle is "fewer than
+    /// four" — see `has_counters_fewer_than_four_pronoun_is_source`.
     #[test]
     fn parse_inner_condition_it_has_counters_is_source_referential() {
         let (rest, c) = parse_inner_condition("it has three or more +1/+1 counters on it").unwrap();
@@ -19930,6 +21797,130 @@ mod tests {
                 maximum: Some(2),
             }
         );
+    }
+
+    /// CR 107.1 + CR 122.1: "fewer than three" is the strict-LT integer band
+    /// {0,1,2}, encoded `(0, Some(2))` — the same AST as inclusive "two or fewer".
+    #[test]
+    fn has_counters_fewer_than_three_plus1() {
+        let expected = StaticCondition::HasCounters {
+            counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+            minimum: 0,
+            maximum: Some(2),
+        };
+        for text in [
+            "~ has fewer than three +1/+1 counters on it",
+            "this creature has fewer than three +1/+1 counters on it",
+        ] {
+            let (rest, cond) = parse_source_has_counters(text)
+                .unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+            assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+            assert_eq!(cond, expected, "wrong condition for {text:?}");
+        }
+
+        let (_, or_fewer) = parse_source_has_counters("~ has two or fewer +1/+1 counters on it")
+            .expect("two or fewer sibling must still parse");
+        assert_eq!(or_fewer, expected);
+    }
+
+    /// Ayara's Oathsworn: intervening-if "if it has fewer than four +1/+1
+    /// counters on it" is source-referential `HasCounters`, not
+    /// `RecipientHasCounters`.
+    #[test]
+    fn has_counters_fewer_than_four_pronoun_is_source() {
+        let expected = StaticCondition::HasCounters {
+            counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+            minimum: 0,
+            maximum: Some(3),
+        };
+        let (rest, inner) =
+            parse_inner_condition("it has fewer than four +1/+1 counters on it").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(inner, expected);
+
+        let (rest, source) =
+            parse_source_has_counters("it has fewer than four +1/+1 counters on it").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(source, expected);
+        assert!(
+            !matches!(inner, StaticCondition::RecipientHasCounters { .. }),
+            "source-referential `it` must not lower to RecipientHasCounters"
+        );
+    }
+
+    /// Adaptive Training Post: charge-counter type axis with the same LT bounds.
+    #[test]
+    fn has_counters_fewer_than_three_charge() {
+        let (rest, cond) =
+            parse_source_has_counters("this artifact has fewer than three charge counters on it")
+                .expect("ATP charge fewer-than form must parse");
+        assert_eq!(rest, "");
+        assert_eq!(
+            cond,
+            StaticCondition::HasCounters {
+                counters: CounterMatch::OfType(CounterType::Generic("charge".to_string())),
+                minimum: 0,
+                maximum: Some(2),
+            }
+        );
+    }
+
+    /// CR 107.1: "more than two" is the paired GT prefix → `(3, None)`, equal
+    /// to inclusive "three or more".
+    #[test]
+    fn has_counters_more_than_two_plus1() {
+        let expected = StaticCondition::HasCounters {
+            counters: CounterMatch::OfType(CounterType::Plus1Plus1),
+            minimum: 3,
+            maximum: None,
+        };
+        let (rest, more) =
+            parse_source_has_counters("~ has more than two +1/+1 counters on it").unwrap();
+        assert_eq!(rest, "");
+        assert_eq!(more, expected);
+
+        let (_, or_more) = parse_source_has_counters("~ has three or more +1/+1 counters on it")
+            .expect("three or more sibling must still parse");
+        assert_eq!(or_more, expected);
+    }
+
+    /// Mixed "fewer than N or more" is not English and must fail rather than
+    /// swallow "or more +1/+1" as a Generic counter type. Reach-guard: the
+    /// unmixed fewer-than form is Ok.
+    #[test]
+    fn has_counters_fewer_than_mixed_or_more_is_err() {
+        let (rest, ok) = parse_source_has_counters("~ has fewer than three +1/+1 counters on it")
+            .expect("unmixed fewer-than form is the reach-guard");
+        assert_eq!(rest, "");
+        assert!(matches!(
+            ok,
+            StaticCondition::HasCounters {
+                minimum: 0,
+                maximum: Some(2),
+                ..
+            }
+        ));
+
+        assert!(
+            parse_source_has_counters("~ has fewer than three or more +1/+1 counters on it")
+                .is_err(),
+            "mixed fewer-than N or more must fail"
+        );
+
+        // CR 107.1: "fewer than 0" is not an English integer band.
+        assert!(parse_source_has_counters("~ has fewer than 0 +1/+1 counters on it").is_err());
+
+        // Sibling: "exactly three" is unchanged EQ.
+        let (_, exact) = parse_source_has_counters("~ has exactly three +1/+1 counters on it")
+            .expect("exactly N sibling must still parse");
+        assert!(matches!(
+            exact,
+            StaticCondition::HasCounters {
+                minimum: 3,
+                maximum: Some(3),
+                ..
+            }
+        ));
     }
 
     /// "no" variant — zero counters (min 0, max 0).
@@ -20320,7 +22311,7 @@ mod tests {
         assert_eq!(recipient, DamagedThisWayRecipient::Player);
     }
 
-    /// The recipient axis is a `parse_type_phrase` concern, so the whole class
+    /// The recipient axis is a `parse_type_phrase_folding` concern, so the whole class
     /// of nouns comes for free — plural verbs included.
     #[test]
     fn test_damaged_this_way_recipient_class() {
@@ -20771,6 +22762,44 @@ mod tests {
     }
 
     // -- "have total {power|toughness|mana value} N or {greater|less}" predicate --
+
+    #[test]
+    fn pack_tactics_total_power_uses_triggering_batch() {
+        let (rest, condition) = parse_inner_condition(
+            "you attacked with creatures with total power 6 or greater this combat",
+        )
+        .expect("Pack Tactics condition should parse");
+        assert_eq!(rest, "");
+        assert_eq!(
+            condition,
+            StaticCondition::QuantityComparison {
+                lhs: QuantityExpr::Ref {
+                    qty: QuantityRef::PropertyAggregate(
+                        PropertyAggregate::new(
+                            AggregateFunction::Sum,
+                            ObjectProperty::Power,
+                            CardTypeSetSource::TrackedSet {
+                                set: TrackedAnaphorSource::TriggeringBatch,
+                                caused_by: None,
+                            },
+                        )
+                        .expect("valid aggregate"),
+                    ),
+                },
+                comparator: Comparator::GE,
+                rhs: QuantityExpr::Fixed { value: 6 },
+            }
+        );
+    }
+
+    #[test]
+    fn pack_tactics_near_phrasing_does_not_parse_as_total_power_condition() {
+        assert!(parse_inner_condition(
+            "you attacked with creatures with combined power 6 or greater this combat"
+        )
+        .is_err());
+    }
+
     //
     // CR 107.3e + CR 208.1 + CR 202.3: Building-block predicate for
     // aggregate-property thresholds across a filter (Sum function). Single
@@ -21675,9 +23704,9 @@ mod tests {
 
     /// CR 401.1: Mul Daya Channelers's "the top card of your library is a creature
     /// card" / "... a land card" parse to top-of-library core-type gates. The
-    /// informational " card" suffix is folded by `parse_type_phrase` (the same
+    /// informational " card" suffix is folded by `parse_type_phrase_folding` (the same
     /// helper the graveyard-presence gate uses), so the filter is exactly the bare
-    /// core-type filter — asserted against `parse_type_phrase`'s own output.
+    /// core-type filter — asserted against `parse_type_phrase_folding`'s own output.
     #[test]
     fn parse_inner_condition_top_of_library_is_type_card() {
         for (text, phrase) in [
@@ -21689,7 +23718,7 @@ mod tests {
         ] {
             let (rest, c) = parse_inner_condition(text).unwrap_or_else(|e| panic!("{text}: {e:?}"));
             assert!(rest.is_empty(), "{text}: leftover {rest:?}");
-            let (expected_filter, _) = parse_type_phrase(phrase);
+            let (expected_filter, _) = parse_type_phrase_folding(phrase);
             assert_eq!(
                 c,
                 StaticCondition::TopOfLibraryMatches {
@@ -21702,13 +23731,13 @@ mod tests {
 
     /// CR 401.1: Conspicuous Snoop's "the top card of your library is a Goblin
     /// card" parses to a top-of-library subtype gate (the subtype-word path of
-    /// `parse_type_phrase`). The condition parser runs on lowercased text.
+    /// `parse_type_phrase_folding`). The condition parser runs on lowercased text.
     #[test]
     fn parse_inner_condition_top_of_library_is_subtype_card() {
         let (rest, c) =
             parse_inner_condition("the top card of your library is a goblin card").unwrap();
         assert!(rest.is_empty(), "leftover: {rest:?}");
-        let (expected_filter, _) = parse_type_phrase("goblin card");
+        let (expected_filter, _) = parse_type_phrase_folding("goblin card");
         assert_eq!(
             c,
             StaticCondition::TopOfLibraryMatches {
@@ -21719,18 +23748,18 @@ mod tests {
 
     /// CR 401.1: Skill Borrower's "the top card of your library is an
     /// artifact or creature card" folds the "X or Y card" disjunction into a
-    /// single top-of-library gate over an `Or` *filter* — `parse_type_phrase`
+    /// single top-of-library gate over an `Or` *filter* — `parse_type_phrase_folding`
     /// consumes the whole compound (no per-disjunct article), so
     /// `parse_bare_predicate_disjunction` yields one filter and the runtime
     /// `matches_target_filter` disjunction handles the two card types. The `Or`
-    /// filter is asserted against `parse_type_phrase`'s own compound output.
+    /// filter is asserted against `parse_type_phrase_folding`'s own compound output.
     #[test]
     fn parse_inner_condition_top_of_library_is_disjunction() {
         let (rest, c) =
             parse_inner_condition("the top card of your library is an artifact or creature card")
                 .unwrap();
         assert!(rest.is_empty(), "leftover: {rest:?}");
-        let (expected_filter, _) = parse_type_phrase("artifact or creature card");
+        let (expected_filter, _) = parse_type_phrase_folding("artifact or creature card");
         assert!(
             matches!(&expected_filter, TargetFilter::Or { filters } if filters.len() == 2),
             "sanity: expected an Or filter, got {expected_filter:?}"
@@ -21894,6 +23923,37 @@ mod tests {
         );
     }
 
+    /// Same quantity axis: existential "there are fewer than N [type] counters
+    /// on ~" shares the LT encoding. Reach-guard: Mazemind "four or more" still
+    /// `(4, None)`.
+    #[test]
+    fn parse_source_counters_exist_fewer_than() {
+        let (rest, cond) =
+            parse_source_counters_exist("there are fewer than three charge counters on ~")
+                .expect("existential fewer-than form must parse");
+        assert_eq!(rest, "");
+        assert_eq!(
+            cond,
+            StaticCondition::HasCounters {
+                counters: CounterMatch::OfType(CounterType::Generic("charge".to_string())),
+                minimum: 0,
+                maximum: Some(2),
+            }
+        );
+
+        let (_, mazemind) =
+            parse_source_counters_exist("there are four or more page counters on ~")
+                .expect("Mazemind four-or-more reach-guard must still parse");
+        assert_eq!(
+            mazemind,
+            StaticCondition::HasCounters {
+                counters: CounterMatch::OfType(CounterType::Generic("page".to_string())),
+                minimum: 4,
+                maximum: None,
+            }
+        );
+    }
+
     /// Non-regression: factoring the counter-noun axis into
     /// `parse_counter_noun_match` must leave the possessive form's parse
     /// byte-identical (Darksteel Reactor / Mazemind-class shared authority).
@@ -22035,7 +24095,7 @@ mod tests {
     /// CR 120.10 + CR 603.4: Rith, Liberated Primeval's "a creature or
     /// planeswalker an opponent controlled was dealt excess damage this turn"
     /// must parse as an opponent-filtered DamageDealtThisTurn with channel:Excess.
-    /// `parse_type_phrase` produces `TargetFilter::Or` for compound types, so
+    /// `parse_type_phrase_folding` produces `TargetFilter::Or` for compound types, so
     /// this test checks that the channel is Excess and the target is non-Any.
     #[test]
     fn parse_inner_condition_typed_subject_was_dealt_excess_damage_this_turn() {
@@ -22061,12 +24121,292 @@ mod tests {
             panic!("expected QuantityComparison(DamageDealtThisTurn), got: {cond:?}");
         };
         assert_eq!(channel, DamageChannel::Excess, "channel must be Excess");
-        // parse_type_phrase emits Or{Typed(Creature+Opp), Typed(Planeswalker+Opp)}
+        // parse_type_phrase_folding emits Or{Typed(Creature+Opp), Typed(Planeswalker+Opp)}
         // for compound types — verify the filter is non-trivial (not Any).
         assert!(
             !matches!(target.as_ref(), TargetFilter::Any),
             "target filter must be non-Any, got: {target:?}"
         );
+    }
+
+    /// Assert exact AST equality and full consumption for paired ASCII (`'`) and
+    /// typographic (`’`, U+2019) apostrophe inputs across condition combinators.
+    #[test]
+    fn test_typographic_apostrophe_equivalence() {
+        let pairs = [
+            (
+                "you control ~ or it's your commander",
+                "you control ~ or it\u{2019}s your commander",
+            ),
+            ("it isn't an artifact", "it isn\u{2019}t an artifact"),
+            (
+                "this creature isn't saddled",
+                "this creature isn\u{2019}t saddled",
+            ),
+            ("he's equipped", "he\u{2019}s equipped"),
+            ("they're attacking", "they\u{2019}re attacking"),
+            ("it wasn't cast", "it wasn\u{2019}t cast"),
+            ("they weren't cast", "they weren\u{2019}t cast"),
+            (
+                "you don't have max speed",
+                "you don\u{2019}t have max speed",
+            ),
+            (
+                "you've completed a dungeon",
+                "you\u{2019}ve completed a dungeon",
+            ),
+            (
+                "you weren't the starting player",
+                "you weren\u{2019}t the starting player",
+            ),
+            (
+                "you've cast a spell named peer through depths this turn",
+                "you\u{2019}ve cast a spell named peer through depths this turn",
+            ),
+            (
+                "it's an opponent's turn",
+                "it\u{2019}s an opponent\u{2019}s turn",
+            ),
+            ("it's your turn", "it\u{2019}s your turn"),
+            ("it's not your turn", "it\u{2019}s not your turn"),
+            (
+                "~ hasn't dealt damage yet",
+                "~ hasn\u{2019}t dealt damage yet",
+            ),
+            (
+                "you have the city's blessing",
+                "you have the city\u{2019}s blessing",
+            ),
+            (
+                "an opponent's life total is 10 or less",
+                "an opponent\u{2019}s life total is 10 or less",
+            ),
+            (
+                "a player's life total is 10 or less",
+                "a player\u{2019}s life total is 10 or less",
+            ),
+            ("it's attacking alone", "it\u{2019}s attacking alone"),
+            (
+                "you haven't cast a spell this turn",
+                "you haven\u{2019}t cast a spell this turn",
+            ),
+            (
+                "you didn't cast a spell this turn",
+                "you didn\u{2019}t cast a spell this turn",
+            ),
+            (
+                "~ didn't attack this turn",
+                "~ didn\u{2019}t attack this turn",
+            ),
+            (
+                "there's a creature card and an artifact card in your graveyard",
+                "there\u{2019}s a creature card and an artifact card in your graveyard",
+            ),
+            (
+                "there's a creature card in your graveyard",
+                "there\u{2019}s a creature card in your graveyard",
+            ),
+            ("you're the monarch", "you\u{2019}re the monarch"),
+            (
+                "it had power greater than ~'s power",
+                "it had power greater than ~’s power",
+            ),
+            (
+                "enchanted creature's power is 4 or greater",
+                "enchanted creature\u{2019}s power is 4 or greater",
+            ),
+            (
+                "that player or that planeswalker's controller has more life than you",
+                "that player or that planeswalker\u{2019}s controller has more life than you",
+            ),
+            (
+                "the spell's mana value is less than or equal to 3",
+                "the spell\u{2019}s mana value is less than or equal to 3",
+            ),
+            (
+                "the amount of mana you spent is greater than this creature's power",
+                "the amount of mana you spent is greater than this creature\u{2019}s power",
+            ),
+            (
+                "a creature entered the battlefield under an opponent's control this turn",
+                "a creature entered the battlefield under an opponent\u{2019}s control this turn",
+            ),
+        ];
+
+        for (ascii, typographic) in pairs {
+            let (rest_ascii, ast_ascii) = parse_inner_condition(ascii)
+                .unwrap_or_else(|e| panic!("failed to parse ASCII {ascii:?}: {e:?}"));
+            let (rest_typo, ast_typo) = parse_inner_condition(typographic)
+                .unwrap_or_else(|e| panic!("failed to parse typographic {typographic:?}: {e:?}"));
+
+            assert_eq!(
+                rest_ascii, "",
+                "ASCII {ascii:?} must be fully consumed, remaining: {rest_ascii:?}"
+            );
+            assert_eq!(
+                rest_typo, "",
+                "typographic {typographic:?} must be fully consumed, remaining: {rest_typo:?}"
+            );
+            assert_eq!(
+                ast_ascii, ast_typo,
+                "AST mismatch between {ascii:?} and {typographic:?}"
+            );
+        }
+
+        let this_way_pairs = [
+            (
+                "a creature wasn't put onto the battlefield this way",
+                "a creature wasn\u{2019}t put onto the battlefield this way",
+            ),
+            (
+                "a creature isn't put onto the battlefield this way",
+                "a creature isn\u{2019}t put onto the battlefield this way",
+            ),
+        ];
+
+        for (ascii, typographic) in this_way_pairs {
+            let (rest_ascii, ast_ascii) = parse_entry_this_way_clause(ascii)
+                .unwrap_or_else(|e| panic!("failed to parse ASCII this-way {ascii:?}: {e:?}"));
+            let (rest_typo, ast_typo) =
+                parse_entry_this_way_clause(typographic).unwrap_or_else(|e| {
+                    panic!("failed to parse typographic this-way {typographic:?}: {e:?}")
+                });
+
+            assert_eq!(
+                rest_ascii, "",
+                "ASCII this-way {ascii:?} must be fully consumed, remaining: {rest_ascii:?}"
+            );
+            assert_eq!(
+                rest_typo, "",
+                "typographic this-way {typographic:?} must be fully consumed, remaining: {rest_typo:?}"
+            );
+            assert_eq!(
+                ast_ascii, ast_typo,
+                "AST mismatch between {ascii:?} and {typographic:?}"
+            );
+        }
+
+        let connector_pairs = [
+            (
+                "if that player doesn't, ",
+                "if that player doesn\u{2019}t, ",
+            ),
+            ("if they don't, ", "if they don\u{2019}t, "),
+            (
+                "if that player doesn't discard a card this way, ",
+                "if that player doesn\u{2019}t discard a card this way, ",
+            ),
+        ];
+
+        for (ascii, typographic) in connector_pairs {
+            let (rest_ascii, ast_ascii) = parse_negated_reflexive_connector(ascii)
+                .unwrap_or_else(|e| panic!("failed to parse ASCII connector {ascii:?}: {e:?}"));
+            let (rest_typo, ast_typo) = parse_negated_reflexive_connector(typographic)
+                .unwrap_or_else(|e| {
+                    panic!("failed to parse typographic connector {typographic:?}: {e:?}")
+                });
+
+            assert_eq!(
+                rest_ascii, "",
+                "ASCII connector {ascii:?} must be fully consumed, remaining: {rest_ascii:?}"
+            );
+            assert_eq!(
+                rest_typo, "",
+                "typographic connector {typographic:?} must be fully consumed, remaining: {rest_typo:?}"
+            );
+            assert_eq!(
+                ast_ascii, ast_typo,
+                "AST mismatch between connectors {ascii:?} and {typographic:?}"
+            );
+        }
+
+        let teamwork_pairs = [
+            (
+                "it's cast using teamwork",
+                "it\u{2019}s cast using teamwork",
+            ),
+            ("it is cast using teamwork", "it is cast using teamwork"),
+        ];
+
+        for (ascii, typographic) in teamwork_pairs {
+            let (rest_ascii, ()) = parse_cast_using_teamwork_phrase(ascii)
+                .unwrap_or_else(|e| panic!("failed to parse ASCII teamwork {ascii:?}: {e:?}"));
+            let (rest_typo, ()) =
+                parse_cast_using_teamwork_phrase(typographic).unwrap_or_else(|e| {
+                    panic!("failed to parse typographic teamwork {typographic:?}: {e:?}")
+                });
+
+            assert_eq!(
+                rest_ascii, "",
+                "ASCII teamwork {ascii:?} must be fully consumed, remaining: {rest_ascii:?}"
+            );
+            assert_eq!(
+                rest_typo, "",
+                "typographic teamwork {typographic:?} must be fully consumed, remaining: {rest_typo:?}"
+            );
+        }
+
+        // Unless-pay tax condition scaling check
+        let unless_pay_pairs = [(
+            "their controller pays {2} for each creature they control that's blocking it",
+            "their controller pays {2} for each creature they control that\u{2019}s blocking it",
+        )];
+
+        for (ascii, typographic) in unless_pay_pairs {
+            let (rest_ascii, ast_ascii) = parse_unless_condition(ascii)
+                .unwrap_or_else(|e| panic!("failed to parse ASCII unless {ascii:?}: {e:?}"));
+            let (rest_typo, ast_typo) = parse_unless_condition(typographic).unwrap_or_else(|e| {
+                panic!("failed to parse typographic unless {typographic:?}: {e:?}")
+            });
+
+            assert_eq!(
+                rest_ascii, "",
+                "ASCII unless {ascii:?} must be fully consumed, remaining: {rest_ascii:?}"
+            );
+            assert_eq!(
+                rest_typo, "",
+                "typographic unless {typographic:?} must be fully consumed, remaining: {rest_typo:?}"
+            );
+            assert_eq!(
+                ast_ascii, ast_typo,
+                "AST mismatch between unless {ascii:?} and {typographic:?}"
+            );
+        }
+
+        // Primitive combinator direct assertions
+        assert_eq!(parse_apostrophe("'"), Ok(("", "'")));
+        assert_eq!(parse_apostrophe("\u{2019}"), Ok(("", "\u{2019}")));
+        assert_eq!(parse_apostrophe_s("'s"), Ok(("", "'s")));
+        assert_eq!(parse_apostrophe_s("\u{2019}s"), Ok(("", "\u{2019}s")));
+        assert_eq!(parse_apostrophe_re("'re"), Ok(("", "'re")));
+        assert_eq!(parse_apostrophe_re("\u{2019}re"), Ok(("", "\u{2019}re")));
+        assert_eq!(parse_isnt("isn't"), Ok(("", "isn't")));
+        assert_eq!(parse_isnt("isn\u{2019}t"), Ok(("", "isn\u{2019}t")));
+        assert_eq!(parse_wasnt("wasn't"), Ok(("", "wasn't")));
+        assert_eq!(parse_wasnt("wasn\u{2019}t"), Ok(("", "wasn\u{2019}t")));
+        assert_eq!(parse_werent("weren't"), Ok(("", "weren't")));
+        assert_eq!(parse_werent("weren\u{2019}t"), Ok(("", "weren\u{2019}t")));
+        assert_eq!(parse_doesnt("doesn't"), Ok(("", "doesn't")));
+        assert_eq!(parse_doesnt("doesn\u{2019}t"), Ok(("", "doesn\u{2019}t")));
+        assert_eq!(parse_dont("don't"), Ok(("", "don't")));
+        assert_eq!(parse_dont("don\u{2019}t"), Ok(("", "don\u{2019}t")));
+        assert_eq!(parse_hasnt("hasn't"), Ok(("", "hasn't")));
+        assert_eq!(parse_hasnt("hasn\u{2019}t"), Ok(("", "hasn\u{2019}t")));
+        assert_eq!(parse_youve("you've"), Ok(("", "you've")));
+        assert_eq!(parse_youve("you\u{2019}ve"), Ok(("", "you\u{2019}ve")));
+        assert_eq!(parse_havent("haven't"), Ok(("", "haven't")));
+        assert_eq!(parse_havent("haven\u{2019}t"), Ok(("", "haven\u{2019}t")));
+        assert_eq!(parse_didnt("didn't"), Ok(("", "didn't")));
+        assert_eq!(parse_didnt("didn\u{2019}t"), Ok(("", "didn\u{2019}t")));
+        assert_eq!(parse_you_are("you're"), Ok(("", "you're")));
+        assert_eq!(parse_you_are("you\u{2019}re"), Ok(("", "you\u{2019}re")));
+        assert_eq!(parse_you_are("you are"), Ok(("", "you are")));
+        assert_eq!(parse_theres("there's"), Ok(("", "there's")));
+        assert_eq!(parse_theres("there\u{2019}s"), Ok(("", "there\u{2019}s")));
+        assert_eq!(parse_theres("there is"), Ok(("", "there is")));
+        assert_eq!(parse_it_is("it's"), Ok(("", "it's")));
+        assert_eq!(parse_it_is("it\u{2019}s"), Ok(("", "it\u{2019}s")));
+        assert_eq!(parse_it_is("it is"), Ok(("", "it is")));
     }
 }
 

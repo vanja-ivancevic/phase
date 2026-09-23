@@ -59,7 +59,7 @@ use crate::types::zones::Zone;
 use super::casting::{
     ability_mana_payment_excluded_sources, can_pay_effect_mana_cost_after_auto_tap,
     find_eligible_discard_targets, mana_ability_cost_payment_is_paused, pay_ability_mana_cost,
-    pay_ability_mana_cost_excluding, pay_effect_mana_cost_with_resume,
+    pay_ability_mana_cost_excluding, pay_effect_mana_cost_with_resume, PausedManaPayment,
 };
 use super::engine::EngineError;
 use super::filter::FilterContext;
@@ -842,7 +842,13 @@ fn pay_ability_cost_inner(
             // auto-tap path. Pre-flight then pay; either step failing is a
             // payment failure (not an engine error).
             PaymentScope::Resolution { .. } => {
-                if !can_pay_effect_mana_cost_after_auto_tap(state, player, source_id, cost) {
+                if !can_pay_effect_mana_cost_after_auto_tap(
+                    state,
+                    player,
+                    source_id,
+                    cost,
+                    PausedManaPayment::Resumable,
+                ) {
                     return Ok(payment_failed("insufficient mana"));
                 }
                 let resume = effect_pay_cost_mana_resume(
@@ -888,7 +894,13 @@ fn pay_ability_cost_inner(
             PaymentScope::Resolution { .. } => {
                 let amount = resolve_cost_quantity(state, quantity, player, source_id, scope);
                 let mana_cost = crate::types::mana::ManaCost::generic(amount.max(0) as u32);
-                if !can_pay_effect_mana_cost_after_auto_tap(state, player, source_id, &mana_cost) {
+                if !can_pay_effect_mana_cost_after_auto_tap(
+                    state,
+                    player,
+                    source_id,
+                    &mana_cost,
+                    PausedManaPayment::Resumable,
+                ) {
                     return Ok(payment_failed("insufficient mana"));
                 }
                 let resume = effect_pay_cost_mana_resume(
@@ -1866,16 +1878,24 @@ pub(crate) fn can_pay(
             if !cost.is_payable_for_activation(state, payer, source_id, *ability_index) {
                 return false;
             }
-            // CR 118.12a: disjunctive activation costs resolve via
-            // `ActivationCostOneOfChoice`, but each branch must still pass the
-            // same activation affordability authority (is_payable + dry-run) as a
-            // deterministic cost. `is_payable` alone does not catch tapped-source
-            // `{T}` legs — shard-style `OneOf([Composite([Mana, Tap]), …])` would
-            // otherwise surface as legal when every branch needs an untapped source.
-            if let AbilityCost::OneOf { costs } = cost {
-                return costs
-                    .iter()
-                    .any(|branch| can_pay(state, payer, source_id, branch, scope));
+            // CR 601.2h + CR 602.2b + CR 118.3: a disjunctive leg anywhere in the
+            // activation cost is payable iff some branch, substituted into the
+            // total cost, passes the same authority. Disjunctions resolve via
+            // `ActivationCostOneOfChoice`; `is_payable` alone does not catch
+            // tapped-source `{T}` legs (shard-style `OneOf([Composite([Mana, Tap]),
+            // …])`), nor sibling mana legs summed with a branch's mana (Camellia's
+            // `Composite([Mana {2}, OneOf([Exile, Sacrifice])])`).
+            if let Some(branches) = super::casting::find_one_of_cost(cost) {
+                return branches.iter().any(|branch| {
+                    super::casting::one_of_branch_payable_in(
+                        state,
+                        payer,
+                        source_id,
+                        cost,
+                        branch,
+                        *ability_index,
+                    )
+                });
             }
             // CR 701.67a: A bare Waterbend cost has no deterministic component
             // to dry-run — its affordability is fully answered by `is_payable`'s
@@ -2277,7 +2297,13 @@ fn can_pay_resolution(
     use crate::types::ability::{CardSelectionMode, DiscardSelfScope};
     match cost {
         AbilityCost::Mana { cost: mana_cost } => {
-            can_pay_effect_mana_cost_after_auto_tap(state, payer, ability.source_id, mana_cost)
+            can_pay_effect_mana_cost_after_auto_tap(
+                state,
+                payer,
+                ability.source_id,
+                mana_cost,
+                PausedManaPayment::Resumable,
+            )
         }
         // CR 118.4 + CR 107.3c: Resolve the dynamic generic to a concrete
         // amount, then check mana payability. Dynamic-generic ability costs
@@ -2286,7 +2312,13 @@ fn can_pay_resolution(
         AbilityCost::ManaDynamic { quantity } => {
             let amount = resolve_quantity_with_targets(state, quantity, ability);
             let mana = crate::types::mana::ManaCost::generic(amount.max(0) as u32);
-            can_pay_effect_mana_cost_after_auto_tap(state, payer, ability.source_id, &mana)
+            can_pay_effect_mana_cost_after_auto_tap(
+                state,
+                payer,
+                ability.source_id,
+                &mana,
+                PausedManaPayment::Resumable,
+            )
         }
         // CR 119.4: Pay life requires the player's life total to be at least the
         // payment amount (and no CantLoseLife lock).

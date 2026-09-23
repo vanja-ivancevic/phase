@@ -10,7 +10,7 @@ use nom::Parser;
 
 use super::oracle_nom::condition as nom_condition;
 use super::oracle_nom::primitives as nom_primitives;
-use super::oracle_target::parse_type_phrase;
+use super::oracle_target::parse_type_phrase_folding;
 use crate::types::ability::{
     Comparator, ControllerRef, FilterProp, ParsedCondition, QuantityExpr, QuantityRef,
     StaticCondition, TargetFilter, TypeFilter, TypedFilter,
@@ -129,7 +129,7 @@ pub fn parse_restriction_condition(text: &str) -> Option<ParsedCondition> {
 /// grammar and full consumption; an unrelated or partially recognized phrase
 /// remains an honest gap.
 fn parse_attached_subject_restriction(text: &str) -> Option<ParsedCondition> {
-let (rest, filter) = nom_condition::parse_attached_subject_is_filter(text).ok()?;
+    let (rest, filter) = nom_condition::parse_attached_subject_is_filter(text).ok()?;
     let (rest, state_prop) = opt(preceded(
         tag::<_, _, OracleError<'_>>(" and "),
         alt((
@@ -521,6 +521,19 @@ fn static_condition_to_restriction_condition(
         StaticCondition::HasMaxSpeed => Some(ParsedCondition::HasMaxSpeed),
         // CR 702.195b: The enduring story designation is available to restrictions.
         StaticCondition::HasEnduringStory => Some(ParsedCondition::HasEnduringStory),
+        // CR 309.7 + CR 602.5b: dungeon completion is a player-status leaf of the
+        // same shape as the city's blessing and the enduring story above — read off
+        // the scoped player, carrying no filter or quantity, so it converts EXACTLY
+        // rather than approximately. The `Not` recursion arm yields the negative
+        // sense ("only if you haven't completed a dungeon").
+        //
+        // The shared grammar spells only the unqualified phrase, so `specific` is
+        // `None` here; the field exists to mirror the three sibling layers, whose
+        // named-dungeon form (`specific: Some(d)`) the same restriction evaluator
+        // will read unchanged once a card prints it.
+        StaticCondition::CompletedADungeon => {
+            Some(ParsedCondition::CompletedDungeon { specific: None })
+        }
         StaticCondition::OpponentPoisonAtLeast { count } => {
             Some(ParsedCondition::OpponentPoisonAtLeast { count })
         }
@@ -600,7 +613,6 @@ fn static_condition_to_restriction_condition(
         | StaticCondition::IsMonarch { .. }
         | StaticCondition::IsInitiative
         | StaticCondition::NoMonarch
-        | StaticCondition::CompletedADungeon
         | StaticCondition::WasStartingPlayer { .. }
         | StaticCondition::SpellCastWithVariantThisTurn { .. }
         | StaticCondition::SharesColorWithMostCommonColorAmongPermanents
@@ -951,10 +963,10 @@ fn parse_color_word(text: &str) -> Option<ManaColor> {
 
 /// CR 601.3d + CR 608.2c: Parse `"it targets a <type_phrase>"` (or `"it targets <type_phrase>"`)
 /// into a `ParsedCondition::SpellTargetsFilter` whose filter is derived from
-/// `parse_type_phrase`. The pronoun `it` refers to the spell being cast — this
+/// `parse_type_phrase_folding`. The pronoun `it` refers to the spell being cast — this
 /// condition gates target-dependent casting permissions ("you may cast this spell
 /// as though it had flash if it targets a commander" — Timely Ward). The trailing
-/// remainder returned by `parse_type_phrase` must be empty for the parse to
+/// remainder returned by `parse_type_phrase_folding` must be empty for the parse to
 /// succeed; otherwise we'd silently truncate qualifying clauses that the filter
 /// layer hasn't absorbed.
 pub(crate) fn parse_spell_targets_filter(text: &str) -> Option<ParsedCondition> {
@@ -967,7 +979,7 @@ pub(crate) fn parse_spell_targets_filter(text: &str) -> Option<ParsedCondition> 
     .ok()?
     .0;
     // CR 903.3: Bare "commander" / "commanders" without a possessive or
-    // controller suffix is not lifted by `parse_type_phrase` (which expects
+    // controller suffix is not lifted by `parse_type_phrase_folding` (which expects
     // type words) or by the possessive arms of `parse_target` (which require
     // "your" / "their" / a trailing controller-suffix). Recognize it here
     // explicitly so "it targets a commander" maps to the `IsCommander`
@@ -986,7 +998,7 @@ pub(crate) fn parse_spell_targets_filter(text: &str) -> Option<ParsedCondition> 
         }
     }
     // CR 115.1: "it targets a permanent or player" — proliferate-style pool
-    // (Shiko and Narset, Unified Flurry gate). Matched before `parse_type_phrase`
+    // (Shiko and Narset, Unified Flurry gate). Matched before `parse_type_phrase_folding`
     // so the "or player" half is not dropped.
     if rest.trim() == "permanent or player" {
         return Some(ParsedCondition::SpellTargetsFilter {
@@ -1006,11 +1018,11 @@ pub(crate) fn parse_spell_targets_filter(text: &str) -> Option<ParsedCondition> 
     )))
     .parse(rest)
     .ok()?;
-    let (filter, remainder) = parse_type_phrase(rest);
+    let (filter, remainder) = parse_type_phrase_folding(rest);
     if !remainder.trim().is_empty() {
         return None;
     }
-    // `parse_type_phrase` falls back to `TargetFilter::Any` when no type word
+    // `parse_type_phrase_folding` falls back to `TargetFilter::Any` when no type word
     // matched. A bare "it targets a frob" must not silently widen the gate to
     // "any target"; refuse the parse instead so the casting permission is not
     // emitted (strictly safe — the spell stays sorcery-speed until the

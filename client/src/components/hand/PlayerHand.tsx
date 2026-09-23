@@ -1,4 +1,4 @@
-import { memo, useState, useCallback, useMemo, useRef } from "react";
+import { memo, useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { AnimatePresence, motion, useMotionValue, useSpring, useTransform, useReducedMotion } from "framer-motion";
 import type { MotionValue, PanInfo } from "framer-motion";
 import { useTranslation } from "react-i18next";
@@ -6,6 +6,7 @@ import { useTranslation } from "react-i18next";
 import { CardImage } from "../card/CardImage.tsx";
 import { ManaCostPips } from "../mana/ManaCostPips.tsx";
 import { spellCostDisplay } from "../../viewmodel/costLabel.ts";
+import { useBackFaceSpellCost } from "../../hooks/useBackFaceSpellCost.ts";
 import { useGameStore } from "../../stores/gameStore.ts";
 import { useUiStore } from "../../stores/uiStore.ts";
 import { usePreferencesStore } from "../../stores/preferencesStore.ts";
@@ -75,7 +76,11 @@ const DROP_ARROW_PX = 28;
 // stays on the gap center for any fan tilt.
 const ARROW_TIP_FRAC = 20 / 24;
 
-export function PlayerHand() {
+interface PlayerHandProps {
+  interactionDisabled?: boolean;
+}
+
+export function PlayerHand({ interactionDisabled = false }: PlayerHandProps) {
   const { t } = useTranslation("game");
   const playerId = usePerspectivePlayerId();
   const handContainerRef = useRef<HTMLDivElement | null>(null);
@@ -98,6 +103,7 @@ export function PlayerHand() {
   const [expanded, setExpanded] = useState(false);
   const [selectedCardId, setSelectedCardId] = useState<number | null>(null);
   const [draggingCardId, setDraggingCardId] = useState<number | null>(null);
+  const interactionWasDisabledRef = useRef(false);
 
   const legalActionsByObject = useGameStore((s) => s.legalActionsByObject);
   const manaPaymentPreviewRequestId = useRef(0);
@@ -131,6 +137,16 @@ export function PlayerHand() {
     () => (player?.hand ?? []).filter((id) => objects?.[id] && id !== pendingObjectId),
     [player?.hand, objects, pendingObjectId],
   );
+
+  useEffect(() => {
+    const interactionBegan = interactionDisabled && !interactionWasDisabledRef.current;
+    interactionWasDisabledRef.current = interactionDisabled;
+    if (!interactionBegan) return;
+
+    if (useUiStore.getState().previewSource === "playerHand") {
+      useUiStore.getState().dismissPreview();
+    }
+  }, [interactionDisabled]);
   const organizer = useCardOrganizer({
     cards: handCardIds,
     objects: objects ?? EMPTY_OBJECTS,
@@ -380,6 +396,11 @@ export function PlayerHand() {
       arrowRotateRaw.set(0);
       insertionSlotMV.set(-1);
       draggingIndexMV.set(-1);
+      // A choice overlay can appear after the pointer-down that began this
+      // gesture. The container's pointer-events guard prevents new gestures,
+      // but Framer still completes an already-active drag, so reject the stale
+      // drop before it can reorder or play a card behind the overlay.
+      if (interactionDisabled) return false;
       const bounds = handContainerRef.current?.getBoundingClientRect();
       const releasedInsideHand =
         bounds != null
@@ -432,7 +453,7 @@ export function PlayerHand() {
       playCard(objectId);
       return true;
     },
-    [hasPriority, playCard, hand, playerId, pendingObjectId, organizeActive, arrowOpacity, arrowRotateRaw, insertionSlotMV, draggingIndexMV],
+    [hasPriority, playCard, hand, playerId, pendingObjectId, organizeActive, interactionDisabled, arrowOpacity, arrowRotateRaw, insertionSlotMV, draggingIndexMV],
   );
 
   const handleCardClick = useCallback(
@@ -454,7 +475,7 @@ export function PlayerHand() {
       if (!hasPriority) return;
 
       setSelectedCardId(objectId);
-      inspectObject(objectId);
+      inspectObject(objectId, undefined, "hover", "cursor", "playerHand");
     },
     [isMobile, hasPriority, inspectObject, setMobileHandOpen],
   );
@@ -530,8 +551,12 @@ export function PlayerHand() {
     insertionSlotMV.set(-1);
     draggingIndexMV.set(-1);
   }, [arrowOpacity, arrowRotateRaw, insertionSlotMV, draggingIndexMV]);
-  const handleMouseEnter = useCallback((id: number) => inspectObject(id), [inspectObject]);
-  const handleMouseLeave = useCallback(() => inspectObject(null), [inspectObject]);
+  const handleMouseEnter = useCallback((id: number) => {
+    inspectObject(id, undefined, "hover", "cursor", "playerHand");
+  }, [inspectObject]);
+  const handleMouseLeave = useCallback(() => {
+    inspectObject(null);
+  }, [inspectObject]);
 
   if (!player || !objects) return null;
 
@@ -559,9 +584,10 @@ export function PlayerHand() {
     <>
       <div
       ref={handContainerRef}
+      data-player-hand
       className={`relative flex items-end justify-center overflow-visible px-4 py-1 ${
         isCompactHeight ? "min-h-[40px]" : "min-h-[calc(var(--card-h)*0.7)]"
-      } ${isMobile ? "touch-none" : ""}`}
+      } ${isMobile ? "touch-none" : ""} ${interactionDisabled ? "pointer-events-none" : ""}`}
       style={{
         perspective: "800px",
         ...playerHandFanSizingStyle(totalFanCards),
@@ -635,6 +661,7 @@ export function PlayerHand() {
                 objectId={obj.id}
                 cardName={obj.name}
                 manaCost={obj.mana_cost}
+                backFaceManaCost={obj.back_face?.mana_cost}
                 unimplementedMechanics={obj.unimplemented_mechanics}
                 rotation={fan.rotation(j)}
                 arcOffset={fan.arc(j)}
@@ -668,6 +695,7 @@ export function PlayerHand() {
               oracleId={obj.printed_ref?.oracle_id}
               faceName={obj.printed_ref?.face_name}
               manaCost={obj.mana_cost}
+              backFaceManaCost={obj.back_face?.mana_cost}
               unimplementedMechanics={obj.unimplemented_mechanics}
               index={i}
               handSize={handObjects.length}
@@ -706,6 +734,7 @@ export function PlayerHand() {
                 objectId={obj.id}
                 cardName={obj.name}
                 manaCost={obj.mana_cost}
+                backFaceManaCost={obj.back_face?.mana_cost}
                 unimplementedMechanics={obj.unimplemented_mechanics}
                 rotation={fan.rotation(k)}
                 arcOffset={fan.arc(k)}
@@ -821,6 +850,7 @@ interface HandCardProps {
   oracleId?: string;
   faceName?: string;
   manaCost: ManaCost;
+  backFaceManaCost?: ManaCost;
   unimplementedMechanics?: string[];
   index: number;
   handSize: number;
@@ -854,6 +884,7 @@ const HandCard = memo(function HandCard({
   oracleId,
   faceName,
   manaCost,
+  backFaceManaCost,
   unimplementedMechanics,
   index,
   handSize,
@@ -928,11 +959,12 @@ const HandCard = memo(function HandCard({
   // free-cast permissions such as Omniscience); falls back to the printed cost.
   const effectiveCost = useGameStore((s) => s.spellCosts[String(objectId)]);
   const { displayCost, isReduced } = spellCostDisplay(effectiveCost, manaCost);
+  const backFace = useBackFaceSpellCost(objectId, backFaceManaCost);
   const playedRef = useRef(false);
 
   const setPreviewSticky = useUiStore((s) => s.setPreviewSticky);
   const { handlers: longPressHandlers, firedRef: longPressFired } = useLongPress(() => {
-    inspectObject(objectId);
+    inspectObject(objectId, undefined, "hover", "cursor", "playerHand");
     setPreviewSticky(true);
   });
 
@@ -1046,7 +1078,7 @@ const HandCard = memo(function HandCard({
             from the card wrapper, so container-type can't collapse it); lets the
             pips scale in cqi with --hand-card-w instead of a fixed px size. */}
         <div className="pointer-events-none absolute inset-0 @container">
-          <ManaCostPips cost={displayCost} isReduced={isReduced} size="fluid" />
+          <ManaCostPips cost={displayCost} isReduced={isReduced} backFace={backFace} size="fluid" />
         </div>
       </motion.div>
     </motion.div>
@@ -1057,6 +1089,7 @@ interface ZoneFanCardProps {
   objectId: number;
   cardName: string;
   manaCost: ManaCost;
+  backFaceManaCost?: ManaCost;
   unimplementedMechanics?: string[];
   rotation: number;
   arcOffset: number;
@@ -1087,6 +1120,7 @@ const ZoneFanCard = memo(function ZoneFanCard({
   objectId,
   cardName,
   manaCost,
+  backFaceManaCost,
   unimplementedMechanics,
   rotation,
   arcOffset,
@@ -1109,12 +1143,13 @@ const ZoneFanCard = memo(function ZoneFanCard({
   const setDragging = useUiStore((s) => s.setDragging);
   const setPreviewSticky = useUiStore((s) => s.setPreviewSticky);
   const { handlers: longPressHandlers, firedRef: longPressFired } = useLongPress(() => {
-    inspectObject(objectId);
+    inspectObject(objectId, undefined, "hover", "cursor", "playerHand");
     setPreviewSticky(true);
   });
 
   const effectiveCost = useGameStore((s) => s.spellCosts[String(objectId)]);
   const { displayCost, isReduced } = spellCostDisplay(effectiveCost, manaCost);
+  const backFace = useBackFaceSpellCost(objectId, backFaceManaCost);
   // Suppress dragSnapToOrigin only when the flick actually cast the card, so a
   // short/sideways drag springs back into the wing instead of flying off.
   const playedRef = useRef(false);
@@ -1192,7 +1227,7 @@ const ZoneFanCard = memo(function ZoneFanCard({
       {/* @container overlay sized to the card so the pips scale in cqi with
           --hand-card-w (see the hand-card render above). */}
       <div className="pointer-events-none absolute inset-0 @container">
-        <ManaCostPips cost={displayCost} isReduced={isReduced} size="fluid" />
+        <ManaCostPips cost={displayCost} isReduced={isReduced} backFace={backFace} size="fluid" />
       </div>
     </motion.div>
   );

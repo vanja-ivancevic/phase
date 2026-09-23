@@ -23,6 +23,25 @@ pub struct PerfCounterSnapshot {
     pub layers_escalated: u64,
     pub mana_display_sweeps: u64,
     pub mana_display_swept_objects: u64,
+    /// CR 602.5 + CR 118.3: how many times the shared activation-legality core
+    /// (`casting::activation_verdict`) ran, across BOTH the enforcement shim and
+    /// the display read-out. Pins "one core evaluation per examined ability".
+    pub activation_verdict_passes: u64,
+    /// CR 118.3: activated abilities examined by
+    /// `ai_support::activation_block_reasons`. Paired with the counter above so
+    /// a passes-per-ability ratio is attributable rather than coincidental.
+    pub activation_block_display_abilities_examined: u64,
+    /// CR 613.1: whole-state flush clones taken by `casting::activation_verdict`'s
+    /// target-legality tail, which now clones only when `layers_dirty` is dirty
+    /// (it cloned unconditionally before, and incremented no counter at all).
+    ///
+    /// Deliberately its OWN field rather than `state_clone_for_legality`. That
+    /// field is a per-candidate legality-clone budget consumed by shipped memo
+    /// tests in `ai_support::filter`; folding a previously-uncounted clone into
+    /// it would silently double their expected budgets and turn a pure
+    /// instrumentation change into a behavioural-looking regression. Counting it
+    /// separately keeps both numbers attributable.
+    pub activation_verdict_flush_clones: u64,
     pub stack_batch_candidates: u64,
     pub stack_batch_plans: u64,
     pub stack_batch_observer_refusals: u64,
@@ -69,6 +88,37 @@ pub struct PriorTargetBindingCounters {
     pub selection_bindings: u64,
 }
 
+/// Test-only counters for the CR 508.1d attack-declaration solver
+/// (`combat::selectable_targets_by_attacker` and the strict validator it
+/// drives). Kept out of [`PerfCounterSnapshot`] for the same reason the two
+/// counter sets above are: that struct's serialized field set powers the AI
+/// performance baseline (`phase-ai::duel_suite::perf`), which these
+/// declare-attackers-prompt guards have no business perturbing.
+#[cfg(feature = "test-support")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AttackDeclarationSolverCounters {
+    /// Times the solver built its per-candidate target table
+    /// (`SolverTargetTable::build`). The table depends only on the constraints
+    /// model + target universe, never on the forced pair, so the prompt builder
+    /// must build ONE per universe rather than one per (attacker, target) pair.
+    pub target_table_builds: u64,
+    /// Whole-battlefield static sweeps taken to derive an attacker cap
+    /// (`max_attackers_each_combat` / `per_defender_caps` /
+    /// `per_permanent_defender_caps`). The constraints model caches all three at
+    /// build time, so a validation run against a prebuilt model must add none.
+    pub cap_static_sweeps: u64,
+    /// CR 508.1b: per-(attacker, defender) pairability evaluations
+    /// (`combat::attacker_can_attack_target`), the single predicate behind both
+    /// views of `combat::legal_attack_targets_iter`.
+    ///
+    /// Pins that the EXISTENTIAL view (CR 508.1d "if able", asked once per
+    /// must-attack creature by `AttackDeclarationConstraints::build` and by the
+    /// AI mandatory-attacker filter) short-circuits on the first legal pairing
+    /// instead of evaluating — and sorting — the whole defender universe. Only
+    /// the LIST view may spend one evaluation per defender.
+    pub pairability_evaluations: u64,
+}
+
 thread_local! {
     /// Per-thread (NOT process-global) so parallel `cargo test` runs do not
     /// cross-pollute counters between a test's `reset()` and `snapshot()`.
@@ -103,6 +153,9 @@ thread_local! {
         layers_escalated: 0,
         mana_display_sweeps: 0,
         mana_display_swept_objects: 0,
+        activation_verdict_passes: 0,
+        activation_block_display_abilities_examined: 0,
+        activation_verdict_flush_clones: 0,
         stack_batch_candidates: 0,
         stack_batch_plans: 0,
         stack_batch_observer_refusals: 0,
@@ -137,6 +190,14 @@ thread_local! {
         Cell::new(PriorTargetBindingCounters {
             static_union_enumerations: 0,
             selection_bindings: 0,
+        })
+    };
+    #[cfg(feature = "test-support")]
+    static ATTACK_DECLARATION_SOLVER_COUNTERS: Cell<AttackDeclarationSolverCounters> = const {
+        Cell::new(AttackDeclarationSolverCounters {
+            target_table_builds: 0,
+            cap_static_sweeps: 0,
+            pairability_evaluations: 0,
         })
     };
     static LEGALITY_CLONE_PHASE: Cell<Option<LegalityClonePhase>> = const { Cell::new(None) };
@@ -303,6 +364,13 @@ pub(crate) fn record_post_apply_uncached_source_collection() {
 /// O(battlefield) `.any()` behind the O(1) `static_kind_present(IgnoreHexproof)`
 /// presence index — so on a board with zero functioning `IgnoreHexproof` statics this
 /// counter stays at 0 across an entire target enumeration.
+///
+/// Also incremented by `combat::compute_combat_tax` once per admitted call — i.e.
+/// once per real `battlefield ∪ command_zone` tax sweep, AFTER its O(1)
+/// `static_kind_present(CantAttack / CantBlock / CantAttackOrBlock)` gate. Attack
+/// candidate enumeration asks for a tax verdict once per proposed (attacker,
+/// target) pairing, so on a board with no combat-tax static this counter stays at
+/// 0 across the whole enumeration instead of reaching 2N.
 pub fn record_static_full_scan() {
     with_mut(|s| s.static_full_scans += 1);
 }
@@ -374,6 +442,18 @@ pub fn record_layers_incremental() {
 
 pub fn record_layers_escalated() {
     with_mut(|s| s.layers_escalated += 1);
+}
+
+pub fn record_activation_verdict_pass() {
+    with_mut(|s| s.activation_verdict_passes += 1);
+}
+
+pub fn record_activation_block_display_abilities_examined(examined: usize) {
+    with_mut(|s| s.activation_block_display_abilities_examined += examined as u64);
+}
+
+pub fn record_activation_verdict_flush_clone() {
+    with_mut(|s| s.activation_verdict_flush_clones += 1);
 }
 
 pub fn record_mana_display_sweep(swept_objects: usize) {
@@ -452,6 +532,41 @@ pub fn prior_target_binding_snapshot() -> PriorTargetBindingCounters {
     PRIOR_TARGET_BINDING_COUNTERS.with(Cell::get)
 }
 
+/// CR 508.1d: one solver target-table build.
+#[cfg(feature = "test-support")]
+pub fn record_attack_solver_target_table_build() {
+    ATTACK_DECLARATION_SOLVER_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.target_table_builds += 1;
+        cell.set(counters);
+    });
+}
+
+/// CR 508.1c: one whole-battlefield sweep taken to derive an attacker cap.
+#[cfg(feature = "test-support")]
+pub fn record_attack_cap_static_sweep() {
+    ATTACK_DECLARATION_SOLVER_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.cap_static_sweeps += 1;
+        cell.set(counters);
+    });
+}
+
+/// CR 508.1b: one per-pairing `attacker_can_attack_target` evaluation.
+#[cfg(feature = "test-support")]
+pub fn record_attack_pairability_evaluation() {
+    ATTACK_DECLARATION_SOLVER_COUNTERS.with(|cell| {
+        let mut counters = cell.get();
+        counters.pairability_evaluations += 1;
+        cell.set(counters);
+    });
+}
+
+#[cfg(feature = "test-support")]
+pub fn attack_declaration_solver_snapshot() -> AttackDeclarationSolverCounters {
+    ATTACK_DECLARATION_SOLVER_COUNTERS.with(Cell::get)
+}
+
 #[cfg(feature = "test-support")]
 pub fn reset_prior_target_binding_counters() {
     PRIOR_TARGET_BINDING_COUNTERS
@@ -465,4 +580,7 @@ pub fn reset() {
         .with(|counters| counters.set(HomogeneousTargetWalkCacheCounters::default()));
     #[cfg(feature = "test-support")]
     reset_prior_target_binding_counters();
+    #[cfg(feature = "test-support")]
+    ATTACK_DECLARATION_SOLVER_COUNTERS
+        .with(|counters| counters.set(AttackDeclarationSolverCounters::default()));
 }

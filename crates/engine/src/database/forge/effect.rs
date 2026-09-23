@@ -199,6 +199,7 @@ fn translate_draw(
     Ok(Effect::Draw {
         count,
         target: resolve_defined(params),
+        target: TargetFilter::Controller,
     })
 }
 
@@ -654,8 +655,9 @@ mod tests {
         let mut resolver = make_resolver();
         let effect = translate_effect(&params, &mut resolver).unwrap();
         match effect {
-            Effect::Draw { count, .. } => {
+            Effect::Draw { count, target } => {
                 assert_eq!(count, QuantityExpr::Fixed { value: 2 });
+                assert_eq!(target, TargetFilter::Controller);
             }
             other => panic!("expected Draw, got {other:?}"),
         }

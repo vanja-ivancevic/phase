@@ -1,8 +1,9 @@
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 import { MemoryRouter } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { draftProcedureFixture } from "../../adapter/__tests__/draftProcedureFixture";
 
 const mocks = vi.hoisted(() => ({
   draftProcedure: vi.fn(),
@@ -49,7 +50,12 @@ vi.mock("../../stores/multiplayerDraftStore", async (importOriginal) => ({
 
 // The engine's per-kind procedure. `pod_size` is deliberately NOT 4 so a client
 // literal cannot coincide with the adopted value.
-vi.mock("../../adapter/draft-adapter", () => ({
+// Only the adapter CLASS is replaced. The module's shape helpers
+// (`setPackSequence`, `distinctJoined`, `isSharedStackDistribution`) are the
+// boundary's own logic and the store calls them while this page renders —
+// stubbing them away would make this suite answer questions about the mock.
+vi.mock("../../adapter/draft-adapter", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../adapter/draft-adapter")>()),
   DraftAdapter: class {
     draftProcedure = mocks.draftProcedure;
   },
@@ -76,7 +82,6 @@ vi.mock("../../components/draft/HostControls", () => {
   };
 });
 vi.mock("../../components/draft/SetSelector", () => ({ SetSelector: () => null }));
-vi.mock("../../components/draft/CubeSetupPanel", () => ({ CubeSetupPanel: () => null }));
 
 import { DraftPodPage } from "../DraftPodPage";
 import { useDraftPodStore } from "../../stores/draftPodStore";
@@ -93,11 +98,15 @@ function engineView(
     pack_sizes: number[];
     min_deck_size: number;
     launch_capability: "None" | "CommanderMultiplayer";
+    commanders_required: number;
+    distribution: unknown;
   }> = {},
 ) {
   return {
     kind,
     launch_capability: "None",
+    distribution: "PickAndPass",
+    commanders_required: 0,
     seats: Array.from({ length: seatCount }, (_, seat_index) => ({ seat_index })),
     pack_count: 4,
     cards_per_pack: 12,
@@ -123,7 +132,7 @@ describe("DraftPodPage ?kind= mode entry", () => {
     mocks.multiplayerState.phase = "idle";
     mocks.multiplayerState.view = null;
     mocks.loadActiveDraftPod.mockReturnValue(null);
-    mocks.draftProcedure.mockResolvedValue({
+    mocks.draftProcedure.mockResolvedValue(draftProcedureFixture({
       pod_size: 6,
       human_seats: 1,
       min_pod_size: 3,
@@ -133,9 +142,10 @@ describe("DraftPodPage ?kind= mode entry", () => {
       cards_per_pick: 2,
       distribution: "PickAndPass",
       min_deck_size: 60,
+      cube_min_deck_size: 53,
       post_draft_play: "CompleteImmediately",
-      match_config: { best_of: 1 },
-    });
+      match_config: { match_type: "Bo1" },
+    }));
     useDraftPodStore.getState().reset();
   });
 
@@ -172,6 +182,51 @@ describe("DraftPodPage ?kind= mode entry", () => {
         "Each player drafts two cards at a time and builds a 60-card Commander deck, then the pod plays one multiplayer game.",
       ),
     ).toBeInTheDocument();
+  });
+
+  it("applies the deep-linked Winston kind through the same slug map", async () => {
+    renderAt("/draft-pod?kind=winston");
+
+    // REVERT-FAILING: with no `winston` entry in `DRAFT_KIND_ENTRIES` the slug
+    // resolves to `null` and the kind stays "Premier". `podSize: 6` is the
+    // fixture's, so a hardcoded client default fails the second half.
+    await waitFor(() =>
+      expect(useDraftPodStore.getState().config).toMatchObject({
+        kind: "Winston",
+        podSize: 6,
+      }),
+    );
+    expect(mocks.draftProcedure).toHaveBeenCalledWith("Winston", "Swiss");
+  });
+
+  it("offers Winston in the pod kind selector", async () => {
+    const user = userEvent.setup();
+    renderAt("/draft-pod?kind=winston");
+
+    await user.click(screen.getByRole("button", { name: /Host a Pod/ }));
+
+    // Reach guard: the pre-existing radios rendered.
+    expect(screen.getByRole("radio", { name: "Premier" })).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("radio", { name: "Winston" })).toBeChecked());
+    expect(
+      screen.getByText(
+        "Two to four players draft one shared face-down stack through three piles: on your turn, look at a pile and take it or decline and add a card to it.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("ignores an unknown ?kind= slug instead of failing the route", async () => {
+    const user = userEvent.setup();
+    renderAt("/draft-pod?kind=nonesuch");
+
+    await user.click(screen.getByRole("button", { name: /Host a Pod/ }));
+
+    expect(useDraftPodStore.getState().config.kind).toBe("Premier");
+    expect(screen.getByRole("radio", { name: "Winston" })).not.toBeChecked();
+    await waitFor(() => expect(mocks.draftProcedure).toHaveBeenCalledWith("Premier", "Swiss"));
+    // The witness that no kind-intent effect fired, as in the bare-route case:
+    // the store keeps its own default rather than adopting the fixture's 6.
+    expect(useDraftPodStore.getState().config.podSize).toBe(8);
   });
 
   it("leaves a bare /draft-pod on the Premier default", async () => {
@@ -227,7 +282,7 @@ describe("DraftPodPage ?kind= mode entry", () => {
     mocks.draftProcedure.mockImplementation(async (
       requestedKind: string,
       requestedTournamentFormat: string,
-    ) => ({
+    ) => draftProcedureFixture({
       pod_size: 8,
       human_seats: 1,
       min_pod_size: requestedKind === "CommanderDraft" ? 3 : 2,
@@ -242,10 +297,11 @@ describe("DraftPodPage ?kind= mode entry", () => {
       cards_per_pick: requestedKind === "CommanderDraft" ? 2 : 1,
       distribution: "PickAndPass",
       min_deck_size: 60,
+      cube_min_deck_size: 53,
       post_draft_play: requestedKind === "CommanderDraft"
         ? "CompleteImmediately"
         : "TournamentPairings",
-      match_config: { best_of: 1 },
+      match_config: { match_type: "Bo1" },
     }));
 
     renderAt("/draft-pod");
@@ -272,7 +328,7 @@ describe("DraftPodPage ?kind= mode entry", () => {
     let resolveCommanderProcedure!: () => void;
     mocks.draftProcedure.mockImplementation((kind: string) => {
       if (kind !== "CommanderDraft") {
-        return Promise.resolve({
+        return Promise.resolve(draftProcedureFixture({
           pod_size: 8,
           human_seats: 1,
           min_pod_size: 2,
@@ -282,13 +338,14 @@ describe("DraftPodPage ?kind= mode entry", () => {
           cards_per_pick: 1,
           distribution: "PickAndPass",
           min_deck_size: 60,
+          cube_min_deck_size: 53,
           post_draft_play: "TournamentPairings",
-          match_config: { best_of: 1 },
-        });
+          match_config: { match_type: "Bo1" },
+        }));
       }
 
       return new Promise((resolve) => {
-        resolveCommanderProcedure = () => resolve({
+        resolveCommanderProcedure = () => resolve(draftProcedureFixture({
           pod_size: 4,
           human_seats: 1,
           min_pod_size: 3,
@@ -298,9 +355,10 @@ describe("DraftPodPage ?kind= mode entry", () => {
           cards_per_pick: 2,
           distribution: "PickAndPass",
           min_deck_size: 60,
+          cube_min_deck_size: 73,
           post_draft_play: "CompleteImmediately",
-          match_config: { best_of: 1 },
-        });
+          match_config: { match_type: "Bo1" },
+        }));
       });
     });
 
@@ -330,6 +388,105 @@ describe("DraftPodPage ?kind= mode entry", () => {
       "7 players",
       "8 players",
     ]);
+  });
+
+  it("keeps the real cube panel mounted across pending floor changes", async () => {
+    let resolveHigher!: () => void;
+    let resolveLower!: () => void;
+    mocks.draftProcedure.mockImplementation((kind: string) => {
+      const base = draftProcedureFixture({
+        pod_size: 8,
+        human_seats: 1,
+        min_pod_size: 2,
+        max_pod_size: 8,
+        allowed_pod_sizes: [2, 3, 4, 5, 6, 7, 8],
+        packs_per_player: 3,
+        cards_per_pick: 1,
+        distribution: "PickAndPass",
+        min_deck_size: 40,
+        cube_min_deck_size: 53,
+        post_draft_play: "TournamentPairings",
+        match_config: { match_type: "Bo1" },
+      });
+      if (kind === "CommanderDraft") {
+        return new Promise((resolve) => {
+          resolveHigher = () => resolve({
+            ...base,
+            cube_min_deck_size: 73,
+            min_pod_size: 3,
+            cards_per_pick: 2,
+            post_draft_play: "CompleteImmediately",
+          });
+        });
+      }
+      if (kind === "Traditional") {
+        return new Promise((resolve) => {
+          resolveLower = () => resolve({ ...base, cube_min_deck_size: 61 });
+        });
+      }
+      return Promise.resolve(base);
+    });
+
+    const user = userEvent.setup();
+    renderAt("/draft-pod");
+    await user.click(screen.getByRole("button", { name: /Host a Pod/ }));
+    await waitFor(() => expect(useDraftPodStore.getState().cubeMinDeckSize).toBe(53));
+    await user.click(screen.getByRole("button", { name: "Cube" }));
+
+    const minimum = screen.getByRole("spinbutton", { name: "Min Deck" });
+    const cubeList = screen.getByPlaceholderText(/1 Lightning Bolt/);
+    fireEvent.change(minimum, { target: { value: "67" } });
+    await user.type(cubeList, "1 Opt");
+
+    await user.click(screen.getByRole("radio", { name: "Commander" }));
+    expect(screen.getByRole("spinbutton", { name: "Min Deck" })).toBe(minimum);
+    expect(screen.getByRole("button", { name: "Start Cube Draft" })).toBeDisabled();
+    expect(cubeList).toHaveValue("1 Opt");
+    resolveHigher();
+    await waitFor(() => expect(minimum).toHaveValue(73));
+
+    await user.click(screen.getByRole("radio", { name: "Traditional" }));
+    expect(screen.getByRole("spinbutton", { name: "Min Deck" })).toBe(minimum);
+    expect(screen.getByRole("button", { name: "Start Cube Draft" })).toBeDisabled();
+    expect(cubeList).toHaveValue("1 Opt");
+    resolveLower();
+    await waitFor(() => expect(minimum).toHaveValue(67));
+
+    await user.click(screen.getByRole("button", { name: "Start Cube Draft" }));
+    expect(useDraftPodStore.getState().cubeForm).toMatchObject({
+      cubeListText: "1 Opt",
+      settings: { min_deck_size: 67 },
+    });
+  });
+
+  it("leaves cube setup only after an all-at-once procedure resolves", async () => {
+    mocks.draftProcedure.mockImplementation(async (kind: string) => draftProcedureFixture({
+      pod_size: 8,
+      human_seats: 1,
+      min_pod_size: 2,
+      max_pod_size: 8,
+      allowed_pod_sizes: [2, 3, 4, 5, 6, 7, 8],
+      packs_per_player: kind === "Sealed" ? 6 : 3,
+      cards_per_pick: 1,
+      distribution: kind === "Sealed" ? "AllAtOnce" : "PickAndPass",
+      min_deck_size: 40,
+      cube_min_deck_size: 1,
+      post_draft_play: "TournamentPairings",
+      match_config: { match_type: "Bo1" },
+    }));
+
+    const user = userEvent.setup();
+    renderAt("/draft-pod");
+    await user.click(screen.getByRole("button", { name: /Host a Pod/ }));
+    await waitFor(() => expect(useDraftPodStore.getState().cubeMinDeckSize).toBe(1));
+    await user.click(screen.getByRole("button", { name: "Cube" }));
+    expect(screen.getByPlaceholderText(/1 Lightning Bolt/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("radio", { name: "Sealed" }));
+
+    await waitFor(() => expect(useDraftPodStore.getState().packDistribution).toBe("AllAtOnce"));
+    expect(useDraftPodStore.getState().poolMode).toBe("set");
+    expect(screen.queryByPlaceholderText(/1 Lightning Bolt/)).toBeNull();
   });
 
   it("lets the persisted session win over a URL kind intent", async () => {
@@ -372,6 +529,61 @@ describe("DraftPodPage ?kind= mode entry", () => {
         "After drafting, build a Commander deck of at least 63 cards and play one multiplayer game",
       ),
     ).toBeInTheDocument();
+  });
+
+  it("describes a shared stack rather than passing packs, on the engine's distribution", () => {
+    // THE ORDERING CASE. A Winston pod's `launch_capability` is "None", exactly
+    // like an ordinary pod's, so a capability-first test falls through to the
+    // pod copy and tells the players to open packs and pass them — a procedure
+    // this format does not have. The fixture keeps the capability at its
+    // default so only the distribution can be doing the work, and the store is
+    // left on its "Premier" default so nothing can be reading a kind label.
+    mocks.multiplayerState.phase = "drafting";
+    mocks.multiplayerState.view = engineView("Winston", 2, {
+      pack_count: 3,
+      cards_per_pack: 15,
+      pack_sizes: [15, 15, 15],
+      min_deck_size: 40,
+      distribution: { SharedStackPiles: { pile_count: 3 } },
+    });
+    renderAt("/draft-pod");
+
+    expect(screen.getByText("Winston Draft")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Every player's 3 packs are opened without anyone looking, and every card is shuffled together into one face-down stack",
+      ),
+    ).toBeInTheDocument();
+    // The pile count comes from the engine's own `pile_count`, not a literal.
+    expect(
+      screen.getByText(
+        "3 one-card piles are dealt off the top. On your turn, look at the first pile: take it, or decline it and move to the next",
+      ),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "Turns alternate until no cards are left; then build a deck of at least 40 cards and play tournament matches",
+      ),
+    ).toBeInTheDocument();
+
+    // And none of the pack-passing copy survives — the actual complaint.
+    expect(screen.queryByText(/pick one, pass the rest/)).toBeNull();
+    expect(screen.queryByText(/passing direction/)).toBeNull();
+  });
+
+  it("still describes a pack-passing pod for every other distribution", () => {
+    // The paired negative, on the same helper: an ordinary pod keeps its copy,
+    // so the row above is the distribution doing the work rather than the
+    // Winston branch swallowing everything.
+    mocks.multiplayerState.phase = "drafting";
+    mocks.multiplayerState.view = engineView("Premier", 8, { min_deck_size: 40 });
+    renderAt("/draft-pod");
+
+    expect(screen.getByText("Pod Draft")).toBeInTheDocument();
+    expect(
+      screen.getByText("Open 4 packs; each pack contains 12 cards — pick one, pass the rest"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/face-down stack/)).toBeNull();
   });
 
   it("counts the pod from the ENGINE-published seats, not the local config", () => {

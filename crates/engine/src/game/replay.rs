@@ -72,7 +72,7 @@ pub enum ReplayError {
 /// empty libraries).
 pub fn reconstruct_initial_state(
     header: &ReplayHeader,
-    db: Option<&CardDatabase>,
+    db: Option<&std::sync::Arc<CardDatabase>>,
 ) -> Result<GameState, ReplayError> {
     let mut state = GameState::new(
         header.format_config.clone(),
@@ -103,8 +103,12 @@ pub fn reconstruct_initial_state(
     match (&header.deck_data, db) {
         (Some(deck_data), Some(db)) => {
             let payload = resolve_deck_list(db, deck_data);
-            load_and_hydrate_decks(&mut state, &payload, Some(db));
+            load_and_hydrate_decks(&mut state, &payload, Some(&**db));
             state.all_card_names = db.card_names().into();
+            // CR 707.2 + CR 202.3: a replayed Momir game draws its random
+            // creatures from the whole corpus at resolution time, so the
+            // reconstructed state needs the same draw source a live game gets.
+            crate::game::install_card_db(&mut state, std::sync::Arc::clone(db));
         }
         (Some(_), None) => return Err(ReplayError::MissingCardDatabase),
         (None, _) => {}
@@ -136,7 +140,10 @@ impl ReplayPlayer {
     /// (post-`start_game`) checkpoint. `db` is forwarded to
     /// `reconstruct_initial_state`, which errors if `log.header.deck_data`
     /// is `Some` and `db` is `None` — see that function's doc comment.
-    pub fn load(log: ReplayLog, db: Option<&CardDatabase>) -> Result<Self, ReplayError> {
+    pub fn load(
+        log: ReplayLog,
+        db: Option<&std::sync::Arc<CardDatabase>>,
+    ) -> Result<Self, ReplayError> {
         match log.format_version {
             Some(2 | REPLAY_FORMAT_VERSION) => {}
             Some(version) => return Err(ReplayError::UnsupportedFormatVersion { version }),
@@ -293,7 +300,7 @@ mod tests {
         AbilityDefinition, AbilityKind, Effect, QuantityExpr, ResolvedAbility, TargetFilter,
         TriggerBaseSetInstanceRef, TriggerDefinitionOccurrenceRef,
     };
-    use crate::types::actions::{GameAction, ResolveAllConsentDecision};
+    use crate::types::actions::{GameAction, ResolveAllConsentDecision, ResolveAllScope};
     use crate::types::card_type::CoreType;
     use crate::types::format::FormatConfig;
     use crate::types::game_state::{
@@ -540,7 +547,10 @@ mod tests {
         initial.stack.push_back(no_op_entry(1, PlayerId(0)));
         let mut log = ReplayLog::new(header);
 
-        let begin = GameAction::BeginResolveAll { max_resolutions: 0 };
+        let begin = GameAction::BeginResolveAll {
+            max_resolutions: 0,
+            scope: ResolveAllScope::Shared,
+        };
         let mut consent = initial.clone();
         apply(&mut consent, PlayerId(0), begin.clone())
             .expect("P0 can begin Resolve All from priority");
@@ -698,7 +708,10 @@ mod tests {
             );
         }
 
-        let begin = GameAction::BeginResolveAll { max_resolutions: 0 };
+        let begin = GameAction::BeginResolveAll {
+            max_resolutions: 0,
+            scope: ResolveAllScope::Shared,
+        };
         apply(&mut initial, PlayerId(0), begin).expect("P0 begins Resolve All consent");
         let WaitingFor::ResolveAllConsent { epoch, .. } = initial.waiting_for else {
             panic!(

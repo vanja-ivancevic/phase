@@ -330,7 +330,9 @@ mod tests {
             filter: Some(TargetFilter::Typed(
                 crate::types::ability::TypedFilter::permanent(),
             )),
-            chooser: Chooser::OwningPlayer,
+            chooser: Chooser::OwningPlayer.into(),
+            candidate_source: crate::types::ability::ZoneChoiceCandidateSource::Legacy,
+            reciprocal_role: None,
             up_to: false,
             selection: CardSelectionMode::Chosen,
             constraint: None,
@@ -349,6 +351,7 @@ mod tests {
                 enter_with_counters: vec![],
                 face_down_profile: None,
                 library_position: None,
+                library_shuffle: crate::types::ability::MassLibraryShuffleMode::default(),
                 random_order: false,
             },
         );
@@ -428,12 +431,7 @@ mod tests {
             matches!(replacement_effect, Effect::CreateDrawReplacement { .. }),
             "Words of Waste must enter the live draw-replacement parser path"
         );
-        let install = ResolvedAbility::new(
-            replacement_effect,
-            vec![],
-            source,
-            P0,
-        );
+        let install = ResolvedAbility::new(replacement_effect, vec![], source, P0);
 
         let mut events = Vec::new();
         resolve(&mut state, &install, &mut events).unwrap();

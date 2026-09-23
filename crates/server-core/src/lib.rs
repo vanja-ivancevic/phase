@@ -37,8 +37,8 @@ pub use deck_resolve::resolve_deck;
 pub use draft_action_payload_guard::guard_draft_action_payload;
 pub use draft_session::{generate_draft_code, DraftSession, DraftSessionManager};
 pub use draft_wire_guard::{
-    guard_create_draft_with_settings, guard_draft_action, guard_join_draft_with_password,
-    guard_reconnect_draft,
+    guard_chaos_layout_for_kind, guard_create_draft_with_settings, guard_draft_action,
+    guard_join_draft_with_password, guard_reconnect_draft,
 };
 pub use emote_guard::guard_emote;
 pub use filter::{filter_events_for_player, filter_state_for_player};
@@ -68,7 +68,8 @@ pub use seat_mutation_wire_guard::guard_seat_mutation;
 pub use session::{
     acting_player, acting_players, generate_game_code, generate_player_token, is_acting,
     AiDriverFailure, AiDriverFault, BroadcastSnapshot, FullPersistDisposition, FullPersistSnapshot,
-    FullRuntime, FullSessionKey, RevisionedActionResult, SessionActionError, SessionManager,
+    FullRuntime, FullSessionKey, PreviewRefusal, RevisionedActionResult, SessionActionError,
+    SessionManager,
 };
 pub use spectator_wire_guard::{
     guard_draft_spectator_capacity, guard_game_spectator_capacity, guard_spectate_draft,

@@ -1,6 +1,7 @@
 import { act } from "react";
 import { beforeEach, describe, expect, it } from "vitest";
 
+import { usePreferencesStore } from "../preferencesStore";
 import { blockerAssignmentPairs, useUiStore } from "../uiStore";
 
 describe("uiStore", () => {
@@ -10,6 +11,7 @@ describe("uiStore", () => {
         selectedObjectId: null,
         hoveredObjectId: null,
         inspectedObjectId: null,
+        inspectedCardName: null,
         inspectedFaceIndex: 0,
         altHeld: false,
         selectedCardIds: [],
@@ -33,6 +35,19 @@ describe("uiStore", () => {
   it("inspectObject sets inspectedObjectId", () => {
     act(() => useUiStore.getState().inspectObject(99));
     expect(useUiStore.getState().inspectedObjectId).toBe(99);
+  });
+
+  it("keeps a public log card name when its live object is unavailable", () => {
+    act(() => useUiStore.getState().inspectObjectSticky(99, 0, "cursor", "Pithing Needle"));
+
+    expect(useUiStore.getState()).toMatchObject({
+      inspectedObjectId: 99,
+      inspectedCardName: "Pithing Needle",
+      previewSticky: true,
+    });
+
+    act(() => useUiStore.getState().dismissPreview());
+    expect(useUiStore.getState().inspectedCardName).toBeNull();
   });
 
   it("inspecting a different object resets a pinned altHeld", () => {
@@ -148,5 +163,53 @@ describe("uiStore", () => {
     expect(useUiStore.getState().debugClickModeButtonVisible).toBe(true);
     act(() => useUiStore.getState().toggleDebugClickModeButtonVisible());
     expect(useUiStore.getState().debugClickModeButtonVisible).toBe(false);
+  });
+
+  it("toggleLogPanel closes the panel and remembers the closed choice", () => {
+    act(() => {
+      useUiStore.setState({ logPanelOpen: true });
+      usePreferencesStore.setState({ logPanelLastChoice: "open" });
+    });
+
+    act(() => useUiStore.getState().toggleLogPanel());
+
+    expect(useUiStore.getState().logPanelOpen).toBe(false);
+    expect(usePreferencesStore.getState().logPanelLastChoice).toBe("closed");
+  });
+
+  it("toggleLogPanel opens the panel and remembers the open choice", () => {
+    act(() => {
+      useUiStore.setState({ logPanelOpen: false });
+      usePreferencesStore.setState({ logPanelLastChoice: "closed" });
+    });
+
+    act(() => useUiStore.getState().toggleLogPanel());
+
+    expect(useUiStore.getState().logPanelOpen).toBe(true);
+    expect(usePreferencesStore.getState().logPanelLastChoice).toBe("open");
+  });
+
+  it("setLogPanelOpenByUser(false) remembers the closed choice", () => {
+    act(() => {
+      useUiStore.setState({ logPanelOpen: true });
+      usePreferencesStore.setState({ logPanelLastChoice: "open" });
+    });
+
+    act(() => useUiStore.getState().setLogPanelOpenByUser(false));
+
+    expect(useUiStore.getState().logPanelOpen).toBe(false);
+    expect(usePreferencesStore.getState().logPanelLastChoice).toBe("closed");
+  });
+
+  it("setLogPanelOpen is engine-initiated and does not touch the remembered choice", () => {
+    act(() => {
+      useUiStore.setState({ logPanelOpen: false });
+      usePreferencesStore.setState({ logPanelLastChoice: "closed" });
+    });
+
+    act(() => useUiStore.getState().setLogPanelOpen(true));
+
+    expect(useUiStore.getState().logPanelOpen).toBe(true);
+    expect(usePreferencesStore.getState().logPanelLastChoice).toBe("closed");
   });
 });

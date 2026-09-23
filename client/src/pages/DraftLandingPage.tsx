@@ -4,7 +4,7 @@ import type { TFunction } from "i18next";
 import { useNavigate } from "react-router";
 
 import { ScreenChrome } from "../components/chrome/ScreenChrome";
-import { COMMANDER_DRAFT_ENTRY, draftKindLabels } from "../components/draft/draftKind";
+import { COMMANDER_DRAFT_ENTRY, WINSTON_DRAFT_ENTRY, draftKindLabels } from "../components/draft/draftKind";
 import { MenuShell } from "../components/menu/MenuShell";
 import { MenuActionTile } from "../components/menu/MenuActionTile";
 import { PodIcon } from "../components/draft/PodIcon";
@@ -19,6 +19,7 @@ import {
   type ActiveDraftPodMeta,
 } from "../services/draftPersistence";
 import { loadGame } from "../services/gamePersistence";
+import { useEffectiveOffline } from "../stores/connectivityStore";
 
 const SET_LABELS: Record<string, string> = {
   otj: "Outlaws of Thunder Junction",
@@ -76,6 +77,7 @@ export function DraftLandingPage() {
   // rather than duplicating the string into draft locales.
   const { t: tMenu } = useTranslation("menu");
   const navigate = useNavigate();
+  const effectiveOffline = useEffectiveOffline();
   const [activeDraft, setActiveDraft] = useState<ActiveQuickDraftMeta | null>(null);
   const [activePod, setActivePod] = useState<ActiveDraftPodMeta | null>(null);
   const [activeGuestPod, setActiveGuestPod] = useState<ActiveDraftGuestMeta | null>(null);
@@ -143,19 +145,37 @@ export function DraftLandingPage() {
                 tone="jade"
                 motif="network"
                 title={t("landing.podDraft.title")}
-                description={t("landing.podDraft.description")}
+                description={effectiveOffline
+                  ? t("offline.startUnavailable")
+                  : t("landing.podDraft.description")}
                 enterLabel={tMenu("home.dashboard.enter")}
                 renderIcon={(cls) => <PodIcon className={cls} />}
                 onClick={() => navigate("/draft-pod")}
+                disabled={effectiveOffline}
               />
               <MenuActionTile
                 tone="arcane"
                 motif="network"
                 title={t("landing.commanderDraft.title")}
-                description={t("landing.commanderDraft.description")}
+                description={effectiveOffline
+                  ? t("offline.startUnavailable")
+                  : t("landing.commanderDraft.description")}
                 enterLabel={tMenu("home.dashboard.enter")}
                 renderIcon={(cls) => <CrownIcon className={cls} />}
                 onClick={() => navigate(`/draft-pod?kind=${COMMANDER_DRAFT_ENTRY}`)}
+                disabled={effectiveOffline}
+              />
+              <MenuActionTile
+                tone="ember"
+                motif="network"
+                title={t("landing.winstonDraft.title")}
+                description={effectiveOffline
+                  ? t("offline.startUnavailable")
+                  : t("landing.winstonDraft.description")}
+                enterLabel={tMenu("home.dashboard.enter")}
+                renderIcon={(cls) => <PilesIcon className={cls} />}
+                onClick={() => navigate(`/draft-pod?kind=${WINSTON_DRAFT_ENTRY}`)}
+                disabled={effectiveOffline}
               />
             </div>
           </div>
@@ -388,6 +408,15 @@ function CubeIcon({ className = "h-6 w-6" }: { className?: string }) {
   return (
     <svg aria-hidden="true" viewBox="0 0 24 24" className={`${className} fill-current`}>
       <path d="M12 2.4 3.5 6.8v10.4L12 21.6l8.5-4.4V6.8L12 2.4Zm0 2.25 5.55 2.88L12 10.4 6.45 7.53 12 4.65Zm-6.5 4.5 5.5 2.85v6.8l-5.5-2.85v-6.8Zm7.5 9.65V12l5.5-2.85v6.8L13 18.8Z" />
+    </svg>
+  );
+}
+
+/** Three piles side by side — the shape of a Winston table. */
+function PilesIcon({ className = "h-6 w-6" }: { className?: string }) {
+  return (
+    <svg aria-hidden="true" viewBox="0 0 24 24" className={`${className} fill-current`}>
+      <path d="M2.5 7.5h5v11h-5v-11Zm1.5 1.5v8h2v-8H4Zm5.5-3.5h5v14.5h-5V5.5ZM11 7v11.5h2V7h-2Zm5.5.5h5v11h-5v-11ZM18 9v8h2V9h-2Z" />
     </svg>
   );
 }

@@ -946,6 +946,16 @@ pub enum Keyword {
     /// CR 701.57a: Discover N — exile from top until nonland card with MV ≤ N.
     Discover(u32),
     Spree,
+    /// CR 702.183a: Tiered is a static ability found on some modal spells that
+    /// applies while the spell is on the stack: "Choose one. As an additional
+    /// cost to cast this spell, pay the cost associated with that mode."
+    /// RUNTIME: no independent handler — the choose-exactly-one shape and the
+    /// per-mode additional cost (CR 700.2h) are carried by the spell's
+    /// `ModalChoice` (`min_choices = max_choices = 1`) plus `mode_costs`, composed
+    /// into the total cost by `game/casting_targets.rs::compute_modal_total_cost`.
+    /// This variant is the typed tag for that structure (the Spree precedent,
+    /// CR 702.172). It is not a stub.
+    Tiered,
     Ravenous,
     Daybound,
     Nightbound,
@@ -1399,6 +1409,7 @@ impl Keyword {
             | Keyword::Gift(_)
             | Keyword::Discover(_)
             | Keyword::Spree
+            | Keyword::Tiered
             | Keyword::Ravenous
             | Keyword::Enlist
             | Keyword::ReadAhead
@@ -1673,6 +1684,7 @@ impl Keyword {
             | Keyword::Spectacle(_)
             | Keyword::SplitSecond
             | Keyword::Spree
+            | Keyword::Tiered
             | Keyword::Squad(_)
             | Keyword::Storm
             | Keyword::Surge(_)
@@ -1801,6 +1813,7 @@ impl Keyword {
             | Keyword::Spectacle(_)
             | Keyword::SplitSecond
             | Keyword::Spree
+            | Keyword::Tiered
             | Keyword::Squad(_)
             | Keyword::StartingIntensity(_)
             | Keyword::Storm
@@ -2343,19 +2356,25 @@ fn parse_affinity_type(s: &str) -> Option<TypedFilter> {
                     return Some(filter);
                 }
             }
-            // CR 702.41a + CR 205.3: otherwise the text is a subtype. Unknown names
-            // are subtypes, but not always land subtypes ("Daleks", "Cats",
-            // "Birds"). Keep this as a bare subtype constraint so it covers land,
-            // artifact, enchantment, and creature subtype affinity without adding a
-            // false type conjunct.
-            let capitalized = format!("{}{}", &s[..1].to_uppercase(), &s[1..]);
-            // Strip trailing 's' for plural subtype words (e.g., "Daleks" →
-            // "Dalek", "Islands" → "Island"; "Plains" stays "Plains").
-            let subtype = if capitalized.ends_with('s') && capitalized != "Plains" {
-                capitalized[..capitalized.len() - 1].to_string()
-            } else {
-                capitalized
-            };
+            // CR 702.41a + CR 205.3: otherwise the text is a subtype. Use the shared
+            // subtype parser first so irregular plurals such as "Elves" are
+            // canonicalized to their rules name ("Elf"). Unknown names are still
+            // valid subtypes (for example, Daleks), so retain the generic fallback.
+            let subtype = crate::parser::oracle_util::parse_subtype(s)
+                .filter(|(_, consumed)| *consumed == s.len())
+                .map(|(subtype, _)| subtype)
+                .unwrap_or_else(|| {
+                    let capitalized = format!("{}{}", &s[..1].to_uppercase(), &s[1..]);
+                    // Unknown plural subtype words retain the legacy fallback
+                    // ("Daleks" → "Dalek"), while values returned by
+                    // `parse_subtype` above are already canonical and must not be
+                    // singularized again ("Fungus" and "Locus" stay unchanged).
+                    if capitalized.ends_with('s') && capitalized != "Plains" {
+                        capitalized[..capitalized.len() - 1].to_string()
+                    } else {
+                        capitalized
+                    }
+                });
             Some(TypedFilter::default().subtype(subtype))
         }
     }
@@ -3077,6 +3096,7 @@ impl FromStr for Keyword {
                 Ok(Keyword::Discover(n))
             }
             "spree" => Ok(Keyword::Spree),
+            "tiered" => Ok(Keyword::Tiered),
             "ravenous" => Ok(Keyword::Ravenous),
             "daybound" => Ok(Keyword::Daybound),
             "nightbound" => Ok(Keyword::Nightbound),
@@ -3446,6 +3466,7 @@ fn keyword_from_tagged(variant: &str, data: &serde_json::Value) -> Result<Keywor
             .map(Keyword::Discover)
             .map_err(|error| format!("Discover: {error}")),
         "Spree" => Ok(Keyword::Spree),
+        "Tiered" => Ok(Keyword::Tiered),
         "Ravenous" => Ok(Keyword::Ravenous),
         "Daybound" => Ok(Keyword::Daybound),
         "Nightbound" => Ok(Keyword::Nightbound),
@@ -4168,6 +4189,28 @@ mod tests {
         }
     }
 
+    /// CR 702.183a: Tiered is a unit keyword — `FromStr` accepts both the
+    /// lowercase MTGJSON spelling and the PascalCase Oracle spelling, and serde
+    /// round-trips it through the bare-string and externally-tagged shapes
+    /// (the latter pinned via `keyword_from_tagged`).
+    #[test]
+    fn tiered_from_str_and_serde_shapes() {
+        assert_eq!(Keyword::from_str("Tiered").unwrap(), Keyword::Tiered);
+        assert_eq!(Keyword::from_str("tiered").unwrap(), Keyword::Tiered);
+        assert_eq!(
+            serde_json::to_value(Keyword::Tiered).unwrap(),
+            serde_json::json!("Tiered")
+        );
+        assert_eq!(
+            serde_json::from_value::<Keyword>(serde_json::json!("Tiered")).unwrap(),
+            Keyword::Tiered
+        );
+        assert_eq!(
+            serde_json::from_value::<Keyword>(serde_json::json!({ "Tiered": null })).unwrap(),
+            Keyword::Tiered
+        );
+    }
+
     #[test]
     fn display_landwalk_uses_oracle_spelling_for_subtypes_and_card_types() {
         assert_eq!(
@@ -4262,6 +4305,24 @@ mod tests {
             vec![TypeFilter::Subtype("Island".to_string())],
             "land subtype affinity still matches by subtype without requiring an explicit Land conjunct"
         );
+
+        for (input, expected) in [
+            ("Affinity for Elves", "Elf"),
+            ("Affinity:for Allies", "Ally"),
+            ("Affinity:for Fungus", "Fungus"),
+            ("Affinity for Locus", "Locus"),
+            ("Affinity:for Plains", "Plains"),
+            ("Affinity for Sphinxes", "Sphinx"),
+        ] {
+            let Keyword::Affinity(filter) = Keyword::from_str(input).unwrap() else {
+                panic!("expected Affinity keyword for {input}");
+            };
+            assert_eq!(
+                filter.type_filters,
+                vec![TypeFilter::Subtype(expected.to_string())],
+                "Affinity subtype must use the canonical rules name: {input}"
+            );
+        }
     }
 
     #[test]
@@ -5785,6 +5846,7 @@ mod tests {
             | Keyword::Storm
             | Keyword::Totem
             | Keyword::Spree
+            | Keyword::Tiered
             | Keyword::Ravenous
             | Keyword::Daybound
             | Keyword::Nightbound
@@ -5996,6 +6058,7 @@ mod tests {
         Keyword::Storm,
         Keyword::Totem,
         Keyword::Spree,
+        Keyword::Tiered,
         Keyword::Ravenous,
         Keyword::Daybound,
         Keyword::Nightbound,

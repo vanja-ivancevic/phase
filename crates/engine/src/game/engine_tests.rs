@@ -436,6 +436,8 @@ fn choose_new_targets_all_allows_unchanged_illegal_target() {
         stack_entry_index: 0,
         scope: RetargetScope::All,
         current_targets: vec![unchanged.clone()],
+        slots: vec![],
+        slot_pools: vec![],
         legal_new_targets: vec![legal_alternative],
     };
 
@@ -1787,6 +1789,7 @@ fn broadside_bombardiers_boast_activates_after_attacking_and_requires_sacrifice(
 fn room_back_face(name: &str) -> BackFaceData {
     BackFaceData {
         is_swap_snapshot: false,
+        trigger_printed_origins: Vec::new(),
         name: name.to_string(),
         power: None,
         toughness: None,
@@ -5465,7 +5468,7 @@ fn new_game_creates_two_player_state() {
 }
 
 /// CR 117.1c + CR 503.2: After Untap (no priority), the active player
-/// receives priority during their Upkeep step. CR 103.7a skips the
+/// receives priority during their Upkeep step. CR 103.8a skips the
 /// first-turn Draw step entirely, so passing both priorities through
 /// Upkeep lands at PreCombatMain.
 #[test]
@@ -5483,7 +5486,7 @@ fn start_game_pauses_at_first_turn_upkeep_priority() {
         }
     ));
 
-    // Both players pass through Upkeep → CR 103.7a skips Draw → PreCombatMain.
+    // Both players pass through Upkeep → CR 103.8a skips Draw → PreCombatMain.
     apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     let result = apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     assert_eq!(state.phase, Phase::PreCombatMain);
@@ -5513,6 +5516,39 @@ fn start_game_skips_draw_on_first_turn() {
     // Card should still be in library (draw skipped on turn 1)
     assert!(state.players[0].library.contains(&id));
     assert!(!state.players[0].hand.contains(&id));
+}
+
+// CR 103.8 + CR 500: the starting player TAKES their first turn, so it must
+// count toward `turns_taken` like every other turn. Turn 1 is established
+// inline by the game-start path rather than by `turns::start_next_turn`, so
+// before this was fixed the starting player stayed permanently one turn behind
+// every other seat — `QuantityRef::TurnsTaken` read low for exactly the player
+// who had taken the most turns.
+#[test]
+fn start_game_counts_the_starting_players_first_turn() {
+    for starting_player in [PlayerId(0), PlayerId(1)] {
+        let mut state = new_game(42);
+        start_game_with_starting_player(&mut state, starting_player);
+
+        assert_eq!(
+            state.players[starting_player.0 as usize].turns_taken, 1,
+            "the starting player's own first turn counts"
+        );
+        for player in state.players.iter() {
+            if player.id != starting_player {
+                assert_eq!(
+                    player.turns_taken, 0,
+                    "a player who has not had a turn yet counts none"
+                );
+            }
+        }
+    }
+
+    // `start_game_skip_mulligan` establishes turn 1 through the same inline
+    // path and must agree.
+    let mut state = new_game(42);
+    start_game_skip_mulligan(&mut state);
+    assert_eq!(state.players[0].turns_taken, 1);
 }
 
 #[test]
@@ -5558,7 +5594,7 @@ fn integration_full_turn_cycle() {
     let mut state = new_game(42);
 
     // Start game (turn 1, player 0) — engine pauses at Upkeep priority per
-    // CR 117.1c. CR 103.7a skips the first-turn Draw step entirely.
+    // CR 117.1c. CR 103.8a skips the first-turn Draw step entirely.
     // (Libraries are empty, which is fine because the first-turn player
     // never draws and we stop the test before turn 2's draw step.)
     let _result = start_game_with_starting_player(&mut state, PlayerId(0));
@@ -5668,7 +5704,7 @@ fn integration_play_land_then_pass() {
 
     // CR 305.3 + CR 117.1c: lands are sorcery-speed, so pass Upkeep
     // priority (both players) to reach PreCombatMain before playing.
-    // CR 103.7a skips first-turn Draw so two passes is enough.
+    // CR 103.8a skips first-turn Draw so two passes is enough.
     apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     assert_eq!(state.phase, Phase::PreCombatMain);
@@ -7492,7 +7528,7 @@ fn full_turn_integration_with_mulligan() {
     ));
     assert_eq!(state.phase, Phase::Upkeep);
 
-    // Drain Upkeep priority (turn 1 skips Draw per CR 103.7a) to reach Main.
+    // Drain Upkeep priority (turn 1 skips Draw per CR 103.8a) to reach Main.
     apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     apply_as_current(&mut state, GameAction::PassPriority).unwrap();
     assert_eq!(state.phase, Phase::PreCombatMain);
@@ -9248,7 +9284,10 @@ fn test_mana_ability_during_mana_payment_stays_in_mana_payment() {
         prepaid_actual_mana_spent: None,
         base_cost: None,
         declared_mana_additions: Vec::new(),
+        accepted_cost_reductions: Vec::new(),
+        cost_reduction_election: None,
         activation_cost: None,
+        deferred_random_discard_cost: None,
         activation_ability_index: None,
         pending_loyalty_activation_player: None,
         target_constraints: vec![],
@@ -9685,7 +9724,10 @@ fn taps_for_mana_multiplier_fires_once_on_color_choice_mana_payment_resume() {
         prepaid_actual_mana_spent: None,
         base_cost: None,
         declared_mana_additions: Vec::new(),
+        accepted_cost_reductions: Vec::new(),
+        cost_reduction_election: None,
         activation_cost: None,
+        deferred_random_discard_cost: None,
         activation_ability_index: None,
         pending_loyalty_activation_player: None,
         target_constraints: vec![],
@@ -12663,4 +12705,171 @@ fn derived_fodder_class_is_one_class_multiset_gate() {
         "A-2c: a torn frame is refused, not under-counted (delete the `.then_some` \
          reconciliation and this returns Some((class, 1)))"
     );
+}
+
+/// CR 732.2a: `entry_publishes_pin_slots` must withhold the CR 603.5 "may" pin
+/// slot once the stamped announcer is not the proposer — a shortcut cannot
+/// describe "a sequence of game choices" that includes a choice which will
+/// never be posed to the proposer. Academy Loremaster's bare-`ScopedPlayer`
+/// stamp (P7: `filter_uses_relative_controller_scoped` does not match a bare
+/// `ScopedPlayer`, so this route is genuinely new) moves the announcer seat to
+/// whichever player's draw step it is, so once the draw step belongs to
+/// someone other than the ability's controller (== the proposer here), the
+/// slot this instrument publishes for that proposer must disappear.
+///
+/// Direction: strictly FEWER offers, never more — a shortcut slot is withheld
+/// when the announcer is not the proposer, never published to a seat that will
+/// not be asked. (The "Direction: strictly FEWER offers, never more." comment
+/// at `engine.rs:3894` documents a PRIOR change — the `optional_for`/infeasible
+/// withholds — and is not the evidence for this one; this test is.)
+///
+/// Willie cannot reach this branch (his stamp lives on a `sub_ability`; the
+/// stack entry's ability is the unstamped top-level), and none of the 23
+/// `SearchLibrary` movers reach it either (their `prompt_player` does not
+/// move — P2 runtime neutrality). Academy Loremaster is the fixture because
+/// its stamp lands on the top-level `execute` this instrument reads.
+///
+/// Positive control IN THIS SAME TEST: at the controller's own draw step, the
+/// identical call publishes a `may` slot — proving the instrument publishes a
+/// slot at all, and that the withhold below is caused by the seat move and not
+/// by a broken instrument.
+#[test]
+fn academy_loremaster_may_slot_is_withheld_when_the_announcer_is_not_the_proposer() {
+    const ACADEMY_LOREMASTER_ORACLE: &str = "At the beginning of each player's draw step, that \
+         player may draw an additional card. If they do, spells they cast this turn cost {2} \
+         more to cast.";
+
+    fn advance_to_priority_with_nonempty_stack(runner: &mut crate::game::scenario::GameRunner) {
+        for _ in 0..240 {
+            match runner.state().waiting_for.clone() {
+                // The `phase == Draw` conjunct makes the caller's reach-guard a
+                // loop invariant rather than a post-hoc hope: without it this
+                // could stop on an unrelated non-empty-stack priority window if
+                // the fixture ever gains another trigger source.
+                WaitingFor::Priority { .. }
+                    if !runner.state().stack.is_empty() && runner.state().phase == Phase::Draw =>
+                {
+                    return
+                }
+                WaitingFor::Priority { .. } => {
+                    runner.act(GameAction::PassPriority).ok();
+                }
+                WaitingFor::DeclareAttackers { .. } => {
+                    runner
+                        .act(GameAction::DeclareAttackers {
+                            attacks: vec![],
+                            bands: vec![],
+                        })
+                        .ok();
+                }
+                WaitingFor::DeclareBlockers { .. } => {
+                    runner
+                        .act(GameAction::DeclareBlockers {
+                            assignments: vec![],
+                        })
+                        .ok();
+                }
+                WaitingFor::OptionalEffectChoice { .. } => {
+                    runner
+                        .act(GameAction::DecideOptionalEffect { accept: false })
+                        .ok();
+                }
+                _ => return,
+            }
+        }
+    }
+
+    fn settle_optional_effect_and_pass(runner: &mut crate::game::scenario::GameRunner) {
+        for _ in 0..240 {
+            match runner.state().waiting_for.clone() {
+                WaitingFor::OptionalEffectChoice { .. } => {
+                    runner
+                        .act(GameAction::DecideOptionalEffect { accept: false })
+                        .ok();
+                }
+                // Stop as soon as THIS trigger has finished resolving. Without
+                // this guard the loop passes straight through the OTHER player's
+                // draw step and consumes the very trigger the negative half
+                // below inspects, then burns the whole iteration budget and
+                // lands back on the controller's own draw step.
+                WaitingFor::Priority { .. } if runner.state().stack.is_empty() => return,
+                WaitingFor::Priority { .. } => {
+                    runner.act(GameAction::PassPriority).ok();
+                }
+                WaitingFor::DeclareAttackers { .. } => {
+                    runner
+                        .act(GameAction::DeclareAttackers {
+                            attacks: vec![],
+                            bands: vec![],
+                        })
+                        .ok();
+                }
+                WaitingFor::DeclareBlockers { .. } => {
+                    runner
+                        .act(GameAction::DeclareBlockers {
+                            assignments: vec![],
+                        })
+                        .ok();
+                }
+                _ => return,
+            }
+        }
+    }
+
+    let proposer = P0;
+    let restricted = crate::game::scenario::P1;
+
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::Untap);
+    for &pid in &[P0, restricted] {
+        scenario.with_library_top(pid, &["Lib A", "Lib B", "Lib C", "Lib D", "Lib E", "Lib F"]);
+    }
+    scenario.add_creature_from_oracle(P0, "Academy Loremaster", 2, 2, ACADEMY_LOREMASTER_ORACLE);
+    let mut runner = scenario.build();
+
+    // ---- Positive control: the controller's OWN draw step (this turn). ----
+    advance_to_priority_with_nonempty_stack(&mut runner);
+    assert_eq!(
+        runner.state().active_player,
+        P0,
+        "reach-guard: this must be the controller's own draw step"
+    );
+    assert_eq!(runner.state().phase, Phase::Draw);
+    {
+        let state = runner.state();
+        let entry = state
+            .stack
+            .back()
+            .expect("Academy Loremaster's draw-step trigger is on the stack");
+        let pins = entry_publishes_pin_slots(state, entry, proposer)
+            .expect("the controller's own draw step must publish a pin slot at all");
+        assert!(
+            pins.may.is_some(),
+            "positive control: at the controller's own draw step the may slot IS published"
+        );
+    }
+    settle_optional_effect_and_pass(&mut runner);
+
+    // ---- Negative: the OTHER player's draw step (next occurrence). ----
+    advance_to_priority_with_nonempty_stack(&mut runner);
+    assert_eq!(
+        runner.state().active_player,
+        restricted,
+        "reach-guard: this must be the OTHER player's draw step"
+    );
+    assert_eq!(runner.state().phase, Phase::Draw);
+    {
+        let state = runner.state();
+        let entry = state
+            .stack
+            .back()
+            .expect("Academy Loremaster's draw-step trigger is on the stack");
+        let pins = entry_publishes_pin_slots(state, entry, proposer);
+        let withheld = pins.is_none_or(|p| p.may.is_none());
+        assert!(
+            withheld,
+            "CR 732.2a: the announcer moved to the other player, who is not the proposer, so the \
+             may slot must be withheld"
+        );
+    }
 }

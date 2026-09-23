@@ -148,7 +148,34 @@ function setupCommanderAvatars(
 }
 
 function setupDraftMatchAvatars(seed: string) {
-  const matchPairing = useMultiplayerDraftStore.getState().matchPairing;
+  const { matchPairing, commanderLaunch, commanderSeat } = useMultiplayerDraftStore.getState();
+
+  // CR 903.13a: a Commander pod launches ONE shared N-seat game, so none of the
+  // pairwise derivation below applies — `matchPairing` is null by design and
+  // `localPlayerId` would hand every one of the four players seat 0, each guest
+  // then rendering and acting as the HOST's seat.
+  //
+  // Fenced on the game id because `commanderLaunch` outlives its game: unfenced,
+  // a LATER draft-match game would take this branch on a stale launch. Keyed on
+  // the launch and not on `matchPairing == null`, which would also swallow an
+  // unpaired ordinary draft-match.
+  //
+  // Writes `activePlayerId` and NOTHING else — the names and avatars for an
+  // N-seat commander game are the extended online/p2p avatar effect's, which
+  // derives them from each player's own commander. Returning before the
+  // wholesale `setState` below is what keeps that from being erased.
+  //
+  // Re-derived on every run rather than consumed once: this effect's cleanup
+  // calls `clearWireAssignedSeat()`, so a one-shot write would leave the seat
+  // null after any remount. A null seat writes NOTHING — falling back to 0 here
+  // is the exact defect this branch exists to remove.
+  if (commanderLaunch?.gameId === seed) {
+    if (commanderSeat !== null) {
+      useMultiplayerStore.getState().setActivePlayerId(commanderSeat);
+    }
+    return;
+  }
+
   const randomAvatars = assignRandomAvatars(2, seed);
   const names = new Map<number, string>();
 
@@ -177,6 +204,29 @@ function setupDraftMatchAvatars(seed: string) {
     playerNames: names,
     playerAvatars,
   });
+}
+
+/**
+ * Drop this client's wire-assigned seat when a game session tears down.
+ *
+ * `activePlayerId` is written only from a wire (`playerIdentity`, P2P
+ * `game_setup`, `setupDraftMatchAvatars`) and had no clear, so it outlived the
+ * game that assigned it. Two consecutive wire-assigned games therefore shared
+ * one value: until the second game's assignment arrived, `resolveLocalSeat`
+ * handed out the FIRST game's seat. `SeatSource` does not cover this — it is
+ * keyed on mode (`"seat-zero"` makes a solo game ignore the field), not on
+ * session, so online → online reads the stale seat.
+ *
+ * Safe against a remount (React StrictMode double-mounts in dev) because every
+ * wire-assigned mode re-establishes the seat when its effect re-runs:
+ * draft-match re-runs `setupDraftMatchAvatars`, and a fresh WS/P2P-guest
+ * adapter re-emits `playerIdentity` from `GameStarted` / `reconnect_ack`. The
+ * P2P HOST is the one path with no re-emit (it emits only from its game-start
+ * flow) — it is unaffected because the host is always seat 0, which is exactly
+ * what `resolveLocalSeat` falls back to.
+ */
+function clearWireAssignedSeat(): void {
+  useMultiplayerStore.getState().setActivePlayerId(null);
 }
 
 function playerNamesRecordToMap(playerNames: Record<number, string>): Map<number, string> {
@@ -524,6 +574,12 @@ export interface GameProviderProps {
   roomName?: string;
   source?: string;
   draftId?: string;
+  /**
+   * The lobby authority this join or spectate was launched from, carried by
+   * the route (`/game?...&server=`). Absent for flows with no explicit
+   * origin, which fall back to the hosting server via `detectServerUrl()`.
+   */
+  serverUrl?: string;
   onWsEvent?: (event: WsAdapterEvent) => void;
   onP2PEvent?: (event: P2PAdapterEvent) => void;
   onReady?: () => void;
@@ -551,6 +607,7 @@ export function GameProvider({
   roomName,
   source,
   draftId,
+  serverUrl: originUrl,
   onWsEvent,
   onP2PEvent,
   onReady,
@@ -607,15 +664,47 @@ export function GameProvider({
   }, [mode, gameId]);
 
   useEffect(() => {
-    if (mode !== "online" && mode !== "p2p-host" && mode !== "p2p-join") return;
+    // A Commander pod's launched game is admitted here for its names and
+    // avatars, and ONLY for those — its seat stays with `setupDraftMatchAvatars`
+    // in the effect below, whose cleanup is what nulls the seat, so writer and
+    // cleanup have to share an effect. This is a deliberate re-division of the
+    // name/avatar authority `setupDraftMatchAvatars` holds for 1v1 pod matches,
+    // not the repair of an oversight: the modes above take their names from a
+    // LOBBY (hence `preservePlayerNames`), and a 1v1 pod match has neither a
+    // lobby nor more than two seats. An N-seat Commander game has no lobby names
+    // either — it has commanders, which is exactly what `setupCommanderAvatars`
+    // already derives an N-player identity map from.
+    //
+    // Same session fence as the seat branch, and for the same reason:
+    // `commanderLaunch` outlives its game.
+    const commanderLaunch = useMultiplayerDraftStore.getState().commanderLaunch;
+    const isCommanderDraftMatch = mode === "draft-match" && commanderLaunch?.gameId === gameId;
+    if (
+      mode !== "online" && mode !== "p2p-host" && mode !== "p2p-join"
+      && !isCommanderDraftMatch
+    ) return;
     const state = useGameStore.getState().gameState;
     const count = state?.players.length ?? playerCount ?? 2;
     setupRandomAvatars(count, gameId, true);
+    if (isCommanderDraftMatch) {
+      // `useMultiplayerStore` is module-level, so a PREVIOUS draft-match's
+      // `{0: "You", 1: …}` survives into this game — and on a seat-2 client
+      // `getOpponentDisplayName(0)` would then label the HOST's seat "You".
+      // Cleared here in the effect body, exactly once: inside
+      // `applyCommanderAvatars` it would re-blank the map on every store update
+      // until the commanders land, and after that gate it would be dead code.
+      // An absent name renders as the viewer-relative fallback instead, and the
+      // viewer's own name is computed from their identity, never read from here.
+      useMultiplayerStore.setState({ playerNames: new Map() });
+    }
     let appliedCommanderAvatars = false;
     const applyCommanderAvatars = (gameState: typeof state) => {
       if (!gameState?.format_config?.uses_commander || !gameState.command_zone?.length) return;
       appliedCommanderAvatars = true;
-      setupCommanderAvatars(gameState, true);
+      // The lobby modes keep their names; the Commander pod game has none to
+      // keep and takes commander-derived ones for every seat. Never `false` for
+      // `setupRandomAvatars` above — that one would write a literal "You".
+      setupCommanderAvatars(gameState, !isCommanderDraftMatch);
     };
     applyCommanderAvatars(state);
     const unsub = useGameStore.subscribe((next) => {
@@ -713,6 +802,7 @@ export function GameProvider({
       return () => {
         audioManager.setContext("menu");
         clearPromptOverlayState();
+        clearWireAssignedSeat();
       };
     }
 
@@ -738,6 +828,9 @@ export function GameProvider({
           void Notification.requestPermission().catch(() => {});
         }
         p2pUnsubscribe = adapter.onEvent((event) => {
+          if (event.type === "playerLatencies") {
+            useMultiplayerStore.setState({ playerLatencies: event.latencies });
+          }
           if (event.type === "playerIdentity") {
             useMultiplayerStore.getState().setActivePlayerId(event.playerId);
             if (event.playerNames) {
@@ -973,7 +1066,12 @@ export function GameProvider({
             }
             // Dial target: `conn.peer` is the actual current host peer id;
             // reconnect reuses it rather than reconstructing a prefix.
-            const { conn, peer } = await joinRoom(code, signal, 10_000);
+            // No timeout override: `joinRoom`'s 30s default is sized for a
+            // relayed ICE negotiation. A 10s budget aborted TURN-relayed joins
+            // mid-negotiation, and it bought nothing for a mistyped code —
+            // that path rejects immediately on `peer-unavailable`, never on the
+            // timeout.
+            const { conn, peer } = await joinRoom(code, signal);
             hostPeerHandle = peer;
             signal.throwIfAborted();
             const adapter = new P2PGuestAdapter(
@@ -1042,12 +1140,14 @@ export function GameProvider({
         ac.abort();
         if (controller) controller.dispose();
         if (p2pUnsubscribe) p2pUnsubscribe();
+        useMultiplayerStore.setState({ playerLatencies: {} });
         // `adapter.dispose()` is the SOLE tear-down path for the host/guest
         // Peer (see plan §4 "Peer ownership"). It also closes per-guest
         // sessions, clears timers, and disposes the WASM engine.
         if (p2pAdapter) p2pAdapter.dispose();
         audioManager.setContext("menu");
         clearPromptOverlayState();
+        clearWireAssignedSeat();
         reset();
       };
     }
@@ -1181,7 +1281,15 @@ export function GameProvider({
             return;
           }
         }
-        const serverUrl = import.meta.env.VITE_WS_URL ?? await detectServerUrl();
+        // Origin precedence: an explicit build override wins; then the
+        // server a resumable session was recorded on (that server holds the
+        // session); then the origin the route carried; and only with none of
+        // those, this client's hosting server.
+        const serverUrl =
+          import.meta.env.VITE_WS_URL
+          ?? reconnectSession?.serverUrl
+          ?? originUrl
+          ?? await detectServerUrl();
         if (cancelled) return;
 
         wsAdapter = new WebSocketAdapter(
@@ -1341,6 +1449,7 @@ export function GameProvider({
         useMultiplayerStore.getState().setSpectators([]);
         audioManager.setContext("menu");
         clearPromptOverlayState();
+        clearWireAssignedSeat();
         reset();
       };
     }
@@ -1441,8 +1550,8 @@ export function GameProvider({
       }
 
       // No saved state — start a new game.
-      // Draft mode: deck data was pre-built by DraftPage and stored in
-      // sessionStorage. Use it directly instead of loadActiveDeck + buildDeckList.
+      // Quick drafts and local Commander pods publish their full engine payload
+      // in sessionStorage, including opaque original cube metadata.
       const draftDeckKey = `phase:draft-deck:${gameId}`;
       const draftDeckRaw = sessionStorage.getItem(draftDeckKey);
       if (draftDeckRaw) {
@@ -1451,11 +1560,9 @@ export function GameProvider({
           player: ExpandedDeck;
           opponent: ExpandedDeck;
           ai_decks: ExpandedDeck[];
-          // CR 903.13f(3): every set the draft contained, written by
-          // `podCommanderDeckPayload`.  Stated here because the payload
-          // carries it; it is passed through opaquely to the engine, so this
-          // annotation documents the contract rather than changing behaviour.
+          // Every set the draft contained, passed opaquely to the engine.
           draft_set_codes?: string[] | null;
+          booster_pack_pool?: string[] | null;
         };
         try {
           await initGame(gameId, adapter, deckList, formatConfig, playerCount, matchConfig, firstPlayer);
@@ -1479,6 +1586,7 @@ export function GameProvider({
         const run = await loadDraftRun(draftId);
         if (run) {
           const deckList = {
+            booster_pack_pool: run.booster_pack_pool,
             player: {
               main_deck: run.playerDeck,
               sideboard: [] as string[],
@@ -1869,7 +1977,7 @@ export function GameProvider({
         scheduleStoreReset(reset);
       }
     };
-  }, [gameId, mode, difficulty, joinCode, formatConfig, playerCount, matchConfig, firstPlayer, useBroker, roomName, source, draftId]);
+  }, [gameId, mode, difficulty, joinCode, formatConfig, playerCount, matchConfig, firstPlayer, useBroker, roomName, source, draftId, originUrl]);
 
   return (
     <GameDispatchContext.Provider value={dispatchAction}>

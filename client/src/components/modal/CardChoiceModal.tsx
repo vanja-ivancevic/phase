@@ -23,6 +23,10 @@ import type {
   WaitingFor,
   Zone,
 } from "../../adapter/types.ts";
+import type {
+  InteractionId,
+  ViewerInteraction,
+} from "../../adapter/generated/interaction/index.ts";
 import { useCanActForWaitingState } from "../../hooks/usePlayerId.ts";
 import {
   CancelButton,
@@ -34,6 +38,7 @@ import { ManaSymbol } from "../mana/ManaSymbol.tsx";
 import { menuButtonClass } from "../menu/buttonStyles.ts";
 import { formatCounterType } from "../../viewmodel/cardProps.ts";
 import { getBoardChoiceView } from "../../viewmodel/gameStateView.ts";
+import { BoosterPackModal, boosterPackEntries } from "./BoosterPackModal.tsx";
 import { NamedChoiceModal } from "./NamedChoiceModal.tsx";
 import { VoteChoiceModal } from "./VoteChoiceModal.tsx";
 import { SpecializeColorModal } from "./SpecializeColorModal.tsx";
@@ -55,8 +60,10 @@ import { CategoryChoiceModal } from "./CategoryChoiceModal.tsx";
 import { EachPlayerCopyChosenModal } from "./EachPlayerCopyChosenModal.tsx";
 import {
   CoinFlipKeepModal,
+  DieKeepModal,
   DigModal,
   RevealModal,
+  RippleBottomOrderModal,
   ScryModal,
   ArrangePlanarDeckTopModal,
   SurveilModal,
@@ -114,6 +121,32 @@ type DamageSourceChoice = Extract<WaitingFor, { type: "DamageSourceChoice" }>;
 type LearnChoice = Extract<WaitingFor, { type: "LearnChoice" }>;
 type BeholdChoice = Extract<WaitingFor, { type: "BeholdChoice" }>;
 
+function effectZoneChoiceInteractionId(
+  interaction: ViewerInteraction | null,
+): InteractionId | null {
+  for (const opportunity of interaction?.opportunities ?? []) {
+    if (opportunity.response.type !== "schema") continue;
+    if (opportunity.response.data.spec.type === "select") {
+      return opportunity.interactionId;
+    }
+  }
+  return null;
+}
+
+function effectZoneChoiceFallbackKey(data: EffectZoneChoice["data"]): string {
+  return [
+    data.player,
+    data.source_id,
+    data.cards.join(","),
+    data.count,
+    data.min_count ?? 0,
+    data.up_to === true,
+    data.effect_kind,
+    data.zone,
+    data.destination ?? "",
+  ].join("|");
+}
+
 /**
  * Generic card choice modal for Scry, Dig, Surveil, Reveal, Search, and NamedChoice.
  * Renders based on the WaitingFor type.
@@ -123,6 +156,9 @@ export function CardChoiceModal() {
   const canActForWaitingState = useCanActForWaitingState();
   const waitingFor = useGameStore((s) => s.waitingFor);
   const objects = useGameStore((s) => s.gameState?.objects);
+  const effectZoneInteractionId = useGameStore((s) =>
+    effectZoneChoiceInteractionId(s.viewerInteraction),
+  );
 
   if (!waitingFor) return null;
 
@@ -133,9 +169,20 @@ export function CardChoiceModal() {
     case "ArrangePlanarDeckTopChoice":
       if (!canActForWaitingState) return null;
       return <ArrangePlanarDeckTopModal data={waitingFor.data} />;
+    case "RippleBottomOrder":
+      if (!canActForWaitingState) return null;
+      return (
+        <RippleBottomOrderModal
+          key={waitingFor.data.cards.join("-")}
+          data={waitingFor.data}
+        />
+      );
     case "CoinFlipKeepChoice":
       if (!canActForWaitingState) return null;
       return <CoinFlipKeepModal data={waitingFor.data} />;
+    case "DieKeepChoice":
+      if (!canActForWaitingState) return null;
+      return <DieKeepModal data={waitingFor.data} />;
     case "DigChoice":
       if (!canActForWaitingState) return null;
       return <DigModal data={waitingFor.data} />;
@@ -151,14 +198,28 @@ export function CardChoiceModal() {
     case "SearchPartitionChoice":
       if (!canActForWaitingState) return null;
       return <SearchPartitionModal data={waitingFor.data} />;
-    case "OutsideGameChoice":
+    case "OutsideGameChoice": {
       if (!canActForWaitingState) return null;
+      // CR 400.11b: an opened booster pack is an outside-the-game choice whose
+      // candidates are all revealed cards from one pack — shown as the pack
+      // itself rather than as the wishboard's name list.
+      const pack = boosterPackEntries(waitingFor.data.choices);
+      if (pack) {
+        return (
+          <BoosterPackModal
+            key={outsideGameChoiceKey(waitingFor.data)}
+            data={waitingFor.data}
+            entries={pack}
+          />
+        );
+      }
       return (
         <OutsideGameModal
           key={outsideGameChoiceKey(waitingFor.data)}
           data={waitingFor.data}
         />
       );
+    }
     case "ChooseFromZoneChoice":
       if (!canActForWaitingState) return null;
       // A "for each player, choose ..." iteration (Breach the Multiverse) emits
@@ -178,7 +239,12 @@ export function CardChoiceModal() {
     case "EffectZoneChoice":
       if (!canActForWaitingState) return null;
       if (getBoardChoiceView(waitingFor, objects)) return null;
-      return <EffectZoneModal data={waitingFor.data} />;
+      return (
+        <EffectZoneModal
+          key={effectZoneInteractionId ?? effectZoneChoiceFallbackKey(waitingFor.data)}
+          data={waitingFor.data}
+        />
+      );
     case "DrawnThisTurnTopdeckChoice":
       if (!canActForWaitingState) return null;
       return <DrawnThisTurnTopdeckModal data={waitingFor.data} />;
@@ -723,6 +789,8 @@ function entryKey(entry: OutsideGameChoiceEntry): string {
       return `sb:${entry.source.data.sideboard_index}`;
     case "FaceUpExile":
       return `fx:${entry.source.data.object_id}`;
+    case "BoosterPack":
+      return `bp:${entry.source.data.pack_slot}`;
   }
 }
 
@@ -742,6 +810,11 @@ function entryToSelection(entry: OutsideGameChoiceEntry): OutsideGameSelection {
       return {
         type: "FaceUpExile",
         data: { object_id: entry.source.data.object_id },
+      };
+    case "BoosterPack":
+      return {
+        type: "BoosterPack",
+        data: { pack_slot: entry.source.data.pack_slot },
       };
   }
 }
@@ -830,7 +903,13 @@ function OutsideGameModal({ data }: { data: OutsideGameChoice["data"] }) {
           const sourceLabel =
             entry.source.type === "FaceUpExile"
               ? t("outsideGame.fromExile")
-              : t("outsideGame.fromSideboard");
+              : entry.source.type === "BoosterPack"
+                ? entry.source.data.origin.type === "Set"
+                  ? t("outsideGame.fromBoosterPack", {
+                      setCode: entry.source.data.origin.data,
+                    })
+                  : t("outsideGame.fromCubeBoosterPack")
+                : t("outsideGame.fromSideboard");
           return (
             <button
               key={key}

@@ -84,6 +84,20 @@ fn player_context_target(
             .map(TargetRef::Player);
     }
 
+    // CR 120.1 + CR 109.4: The damage RECIPIENT's controller. Resolved strictly
+    // through the event-context authority and returned as an `Option`, for the
+    // same reason `ParentTargetController` is handled above rather than being
+    // added to the `resolve_player_for_context_ref` list below: that resolver
+    // ends in an `ability.controller` fallback, and here that fallback IS the
+    // defect this variant exists to prevent — Bellowing Fiend would deal its
+    // "that creature's controller" damage to its own controller, on top of the
+    // "and 3 damage to you" clause. An unresolvable recipient must deal no
+    // damage (CR 608.2b), not damage the wrong player.
+    if matches!(target_filter, TargetFilter::EventTargetController) {
+        return crate::game::targeting::resolve_effect_player_ref(state, ability, target_filter)
+            .map(TargetRef::Player);
+    }
+
     if matches!(
         target_filter,
         TargetFilter::Controller
@@ -151,11 +165,7 @@ fn resolve_effect_recipients(
     // target fallback because a chained node can carry propagated recipient
     // targets while still referring to an earlier slot (Self-Destruct class).
     if let TargetFilter::ParentTargetSlot { index } = target_filter {
-        return crate::game::targeting::resolve_parent_slot_from_root(state, ability, *index)
-            .filter(|target| match target {
-                TargetRef::Object(id) => ability.target_pin_is_current(*id, state),
-                TargetRef::Player(_) => true,
-            })
+        return crate::game::targeting::resolve_live_parent_slot_from_root(state, ability, *index)
             .into_iter()
             .collect();
     }
@@ -1790,7 +1800,8 @@ pub fn resolve_all(
         Some(resolve_quantity_with_targets(state, amount, ability).max(0) as u32)
     };
 
-    let target_filter = crate::game::effects::resolved_object_filter(ability, &target_filter);
+    let target_filter =
+        crate::game::effects::resolved_object_filter(state, ability, &target_filter);
 
     // Collect matching object IDs.
     // CR 107.3a + CR 601.2b: ability-context filter evaluation.
@@ -2681,7 +2692,8 @@ pub fn resolve_each_source_deals_damage(
             })
             .collect(),
         EachDamageRecipient::Shared(_) | EachDamageRecipient::EachController => {
-            let resolved_sources = crate::game::effects::resolved_object_filter(ability, sources);
+            let resolved_sources =
+                crate::game::effects::resolved_object_filter(state, ability, sources);
             let filter_ctx = filter::FilterContext::from_ability(ability);
             state
                 .battlefield
@@ -3346,6 +3358,8 @@ mod tests {
                 duration: None,
                 driver: CastFromZoneDriver::DuringResolution,
                 mana_spend_permission: None,
+                additional_cost: None,
+                cast_cost_modifier: None,
             },
             vec![],
             source,
@@ -3510,6 +3524,8 @@ mod tests {
                 duration: None,
                 driver: CastFromZoneDriver::DuringResolution,
                 mana_spend_permission: None,
+                additional_cost: None,
+                cast_cost_modifier: None,
             },
             vec![],
             source,
@@ -4827,7 +4843,7 @@ mod tests {
             obj.replacement_definitions.push(
                 ReplacementDefinition::new(ReplacementEvent::DamageDone)
                     .damage_modification(DamageModification::PreventionMinus {
-                        value: u32::MAX,
+                        value: crate::types::ability::PreventionFormula::Fixed(u32::MAX),
                     })
                     .damage_counter_removal(CounterType::Plus1Plus1)
                     .valid_card(TargetFilter::SelfRef)
@@ -5501,6 +5517,7 @@ mod tests {
             attacker_ids: vec![star_athlete],
             defending_player: PlayerId(1),
             attacks: vec![],
+            declaration_records: Vec::new(),
         });
         // Zero targets chosen for "up to one target nonland permanent".
         let ability = ResolvedAbility::new(
@@ -5555,6 +5572,7 @@ mod tests {
             attacker_ids: vec![star_athlete],
             defending_player: PlayerId(1),
             attacks: vec![],
+            declaration_records: Vec::new(),
         });
         let ability = ResolvedAbility::new(
             Effect::DealDamage {

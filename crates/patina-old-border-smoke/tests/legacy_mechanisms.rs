@@ -9,11 +9,11 @@ use engine::game::casting::can_activate_ability_now;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
 use engine::types::ability::{
-    AbilityCondition, AbilityDefinition, AbilityKind, AbilityTag, Effect, FilterProp,
-    TargetFilter, TypedFilter,
+    AbilityCondition, AbilityDefinition, AbilityKind, AbilityTag, Effect, FilterProp, TargetFilter,
+    TypedFilter,
 };
-use engine::types::counter::CounterType;
 use engine::types::actions::GameAction;
+use engine::types::counter::CounterType;
 use engine::types::identifiers::ObjectId;
 use engine::types::keywords::Keyword;
 use engine::types::mana::{ManaType, ManaUnit};
@@ -165,7 +165,12 @@ fn matopi_golem_regeneration_rider_survives_and_puts_counter() {
     scenario.at_phase(Phase::PreCombatMain);
     scenario.with_mana_pool(
         P0,
-        vec![ManaUnit::new(ManaType::Colorless, ObjectId(9_902), false, vec![])],
+        vec![ManaUnit::new(
+            ManaType::Colorless,
+            ObjectId(9_902),
+            false,
+            vec![],
+        )],
     );
     let matopi = scenario
         .add_creature_from_oracle(P0, "Matopi Golem", 3, 3, MATOPI_GOLEM_ORACLE)
@@ -212,16 +217,15 @@ fn debt_of_loyalty_regeneration_rider_gains_control_after_shield_use() {
     scenario.at_phase(Phase::PreCombatMain);
     scenario.with_mana_pool(
         P0,
-        vec![ManaUnit::new(ManaType::Colorless, ObjectId(9_903), false, vec![])],
+        vec![ManaUnit::new(
+            ManaType::Colorless,
+            ObjectId(9_903),
+            false,
+            vec![],
+        )],
     );
     let debt = scenario
-        .add_creature_from_oracle(
-            P0,
-            "Debt Probe",
-            2,
-            2,
-            DEBT_OF_LOYALTY_ORACLE,
-        )
+        .add_creature_from_oracle(P0, "Debt Probe", 2, 2, DEBT_OF_LOYALTY_ORACLE)
         .id();
     let victim = scenario.add_creature(P1, "Target Creature", 3, 3).id();
     let destroyer = scenario

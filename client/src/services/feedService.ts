@@ -18,6 +18,7 @@ import {
   removeCachedFeed,
   setCachedFeed,
 } from "./feedPersistence";
+import { getEffectiveOffline } from "../stores/connectivityStore";
 
 // --- Validation ---
 
@@ -58,6 +59,7 @@ export function validateFeed(data: unknown): Feed | null {
   if (typeof data.version !== "number") return null;
   if (!isNonEmptyString(data.updated)) return null;
   if (!Array.isArray(data.decks)) return null;
+  if (data.decks.length === 0) return null;
   if (!data.decks.every(isValidFeedDeck)) return null;
   return data as unknown as Feed;
 }
@@ -66,6 +68,11 @@ export function validateFeed(data: unknown): Feed | null {
 
 /** Auto-refresh any subscription whose cached data is older than this. */
 const FEED_STALE_AFTER_MS = 24 * 60 * 60 * 1000;
+
+/** Translation keys for client-authored feed errors. */
+export const FEED_ERROR_KEYS = {
+  offline: "feedManager.offlineUnavailable",
+} as const;
 
 // --- Internal helpers ---
 
@@ -79,12 +86,19 @@ function normalizeFeedDeckEntries(deck: FeedDeck): FeedDeck {
   };
 }
 
-async function fetchFeed(url: string): Promise<Feed> {
-  const response = await fetch(url);
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException("Feed initialization aborted", "AbortError");
+}
+
+async function fetchFeed(url: string, signal?: AbortSignal): Promise<Feed> {
+  throwIfAborted(signal);
+  const response = await fetch(url, { signal });
+  throwIfAborted(signal);
   if (!response.ok) {
     throw new Error(`Failed to fetch feed: ${response.status} ${response.statusText}`);
   }
   const data: unknown = await response.json();
+  throwIfAborted(signal);
   const feed = validateFeed(data);
   if (!feed) {
     throw new Error("Invalid feed format: missing required fields or malformed deck entries");
@@ -176,12 +190,26 @@ function syncFeedDecksToStorage(feed: Feed): void {
 
 // --- Public API ---
 
-export async function initializeFeeds(): Promise<void> {
+export interface InitializeFeedsOptions {
+  allowRefresh?: boolean;
+  signal?: AbortSignal;
+}
+
+export async function initializeFeeds({ allowRefresh = true, signal }: InitializeFeedsOptions = {}): Promise<void> {
   await hydrateFeedCache();
+  throwIfAborted(signal);
 
   const subs = loadFeedSubscriptions();
+
+  if (!allowRefresh) {
+    for (const sub of subs) {
+      const cached = getCachedFeed(sub.sourceId);
+      if (cached) syncFeedDecksToStorage(cached);
+    }
+    return;
+  }
+
   const subscribedIds = new Set(subs.map((s) => s.sourceId));
-  let changed = false;
 
   // Auto-subscribe to any bundled feeds not yet subscribed
   for (const source of FEED_REGISTRY) {
@@ -189,13 +217,14 @@ export async function initializeFeeds(): Promise<void> {
     if (subscribedIds.has(source.id)) continue;
 
     try {
-      const feed = await fetchFeed(source.url);
+      const feed = await fetchFeed(source.url, signal);
+      throwIfAborted(signal);
       // Use the registry ID as the canonical key — this ensures the
       // subscription sourceId always matches the cache key even if the
       // fetched feed.id differs from the registry.
       const feedId = source.id;
       const normalizedFeed = { ...feed, id: feedId, format: source.format ?? feed.format };
-      await setCachedFeed(feedId, normalizedFeed);
+      const cachePersistence = setCachedFeed(feedId, normalizedFeed);
       syncFeedDecksToStorage(normalizedFeed);
 
       subs.push({
@@ -206,47 +235,53 @@ export async function initializeFeeds(): Promise<void> {
         lastRefreshedAt: Date.now(),
         lastVersion: feed.version,
       });
-      changed = true;
+      saveFeedSubscriptions(subs);
+      await cachePersistence;
     } catch (err) {
+      if (signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) throw err;
       console.error(`Failed to initialize feed "${source.id}":`, err);
     }
   }
 
-  // Auto-refresh any subscription whose cache is older than FEED_STALE_AFTER_MS.
-  // Applies to both bundled (local static assets) and remote (network) feeds.
+  // Bundled feeds are deployment assets and may change without their legacy
+  // numeric version changing. Fetch them on initialization so a fresh local
+  // timestamp can never pin an older IndexedDB copy. Remote feeds retain the
+  // TTL to avoid unnecessary third-party requests.
   // Manual "Refresh all" / per-feed Refresh buttons bypass the TTL via refreshFeed().
   const now = Date.now();
   for (const sub of subs) {
     if (!subscribedIds.has(sub.sourceId)) continue;
 
+    const cached = getCachedFeed(sub.sourceId);
     const isStale = now - sub.lastRefreshedAt >= FEED_STALE_AFTER_MS;
-    if (!isStale) {
-      const cached = getCachedFeed(sub.sourceId);
-      if (cached) syncFeedDecksToStorage(cached);
+    const bundled = sub.type === "bundled";
+    if (!bundled && !isStale && cached) {
+      syncFeedDecksToStorage(cached);
       continue;
     }
 
     try {
-      const feed = await fetchFeed(sub.url);
+      const feed = await fetchFeed(sub.url, signal);
+      throwIfAborted(signal);
       const registrySource = FEED_REGISTRY.find((r) => r.id === sub.sourceId);
       const normalizedFeed = { ...feed, id: sub.sourceId, format: registrySource?.format ?? feed.format };
-      await setCachedFeed(sub.sourceId, normalizedFeed);
+      const cachePersistence = setCachedFeed(sub.sourceId, normalizedFeed);
       syncFeedDecksToStorage(normalizedFeed);
+      const feedChanged = cached?.updated !== normalizedFeed.updated;
+      const metadataChanged = sub.lastVersion !== feed.version || sub.error !== undefined;
       sub.lastVersion = feed.version;
-      sub.lastRefreshedAt = Date.now();
+      if (isStale || feedChanged) sub.lastRefreshedAt = Date.now();
       if (sub.error !== undefined) sub.error = undefined;
-      changed = true;
-    } catch {
+      if (isStale || feedChanged || metadataChanged) saveFeedSubscriptions(subs);
+      await cachePersistence;
+    } catch (err) {
+      if (signal?.aborted || (err instanceof DOMException && err.name === "AbortError")) throw err;
       // Fall back to cached data
       const cached = getCachedFeed(sub.sourceId);
       if (cached) {
         syncFeedDecksToStorage(cached);
       }
     }
-  }
-
-  if (changed) {
-    saveFeedSubscriptions(subs);
   }
 }
 
@@ -255,6 +290,10 @@ export async function subscribe(sourceOrUrl: string): Promise<Feed> {
   const registrySource = FEED_REGISTRY.find((s) => s.id === sourceOrUrl);
   const url = registrySource?.url ?? sourceOrUrl;
   const type = registrySource?.type ?? "remote";
+
+  if (getEffectiveOffline()) {
+    throw new Error(FEED_ERROR_KEYS.offline);
+  }
 
   const feed = await fetchFeed(url);
 
@@ -319,6 +358,10 @@ export async function refreshFeed(feedId: string): Promise<Feed> {
   const subs = loadFeedSubscriptions();
   const sub = subs.find((s) => s.sourceId === feedId);
   if (!sub) throw new Error(`Not subscribed to feed "${feedId}"`);
+
+  if (getEffectiveOffline()) {
+    throw new Error(FEED_ERROR_KEYS.offline);
+  }
 
   try {
     const feed = await fetchFeed(sub.url);

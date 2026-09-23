@@ -1,4 +1,22 @@
 {
+  "lan": {
+    "title": "Local network",
+    "guidance": "Enter a server address to join manually. HTTPS browser pages require a secure wss:// server; use the desktop app for local ws:// addresses.",
+    "unavailable": "LAN hosting and discovery require a current desktop app.",
+    "checking": "Checking desktop LAN support…",
+    "start": "Start LAN hosting",
+    "stop": "Stop LAN hosting",
+    "scan": "Find LAN servers",
+    "pending": "Working…",
+    "running": "LAN hosting is running. Share an address with players on your network.",
+    "empty": "No LAN servers found. Check that the host is running on the same network, then try again.",
+    "add": "Add server",
+    "copy": "Copy address",
+    "copied": "Address copied",
+    "error": "LAN operation failed. {{detail}}",
+    "added": "Server added. Use Dedicated server once its connection is compatible and ready.",
+    "originUnavailable": "LAN hosting is unavailable for this app version or origin."
+  },
   "concedeDialog": {
     "title": "Concede Game?",
     "game": {
@@ -85,7 +103,8 @@
     "firstMessageInvalid": "The host rejected the connection before setup. Refresh both windows and try again.",
     "versionRequired": "This host requires wire protocol v{{version}}. Refresh both windows and try again.",
     "versionMismatch": "Wire protocol mismatch: your client sent v{{guestVersion}}, but the host uses v{{hostVersion}}. Refresh both windows.",
-    "malformedAuthority": "The host rejected invalid connection authority. Rejoin using a new room code."
+    "malformedAuthority": "The host rejected invalid connection authority. Rejoin using a new room code.",
+    "frameUndecodable": "The host sent a message this client could not read. Refresh both windows and try again."
   },
   "serverOfflinePrompt": {
     "title": "Matchmaking unreachable",
@@ -113,18 +132,28 @@
     "draftBadge": "{{setCode}} Draft",
     "p2pBadgeTitle": "Peer-to-peer game (host runs the engine)",
     "sandboxBadgeTitle": "This game allows debug actions. Use for testing — not a competitive match.",
+    "hintSlow": "SLOW",
+    "hintSlowTitle": "This server has been answering slowly for players recently.",
+    "hintUnreliable": "UNRELIABLE",
+    "hintUnreliableTitle": "Players have often failed to connect to this server recently.",
     "rankedBadgeTitle": "Ranked room",
     "rankedBadge": "RANKED",
     "anonymous": "Anonymous",
     "by": "by {{name}}",
     "passwordProtected": "Password protected",
-    "join": "Join"
+    "join": "Join",
+    "originTitle": "Listed by {{name}} {{kind}}",
+    "kindFull": "(game server)",
+    "kindLobbyOnly": "(lobby broker)"
+  },
+  "connectionMode": {
+    "label": "Who hosts?",
+    "server": "Dedicated server",
+    "p2p": "You host (P2P)"
   },
   "serverPicker": {
     "title": "Server",
-    "subtitle": "Pick a region, or connect to a self-hosted instance.",
-    "noneLabel": "None (P2P only)",
-    "directCodes": "direct codes",
+    "subtitle": "Choose where you host, and which lobbies you browse.",
     "official": "Official",
     "selfHosted": "Self-hosted",
     "customUrlPlaceholder": "wss://your-server.example/ws",
@@ -133,7 +162,23 @@
     "urlError": "URL must start with ws:// or wss://",
     "connected": "Connected",
     "connectionFailed": "Connection failed",
-    "testing": "Testing…"
+    "testing": "Testing…",
+    "hostingServer": "Hosting server",
+    "hostingServerHelp": "Where the games you host are created and registered.",
+    "sources": "Lobby sources",
+    "sourcesHelp": "Open tables from every source below are merged into one list.",
+    "addSource": "Add a source",
+    "remove": "Remove",
+    "useForHosting": "Use for hosting",
+    "sourceStatusConnecting": "Connecting…",
+    "sourceStatusDegraded": "Unreachable",
+    "sourceDuplicate": "That server is already a lobby source.",
+    "sourceCapReached": "Up to {{max}} sources can be added.",
+    "directoryOrigin": "Directory",
+    "sourceScore": "Score {{score}}",
+    "enable": "Enable",
+    "disable": "Disable",
+    "incompatibleVersion": "Incompatible — server version {{version}}"
   },
   "lobbyDraftRooms": {
     "noRooms": "No draft rooms available",
@@ -154,10 +199,7 @@
     "createDraft": "Create Draft"
   },
   "lobbyView": {
-    "directConnection": "Direct Connection",
     "onlineLobby": "Online Lobby",
-    "pickServerTitle": "Pick a server to use online lobby mode",
-    "pickServer": "Pick server",
     "online": "{{count}} online",
     "format": "Format",
     "allFormats": "All formats",
@@ -169,26 +211,25 @@
     "noFormatGames": "No {{format}} games right now.",
     "noOpenGames": "No open games right now.",
     "showAllFormats": "Show all formats",
-    "p2pNotice": "Dedicated server unavailable. You can still host or join directly with a 5-character room code.",
-    "joinByCode": "Join by Code",
     "joinATable": "Join a Table",
-    "p2pCodePlaceholder": "Enter 5-character P2P code",
     "serverCodePlaceholder": "Enter code or CODE@IP:PORT",
     "join": "Join",
     "watch": "Watch",
     "host": "Host",
-    "hostP2PDescription": "Create a direct room for one opponent.",
     "hostServerDescription": "Open a room and wait for players.",
     "hostDraft": "Host Draft",
     "hostGame": "Host Game",
-    "hostP2PGame": "Host P2P Game",
     "passwordRequired": "Password Required",
-    "passwordPlaceholder": "Enter password"
+    "passwordPlaceholder": "Enter password",
+    "sourcesDegraded": "Some lobby sources are unreachable",
+    "invalidJoinServer": "That join code's server address isn't valid."
   },
   "hostSetup": {
+    "dedicatedUnavailable": "No dedicated server is available right now. You can host using P2P.",
     "hostDirectMatch": "Host Direct Match",
     "hostMatch": "Host Match",
-    "p2pNotice": "Dedicated server is unavailable, so this room will use a direct connection.",
+    "p2pNotice": "Your device runs the game. Keep the app open and stay connected. You can list your game in the lobby.",
+    "p2pSeatCap": "P2P tables seat at most {{max}} players, so the seat count is capped.",
     "roomName": "Room Name",
     "optional": "(optional)",
     "roomNamePlaceholder": "e.g. Friday Night Commander",
@@ -213,6 +254,10 @@
     "startWhenFull": "Start when full",
     "ranked": "Ranked",
     "listInLobby": "List in lobby",
+    "hostServer": "Host on",
+    "hostServerHelp": "A dedicated server runs the game. It may slow down or go offline. You can list your game in the lobby.",
+    "hostServerScore": "{{name}} — health {{score}}",
+    "hostServerUnscored": "{{name}} — not yet rated",
     "sandboxMode": "Sandbox Mode — allow debug actions",
     "sandboxModeHelp": "The host can directly manipulate the game state (move cards, change life, modify counters) and grant debug permission to other players. Use for testing or sandbox play — not for competitive matches. This setting cannot be changed once the game starts.",
     "setPassword": "Set password",
@@ -253,6 +298,8 @@
     "descriptionDraftLobby": "Waiting for players to join the draft pod.",
     "descriptionDeckSelectFormat": "Pick a deck for {{format}}.",
     "descriptionDeckSelect": "Pick the deck you want to bring online.",
+    "offlineUnavailableTitle": "Multiplayer is unavailable while offline.",
+    "offlineUnavailableDescription": "Reconnect or turn off Offline Mode to host or join a multiplayer game.",
     "eyebrow": "Multiplayer",
     "activeDeck": "Active Deck",
     "edit": "Edit",
@@ -260,7 +307,8 @@
     "noDeckWarning": "No deck selected — you'll need to pick one before hosting.",
     "pickDeck": "Pick Deck",
     "anonymous": "Anonymous",
-    "joining": "Joining"
+    "joining": "Joining",
+    "joinNeedsServer": "Pick a server before joining a game."
   },
   "draftLobbyPanel": {
     "draftPod": "Draft Pod",
