@@ -10811,6 +10811,15 @@ impl<'a> ParsedElement<'a> {
         }
     }
 
+    /// A static scoped by `active_zones` states its restriction as WHERE it
+    /// applies ("If this card is in a graveyard, effects from spells named X count
+    /// it as a card named X"), not as a game-state condition, so its `condition`
+    /// field is correctly `None`. A caller asking whether an "if" clause is
+    /// expressed therefore has to consult the zone, not the condition.
+    fn has_active_zones(&self) -> bool {
+        matches!(self, ParsedElement::Static(s) if !s.active_zones.is_empty())
+    }
+
     /// Check if this element (or any nested ability) has a duration set.
     fn has_duration(&self) -> bool {
         match self {
@@ -11925,7 +11934,16 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 matched.iter().any(|e| e.has_condition() || e.has_unless())
                     || modal_any(&|d: &AbilityDefinition| d.condition.is_some())
             };
+            // "…if this card is in a graveyard…" restricts WHERE a static applies
+            // (its `active_zones`); the condition field is correctly None, so the
+            // clause is expressed even though no condition is set. Require both the
+            // wording and the parsed zone, so a genuinely dropped condition on a
+            // zone-scoped static stays reported.
+            let covered_by_zone_scoped_static = (lower.contains("in a graveyard")
+                || lower.contains("in your graveyard"))
+                && matched.iter().any(|e| e.has_active_zones());
             if !any_has_condition
+                && !covered_by_zone_scoped_static
                 && !covered_by_casting
                 && !all_replacements
                 && !covered_by_replacement
@@ -19024,6 +19042,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
     ///   Misfortune).
     #[test]
     fn pool_cards_flagged_while_their_ast_is_complete() {
+        let mut failures: Vec<String> = Vec::new();
         for (name, types, oracle, flagged_fragment) in [
             (
                 "Diligent Farmhand",
@@ -19072,19 +19091,20 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             face.additional_cost = parsed.additional_cost;
 
             let findings = audit_card_lines(oracle, &face);
-            let hit = findings
-                .iter()
-                .find(|finding| {
-                    finding_line(finding)
-                        .to_ascii_lowercase()
-                        .contains(flagged_fragment)
-                });
-            assert!(
-                hit.is_none(),
-                "{name}: the AST carries this line's semantics, so the audit must not \
-                 report it: {hit:?}\nall findings: {findings:?}"
-            );
+            if let Some(hit) = findings.iter().find(|finding| {
+                finding_line(finding)
+                    .to_ascii_lowercase()
+                    .contains(flagged_fragment)
+            }) {
+                failures.push(format!("{name}: {hit:?}"));
+            }
         }
+        assert!(
+            failures.is_empty(),
+            "the AST carries these lines' semantics, so the audit must not report \
+             them:\n{}",
+            failures.join("\n")
+        );
     }
 
     /// Every `SemanticFinding` carries the Oracle line it is about; matching
@@ -19098,6 +19118,40 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
             | SemanticFinding::WrongParameter { oracle_line, .. }
             | SemanticFinding::SilentDrop { oracle_line } => oracle_line,
         }
+    }
+
+    /// The zone-scoped exemption requires the parsed zone as well as the wording,
+    /// so the same sentence whose static carries no `active_zones` must still be
+    /// reported — otherwise the exemption would mask real drops.
+    #[test]
+    fn counts_as_named_line_without_its_zone_is_still_a_dropped_condition() {
+        const ORACLE: &str = "If this card is in a graveyard, effects from spells named \
+                               Muscle Burst count it as a card named Muscle Burst.";
+        let types = vec!["Creature".to_string()];
+        let parsed =
+            crate::parser::parse_oracle_text(ORACLE, "Diligent Farmhand", &[], &types, &[]);
+
+        let mut face = make_face();
+        face.oracle_text = Some(ORACLE.to_string());
+        face.static_abilities = parsed.statics;
+        assert_eq!(
+            face.static_abilities
+                .first()
+                .map(|static_def| static_def.active_zones.clone()),
+            Some(vec![crate::types::zones::Zone::Graveyard]),
+            "the control is only meaningful when the parser records the zone"
+        );
+        for static_def in face.static_abilities.iter_mut() {
+            static_def.active_zones.clear();
+        }
+
+        let findings = audit_card_lines(ORACLE, &face);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| matches!(finding, SemanticFinding::DroppedCondition { .. })),
+            "without the parsed zone the if-clause is unexpressed: {findings:?}"
+        );
     }
 
     #[test]
