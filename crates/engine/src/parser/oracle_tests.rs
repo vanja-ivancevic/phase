@@ -25329,6 +25329,32 @@ fn legacy_if_attack_requirements_route_as_triggers() {
             parsed.triggers.iter().any(|trigger| trigger.execute.is_some()),
             "{name} must expose a parsed attack trigger: {parsed:#?}"
         );
+        // The requirement itself must be modeled, not merely routed. Without this
+        // the clause could regress to a trigger that does nothing while the shape
+        // assertions above still passed, which is exactly how these three cards
+        // were reported as silent drops by `cargo semantic-audit`.
+        let installs_requirement = parsed.triggers.iter().any(|trigger| {
+            trigger
+                .execute
+                .as_deref()
+                .is_some_and(|execute| match &*execute.effect {
+                    Effect::GenericEffect { static_abilities, .. } => static_abilities
+                        .iter()
+                        .any(|static_def| matches!(static_def.mode, StaticMode::MustAttack)),
+                    _ => false,
+                })
+        });
+        assert!(
+            installs_requirement,
+            "{name}'s execute must install the MustAttack requirement: {parsed:#?}"
+        );
+        assert!(
+            parsed
+                .triggers
+                .iter()
+                .any(|trigger| trigger.valid_card.is_some()),
+            "{name}'s requirement must keep the attack-event filter: {parsed:#?}"
+        );
     }
 }
 
