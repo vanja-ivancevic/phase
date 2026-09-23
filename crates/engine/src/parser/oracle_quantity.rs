@@ -41,11 +41,11 @@ use crate::parser::oracle_target::{
 };
 use crate::parser::oracle_util::{merge_or_filters, parse_count_multiplier};
 use crate::types::ability::{
-    AggregateFunction, AttackScope, AttackSubject, CardTypeSetSource, Comparator, ControllerRef,
-    CountScope, DamageChannel, DamageKindFilter, DevotionColors, FilterProp, ObjectProperty,
-    ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PossessionAxis, PropertyAggregate,
-    QuantityExpr, QuantityRef, RoundingMode, TargetFilter, ThisWayCause, TrackedAnaphorSource,
-    TypeFilter, TypedFilter, ZoneRef,
+    AggregateFunction, AttackSubject, CardTypeSetSource, CombatHistoryScope, Comparator,
+    ControllerRef, CountScope, DamageChannel, DamageKindFilter, DevotionColors, FilterProp,
+    ObjectProperty, ObjectScope, PlayerFilter, PlayerRelation, PlayerScope, PossessionAxis,
+    PropertyAggregate, QuantityExpr, QuantityRef, RoundingMode, TargetFilter, ThisWayCause,
+    TrackedAnaphorSource, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::CounterType;
 use crate::types::events::PlayerActionKind;
@@ -545,7 +545,7 @@ pub(crate) fn parse_quantity_ref_with_context(
             return Some(QuantityRef::PlayerCount {
                 filter: PlayerFilter::OpponentAttacked {
                     subject: AttackSubject::You,
-                    scope: AttackScope::ThisTurn,
+                    scope: CombatHistoryScope::ThisTurn,
                 },
             });
         }
@@ -3545,7 +3545,7 @@ fn parse_for_each_clause_with_they_controller(
         return Some(QuantityRef::PlayerCount {
             filter: PlayerFilter::OpponentAttacked {
                 subject: AttackSubject::You,
-                scope: AttackScope::ThisTurn,
+                scope: CombatHistoryScope::ThisTurn,
             },
         });
     }
@@ -4775,7 +4775,7 @@ mod tests {
                 Some(QuantityRef::PlayerCount {
                     filter: PlayerFilter::OpponentAttacked {
                         subject: AttackSubject::You,
-                        scope: AttackScope::ThisTurn,
+                        scope: CombatHistoryScope::ThisTurn,
                     },
                 }),
                 "phrase {phrase:?} must route to OpponentAttacked {{ You, ThisTurn }}"
@@ -4792,7 +4792,7 @@ mod tests {
             Some(QuantityRef::PlayerCount {
                 filter: PlayerFilter::OpponentAttacked {
                     subject: AttackSubject::You,
-                    scope: AttackScope::ThisTurn,
+                    scope: CombatHistoryScope::ThisTurn,
                 },
             }),
         );

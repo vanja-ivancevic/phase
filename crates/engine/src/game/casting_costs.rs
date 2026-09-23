@@ -4,12 +4,13 @@ use crate::game::functioning_abilities::static_kind_present;
 use crate::types::ability::{
     is_chosen_remove_counter_cost_count, AbilityCondition, AbilityCost, AbilityDefinition,
     AbilityKind, AdditionalCost, AdditionalCostInstance, AdditionalCostOrigin, AggregateFunction,
-    BeholdCostAction, CastTimingPermission, Comparator, CostPaidObjectSnapshot,
-    CounterCostSelection, Effect, KickerVariant, NotedManaPayment, ObjectProperty, QuantityExpr,
-    QuantityRef, ReplacementDefinition, ResolutionCastCleanup, ResolvedAbility, SacrificeCost,
-    SacrificeRequirement, SpellCastingOptionKind, SpellContext, SpellStackToGraveyardReplacement,
-    StaticCondition, TapCreaturesSelectionMode, TargetFilter, TargetRef, ThisWayCause, TypeFilter,
-    TypedFilter, EXILE_COST_X,
+    BeholdCostAction, CastTimingPermission, Comparator, CostMoveOutcome, CostPaidObjectRecord,
+    CostPaidObjectSnapshot, CounterCostSelection, Duration, Effect, KickerVariant,
+    NotedManaPayment, ObjectProperty, QuantityExpr, QuantityRef, ReplacementDefinition,
+    ResolutionCastCleanup, ResolvedAbility, SacrificeCost, SacrificeRequirement,
+    SpellCastingOptionKind, SpellContext, SpellStackToGraveyardReplacement, StaticCondition,
+    TapCreaturesSelectionMode, TargetFilter, TargetRef, ThisWayCause, TypeFilter, TypedFilter,
+    EXILE_COST_X,
 };
 use crate::types::card_type::CoreType;
 use crate::types::casting_costs::{CostReductionElection, CostReductionEntry, ReductionProvenance};
@@ -41,6 +42,7 @@ use super::mana_sources::{self, ManaSourceOption};
 use super::priority;
 use super::restrictions;
 use super::stack;
+use super::triggers::trigger_matcher;
 use super::zone_pipeline::{self, ZoneMoveRequest, ZoneMoveResult};
 
 use super::ability_utils::{
@@ -85,7 +87,48 @@ pub(crate) fn stamp_cast_occurrence_on_stack_spell(
     {
         ability.set_cast_occurrence_recursive(Some(occurrence));
     }
+    end_until_event_durations_on_cast(state, object_id);
     Ok(())
+}
+
+/// CR 611.2a + CR 601.2i: end every `Duration::UntilEvent` effect whose event
+/// is this spell becoming cast. Reached from every production cast, including
+/// a cast copy of an object (CR 707.12); a copy of a spell is not cast
+/// (CR 707.10) and never reaches this seam. Each event is matched against the
+/// source context the effect captured when it began, never against the live
+/// source.
+fn end_until_event_durations_on_cast(state: &mut GameState, object_id: ObjectId) {
+    let Some(spell) = state.objects.get(&object_id) else {
+        return;
+    };
+    let cast = GameEvent::SpellCast {
+        card_id: spell.card_id,
+        controller: spell.controller,
+        object_id,
+        cast_mana_value: Some(spell.spell_mana_value()),
+    };
+    let ended: Vec<u64> = state
+        .transient_continuous_effects
+        .iter()
+        .filter(|effect| {
+            let Duration::UntilEvent { event } = &effect.duration else {
+                return false;
+            };
+            let Some(source) = effect.duration_event_source.as_deref() else {
+                return false;
+            };
+            trigger_matcher(event.mode.clone())
+                .is_some_and(|matcher| matcher(&cast, event, source, state))
+        })
+        .map(|effect| effect.id)
+        .collect();
+    if ended.is_empty() {
+        return;
+    }
+    state
+        .transient_continuous_effects
+        .retain(|effect| !ended.contains(&effect.id));
+    state.layers_dirty.mark_full();
 }
 
 pub(crate) fn validate_cast_occurrence_stack_spell_carrier(
@@ -1948,6 +1991,114 @@ fn next_declared_kicker_cost(pending: &mut PendingCast) -> Option<AbilityCost> {
     costs.get(index).cloned()
 }
 
+/// CR 601.2h + CR 602.2b + CR 400.7j: Capture the post-cost provenance of every
+/// object a non-mana cost is about to consume, BEFORE the cost's own move, so
+/// each entry's `lki` records pre-move characteristics (CR 608.2h). The callers
+/// then hand the result to
+/// `ResolvedAbility::add_cost_paid_objects_recursive`, and the shared
+/// `settle_cost_paid_provenance_recursive` traversal settles the entries THIS
+/// seam moved once its moves complete — re-pinning a public delivery
+/// (CR 400.7j), demoting a hidden DISCARD delivery to membership (CR 701.9c),
+/// and leaving a hidden sacrifice/exile/return delivery `Captured` with its
+/// last known information and a stale pin (CR 608.2h).
+///
+/// A missing object row here is a PROGRAMMER/state invariant violation, not a
+/// player-reachable outcome: every caller has already verified the selection
+/// against a live eligibility list (`find_eligible_discard_targets`,
+/// `find_eligible_sacrifice_targets`, the exile revalidation closure) and no
+/// legal intervening action can remove a chosen row between that check and this
+/// capture. It deliberately panics rather than returning a user-visible `Err`,
+/// which would abort an otherwise-valid cast or activation.
+fn capture_cost_paid_snapshots(
+    state: &GameState,
+    chosen: &[ObjectId],
+    invariant: &'static str,
+) -> Vec<CostPaidObjectSnapshot> {
+    debug_assert!(
+        chosen
+            .iter()
+            .all(|object_id| state.objects.contains_key(object_id)),
+        "{invariant}"
+    );
+    chosen
+        .iter()
+        .map(|object_id| {
+            let object = state.objects.get(object_id).expect(invariant);
+            CostPaidObjectSnapshot::capture(object, object.snapshot_for_mana_spent())
+        })
+        .collect()
+}
+
+/// CR 608.2h + CR 601.2g + CR 400.7j: RE-CAPTURE the SPELL object's
+/// `cast_cost_paid_object` carrier from the live object, immediately before a
+/// DEFERRED sacrifice cost actually pays.
+///
+/// The third cost-paid carrier, and the only one
+/// `ResolvedAbility::refresh_cost_paid_capture_recursive` cannot reach: it
+/// lives on the `GameObject` (`game_object.rs`), not on the `ResolvedAbility`,
+/// so the ability traversal structurally cannot see it. This is a call-site
+/// step in the SAME capture job, not a third traversal — the traversal count in
+/// this family stays two (capture before the move, settlement after).
+///
+/// Why it must exist: `handle_sacrifice_for_cost` stamps this carrier from the
+/// SELECTION snapshot, and on the deferred route CR 601.2g's mana-ability
+/// window sits between that selection and the actual payment — the selected
+/// permanent can be tapped for the very mana being paid. CR 608.2h entitles the
+/// spell's effects to the object as it MOST RECENTLY existed, so a carrier
+/// frozen at selection misreports it. The carrier is not inert: `triggers.rs`
+/// copies it onto a resolved ETB trigger's `cost_paid_object` for permanent
+/// spells whose only cost-paid reference lives in that trigger (Adipose
+/// Offspring's "where X is the sacrificed creature's toughness"), which is
+/// precisely the CR 400.7j "that spell's effects can find that object" case.
+///
+/// GATING mirrors the publication site (`handle_sacrifice_for_cost`) exactly,
+/// because a refresh must never reach further than the stamp it refreshes:
+///
+/// * SPELL CASTS ONLY (`activation_ability_index.is_none()`). An activated
+///   ability's `pending.object_id` is the SOURCE PERMANENT, whose own
+///   `cast_cost_paid_object` records how that permanent was cast and must not
+///   be overwritten by an activation's cost. The publication site declines to
+///   stamp in that case, so there is nothing here to refresh either.
+/// * SCOPED to `deferred_ids` — the exact permanents this seam is about to
+///   sacrifice. A carrier naming any other object belongs to a cost component
+///   that already completed and settled its own move, and re-capturing it would
+///   overwrite a correct post-move LKI with a live read. Same rule, same
+///   reason, as the ability traversal's scoping.
+///
+/// Re-captures through [`CostPaidObjectSnapshot::recapture_from_live`], the
+/// single re-capture seam both ability-side carriers use, so all three carriers
+/// read the same thing. A no-op when the spell row, the carrier, or the
+/// sacrificed object's row is absent.
+///
+/// The caller must have already established that the deferred selection is
+/// still live (`validate_deferred_spell_sacrifices_at_commit`) and must call
+/// this BEFORE `pay_deferred_spell_sacrifices_at_commit`, under the same
+/// non-empty `deferred_ids` guard as the ability traversal.
+fn refresh_deferred_cast_cost_paid_object(
+    state: &mut GameState,
+    pending: &PendingCast,
+    deferred_ids: &[ObjectId],
+) {
+    if pending.activation_ability_index.is_some() {
+        return;
+    }
+    let Some(carrier_id) = state
+        .objects
+        .get(&pending.object_id)
+        .and_then(|spell_obj| spell_obj.cast_cost_paid_object.as_ref())
+        .map(|carrier| carrier.object_id)
+        .filter(|carrier_id| deferred_ids.contains(carrier_id))
+    else {
+        return;
+    };
+    let Some(refreshed) = CostPaidObjectSnapshot::recapture_from_live(state, carrier_id) else {
+        return;
+    };
+    if let Some(spell_obj) = state.objects.get_mut(&pending.object_id) {
+        spell_obj.cast_cost_paid_object = Some(refreshed);
+    }
+}
+
 /// Complete the discard-for-cost flow: discard selected cards, then continue casting.
 pub(crate) fn handle_discard_for_cost(
     state: &mut GameState,
@@ -1973,25 +2124,27 @@ pub(crate) fn handle_discard_for_cost(
         }
     }
 
-    // CR 117.1 + CR 400.7j + CR 608.2k: Capture the discarded card's public
+    // CR 117.1 + CR 400.7j + CR 608.2k: Capture each discarded card's public
     // characteristics BEFORE it leaves the hand, so cost-paid-object property
     // references can resolve at ability resolution.
-    if let Some(&first) = chosen.first() {
-        if let Some(obj) = state.objects.get(&first) {
-            pending
-                .ability
-                .set_cost_paid_object_recursive(CostPaidObjectSnapshot::capture(
-                    obj,
-                    obj.snapshot_for_mana_spent(),
-                ));
-        }
+    let cost_paid_snapshots = capture_cost_paid_snapshots(
+        state,
+        chosen,
+        "discard cost selection must be live before cost move",
+    );
+    if let Some(first) = cost_paid_snapshots.first() {
+        pending
+            .ability
+            .set_cost_paid_object_recursive(first.clone());
     }
     // CR 601.2h + CR 602.2b (issue #4948): Record EVERY discarded card, not
     // just `chosen.first()` above, so this SAME ability's own target
     // selection excludes all of them — a multi-card non-self discard cost
     // paid before targets are chosen can otherwise let a just-discarded card
     // leak into the ability's own "target card in your graveyard" pool.
-    pending.ability.add_cost_paid_object_ids_recursive(chosen);
+    pending
+        .ability
+        .add_cost_paid_objects_recursive(&cost_paid_snapshots);
 
     // CR 601.2h + CR 616.1: Discard each chosen card through the replacement pipeline
     // so Madness (CR 702.35) etc. can intercept.
@@ -2025,6 +2178,38 @@ pub(crate) fn handle_discard_for_cost(
         }
     }
     let cost_event_end = events.len();
+
+    // CR 400.7j + CR 400.7 + CR 608.2k + CR 701.9c: the discard moves above are
+    // this cost's OWN, but they ran through the replacement pipeline, so where
+    // each card actually landed is only knowable NOW. CR 701.9a aims the move at
+    // the graveyard — a public zone — and for a card that got there CR 400.7j
+    // keeps this ability's effects able to find it. The snapshots were
+    // necessarily captured pre-move (their `lki` must record pre-move
+    // characteristics — CR 608.2h), so settlement re-pins those entries to the
+    // incarnation the cost's own move produced; only a LATER zone change reads
+    // as stale from here.
+    //
+    // Settlement — not a bare re-pin — because a replacement (CR 616.1) can
+    // redirect a DETERMINISTIC discard into an unrevealed hidden zone exactly as
+    // it can a random one: how the card was chosen does not change the authority
+    // rule. CR 701.9c leaves such a card's characteristics undefined and
+    // CR 400.7j does not license finding it, so its plural entry is demoted to
+    // membership instead of being re-pinned into a live hidden-zone referent.
+    // Mirrors `finish_cost_object_moves` and `handle_sacrifice_for_cost`, which
+    // already settle on their move seams.
+    // The `NeedsReplacementChoice` arm above returns early and its resumed
+    // suffix settles in `resume_interrupted_cost_payment`.
+    //
+    // SCOPED to `chosen` — exactly the cards this discard component moved. A
+    // record published by a DIFFERENT cost component of the same cast (an
+    // earlier exile leg, a deferred sacrifice) already settled against its own
+    // move; re-judging it here would either re-pin it across an unrelated later
+    // zone change (CR 400.7: a new object) or demote a record that legitimately
+    // settled public. TAGGED `Discard` because CR 701.9a is the move these
+    // lines performed, which is what licenses the CR 701.9c demotion.
+    pending
+        .ability
+        .settle_cost_paid_provenance_recursive(state, chosen, CostMoveOutcome::Discard);
 
     if pending.activation_ability_index.is_some() {
         pending.mark_activation_cost_committed();
@@ -2066,11 +2251,38 @@ fn commit_random_discard_cost_picks(
     pending: &mut PendingCast,
     picks: &[crate::types::game_state::RandomDiscardCostPick],
 ) {
-    let ids = picks
+    // CR 601.2h + CR 701.9b (issue #4948): consume the payment's OWN snapshots,
+    // captured by `discard_at_random` from the live hand object before each card
+    // left (`RandomDiscardCostPick::snapshot`). The plural authority is never
+    // reconstructed from raw ids, so it cannot bind a different incarnation than
+    // the one the random payment actually took.
+    //
+    // CR 400.7j + CR 701.9c: the record VARIANT is chosen PER PICK by where this
+    // cost's own move actually delivered the card, mirroring the singular
+    // referent's public-destination policy below rather than inventing a second
+    // one. A card delivered to a public zone (the graveyard — CR 701.9a) keeps
+    // full `Captured` provenance. A card a replacement instead put into a hidden
+    // zone without revealing it has UNDEFINED characteristics (CR 701.9c) and was
+    // never moved to a public zone, so CR 400.7j does not license this ability's
+    // effects finding it: it is recorded as `MembershipOnly`, which preserves the
+    // exact CR 601.2c / CR 602.2b membership the target-exclusion consumer needs
+    // while refusing captured characteristics and any live reference. A missing
+    // object row reads as not-public for the same fail-closed reason.
+    let records = picks
         .iter()
-        .map(|pick| pick.occurrence.object_id)
+        .map(|pick| {
+            let delivered_to_public_zone = state
+                .objects
+                .get(&pick.occurrence.object_id)
+                .is_some_and(|obj| obj.zone.is_public());
+            if delivered_to_public_zone {
+                CostPaidObjectRecord::Captured(pick.snapshot.clone())
+            } else {
+                CostPaidObjectRecord::MembershipOnly(pick.occurrence.object_id)
+            }
+        })
         .collect::<Vec<_>>();
-    pending.ability.add_cost_paid_object_ids_recursive(&ids);
+    pending.ability.add_cost_paid_records_recursive(&records);
 
     // CR 400.7j + CR 608.2k + CR 701.9c: A cost-paid card remains a usable
     // referent only when its move delivered it to a public zone. If a future
@@ -2088,6 +2300,28 @@ fn commit_random_discard_cost_picks(
                 .set_cost_paid_object_recursive(pick.snapshot.clone());
         }
     }
+
+    // CR 400.7j + CR 400.7 + CR 608.2k + CR 701.9c: this commit runs only after
+    // the random discard move(s) it is committing have already completed
+    // (CR 701.9a: the card is in the graveyard), so settle every cost-paid
+    // referent: re-pin a public delivery to the incarnation the cost's own move
+    // produced, demote a hidden one to membership. Same step as
+    // `finish_cost_object_moves` / `handle_sacrifice_for_cost`, through the same
+    // single traversal authority.
+    //
+    // SCOPED to exactly the picks this commit moved — a record belonging to
+    // another cost component of the same cast settled on its own seam and is
+    // not this one's business. TAGGED `Discard`: CR 701.9b is the move these
+    // picks performed, so CR 701.9c licenses the demotion.
+    //
+    // The per-pick classification above is belt-and-braces with respect to this
+    // call — settlement now enforces the SAME CR 400.7j / CR 701.9c rule on
+    // whatever was published — but it is kept because it prevents even a
+    // transient `Captured` record for a card whose characteristics are undefined.
+    let moved: Vec<ObjectId> = picks.iter().map(|pick| pick.occurrence.object_id).collect();
+    pending
+        .ability
+        .settle_cost_paid_provenance_recursive(state, &moved, CostMoveOutcome::Discard);
 }
 
 fn pay_deferred_random_discard_cost(
@@ -2322,19 +2556,39 @@ fn finish_cost_object_moves(
         }
     }
 
-    // CR 400.7j + CR 400.7 + CR 608.2k: Every cost object move above is now complete, so
-    // re-pin the cost-paid referent to the incarnation the cost's own move
-    // produced. The binding seams capture BEFORE the move (their `lki` must
-    // record pre-move characteristics — CR 608.2h), and without this the
-    // reference would read as stale against the object its own cost just moved
+    // CR 400.7j + CR 400.7 + CR 608.2k + CR 608.2h: Every cost object move above is now
+    // complete, so settle the cost-paid provenance: re-pin the referent to the
+    // incarnation the cost's own move produced. The binding seams capture BEFORE the move
+    // (their `lki` must record pre-move characteristics — CR 608.2h), and without
+    // this the reference would read as stale against the object its own cost just moved
     // (Jhoira of the Ghitu: exile a card as a cost, then put counters on that
     // exiled card). Only a LATER zone change makes it stale from here.
+    //
+    // SCOPED to `chosen`, the exact ids this seam moved: another cost
+    // component's records settled on their own seam and must not be re-judged
+    // against these moves.
+    //
+    // TAGGED `Relocation`, and that is the ONLY correct tag here even though
+    // this function is shared: its `destination` parameter is `Zone::Exile`
+    // (CR 701.13a) or `Zone::Hand` — never a discard (CR 701.9a moves a card
+    // from hand to graveyard; nothing routes that through here). CR 701.9c is
+    // discard-scoped, so it cannot reach either caller. That matters most for
+    // the HAND destination, which is hidden EVERY time: demoting there would
+    // destroy the captured `lki` that CR 608.2h makes the correct reading for a
+    // returned permanent, on every single return-to-hand cost payment. The
+    // `Relocation` arm instead leaves the entry `Captured` with a stale pin, so
+    // the `lki` survives while `live_object_id` still refuses the hidden
+    // referent (CR 400.7j licenses finding only a public-zone delivery).
     //
     // Placed after the loop so it is correct regardless of how many zones the
     // move traversed or whether a replacement effect redirected it; the
     // `NeedsChoice` arm above returns early and re-enters here on resume.
     let mut pending = pending;
-    pending.ability.repin_cost_paid_object_recursive(state);
+    pending.ability.settle_cost_paid_provenance_recursive(
+        state,
+        &chosen,
+        CostMoveOutcome::Relocation,
+    );
 
     let waiting_for = match completion {
         PendingCostMoveCompletion::FinishPending => {
@@ -2633,6 +2887,26 @@ pub(crate) fn resume_interrupted_cost_payment(
                 .take()
                 .and_then(super::casting::remove_selected_discard_cost);
         }
+        // CR 400.7j + CR 400.7 + CR 608.2k + CR 701.9c: the resumed discard
+        // suffix has now completed this cost's own moves, so settle exactly as
+        // the unpaused `handle_discard_for_cost` path does. A
+        // replacement-redirected discard is precisely the case where the
+        // post-move incarnation cannot be predicted from the pre-move capture —
+        // and where the redirect's DESTINATION may not be public at all, in
+        // which case CR 701.9c / CR 400.7j require the entry to be demoted to
+        // membership rather than re-pinned into a live hidden-zone referent.
+        //
+        // SCOPED to the whole `chosen` list, not just the resumed suffix: the
+        // pre-pause prefix was discarded by this SAME component and
+        // `handle_discard_for_cost` returned above its settlement call when it
+        // paused, so nothing in `chosen` has settled yet. Records from another
+        // cost component are excluded, as on every other seam. TAGGED
+        // `Discard` — this is the CR 701.9a move, resumed.
+        pending.ability.settle_cost_paid_provenance_recursive(
+            state,
+            &chosen,
+            CostMoveOutcome::Discard,
+        );
         let cost_event_end = events.len();
         let waiting_for = finish_pending_cost_or_cast(state, player, pending, events)?;
         park_cost_payment_triggers_if_paused(
@@ -3351,15 +3625,35 @@ fn finish_sacrifice_for_cost(
             PendingSacrificeCostCompletion::SelectedNonSelf
             | PendingSacrificeCostCompletion::SelfRef,
         ) => {
-            // CR 400.7j + CR 400.7 + CR 608.2k: this is the RESUMED sacrifice path — the
+            // CR 400.7j + CR 400.7 + CR 608.2k + CR 608.2h: this is the RESUMED sacrifice path — the
             // moves above completed after a replacement-effect choice, so
-            // re-pin here exactly as the non-paused paths do. A redirected
+            // settle here exactly as the non-paused paths do. A redirected
             // sacrifice is precisely the case where the referent's incarnation
             // cannot be predicted from the pre-move capture, so omitting this
             // would leave the resumed cost reading as stale against the object
             // its own cost just moved.
+            //
+            // SCOPED to `chosen` — the full selection this sacrifice component
+            // moved, which is exactly what `handle_sacrifice_for_cost`
+            // published records for. `chosen` rather than the `departed`
+            // subset computed above: a permanent a replacement kept ON the
+            // battlefield never moved, is still in a public zone, and re-pins
+            // to the incarnation it already has (a no-op), whereas filtering by
+            // departure would silently skip a record whose object IS public.
+            //
+            // TAGGED `Relocation`: CR 701.21a aims a sacrifice at the owner's
+            // graveyard and a replacement may redirect it, but CR 701.9c is
+            // discard-scoped and does not reach a sacrifice. A redirect into a
+            // hidden zone therefore leaves the entry `Captured` with its
+            // pre-move `lki` — the last known information CR 608.2h makes the
+            // correct reading for "the sacrificed creature's power" — while its
+            // stale pin keeps `live_object_id` refusing the hidden referent.
             let mut pending = pending;
-            pending.ability.repin_cost_paid_object_recursive(state);
+            pending.ability.settle_cost_paid_provenance_recursive(
+                state,
+                chosen,
+                CostMoveOutcome::Relocation,
+            );
             finish_pending_cost_or_cast(state, player, pending, events)?
         }
         (None, PendingSacrificeCostCompletion::ResolutionOptionalPayment { frame, .. }) => {
@@ -3530,36 +3824,35 @@ pub(crate) fn handle_sacrifice_for_cost(
         }
     });
 
-    // CR 117.1 + CR 400.7j + CR 608.2k: Capture the sacrificed object's public
-    // characteristics BEFORE it leaves the battlefield, stamping it onto the
+    // CR 117.1 + CR 400.7j + CR 608.2k: Capture every sacrificed object's public
+    // characteristics BEFORE it leaves the battlefield, stamping them onto the
     // resolving ability for later cost-paid-object references.
-    if let Some(&first) = chosen.first() {
-        if let Some(snapshot) = state
-            .objects
-            .get(&first)
-            .map(|obj| CostPaidObjectSnapshot::capture(obj, obj.snapshot_for_mana_spent()))
-        {
-            pending
-                .ability
-                .set_cost_paid_object_recursive(snapshot.clone());
-            // CR 400.7d: also stamp the spell object on the stack directly. A
-            // permanent spell whose only cost-paid-object reference lives in an
-            // ETB *trigger* (Adipose Offspring's "where X is the sacrificed
-            // creature's toughness") has no on-resolve Spell ability, so the
-            // ability-gated normalization in `stack::resolve` is skipped and the
-            // pipeline's `CastLinkSnapshot` would otherwise capture `None`.
-            // Stamping the stack object here fulfills the "already-stamped"
-            // contract that the resolution epilogue relies on for ability-less
-            // permanent spells, so the snapshot survives `reset_for_battlefield_entry`.
-            //
-            // Gated to spell casts only: activated-ability sacrifice costs share
-            // this resolver (`activation_ability_index` is set), but their
-            // `object_id` is the source permanent, whose own cast provenance must
-            // not be overwritten. A spell cast leaves this field `None`.
-            if pending.activation_ability_index.is_none() {
-                if let Some(spell_obj) = state.objects.get_mut(&pending.object_id) {
-                    spell_obj.cast_cost_paid_object = Some(snapshot);
-                }
+    let cost_paid_snapshots = capture_cost_paid_snapshots(
+        state,
+        chosen,
+        "sacrifice cost selection must be live before cost move",
+    );
+    if let Some(snapshot) = cost_paid_snapshots.first().cloned() {
+        pending
+            .ability
+            .set_cost_paid_object_recursive(snapshot.clone());
+        // CR 400.7d: also stamp the spell object on the stack directly. A
+        // permanent spell whose only cost-paid-object reference lives in an
+        // ETB *trigger* (Adipose Offspring's "where X is the sacrificed
+        // creature's toughness") has no on-resolve Spell ability, so the
+        // ability-gated normalization in `stack::resolve` is skipped and the
+        // pipeline's `CastLinkSnapshot` would otherwise capture `None`.
+        // Stamping the stack object here fulfills the "already-stamped"
+        // contract that the resolution epilogue relies on for ability-less
+        // permanent spells, so the snapshot survives `reset_for_battlefield_entry`.
+        //
+        // Gated to spell casts only: activated-ability sacrifice costs share
+        // this resolver (`activation_ability_index` is set), but their
+        // `object_id` is the source permanent, whose own cast provenance must
+        // not be overwritten. A spell cast leaves this field `None`.
+        if pending.activation_ability_index.is_none() {
+            if let Some(spell_obj) = state.objects.get_mut(&pending.object_id) {
+                spell_obj.cast_cost_paid_object = Some(snapshot);
             }
         }
     }
@@ -3569,7 +3862,9 @@ pub(crate) fn handle_sacrifice_for_cost(
     // — a sacrifice cost paid before targets are chosen (this engine's
     // documented ordering shortcut, see issue #1301) can otherwise let a
     // just-sacrificed object leak into the ability's own candidate pool.
-    pending.ability.add_cost_paid_object_ids_recursive(chosen);
+    pending
+        .ability
+        .add_cost_paid_objects_recursive(&cost_paid_snapshots);
 
     // CR 702.48c / CR 702.119a: Offering and Emerge use different reduction
     // rules, but both must read the sacrificed permanent before it leaves.
@@ -3670,12 +3965,28 @@ pub(crate) fn handle_sacrifice_for_cost(
         &crate::game::zones::departed_subset(state, chosen),
     );
 
-    // CR 400.7j + CR 400.7 + CR 608.2k: the sacrifice moves above are the cost's own, so
-    // re-pin the referent to the incarnation they produced (see
+    // CR 400.7j + CR 400.7 + CR 608.2k + CR 608.2h: the sacrifice moves above are the cost's own, so
+    // settle the referent against the incarnation they produced (see
     // `finish_cost_object_moves` for the same step on the shared move seam, and
     // `CostPaidObjectSnapshot::repin_to_current_incarnation` for why the pin
     // must not be assumed to advance by a fixed amount).
-    pending.ability.repin_cost_paid_object_recursive(state);
+    //
+    // SCOPED to `chosen`, the permanents THIS sacrifice component moved — the
+    // exact set `add_cost_paid_objects_recursive` published above. Records from
+    // an earlier discard/exile leg of the same cast settled on their own seam.
+    //
+    // TAGGED `Relocation`: CR 701.21a aims the move at the owner's graveyard
+    // and a replacement can redirect it, but CR 701.9c is discard-scoped, so a
+    // hidden destination does NOT make a sacrificed permanent's characteristics
+    // undefined — CR 608.2h makes the captured pre-move `lki` its last known
+    // information, which is exactly what "the sacrificed creature's power"
+    // reads. The entry keeps that `lki` and its stale pin, so the live
+    // reference stays refused (CR 400.7j).
+    pending.ability.settle_cost_paid_provenance_recursive(
+        state,
+        chosen,
+        CostMoveOutcome::Relocation,
+    );
 
     if pending.activation_ability_index.is_some() {
         pending.mark_activation_cost_committed();
@@ -4883,9 +5194,16 @@ fn finish_exile_selection_for_cost(
         recompute_pending_cast_cost_after_additional_cost(state, player, &mut pending);
     }
 
-    // CR 608.2k: Capture the first exiled object's public characteristics BEFORE
-    // it leaves the zone, stamping it recursively onto the resolving ability so
-    // `TargetFilter::CostPaidObject` resolves during ability resolution.
+    // CR 608.2k: Capture the exiled objects' public characteristics BEFORE they
+    // leave the zone, stamping them recursively onto the resolving ability so
+    // `TargetFilter::CostPaidObject` resolves during ability resolution. The
+    // capture happens after the live revalidation loop above, so every chosen
+    // row is guaranteed present.
+    let cost_paid_snapshots = capture_cost_paid_snapshots(
+        state,
+        chosen,
+        "exile cost selection must be live before cost move",
+    );
     if let Some(&first) = chosen.first() {
         if let Some(obj) = state.objects.get(&first) {
             // CR 107.3a + CR 118.9: Shoal-style alternative costs ("exile a
@@ -4902,13 +5220,12 @@ fn finish_exile_selection_for_cost(
                     .ability
                     .set_chosen_x_recursive(obj.effective_mana_value());
             }
-            pending
-                .ability
-                .set_cost_paid_object_recursive(CostPaidObjectSnapshot::capture(
-                    obj,
-                    obj.snapshot_for_mana_spent(),
-                ));
         }
+    }
+    if let Some(snapshot) = cost_paid_snapshots.first() {
+        pending
+            .ability
+            .set_cost_paid_object_recursive(snapshot.clone());
     }
     // CR 601.2h + CR 602.2b (issue #4948): Record EVERY exiled object, not
     // just `chosen.first()` above, so this SAME ability's own target
@@ -4917,7 +5234,14 @@ fn finish_exile_selection_for_cost(
     // battlefield-permanent exile costs (Food Chain class) — either can
     // otherwise let a just-exiled object leak into an ability's own
     // "target card/permanent in exile" pool.
-    pending.ability.add_cost_paid_object_ids_recursive(chosen);
+    //
+    // CR 400.7j: `finish_cost_object_moves` below re-pins every entry once the
+    // exile moves complete, so these snapshots name the cards AS THE COST LEFT
+    // THEM in exile — the exact referent Coin of Fate's "one of the exiled
+    // cards" needs.
+    pending
+        .ability
+        .add_cost_paid_objects_recursive(&cost_paid_snapshots);
 
     if pending.activation_ability_index.is_some() {
         pending.mark_activation_cost_committed();
@@ -14108,34 +14432,98 @@ fn finalize_mana_payment_with_resume(
             return Ok(state.waiting_for.clone());
         }
         validate_deferred_spell_sacrifices_at_commit(state, player, &pending)?;
+        // CR 608.2h + CR 601.2h: RE-CAPTURE the deferred selection's cost-paid
+        // provenance at the ACTUAL payment seam, immediately before the
+        // sacrifices happen. `handle_sacrifice_for_cost` published those records
+        // when the permanents were SELECTED, which on this route is before the
+        // mana window — and the very permanents selected here can be tapped for
+        // that mana in between (issue #5252). CR 601.2g is what puts that window
+        // between selection and payment; CR 608.2h calls for the object's last
+        // known information, i.e. its state as it most recently existed, not its
+        // state at selection, so a record frozen at selection reports an
+        // untapped permanent the game had already tapped.
+        //
+        // This is the CAPTURE job and it must run BEFORE the move (the `lki`
+        // records pre-move characteristics). The settlement call below is the
+        // separate post-move job that owns the incarnation pin and the
+        // public-destination classification, exactly as on every other cost-move
+        // seam — one traversal per job, no parallel append traversal.
+        //
+        // Scoped to exactly the ids this deferred payment is about to sacrifice:
+        // a record belonging to a cost component that already completed its own
+        // move must keep the LKI that move settled. `MembershipOnly` records are
+        // never touched (CR 400.7: they have no pin and must not acquire one).
+        // The traversal covers BOTH ability-side carriers under that one scoping
+        // rule — the plural `cost_paid_objects` records AND the singular
+        // `cost_paid_object` referent, which `handle_sacrifice_for_cost` stamps
+        // from the same selection and which `ObjectScope::CostPaidObject`
+        // quantity resolution reads.
+        //
+        // Placed after `validate_deferred_spell_sacrifices_at_commit`, which has
+        // just proven every selected permanent is still on the battlefield under
+        // this player's control, so the live read is of the object the cost is
+        // about to move.
+        let deferred_ids: Vec<ObjectId> = pending
+            .deferred_sacrificed_permanents
+            .iter()
+            .map(|selection| selection.object_id)
+            .collect();
+        if !deferred_ids.is_empty() {
+            pending
+                .ability
+                .refresh_cost_paid_capture_recursive(state, &deferred_ids);
+            refresh_deferred_cast_cost_paid_object(state, &pending, &deferred_ids);
+        }
         let deferred_sacrifice_events =
             pay_deferred_spell_sacrifices_at_commit(state, player, &pending, events)?;
-        // CR 400.7j + CR 400.7 + CR 608.2k: the fourth cost-completion path. A
+        // CR 400.7j + CR 400.7 + CR 608.2k + CR 608.2h: the fourth cost-completion path. A
         // spell sacrifice deferred until mana payment is captured in
-        // `handle_sacrifice_for_cost` BEFORE the move, then paid here — the
-        // deferral branch returns above the re-pin in that function, so without
+        // `handle_sacrifice_for_cost` BEFORE the move (and re-captured just
+        // above, at the real payment seam), then paid here — the deferral branch
+        // returns above the settlement in that function, so without
         // this the referent stays pinned to the pre-sacrifice incarnation while
         // the live row has already advanced, and every guarded consumer would
         // then resolve it to nothing (Endemic Plague / Fatal Grudge class).
         // CR 400.7j is the rule that mandates the re-pin: a cost that moves an
         // object to a public zone must still let that spell's effects find it.
         //
-        // Guarded on the deferred set being non-empty. CR 400.7j licenses
-        // re-pinning across the COST's own move and nothing else, but mana
-        // payment (`pay_spell_mana_before_deferred_sacrifice`, above) runs
-        // first — so on a cast with no deferred sacrifice an unconditional
-        // re-pin would also bless a LATER move, e.g. a mana ability that
-        // returned the referent from the graveyard.
+        // SCOPED to `deferred_ids` — the exact permanents
+        // `pay_deferred_spell_sacrifices_at_commit` just moved. This seam runs
+        // AFTER `pay_spell_mana_before_deferred_sacrifice`, so an unscoped pass
+        // would judge an earlier discard/exile component's records against a
+        // move that was not theirs (and across the mana window's own zone
+        // changes). TAGGED `Relocation`: this is CR 701.21a sacrifice, which
+        // CR 701.9c does not reach, so a redirected-to-hidden entry keeps the
+        // `lki` CR 608.2h makes its last known information.
         //
-        // NOT covered by a test. `deferred_spell_sacrifice_repin_does_not_bless_a_later_move`
-        // states this rule but cannot constrain this line: it calls
-        // `repin_cost_paid_object_recursive` directly and never enters this
-        // function, so it passes with or without the guard. The guard is latent
-        // for the same reason the re-pin it wraps is (see the SCOPE note on that
-        // test), and the same outstanding work — a test that drives the real
-        // deferred path — would cover both.
-        if !pending.deferred_sacrificed_permanents.is_empty() {
-            pending.ability.repin_cost_paid_object_recursive(state);
+        // The non-empty GUARD is still load-bearing even though the plural pass
+        // is now scoped: the traversal re-pins the SINGULAR `cost_paid_object`
+        // referent UNCONDITIONALLY (unscoped by `moved` — that is settlement's
+        // own deliberate shape, unchanged here), and CR 400.7j licenses settling
+        // across the COST's own move and nothing else — so on a cast with no
+        // deferred sacrifice an unguarded call would bless a LATER move, e.g. a
+        // mana ability that returned the singular referent from the graveyard.
+        // The capture-refresh above carries the same guard, though for the
+        // additional reason that it would otherwise read live state for a
+        // payment that never happened.
+        //
+        // The GUARD itself is not covered by a test.
+        // `deferred_spell_sacrifice_repin_does_not_bless_a_later_move` states
+        // this rule but cannot constrain this line: it calls
+        // `settle_cost_paid_provenance_recursive` directly and never enters this
+        // function, so it passes with or without the guard. The guarded CALL is
+        // reached by `manual_payment_defers_selected_artifact_sacrifice_until_
+        // mana_payment_commit` (tests/integration/issue_5252_additional_
+        // sacrifice_after_mana_abilities.rs), which drives the real deferred
+        // path and asserts the refreshed tapped LKI on all three carriers (the
+        // plural record, the singular referent, and the spell object's
+        // `cast_cost_paid_object`) plus the live referent.
+        if !deferred_ids.is_empty() {
+            pending.ability.settle_cost_paid_provenance_recursive(
+                state,
+                &deferred_ids,
+                CostMoveOutcome::Relocation,
+            );
         }
         if pending.deferred_random_discard_cost.is_some() {
             pending.cost = ManaCost::NoCost;
@@ -14550,34 +14938,82 @@ pub fn finalize_mana_payment_with_phyrexian_choices(
             return Ok(state.waiting_for.clone());
         }
         validate_deferred_spell_sacrifices_at_commit(state, player, &pending)?;
+        // CR 608.2h + CR 601.2h: RE-CAPTURE the deferred selection's cost-paid
+        // provenance at the ACTUAL payment seam — the Phyrexian-choice twin of
+        // the same step in `finalize_mana_payment_with_resume`, and required for
+        // the same reason: `handle_sacrifice_for_cost` published these records
+        // at SELECTION, before the mana window (CR 601.2g), and a selected
+        // permanent can be tapped for that mana in between (issue #5252).
+        // CR 608.2h calls for the object's last known information — its state as
+        // it most recently existed — not its state at selection.
+        //
+        // This is the CAPTURE job and must run BEFORE the move; the settlement
+        // call below is the separate post-move job that owns the incarnation pin
+        // and the public-destination classification. One traversal per job.
+        //
+        // Scoped to exactly the ids this deferred payment is about to sacrifice
+        // and never `MembershipOnly` records (CR 400.7). The traversal covers
+        // BOTH ability-side carriers under that one scoping rule — the plural
+        // `cost_paid_objects` records and the singular `cost_paid_object`
+        // referent — and the spell object's `cast_cost_paid_object` carrier,
+        // which lives on `GameObject` rather than on the ability, is refreshed
+        // alongside it under identical scoping.
+        // `validate_deferred_spell_sacrifices_at_commit` above has just proven
+        // each one is still a battlefield permanent this player controls.
+        let deferred_ids: Vec<ObjectId> = pending
+            .deferred_sacrificed_permanents
+            .iter()
+            .map(|selection| selection.object_id)
+            .collect();
+        if !deferred_ids.is_empty() {
+            pending
+                .ability
+                .refresh_cost_paid_capture_recursive(state, &deferred_ids);
+            refresh_deferred_cast_cost_paid_object(state, &pending, &deferred_ids);
+        }
         let deferred_sacrifice_events =
             pay_deferred_spell_sacrifices_at_commit(state, player, &pending, events)?;
-        // CR 400.7j + CR 400.7 + CR 608.2k: the fourth cost-completion path. A
+        // CR 400.7j + CR 400.7 + CR 608.2k + CR 608.2h: the fourth cost-completion path. A
         // spell sacrifice deferred until mana payment is captured in
-        // `handle_sacrifice_for_cost` BEFORE the move, then paid here — the
-        // deferral branch returns above the re-pin in that function, so without
+        // `handle_sacrifice_for_cost` BEFORE the move (and re-captured just
+        // above, at the real payment seam), then paid here — the deferral branch
+        // returns above the settlement in that function, so without
         // this the referent stays pinned to the pre-sacrifice incarnation while
         // the live row has already advanced, and every guarded consumer would
         // then resolve it to nothing (Endemic Plague / Fatal Grudge class).
         // CR 400.7j is the rule that mandates the re-pin: a cost that moves an
         // object to a public zone must still let that spell's effects find it.
         //
-        // Guarded on the deferred set being non-empty. CR 400.7j licenses
-        // re-pinning across the COST's own move and nothing else, but mana
-        // payment (`pay_spell_mana_before_deferred_sacrifice`, above) runs
-        // first — so on a cast with no deferred sacrifice an unconditional
-        // re-pin would also bless a LATER move, e.g. a mana ability that
-        // returned the referent from the graveyard.
+        // SCOPED and TAGGED exactly as the sibling (non-Phyrexian) route:
+        // `deferred_ids` are the permanents this seam just sacrificed, and
+        // `Relocation` is the CR 701.21a cost action CR 701.9c does not reach,
+        // so a hidden redirect keeps the CR 608.2h `lki` instead of losing it.
         //
-        // NOT covered by a test. `deferred_spell_sacrifice_repin_does_not_bless_a_later_move`
-        // states this rule but cannot constrain this line: it calls
-        // `repin_cost_paid_object_recursive` directly and never enters this
-        // function, so it passes with or without the guard. The guard is latent
-        // for the same reason the re-pin it wraps is (see the SCOPE note on that
-        // test), and the same outstanding work — a test that drives the real
-        // deferred path — would cover both.
-        if !pending.deferred_sacrificed_permanents.is_empty() {
-            pending.ability.repin_cost_paid_object_recursive(state);
+        // The non-empty GUARD remains load-bearing despite the scoping: the
+        // traversal re-pins the SINGULAR `cost_paid_object` referent
+        // unconditionally (unscoped by `moved` — settlement's own deliberate
+        // shape, unchanged here), and mana payment
+        // (`pay_spell_mana_before_deferred_sacrifice`, above) runs first — so on
+        // a cast with no deferred sacrifice an unguarded call would bless a
+        // LATER move of that singular referent. The capture-refresh above
+        // carries the same guard, and additionally would otherwise read live
+        // state for a payment that never happened.
+        //
+        // The GUARD itself is not covered by a test.
+        // `deferred_spell_sacrifice_repin_does_not_bless_a_later_move` states
+        // this rule but cannot constrain this line: it calls
+        // `settle_cost_paid_provenance_recursive` directly and never enters this
+        // function, so it passes with or without the guard. The guarded CALL is
+        // reached on the sibling (non-Phyrexian) route by `manual_payment_defers_
+        // selected_artifact_sacrifice_until_mana_payment_commit`
+        // (tests/integration/issue_5252_additional_sacrifice_after_mana_
+        // abilities.rs); this Phyrexian twin shares the code shape exactly.
+        if !deferred_ids.is_empty() {
+            pending.ability.settle_cost_paid_provenance_recursive(
+                state,
+                &deferred_ids,
+                CostMoveOutcome::Relocation,
+            );
         }
         if pending.deferred_random_discard_cost.is_some() {
             pending.cost = ManaCost::NoCost;
@@ -26216,14 +26652,16 @@ its replicate cost was paid.)\nDraw a card.";
     /// sacrificed creature").
     ///
     /// SCOPE — read this before trusting the name. This test drives
-    /// `repin_cost_paid_object_recursive` DIRECTLY. It does NOT enter
+    /// `settle_cost_paid_provenance_recursive` DIRECTLY. It does NOT enter
     /// `finalize_mana_payment_with_resume`, so it does **not** pin the
-    /// production call site: deleting the two re-pin calls in that function
-    /// leaves this test green. It pins the re-pin's semantics only — that
-    /// re-pinning after the cost's own move restores the referent.
+    /// production call site: deleting the two settlement calls in that function
+    /// leaves this test green. It pins the settlement's SINGULAR-referent
+    /// semantics only — that re-pinning after the cost's own move restores the
+    /// referent.
     ///
-    /// The call site is deliberately untested because the deferred branch could
-    /// not be reached from a test. `can_defer_spell_sacrifice_until_mana_payment`
+    /// The call site is deliberately untested HERE because the deferred branch
+    /// could not be reached from a unit test.
+    /// `can_defer_spell_sacrifice_until_mana_payment`
     /// requires `cost_has_x || cost.mana_value() > 0` after the cost-floor pass,
     /// and an instrumented probe on that gate printed `can_defer=false ...
     /// cost_mv=0` for an additional-cost sacrifice spell in the scenario
@@ -26233,10 +26671,16 @@ its replicate cost was paid.)\nDraw a card.";
     /// this was deleted rather than shipped because it passed with the
     /// production fix reverted.
     ///
-    /// Treat the guarded call in `finalize_mana_payment_with_resume` as latent:
-    /// correct by construction (a path that moves the referent after capture and
-    /// reaches no re-pin must re-pin) but unprotected by coverage. A test that
-    /// drives the real path is the outstanding work.
+    /// The real deferred path IS now driven end-to-end by
+    /// `manual_payment_defers_selected_artifact_sacrifice_until_mana_payment_commit`
+    /// in `tests/integration/issue_5252_additional_sacrifice_after_mana_abilities.rs`,
+    /// which reaches `finalize_mana_payment_with_resume`'s capture-refresh and
+    /// settlement calls through real `GameAction`s and asserts all THREE
+    /// cost-paid carriers — the plural `cost_paid_objects` record, the SINGULAR
+    /// `cost_paid_object` referent, and the spell object's
+    /// `cast_cost_paid_object`. What remains uncovered at the call site is only
+    /// the non-empty `deferred_ids` GUARD itself, as the call-site comments in
+    /// both finalizers state.
     #[test]
     fn deferred_spell_sacrifice_repin_restores_the_cost_referent() {
         use crate::game::zones::create_object;
@@ -26297,7 +26741,17 @@ its replicate cost was paid.)\nDraw a card.";
         );
 
         // What the fix adds after `pay_deferred_spell_sacrifices_at_commit`.
-        ability.repin_cost_paid_object_recursive(&state);
+        // Scoped/tagged exactly as that seam calls it: the deferred sacrifice
+        // moved this one permanent (CR 701.21a ⇒ `Relocation`). Both arguments
+        // are inert for THIS assertion — the SINGULAR referent under test is
+        // re-pinned unconditionally, independent of `moved` and `outcome` — and
+        // they are passed in production form so the fixture cannot drift away
+        // from the seam it stands in for.
+        ability.settle_cost_paid_provenance_recursive(
+            &state,
+            &[sacrificed],
+            CostMoveOutcome::Relocation,
+        );
 
         assert!(
             ability
@@ -26352,7 +26806,16 @@ its replicate cost was paid.)\nDraw a card.";
 
         let mut events = Vec::new();
         crate::game::zones::move_to_zone(&mut state, sacrificed, Zone::Graveyard, &mut events);
-        ability.repin_cost_paid_object_recursive(&state);
+        // Same production shape as the sibling test: the deferred sacrifice
+        // seam settles the id it moved with `CostMoveOutcome::Relocation`. The
+        // SINGULAR referent this test asserts on re-pins regardless of either
+        // argument, so the test's intent (the LATER move must not be blessed)
+        // is unchanged.
+        ability.settle_cost_paid_provenance_recursive(
+            &state,
+            &[sacrificed],
+            CostMoveOutcome::Relocation,
+        );
         assert!(
             ability
                 .cost_paid_object
@@ -26373,5 +26836,741 @@ its replicate cost was paid.)\nDraw a card.";
                 .is_current(&state),
             "CR 400.7: a move AFTER the cost completed makes the referent a new              object again; the re-pin must not bless it"
         );
+    }
+
+    /// CR 601.2h + CR 701.9c + CR 608.2h: the SCOPE half of
+    /// `ResolvedAbility::settle_cost_paid_provenance_recursive` — a settlement
+    /// pass judges ONLY the ids the seam that called it actually moved.
+    ///
+    /// A cost with two non-mana components publishes into ONE plural
+    /// authority, but each component settles on its own seam with its own
+    /// [`CostMoveOutcome`], so the second pass necessarily runs while the first
+    /// component's record is already settled and FINAL. Re-judging that record
+    /// against a move that was never its own is wrong in both directions: a
+    /// hidden-destination RELOCATION record (kept `Captured` with its pre-move
+    /// `lki`, CR 608.2h) would be demoted by a later `Discard` pass under
+    /// CR 701.9c — a rule that is discard-scoped by its own text and does not
+    /// reach a sacrifice (CR 701.21a) at all — and a record that legitimately
+    /// settled public would be re-pinned across a later zone change that
+    /// CR 400.7 makes a NEW object.
+    ///
+    /// UNDER REVERT: delete the `moved.contains(&record.object_id())` guard in
+    /// `settle_cost_paid_provenance_recursive` and the second pass demotes the
+    /// relocation record too — the `matches!(.., Captured(_))` assertion and
+    /// the `lki.name` assertion below both fail, and so does the
+    /// `snapshot().is_some()` guard between them. The discard record's
+    /// `MembershipOnly` assertion is the load-bearing POSITIVE CONTROL: it
+    /// proves the second pass really ran and really applied its CR 701.9c arm,
+    /// so the first record's survival is a SKIP and not a dead traversal.
+    ///
+    /// SCOPE — deliberately TRAVERSAL-level, and NOT claimed as production-path
+    /// coverage. The production ordering it stands in for (a `Relocation`-tagged
+    /// settlement followed by a `Discard`-tagged one on the same ability) is not
+    /// reachable from any printed card today: the single interactive
+    /// activation-cost dispatcher,
+    /// `surface_next_unpaid_interactive_activation_cost`, surfaces its non-self
+    /// DISCARD arm before its SACRIFICE / EXILE / RETURN arms, so a compound
+    /// cost such as Bloodsoaked Altar's `{T}, Pay 2 life, Discard a card,
+    /// Sacrifice a creature` always pays and settles the discard FIRST, when the
+    /// relocation record does not exist yet.
+    ///
+    /// The guard is NOT defensive programming against a hypothetical, though:
+    /// the inverted ordering is already WIRED, in `finalize_mana_payment_with_
+    /// resume`. A deferred spell sacrifice settles `Relocation` at the
+    /// `!deferred_ids.is_empty()` call, and eleven lines later
+    /// `pay_deferred_random_discard_cost` settles the same ability's random
+    /// discard leg as `Discard` — at which point the sacrifice record is still
+    /// `Captured` and, without the scoping guard, would be demoted by a rule
+    /// (CR 701.9c) that never reached it. `finalize_mana_payment_with_
+    /// phyrexian_choices` carries the same pair. Only the absence of a printed
+    /// card pairing a deferred sacrifice with a random discard cost keeps that
+    /// path cold; the seam itself is live. Grep
+    /// `pay_deferred_random_discard_cost` to find it. Promote this to a
+    /// cast-pipeline test the day such a card exists.
+    #[test]
+    fn settlement_skips_records_another_cost_component_already_settled() {
+        use crate::types::ability::{CostPaidObjectSnapshot, ResolvedAbility};
+
+        let mut state = GameState::new_two_player(42);
+        let relocated = create_object(
+            &mut state,
+            CardId(1),
+            PlayerId(0),
+            "Sacrificed Creature".to_string(),
+            Zone::Battlefield,
+        );
+        let discarded = create_object(
+            &mut state,
+            CardId(2),
+            PlayerId(0),
+            "Discarded Card".to_string(),
+            Zone::Hand,
+        );
+        let relocated_before = state.objects[&relocated].incarnation;
+        let discarded_before = state.objects[&discarded].incarnation;
+
+        // CR 608.2h: both components capture BEFORE their own move, exactly as
+        // `handle_sacrifice_for_cost` and `handle_discard_for_cost` do, and both
+        // land in the same plural authority in payment order.
+        let capture = |state: &GameState, object_id: ObjectId| {
+            let object = state.objects.get(&object_id).expect("cost object exists");
+            CostPaidObjectSnapshot::capture(object, object.snapshot_for_mana_spent())
+        };
+        let mut ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            Vec::new(),
+            ObjectId(99),
+            PlayerId(0),
+        );
+        ability.add_cost_paid_objects_recursive(&[
+            capture(&state, relocated),
+            capture(&state, discarded),
+        ]);
+
+        // COMPONENT 1 — a sacrifice (CR 701.21a) whose own graveyard move a
+        // replacement redirected into a hidden zone, settling on its own seam.
+        let mut events = Vec::new();
+        crate::game::zones::move_to_zone(&mut state, relocated, Zone::Library, &mut events);
+        ability.settle_cost_paid_provenance_recursive(
+            &state,
+            &[relocated],
+            CostMoveOutcome::Relocation,
+        );
+        assert!(
+            !state.objects[&relocated].zone.is_public(),
+            "reach guard: component 1's move must have delivered into a HIDDEN zone"
+        );
+        assert_ne!(
+            state.objects[&relocated].incarnation, relocated_before,
+            "reach guard: CR 400.7 — the move must make a new object, otherwise a \
+             never-re-pinned record could not be told from a re-pinned one"
+        );
+        assert!(
+            matches!(
+                &ability.cost_paid_objects[0],
+                CostPaidObjectRecord::Captured(_)
+            ),
+            "reach guard: CR 608.2h — component 1 settles KEPT, so the second pass \
+             below has something it could wrongly destroy, got {:?}",
+            ability.cost_paid_objects[0]
+        );
+
+        // COMPONENT 2 — a later discard (CR 701.9a) whose own move is redirected
+        // the same way, settling on ITS own seam with its own outcome.
+        crate::game::zones::move_to_zone(&mut state, discarded, Zone::Library, &mut events);
+        ability.settle_cost_paid_provenance_recursive(
+            &state,
+            &[discarded],
+            CostMoveOutcome::Discard,
+        );
+
+        // POSITIVE CONTROL: the second pass ran and applied CR 701.9c to the id
+        // it actually moved.
+        assert_ne!(
+            state.objects[&discarded].incarnation, discarded_before,
+            "reach guard: CR 400.7 — component 2's move must have happened"
+        );
+        assert!(
+            matches!(
+                &ability.cost_paid_objects[1],
+                CostPaidObjectRecord::MembershipOnly(id) if *id == discarded
+            ),
+            "CR 701.9c: a discarded card put into an unrevealed hidden zone must be \
+             demoted to membership by its OWN settlement pass, got {:?}",
+            ability.cost_paid_objects[1]
+        );
+
+        // THE DISCRIMINATOR: component 1's record was not this seam's business.
+        let record = &ability.cost_paid_objects[0];
+        assert!(
+            matches!(record, CostPaidObjectRecord::Captured(_)),
+            "CR 701.9c is discard-scoped: a record another component already settled \
+             as a RELOCATION must be skipped, not demoted by this seam's discard, \
+             got {record:?}"
+        );
+        let snapshot = record
+            .snapshot()
+            .expect("a skipped relocation record keeps its captured snapshot");
+        assert_eq!(
+            snapshot.lki.name, "Sacrificed Creature",
+            "CR 608.2h: the pre-move last known information must survive a settlement \
+             pass that did not move this object"
+        );
+        assert_eq!(
+            record.live_object_id(&state),
+            None,
+            "CR 400.7j: the skipped record's pin stays on the pre-move incarnation, so \
+             the hidden-zone referent is still refused"
+        );
+        assert_eq!(
+            ability
+                .cost_paid_objects
+                .iter()
+                .map(CostPaidObjectRecord::object_id)
+                .collect::<Vec<_>>(),
+            vec![relocated, discarded],
+            "CR 601.2c: membership stays EXACT for both components, in payment order"
+        );
+    }
+
+    /// CR 611.2a + CR 601.2i: the event-deadline duration's expiry building
+    /// block (U10-D). Synthetic rules text, no card name. Every effect is
+    /// installed by a real activation or spell resolution, and every expiry is
+    /// driven by a real cast through `apply()`.
+    mod until_event_expiry {
+        use super::*;
+        use crate::game::scenario::{GameRunner, P0, P1};
+        use crate::types::phase::Phase;
+
+        const CREATURE_DEADLINE: &str =
+            "{T}: Target creature loses all abilities until a player casts a creature spell.";
+
+        fn loses_abilities_until(spell: &str) -> String {
+            format!("{{T}}: Target creature loses all abilities until a player casts {spell}.")
+        }
+
+        struct Board {
+            runner: GameRunner,
+            source: ObjectId,
+            bird: ObjectId,
+            bear: ObjectId,
+            late_bear: ObjectId,
+            instant: ObjectId,
+            destroy: ObjectId,
+            copier: ObjectId,
+        }
+
+        fn zero_cost_creature(scenario: &mut GameScenario, name: &str) -> ObjectId {
+            scenario
+                .add_creature_to_hand_from_oracle(P0, name, 2, 2, "")
+                .with_mana_cost(ManaCost::generic(0))
+                .id()
+        }
+
+        fn zero_cost_instant(scenario: &mut GameScenario, name: &str, text: &str) -> ObjectId {
+            scenario
+                .add_spell_to_hand_from_oracle(P0, name, true, text)
+                .with_mana_cost(ManaCost::generic(0))
+                .id()
+        }
+
+        /// P0 controls the deadline source; P1 controls a 1/1 flier. P0 holds
+        /// two free creature spells, a free instant, a free removal spell and
+        /// a free creature-spell copier.
+        fn board(source_text: &str) -> Board {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            let source = scenario
+                .add_creature_from_oracle(P0, "Deadline Source", 1, 1, source_text)
+                .id();
+            let bird = scenario
+                .add_creature_from_oracle(P1, "Flying Bird", 1, 1, "Flying")
+                .id();
+            let bear = zero_cost_creature(&mut scenario, "Cast Bear");
+            let late_bear = zero_cost_creature(&mut scenario, "Late Bear");
+            let instant = zero_cost_instant(&mut scenario, "Gain Instant", "You gain 1 life.");
+            let destroy =
+                zero_cost_instant(&mut scenario, "Destroy Instant", "Destroy target creature.");
+            let copier =
+                zero_cost_instant(&mut scenario, "Twin Instant", "Copy target creature spell.");
+            Board {
+                runner: scenario.build(),
+                source,
+                bird,
+                bear,
+                late_bear,
+                instant,
+                destroy,
+                copier,
+            }
+        }
+
+        fn make_token(board: &mut Board) {
+            board
+                .runner
+                .state_mut()
+                .objects
+                .get_mut(&board.source)
+                .expect("the deadline source exists")
+                .is_token = true;
+        }
+
+        fn activated_index(runner: &GameRunner, source: ObjectId) -> usize {
+            runner.state().objects[&source]
+                .abilities
+                .iter()
+                .position(|ability| ability.kind == AbilityKind::Activated)
+                .expect("the deadline source has an activated ability")
+        }
+
+        /// Activate the source's ability on the bird and resolve it on an empty stack.
+        fn activate(board: &mut Board) {
+            let index = activated_index(&board.runner, board.source);
+            board
+                .runner
+                .activate(board.source, index)
+                .target_object(board.bird)
+                .resolve();
+        }
+
+        /// Activate the source's ability on the bird, leaving it on the stack
+        /// above whatever is already there.
+        fn activate_onto_stack(board: &mut Board) {
+            let index = activated_index(&board.runner, board.source);
+            board
+                .runner
+                .act(GameAction::ActivateAbility {
+                    source_id: board.source,
+                    ability_index: index,
+                })
+                .expect("the activation is legal");
+            while matches!(
+                board.runner.state().waiting_for,
+                WaitingFor::TargetSelection { .. }
+            ) {
+                board
+                    .runner
+                    .act(GameAction::ChooseTarget {
+                        target: Some(TargetRef::Object(board.bird)),
+                    })
+                    .expect("the bird is a legal target");
+            }
+        }
+
+        fn has_flying(runner: &GameRunner, object: ObjectId) -> bool {
+            runner.state().objects[&object].has_keyword(&Keyword::Flying)
+        }
+
+        fn effect_count(runner: &GameRunner) -> usize {
+            runner.state().transient_continuous_effects.len()
+        }
+
+        fn on_stack(runner: &GameRunner, object: ObjectId) -> bool {
+            runner.state().stack.iter().any(|entry| entry.id == object)
+        }
+
+        fn stack_entries_named(runner: &GameRunner, name: &str) -> usize {
+            runner
+                .state()
+                .stack
+                .iter()
+                .filter(|entry| {
+                    runner
+                        .state()
+                        .objects
+                        .get(&entry.id)
+                        .is_some_and(|object| object.name == name)
+                })
+                .count()
+        }
+
+        /// Pass priority until the top of the stack changes (it resolved).
+        fn resolve_top_entry(runner: &mut GameRunner) {
+            let top = runner.state().stack.last().map(|entry| entry.id);
+            for _ in 0..10 {
+                if runner.state().stack.last().map(|entry| entry.id) != top {
+                    return;
+                }
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("passing priority is legal");
+            }
+            panic!("the top of the stack did not resolve");
+        }
+
+        fn assert_effects_ended(runner: &GameRunner, bird: ObjectId, context: &str) {
+            assert_eq!(
+                effect_count(runner),
+                0,
+                "CR 611.2a + CR 601.2i: {context}: the effect ends as the spell becomes cast"
+            );
+            assert!(
+                has_flying(runner, bird),
+                "CR 611.2a: {context}: the target has its abilities again"
+            );
+        }
+
+        fn assert_effect_kept(runner: &GameRunner, bird: ObjectId, context: &str) {
+            assert_eq!(
+                effect_count(runner),
+                1,
+                "CR 611.2a: {context}: the effect is still in force"
+            );
+            assert!(
+                !has_flying(runner, bird),
+                "CR 611.2a: {context}: the target still has no abilities"
+            );
+        }
+
+        /// B-1: a creature spell becoming cast ends the effect before that
+        /// spell resolves.
+        #[test]
+        fn until_event_ends_when_creature_spell_becomes_cast() {
+            let mut board = board(CREATURE_DEADLINE);
+            activate(&mut board);
+            assert_effect_kept(&board.runner, board.bird, "after the activation");
+
+            let _ = board.runner.cast(board.bear).commit();
+            assert!(
+                on_stack(&board.runner, board.bear),
+                "reach: the creature spell is still on the stack"
+            );
+            assert_effects_ended(&board.runner, board.bird, "creature spell cast");
+        }
+
+        /// B-2: a noncreature spell does not match the event.
+        #[test]
+        fn until_event_survives_a_noncreature_cast() {
+            let mut board = board(CREATURE_DEADLINE);
+            activate(&mut board);
+            board.runner.cast(board.instant).resolve();
+            assert_effect_kept(&board.runner, board.bird, "after a noncreature cast");
+
+            let _ = board.runner.cast(board.bear).commit();
+            assert_effects_ended(&board.runner, board.bird, "later creature cast");
+        }
+
+        /// B-3: a creature spell cast before the effect began is not its
+        /// event, including when it resolves afterwards.
+        #[test]
+        fn until_event_ignores_a_creature_spell_cast_before_it_began() {
+            let mut board = board(CREATURE_DEADLINE);
+            let _ = board.runner.cast(board.bear).commit();
+            activate_onto_stack(&mut board);
+            resolve_top_entry(&mut board.runner);
+            assert!(
+                on_stack(&board.runner, board.bear),
+                "reach: the earlier creature spell is still on the stack"
+            );
+            assert_effect_kept(&board.runner, board.bird, "after the activation");
+
+            board.runner.cast(board.instant).resolve();
+            assert_eq!(
+                board.runner.state().objects[&board.bear].zone,
+                Zone::Battlefield,
+                "reach: the earlier creature spell resolved"
+            );
+            assert_effect_kept(
+                &board.runner,
+                board.bird,
+                "after a noncreature cast and the earlier creature spell's resolution",
+            );
+
+            let _ = board.runner.cast(board.late_bear).commit();
+            assert_effects_ended(&board.runner, board.bird, "later creature cast");
+        }
+
+        /// B-4: a copy of a creature spell is not cast (CR 707.10), so it does
+        /// not end the effect. The creature spell is cast before the effect
+        /// begins and copied after it, so the copy is the only candidate event.
+        #[test]
+        fn until_event_survives_a_copy_of_a_creature_spell() {
+            let mut board = board(CREATURE_DEADLINE);
+            let _ = board.runner.cast(board.bear).commit();
+            activate_onto_stack(&mut board);
+            resolve_top_entry(&mut board.runner);
+            assert_effect_kept(&board.runner, board.bird, "immediately before the copy");
+
+            let _ = board
+                .runner
+                .cast(board.copier)
+                .target_object(board.bear)
+                .commit();
+            resolve_top_entry(&mut board.runner);
+            assert_eq!(
+                stack_entries_named(&board.runner, "Cast Bear"),
+                2,
+                "reach: the copier resolved and put a copy of the creature spell on the stack"
+            );
+            assert_effect_kept(&board.runner, board.bird, "after the copy was created");
+
+            board.runner.advance_until_stack_empty();
+            assert!(
+                board.runner.state().stack.is_empty(),
+                "reach: the copy and the original resolved"
+            );
+            assert_effect_kept(&board.runner, board.bird, "after the copy resolved");
+
+            let _ = board.runner.cast(board.late_bear).commit();
+            assert_effects_ended(&board.runner, board.bird, "later creature cast");
+        }
+
+        /// B-5: the event's spell filter is the parsed filter, not "creature".
+        #[test]
+        fn until_event_matches_its_own_spell_filter() {
+            for spell in ["a noncreature spell", "an instant or sorcery spell"] {
+                let mut board = board(&loses_abilities_until(spell));
+                activate(&mut board);
+                board.runner.cast(board.bear).resolve();
+                assert_effect_kept(
+                    &board.runner,
+                    board.bird,
+                    &format!("{spell}: creature cast"),
+                );
+
+                let _ = board.runner.cast(board.instant).commit();
+                assert!(
+                    on_stack(&board.runner, board.instant),
+                    "reach: {spell}: the instant is still on the stack"
+                );
+                assert_effects_ended(&board.runner, board.bird, &format!("{spell}: instant cast"));
+            }
+        }
+
+        /// B-6: a copy of a card that is cast (CR 707.12) is a cast spell, so a
+        /// cast copy of a creature card ends the effect. The carrier is Reenact
+        /// the Crime; the copy is cast while that spell resolves, not by a
+        /// player's cast action.
+        #[test]
+        fn until_event_ends_when_a_copy_of_a_creature_card_is_cast() {
+            const REENACT_THE_CRIME: &str = "Exile target nonland card in a graveyard that was put there from anywhere this turn. Copy it. You may cast the copy without paying its mana cost.";
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            let source = scenario
+                .add_creature_from_oracle(P0, "Deadline Source", 1, 1, CREATURE_DEADLINE)
+                .id();
+            let bird = scenario
+                .add_creature_from_oracle(P1, "Flying Bird", 1, 1, "Flying")
+                .id();
+            let doomed = scenario.add_creature(P0, "Doomed Bear", 2, 2).id();
+            let destroy =
+                zero_cost_instant(&mut scenario, "Destroy Instant", "Destroy target creature.");
+            let reenact = zero_cost_instant(&mut scenario, "Reenact the Crime", REENACT_THE_CRIME);
+            let mut runner = scenario.build();
+            let index = activated_index(&runner, source);
+            runner.activate(source, index).target_object(bird).resolve();
+            assert_effect_kept(&runner, bird, "after the activation");
+
+            runner.cast(destroy).target_object(doomed).resolve();
+            assert_eq!(
+                runner.state().objects[&doomed].zone,
+                Zone::Graveyard,
+                "reach: the creature card was put into a graveyard this turn"
+            );
+
+            let _ = runner.cast(reenact).target_object(doomed).commit();
+            assert_effect_kept(&runner, bird, "after the noncreature carrier was cast");
+            for _ in 0..10 {
+                if matches!(
+                    runner.state().waiting_for,
+                    WaitingFor::ChooseFromZoneChoice { .. }
+                ) {
+                    break;
+                }
+                runner
+                    .act(GameAction::PassPriority)
+                    .expect("passing priority is legal");
+            }
+            let WaitingFor::ChooseFromZoneChoice { cards, .. } = &runner.state().waiting_for else {
+                panic!(
+                    "reach: the carrier offers the copy cast, got {:?}",
+                    runner.state().waiting_for
+                );
+            };
+            let cards = cards.clone();
+            runner
+                .act(GameAction::SelectCards { cards })
+                .expect("casting the copy is legal");
+            assert!(
+                runner.state().stack.iter().any(|entry| runner
+                    .state()
+                    .objects
+                    .get(&entry.id)
+                    .is_some_and(|object| object.is_copy && object.name == "Doomed Bear")),
+                "reach: the copy of the creature card was cast and is on the stack"
+            );
+            assert_effects_ended(&runner, bird, "a cast copy of a creature card");
+        }
+
+        /// B-7: a second effect frame ("gets +2/+0") carries the same deadline.
+        #[test]
+        fn until_event_ends_a_pump_at_its_own_filter() {
+            let mut board =
+                board("{T}: Target creature gets +2/+0 until a player casts a noncreature spell.");
+            activate(&mut board);
+            let bird = board.bird;
+            let power = |runner: &GameRunner| runner.state().objects[&bird].power;
+            assert_eq!(power(&board.runner), Some(3), "reach: the pump applies");
+
+            board.runner.cast(board.bear).resolve();
+            assert_eq!(
+                power(&board.runner),
+                Some(3),
+                "CR 611.2a: a creature cast is not a noncreature spell"
+            );
+
+            let _ = board.runner.cast(board.instant).commit();
+            assert_eq!(
+                power(&board.runner),
+                Some(1),
+                "CR 611.2a + CR 601.2i: the pump ends as the noncreature spell becomes cast"
+            );
+        }
+
+        /// B-8: the effect's source is a token that ceased to exist in the
+        /// state-based-action pass (CR 704.5d) after the effect began. The
+        /// expiry matches against the source as it was when the effect began,
+        /// so the effect still ends. The card-source board is the reach guard.
+        #[test]
+        fn until_event_ends_after_its_token_source_ceased_to_exist() {
+            for token in [false, true] {
+                let mut board = board(CREATURE_DEADLINE);
+                if token {
+                    make_token(&mut board);
+                }
+                activate(&mut board);
+                board
+                    .runner
+                    .cast(board.destroy)
+                    .target_object(board.source)
+                    .resolve();
+                assert_eq!(
+                    board.runner.state().objects.contains_key(&board.source),
+                    !token,
+                    "reach: token={token}: a destroyed token ceases to exist (CR 704.5d), a card \
+                     stays in the graveyard"
+                );
+                assert_effect_kept(&board.runner, board.bird, "after the source left");
+
+                let _ = board.runner.cast(board.bear).commit();
+                assert_effects_ended(
+                    &board.runner,
+                    board.bird,
+                    &format!("token={token}: creature cast after the source left"),
+                );
+            }
+        }
+
+        /// B-9: the effect's source is a copy of a spell, which ceased to exist
+        /// once it resolved (CR 704.5e). Both the copy's and the original's
+        /// effects end at the creature cast.
+        #[test]
+        fn until_event_ends_after_its_spell_copy_source_ceased_to_exist() {
+            let mut scenario = GameScenario::new();
+            scenario.at_phase(Phase::PreCombatMain);
+            let bird = scenario
+                .add_creature_from_oracle(P1, "Flying Bird", 1, 1, "Flying")
+                .id();
+            let hex = zero_cost_instant(
+                &mut scenario,
+                "Deadline Hex",
+                "Target creature loses all abilities until a player casts a creature spell.",
+            );
+            let copier = zero_cost_instant(&mut scenario, "Spell Copier", "Copy target spell.");
+            let bear = zero_cost_creature(&mut scenario, "Cast Bear");
+            let mut runner = scenario.build();
+
+            let _ = runner.cast(hex).target_object(bird).commit();
+            let _ = runner.cast(copier).target_object(hex).commit();
+            resolve_top_entry(&mut runner);
+            let copy = runner
+                .state()
+                .stack
+                .last()
+                .map(|entry| entry.id)
+                .expect("the copier put a copy of the spell on the stack");
+            assert_ne!(copy, hex, "reach: the top of the stack is the copy");
+            runner.advance_until_stack_empty();
+
+            assert!(
+                !runner.state().objects.contains_key(&copy),
+                "reach: the resolved copy ceased to exist (CR 704.5e)"
+            );
+            assert_eq!(
+                effect_count(&runner),
+                2,
+                "reach: the copy and the original each applied"
+            );
+            assert!(
+                runner
+                    .state()
+                    .transient_continuous_effects
+                    .iter()
+                    .any(|effect| effect.source_id == copy),
+                "reach: one effect's source is the ceased copy"
+            );
+            assert!(
+                !has_flying(&runner, bird),
+                "reach: the target has no abilities"
+            );
+
+            let _ = runner.cast(bear).commit();
+            assert_effects_ended(
+                &runner,
+                bird,
+                "creature cast after the copy ceased to exist",
+            );
+        }
+
+        /// B-10: the source ceased to exist while its ability was on the stack.
+        /// The ability still resolves (CR 113.7a), and the effect it creates
+        /// still ends at a creature cast.
+        #[test]
+        fn until_event_ends_when_its_source_ceased_before_the_effect_began() {
+            let mut board = board(CREATURE_DEADLINE);
+            make_token(&mut board);
+            activate_onto_stack(&mut board);
+            assert_eq!(
+                board.runner.state().stack.len(),
+                1,
+                "reach: the ability is on the stack"
+            );
+
+            let _ = board
+                .runner
+                .cast(board.destroy)
+                .target_object(board.source)
+                .commit();
+            resolve_top_entry(&mut board.runner);
+            assert!(
+                !board.runner.state().objects.contains_key(&board.source),
+                "reach: the token source ceased to exist (CR 704.5d)"
+            );
+            assert_eq!(
+                board.runner.state().stack.len(),
+                1,
+                "reach: the ability is still on the stack"
+            );
+
+            resolve_top_entry(&mut board.runner);
+            assert_effect_kept(&board.runner, board.bird, "after the ability resolved");
+
+            let _ = board.runner.cast(board.bear).commit();
+            assert_effects_ended(
+                &board.runner,
+                board.bird,
+                "creature cast after the source ceased before the effect began",
+            );
+        }
+
+        /// D-8 reading: a dies trigger's source has changed zones before its
+        /// effect is created. The effect still ends at a creature cast.
+        #[test]
+        fn until_event_from_a_dies_trigger_ends_at_a_creature_cast() {
+            let mut board = board(
+                "When this creature dies, target creature loses all abilities until a player casts a creature spell.",
+            );
+            board
+                .runner
+                .cast(board.destroy)
+                .target_objects(&[board.source, board.bird])
+                .resolve();
+            assert_eq!(
+                board.runner.state().objects[&board.source].zone,
+                Zone::Graveyard,
+                "reach: the source died"
+            );
+            assert_effect_kept(&board.runner, board.bird, "after the dies trigger resolved");
+
+            let _ = board.runner.cast(board.bear).commit();
+            assert_effects_ended(
+                &board.runner,
+                board.bird,
+                "creature cast after the source died",
+            );
+        }
     }
 }

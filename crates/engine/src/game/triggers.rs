@@ -12363,7 +12363,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         // without changing what the field MEANS: selectors over a characteristic (`PtStat`,
         // `SharedQuality`, `CounterMatch`, `AttachmentKind`, `DamageKindFilter`, `Zone`),
         // polarity flags (`SharedQualityRelation`, `SourceExclusion`), comparison data
-        // (`Comparator` and the integer bounds beside it), and time windows (`AttackScope` —
+        // (`Comparator` and the integer bounds beside it), and time windows (`CombatHistoryScope` —
         // BOTH legs read the same window, and state moving between them is what CR 603.4's
         // two checks are FOR, not a divergence in the sense this module screens).
     }
@@ -14273,8 +14273,9 @@ fn evaluate_trigger_condition_with_source(
                         .attacking_incarnations_this_combat
                         .contains(&source.identity.reference)
                         || combat
-                            .blocking_incarnations_this_combat
-                            .contains(&source.identity.reference)
+                            .creature_blocked_attackers_this_combat
+                            .iter()
+                            .any(|pair| pair.blocker == source.identity.reference)
                 })
             })
         }
@@ -19726,7 +19727,9 @@ pub mod tests {
     /// Tolsimir. If Tolsimir did not attack, no trigger is created.
     #[test]
     fn tolsimir_attack_trigger_runs_from_parser_through_stack_to_block_legality() {
-        use crate::game::combat::{validate_blockers, AttackTarget, AttackerInfo, CombatState};
+        use crate::game::combat::{
+            validate_blockers, AttackTarget, AttackerInfo, BlockHistoryPair, CombatState,
+        };
         use crate::types::actions::GameAction;
 
         const ORACLE: &str = "Whenever a Wolf you control attacks, if Tolsimir, Midnight's Light attacked this combat, target creature an opponent controls blocks that Wolf this combat if able.";
@@ -19829,13 +19832,19 @@ pub mod tests {
         let mut blocked_only = state.clone();
         let tolsimir_reference =
             ObjectIncarnationRef::from_object(&blocked_only.objects[&tolsimir]);
+        let wolf_reference = ObjectIncarnationRef::from_object(&blocked_only.objects[&wolf]);
         let combat = blocked_only.combat.as_mut().expect("combat exists");
         combat
             .attacking_incarnations_this_combat
             .remove(&tolsimir_reference);
+        // CR 509.1g: a blocker-only source is recorded as the blocker side of a
+        // block-history pair, not in the attacking set.
         combat
-            .blocking_incarnations_this_combat
-            .insert(tolsimir_reference);
+            .creature_blocked_attackers_this_combat
+            .insert(BlockHistoryPair {
+                blocker: tolsimir_reference,
+                attacker: wolf_reference,
+            });
         assert!(!check_trigger_condition(
             &blocked_only,
             &TriggerCondition::SourceAttackedThisCombat,
@@ -27907,6 +27916,7 @@ pub mod tests {
                             .controller(ControllerRef::You),
                     ),
                     target: TargetFilter::SelfRef,
+                    selection: crate::types::ability::AttachSelection::Targeted,
                 },
             );
             execute.optional = true;
@@ -41842,6 +41852,7 @@ pub mod tests {
             condition: None,
             duration_subject: None,
             end_permission: None,
+            duration_event_source: None,
             source_name: "Jhoira".to_string(),
         };
         state.transient_continuous_effects.push_back(grant.clone());
@@ -41936,6 +41947,7 @@ pub mod tests {
                 condition: None,
                 duration_subject: None,
                 end_permission: None,
+                duration_event_source: None,
                 source_name: "Grant source".to_string(),
             });
 
@@ -42081,6 +42093,7 @@ pub mod tests {
                     condition: None,
                     duration_subject: None,
                     end_permission: None,
+                    duration_event_source: None,
                     source_name: "Jhoira of the Ghitu".to_string(),
                 },
             );
@@ -43790,6 +43803,7 @@ pub mod tests {
                 ),
                 total_power_cap: None,
                 keeper_constraint: None,
+                keeper_counter: None,
             },
         );
         let trigger = TriggerDefinition::new(TriggerMode::Phase).execute(ability);

@@ -79,8 +79,9 @@ use crate::analysis::resource::{
     object_class, CounterClass, ObjectClass, ResourceAxis, UnboundedMarkKind,
 };
 use crate::game::bracket_estimate::CommanderBracketTier;
-use crate::game::combat::{AttackTarget, CombatState};
+use crate::game::combat::{AttackTarget, BlockHistoryPair, CombatState};
 use crate::game::deck_loading::DeckEntry;
+use crate::game::triggers::trigger_source_context_for_latch;
 
 use crate::game::game_object::{AttachTarget, BackFaceData, CaseState, GameObject, PhaseStatus};
 
@@ -6621,6 +6622,14 @@ pub enum PendingCounterPostAction {
         subtype: String,
         ability: Box<ResolvedAbility>,
     },
+    /// CR 701.71a: a token-creation replacement paused the Jace token's
+    /// creation; once it settles, choose a Jace token and put `count` loyalty
+    /// counters on it. `count` is N, already determined (CR 608.2h).
+    ContinueEmpowerJaceAfterTokenCreation {
+        controller: PlayerId,
+        source_id: ObjectId,
+        count: u32,
+    },
     InjectPredefinedTokenAbilities {
         object_id: ObjectId,
         /// CR 110.2a + CR 305.1: the incubating effect's actor, retained until
@@ -6783,6 +6792,37 @@ pub enum PendingCounterPostAction {
     /// did not itself require a bump.
     ContinueProliferateActions {
         pending: PendingProliferateActions,
+    },
+    /// CR 608.2c + CR 701.21a + CR 616.1: the keeper marks a keeper-and-dispose
+    /// instruction owed have all landed; sacrifice everything else in scope.
+    ///
+    /// The sacrifice `selections` are deliberately NOT carried across the pause —
+    /// they are re-derived from `kept` by
+    /// `choose_and_sacrifice_rest::unchosen_sacrifice_selections_for_scope` when this
+    /// runs, so the complement is computed against the state as it then is
+    /// (CR 608.2c) and no cursor can go stale across a CR 616.1 choice.
+    ///
+    /// Runs at most once per instruction: `drain_pending_counter_additions` pops the
+    /// post-action off the queue BEFORE invoking it and re-parks only the remainder,
+    /// so a nested pause cannot re-derive and re-execute a sacrifice already begun.
+    ///
+    /// `add-engine-variant` gate, recorded because the verdict is binding:
+    /// * Stage 1 DOES_NOT_EXIST — no post-action resumes a player-scope sacrifice.
+    /// * Stage 2 EXTEND_OK — the `Continue*` members carry structurally disjoint
+    ///   payloads for distinct suspended operations, with no `(op, scope, target)`
+    ///   axis to parameterize over; see `ContinueProliferateActions`'s note.
+    /// * Stage 3 WITHIN_SECTION — payload lies wholly inside CR 701.21a + CR 616.1,
+    ///   and this is a resumption layer, not a leaf-reference layer.
+    ///
+    /// Serialized surface: reaches persisted state through
+    /// `PendingEffectResolved::post_actions` on the `RESOLUTION_STATE_WIRE_VERSION`
+    /// frame wire. A new externally-tagged variant is backward compatible.
+    ContinuePlayerScopeSacrifice {
+        kept: Vec<ObjectId>,
+        scoped_players: Vec<PlayerId>,
+        sacrifice_filter: TargetFilter,
+        source_id: ObjectId,
+        source_controller: PlayerId,
     },
 }
 
@@ -13444,6 +13484,17 @@ pub enum WaitingFor {
         player: PlayerId,
         choices: Vec<ObjectId>,
     },
+    /// CR 701.71a + CR 608.2d: choose a Jace planeswalker token you control.
+    /// Raised only when two or more candidates exist (one candidate
+    /// auto-collapses). `count` is N, determined once before the token-creation
+    /// step (CR 608.2h), so the handler places exactly that many loyalty
+    /// counters on the chosen token without re-reading the board.
+    EmpowerJaceChoice {
+        player: PlayerId,
+        source_id: ObjectId,
+        choices: Vec<ObjectId>,
+        count: u32,
+    },
     /// CR 701.55a: Player chooses one branch while facing a villainous choice,
     /// or another inline resolution-time "choose A or B" effect.
     ChooseOneOfBranch {
@@ -14901,6 +14952,11 @@ pub enum WaitingFor {
         /// `eligible.len()`.
         #[serde(alias = "count")]
         required_count: usize,
+        /// CR 608.2c + CR 122.1: the keeper mark the instruction owes, with its count
+        /// already resolved (CR 608.2h). The `ResolvedAbility` is gone by the time
+        /// `GameAction::ChooseKeptPermanents` resumes, so the mark rides here.
+        #[serde(default)]
+        keeper_counter: Option<(CounterType, u32)>,
         #[serde(default = "default_target_filter_permanent")]
         choose_filter: TargetFilter,
         #[serde(default = "default_target_filter_permanent")]
@@ -15536,6 +15592,7 @@ impl WaitingFor {
             WaitingFor::OutsideGameChoice { .. } => "OutsideGameChoice",
             WaitingFor::ChooseFromZoneChoice { .. } => "ChooseFromZoneChoice",
             WaitingFor::BeholdChoice { .. } => "BeholdChoice",
+            WaitingFor::EmpowerJaceChoice { .. } => "EmpowerJaceChoice",
             WaitingFor::ChooseOneOfBranch { .. } => "ChooseOneOfBranch",
             WaitingFor::ConniveDiscard { .. } => "ConniveDiscard",
             WaitingFor::DiscardChoice { .. } => "DiscardChoice",
@@ -15699,6 +15756,7 @@ impl WaitingFor {
             | WaitingFor::OutsideGameChoice { player, .. }
             | WaitingFor::ChooseFromZoneChoice { player, .. }
             | WaitingFor::BeholdChoice { player, .. }
+            | WaitingFor::EmpowerJaceChoice { player, .. }
             | WaitingFor::ChooseOneOfBranch { player, .. }
             | WaitingFor::LearnChoice { player, .. }
             | WaitingFor::ManifestDreadChoice { player, .. }
@@ -19511,6 +19569,14 @@ declare_game_state! {
     #[serde(default)]
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map_of_hash_set")]
     pub creature_attacked_defenders_this_turn: HashMap<ObjectId, HashSet<PlayerId>>,
+    /// CR 509.1g + CR 400.7 + CR 500.8: The turn-scoped counterpart to
+    /// `CombatState::creature_blocked_attackers_this_combat`, accumulated across
+    /// every combat phase of the turn — effects can add phases to a turn
+    /// (CR 500.8), so this ledger is not limited to a single combat's worth of
+    /// records.
+    #[serde(default)]
+    #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
+    pub creature_blocked_attackers_this_turn: HashSet<BlockHistoryPair>,
     /// CR 500.8 + CR 506.1: Number of combat phases that have begun this turn.
     /// Used by intervening-if triggers that only fire during the first combat phase.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
@@ -21085,6 +21151,13 @@ pub struct TransientContinuousEffect {
     /// non-current sentinel.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_subject: Option<ObjectIncarnationRef>,
+    /// CR 611.2a + CR 400.7: the source context a `Duration::UntilEvent`
+    /// effect's event is matched against, captured when the effect is created
+    /// (as a `WhenNextEvent` delayed trigger carries one). `None` for every
+    /// other duration. Rides inside the journaled
+    /// `ResolvedContinuousEffectCommand`, so replay installs it verbatim.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_event_source: Option<Box<TriggerSourceContext>>,
     /// CR 116.2c: see [`EndEffectPermission`]. `None` for every effect with no
     /// printed termination permission. Set inside the single construction
     /// authority (`add_transient_continuous_effect_with_end_permission`), so it
@@ -24971,22 +25044,45 @@ impl GameState {
     pub fn opponent_attacked(
         &self,
         subject: AttackSubject,
-        scope: crate::types::ability::AttackScope,
+        scope: crate::types::ability::CombatHistoryScope,
         controller: PlayerId,
         source_id: ObjectId,
         target: PlayerId,
     ) -> bool {
-        use crate::types::ability::{AttackScope, AttackSubject};
+        use crate::types::ability::{AttackSubject, CombatHistoryScope};
         match (subject, scope) {
-            (AttackSubject::You, AttackScope::ThisTurn) => self.has_attacked(controller, target),
-            (AttackSubject::Source, AttackScope::ThisTurn) => {
+            (AttackSubject::You, CombatHistoryScope::ThisTurn) => {
+                self.has_attacked(controller, target)
+            }
+            (AttackSubject::Source, CombatHistoryScope::ThisTurn) => {
                 self.creature_attacked_player_this_turn(source_id, target)
             }
-            (AttackSubject::You, AttackScope::ThisCombat) => {
+            (AttackSubject::You, CombatHistoryScope::ThisCombat) => {
                 self.player_attacked_player_this_combat(controller, target)
             }
-            (AttackSubject::Source, AttackScope::ThisCombat) => {
+            (AttackSubject::Source, CombatHistoryScope::ThisCombat) => {
                 self.creature_attacked_player_this_combat(source_id, target)
+            }
+        }
+    }
+
+    /// CR 509.1g + CR 400.7: Did exactly `blocker` block exactly `attacker` within `scope`?
+    pub fn creature_blocked_attacker(
+        &self,
+        blocker: ObjectIncarnationRef,
+        attacker: ObjectIncarnationRef,
+        scope: crate::types::ability::CombatHistoryScope,
+    ) -> bool {
+        use crate::types::ability::CombatHistoryScope;
+        let pair = BlockHistoryPair { blocker, attacker };
+        match scope {
+            CombatHistoryScope::ThisCombat => self.combat.as_ref().is_some_and(|combat| {
+                combat
+                    .creature_blocked_attackers_this_combat
+                    .contains(&pair)
+            }),
+            CombatHistoryScope::ThisTurn => {
+                self.creature_blocked_attackers_this_turn.contains(&pair)
             }
         }
     }
@@ -25234,6 +25330,7 @@ impl GameState {
             attacked_defenders_this_turn: HashMap::new(),
             attacked_defenders_last_turn: Box::default(),
             creature_attacked_defenders_this_turn: HashMap::new(),
+            creature_blocked_attackers_this_turn: HashSet::new(),
             combat_phases_started_this_turn: 0,
             end_steps_started_this_turn: 0,
             creatures_attacked_this_turn: HashSet::new(),
@@ -26014,6 +26111,30 @@ impl GameState {
             .map(|o| o.name.clone())
             .or_else(|| self.lki_cache.get(&source_id).map(|lki| lki.name.clone()))
             .unwrap_or_default();
+        // CR 611.2a + CR 400.7: an event deadline is matched against its source
+        // as it was when the effect began, so the context is captured here and
+        // never re-read from `objects`. CR 113.7a: an activated or triggered
+        // ability resolves even when its source is gone; if the source has
+        // ceased to exist (CR 704.5d / CR 704.5e), its terminal battlefield
+        // departure record is the authority for it (CR 608.2i).
+        let duration_event_source = match duration {
+            Duration::UntilEvent { .. } => self
+                .objects
+                .get(&source_id)
+                .map(|source| trigger_source_context_for_latch(self, source))
+                .or_else(|| {
+                    let record = terminal_battlefield_departure_row(self, source_id)?;
+                    match battlefield_departure_source_context_from_record(record) {
+                        BattlefieldDepartureSourceContext::Present(context) => {
+                            Some(context.clone())
+                        }
+                        BattlefieldDepartureSourceContext::Absent
+                        | BattlefieldDepartureSourceContext::Malformed => None,
+                    }
+                })
+                .map(Box::new),
+            _ => None,
+        };
         let command = ResolvedContinuousEffectCommand {
             effect: TransientContinuousEffect {
                 id,
@@ -26026,6 +26147,7 @@ impl GameState {
                 modifications,
                 condition,
                 duration_subject: bindings.duration_subject,
+                duration_event_source,
                 end_permission,
                 source_name,
             },
@@ -27484,6 +27606,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         attacked_defenders_this_turn: _,
         attacked_defenders_last_turn: _,
         creature_attacked_defenders_this_turn: _,
+        creature_blocked_attackers_this_turn: _,
         combat_phases_started_this_turn: _,
         end_steps_started_this_turn: _,
         creatures_attacked_this_turn: _,
@@ -27825,6 +27948,8 @@ impl PartialEq for GameState {
             && self.attacked_defenders_last_turn == other.attacked_defenders_last_turn
             && self.creature_attacked_defenders_this_turn
                 == other.creature_attacked_defenders_this_turn
+            && self.creature_blocked_attackers_this_turn
+                == other.creature_blocked_attackers_this_turn
             && self.combat_phases_started_this_turn == other.combat_phases_started_this_turn
             && self.end_steps_started_this_turn == other.end_steps_started_this_turn
             && self.creatures_attacked_this_turn == other.creatures_attacked_this_turn
@@ -29880,6 +30005,7 @@ mod tests {
             condition: None,
             duration_subject: Some(ObjectIncarnationRef::of(ObjectId(9), 3)),
             end_permission: None,
+            duration_event_source: None,
             source_name: String::new(),
         };
         let mut legacy = serde_json::to_value(effect).expect("effect serializes");

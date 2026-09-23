@@ -308,6 +308,7 @@ fn human_response_model(waiting_for: &WaitingFor, semantic_owner: PlayerId) -> H
         | WaitingFor::RedistributeLifeTotals { .. }
         | WaitingFor::RevealChoice { .. }
         | WaitingFor::BeholdChoice { .. }
+        | WaitingFor::EmpowerJaceChoice { .. }
         | WaitingFor::ChooseOneOfBranch { .. }
         | WaitingFor::LearnChoice { .. }
         | WaitingFor::ManifestDreadChoice { .. }
@@ -564,6 +565,7 @@ fn classify_waiting_for(waiting_for: &WaitingFor) -> WaitingClassification {
         | WaitingFor::EquipTarget { .. }
         | WaitingFor::RevealChoice { .. }
         | WaitingFor::BeholdChoice { .. }
+        | WaitingFor::EmpowerJaceChoice { .. }
         | WaitingFor::DiscardChoice {
             unless_filter: Some(_),
             ..
@@ -4739,6 +4741,7 @@ fn selection_projection(
         | WaitingFor::RevealChoice { .. }
         | WaitingFor::OutsideGameChoice { .. }
         | WaitingFor::BeholdChoice { .. }
+        | WaitingFor::EmpowerJaceChoice { .. }
         | WaitingFor::ChooseOneOfBranch { .. }
         | WaitingFor::LearnChoice { .. }
         | WaitingFor::ManifestDreadChoice { .. }

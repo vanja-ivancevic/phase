@@ -2,8 +2,8 @@ use std::collections::HashSet;
 
 use crate::ai_support::copy_target_mana_value_ceiling;
 use crate::types::ability::{
-    AbilityDefinition, CopyTargetPurpose, Effect, PostReplacementContinuation, ResolvedAbility,
-    TargetFilter, TargetRef,
+    AbilityDefinition, AttachCardinality, AttachSelection, CopyTargetPurpose, Effect,
+    PostReplacementContinuation, ResolvedAbility, TargetFilter, TargetRef,
 };
 #[cfg(test)]
 use crate::types::ability::{EffectScope, TapStateChange};
@@ -2677,6 +2677,9 @@ fn finish_copy_target_choice_entry(
                     Effect::Attach {
                         attachment: TargetFilter::SelfRef,
                         target: TargetFilter::Any,
+                        selection: AttachSelection::AtResolution {
+                            count: AttachCardinality::One,
+                        },
                     },
                     Vec::new(),
                     source_id,
@@ -5112,6 +5115,7 @@ mod tests {
                 display_name: "Soldier".to_string(),
                 power: Some(2),
                 toughness: Some(2),
+                loyalty: None,
                 core_types: vec![CoreType::Creature],
                 subtypes: vec!["Soldier".to_string()],
                 supertypes: Vec::new(),
@@ -5237,6 +5241,7 @@ mod tests {
                 display_name: "Treasure".to_string(),
                 power: None,
                 toughness: None,
+                loyalty: None,
                 core_types: vec![CoreType::Artifact],
                 subtypes: vec!["Treasure".to_string()],
                 supertypes: Vec::new(),
@@ -5395,6 +5400,7 @@ mod tests {
                 display_name: "Treasure".to_string(),
                 power: None,
                 toughness: None,
+                loyalty: None,
                 core_types: vec![CoreType::Artifact],
                 subtypes: vec!["Treasure".to_string()],
                 supertypes: Vec::new(),
@@ -5570,6 +5576,7 @@ mod tests {
                 display_name: "Treasure".to_string(),
                 power: None,
                 toughness: None,
+                loyalty: None,
                 core_types: vec![CoreType::Artifact],
                 subtypes: vec!["Treasure".to_string()],
                 supertypes: Vec::new(),
@@ -5724,6 +5731,7 @@ mod tests {
                 display_name: "Dog".to_string(),
                 power: Some(2),
                 toughness: Some(2),
+                loyalty: None,
                 core_types: vec![CoreType::Creature],
                 subtypes: vec!["Dog".to_string()],
                 supertypes: Vec::new(),
@@ -5861,6 +5869,7 @@ mod tests {
                 display_name: "Treasure".to_string(),
                 power: None,
                 toughness: None,
+                loyalty: None,
                 core_types: vec![CoreType::Artifact],
                 subtypes: vec!["Treasure".to_string()],
                 supertypes: Vec::new(),

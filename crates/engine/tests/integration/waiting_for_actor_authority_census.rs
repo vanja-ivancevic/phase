@@ -768,9 +768,16 @@ fn every_waiting_for_arm_declares_its_acting_authority() {
     // ReorderLibraryChoice each name the one player who must answer the
     // life-payment or library-order prompt. Both already take the
     // ActingAuthority::One(player) arm; neither is actorless or simultaneous.
-    if declared.len() != 139 {
+    // 139 -> 140 is adjudicated: CR 701.71a's Empower Jace choice (CR 608.2d)
+    // added `EmpowerJaceChoice`. It names one acting `player` — CR 701.71a
+    // gives "Choose a Jace planeswalker token you control" to the player
+    // performing the keyword action, i.e. the resolving controller — and is
+    // classified by `WaitingFor::acting_authority` as
+    // `ActingAuthority::One(player)`. Not actorless: the prompt cannot advance
+    // without that player's `GameAction::SelectCards`.
+    if declared.len() != 140 {
         failures.push(format!(
-            "PIN declared.len()={} != 139.\n\
+            "PIN declared.len()={} != 140.\n\
              \n\
              Adding a `WaitingFor` variant IS the counted event this gate exists to make loud. \
              Repair it by ADJUDICATING, not by bumping the number:\n\

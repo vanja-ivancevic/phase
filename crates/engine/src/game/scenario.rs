@@ -2036,6 +2036,7 @@ impl GameRunner {
             WaitingFor::OutsideGameChoice { .. } => "OutsideGameChoice",
             WaitingFor::ChooseFromZoneChoice { .. } => "ChooseFromZoneChoice",
             WaitingFor::BeholdChoice { .. } => "BeholdChoice",
+            WaitingFor::EmpowerJaceChoice { .. } => "EmpowerJaceChoice",
             WaitingFor::ChooseOneOfBranch { .. } => "ChooseOneOfBranch",
             WaitingFor::ConniveDiscard { .. } => "ConniveDiscard",
             WaitingFor::DiscardChoice { .. } => "DiscardChoice",
