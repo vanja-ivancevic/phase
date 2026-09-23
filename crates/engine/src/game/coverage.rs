@@ -11277,6 +11277,12 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 || effective_lower.contains("as though it had flash")
                 || effective_lower.contains("you may cast this spell for")
                 || effective_lower.contains("you may pay"));
+        // CR 207.2c + CR 601.2f: "This spell costs {…} more to cast for each target
+        // beyond the first" is stored as the card's per-target surcharge rather than
+        // as an ability, so no ability item carries the line. Mirrors the additional
+        // cost arm: the parsed surcharge is the AST half, the wording the other.
+        let covered_by_strive_cost =
+            face.strive_cost.is_some() && lower.contains("for each target beyond the first");
         let covered_by_additional_cost = face.additional_cost.is_some()
             && (lower.starts_with("as an additional cost ")
                 || effective_lower.starts_with("as an additional cost ")
@@ -11887,6 +11893,7 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
             && !covered_by_casting
             && !covered_by_casting_option
             && !covered_by_additional_cost
+            && !covered_by_strive_cost
             && !covered_by_enchant
             && !covered_by_replacement
             && !covered_by_replacement_event
@@ -11919,6 +11926,7 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                 || covered_by_casting
                 || covered_by_casting_option
                 || covered_by_additional_cost
+                || covered_by_strive_cost
                 || covered_by_saga
                 || covered_by_attraction
                 || covered_by_quoted)
