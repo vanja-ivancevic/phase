@@ -8,6 +8,10 @@ import type { AiActionProposal, GameAction, GameState, WaitingFor } from "../../
 import { AdapterError, AdapterErrorCode } from "../../adapter/types";
 import { pressureMultiplier } from "../../utils/stackPressure";
 import { effectiveStackPressure } from "../../utils/stackThroughput";
+import {
+  clearAiDecisionDiagnostic,
+  recordAiDecisionDiagnostic,
+} from "../aiDecisionDiagnostics";
 import { debugLog } from "../debugLog";
 import { dispatchAiActionProposal } from "../dispatch";
 import { attemptStateRehydrate, isEnginePanic, notifyEngineLost, routePanic } from "../engineRecovery";

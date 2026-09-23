@@ -4260,6 +4260,9 @@ fn instruction_outlives_declined_gate(
         target_selection_mode: _,
         chosen_players: _,
         replacement_applied: _,
+        // Fork-added flag recording whether the declined cost was a cumulative
+        // upkeep; the payment handler reads it, the gate audit does not.
+        unless_was_cumulative_upkeep: _,
         parent_target_missing_reason: _,
     } = node;
     let unbound = condition.is_none()

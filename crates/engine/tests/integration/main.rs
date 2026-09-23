@@ -275,6 +275,7 @@ mod dragon_man_reformed_robot_graveyard_discard_cost;
 mod dragon_whelp_activation_threshold_8388;
 mod dragonstorm_forecaster_named_or_tutor;
 mod drain_life_pre_damage_cap;
+mod drake_familiar_unrestricted_return_to_hand;
 mod draw_delivery_preview;
 mod draw_from_general_post_replacement;
 mod draw_preflight_matches_live_pipeline;
