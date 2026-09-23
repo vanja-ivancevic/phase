@@ -4721,6 +4721,11 @@ fn audit_later_instruction(effect: &Effect) -> LaterInstructionAudit<'_> {
         | Effect::Intensify { .. }
         | Effect::DraftFromSpellbook { .. }
         | Effect::ChooseOneOf { .. }
+        // Fork-added variants with no upstream counterpart: refused like every
+        // other unaudited shape until a later sync adjudicates them.
+        | Effect::LoseAllUnspentMana { .. }
+        | Effect::RepeatPaidLibraryLook
+        | Effect::RevealChosenLowestManaValueCreatures
         | Effect::Unimplemented { .. } => (None, ParentTargetHandling::NotAudited),
     };
     let mut quantities_fixed = true;

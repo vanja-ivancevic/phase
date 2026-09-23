@@ -32430,6 +32430,7 @@ impl PartialEq for ResolvedAbility {
             copy_count_status: a_copy_count_status,
             forward_result: a_forward_result,
             unless_pay: a_unless_pay,
+            unless_was_cumulative_upkeep: a_unless_was_cumulative_upkeep,
             distribution: a_distribution,
             distribute: a_distribute,
             player_scope: a_player_scope,
@@ -32492,6 +32493,7 @@ impl PartialEq for ResolvedAbility {
             copy_count_status: b_copy_count_status,
             forward_result: b_forward_result,
             unless_pay: b_unless_pay,
+            unless_was_cumulative_upkeep: b_unless_was_cumulative_upkeep,
             distribution: b_distribution,
             distribute: b_distribute,
             player_scope: b_player_scope,
@@ -32554,6 +32556,7 @@ impl PartialEq for ResolvedAbility {
             && a_copy_count_status == b_copy_count_status
             && a_forward_result == b_forward_result
             && a_unless_pay == b_unless_pay
+            && a_unless_was_cumulative_upkeep == b_unless_was_cumulative_upkeep
             && a_distribution == b_distribution
             && a_distribute == b_distribute
             && a_player_scope == b_player_scope
