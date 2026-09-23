@@ -19009,6 +19009,97 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
         );
     }
 
+    /// The mirror image of a silent drop: cards the audit flagged while the AST
+    /// already carries the semantics. Each case is the whole card — its real Oracle
+    /// text and the parsed shape the parser really produces — and the assertion is
+    /// scoped to the flagged line, because other lines of the same card may
+    /// legitimately carry findings.
+    ///
+    /// - `CountsAsNamed` models "effects from spells named X count it as a card
+    ///   named X" (Diligent Farmhand, Pardic Firecat).
+    /// - `strive_cost` models "this spell costs {1} more to cast for each target
+    ///   beyond the first" (Fireball).
+    /// - an opponent-chooser modal models "An opponent chooses one —" plus its two
+    ///   bullets as one modal with two mode descriptions (Library of Lat-Nam,
+    ///   Misfortune).
+    #[test]
+    fn pool_cards_flagged_while_their_ast_is_complete() {
+        for (name, types, oracle, flagged_fragment) in [
+            (
+                "Diligent Farmhand",
+                vec!["Creature"],
+                "{1}{G}, Sacrifice this creature: Search your library for a basic land card, put that card onto the battlefield tapped, then shuffle.\nIf this card is in a graveyard, effects from spells named Muscle Burst count it as a card named Muscle Burst.",
+                "count it as a card named",
+            ),
+            (
+                "Pardic Firecat",
+                vec!["Creature"],
+                "Haste\nIf this card is in a graveyard, effects from spells named Flame Burst count it as a card named Flame Burst.",
+                "count it as a card named",
+            ),
+            (
+                "Fireball",
+                vec!["Sorcery"],
+                "This spell costs {1} more to cast for each target beyond the first.\nFireball deals X damage divided evenly, rounded down, among any number of targets.",
+                "more to cast for each target beyond the first",
+            ),
+            (
+                "Library of Lat-Nam",
+                vec!["Sorcery"],
+                "An opponent chooses one \u{2014}\n\u{2022} You draw three cards at the beginning of the next turn's upkeep.\n\u{2022} You search your library for a card, put that card into your hand, then shuffle.",
+                "an opponent chooses one",
+            ),
+            (
+                "Misfortune",
+                vec!["Sorcery"],
+                "An opponent chooses one \u{2014}\n\u{2022} You put a +1/+1 counter on each creature you control and gain 4 life.\n\u{2022} You put a -1/-1 counter on each creature that player controls and Misfortune deals 4 damage to that player.",
+                "an opponent chooses one",
+            ),
+        ] {
+            let type_refs: Vec<String> = types.iter().map(|s| s.to_string()).collect();
+            let parsed = crate::parser::parse_oracle_text(oracle, name, &[], &type_refs, &[]);
+
+            let mut face = make_face();
+            face.name = name.to_string();
+            face.oracle_text = Some(oracle.to_string());
+            face.keywords = parsed.extracted_keywords;
+            face.abilities = parsed.abilities;
+            face.triggers = parsed.triggers;
+            face.static_abilities = parsed.statics;
+            face.replacements = parsed.replacements;
+            face.modal = parsed.modal;
+            face.strive_cost = parsed.strive_cost;
+            face.additional_cost = parsed.additional_cost;
+
+            let findings = audit_card_lines(oracle, &face);
+            let hit = findings
+                .iter()
+                .find(|finding| {
+                    finding_line(finding)
+                        .to_ascii_lowercase()
+                        .contains(flagged_fragment)
+                });
+            assert!(
+                hit.is_none(),
+                "{name}: the AST carries this line's semantics, so the audit must not \
+                 report it: {hit:?}\nall findings: {findings:?}"
+            );
+        }
+    }
+
+    /// Every `SemanticFinding` carries the Oracle line it is about; matching
+    /// exhaustively keeps a future variant from silently escaping the test above.
+    fn finding_line(finding: &SemanticFinding) -> &str {
+        match finding {
+            SemanticFinding::WrongAbilityType { oracle_line, .. }
+            | SemanticFinding::UnimplementedSubEffect { oracle_line, .. }
+            | SemanticFinding::DroppedCondition { oracle_line, .. }
+            | SemanticFinding::DroppedDuration { oracle_line, .. }
+            | SemanticFinding::WrongParameter { oracle_line, .. }
+            | SemanticFinding::SilentDrop { oracle_line } => oracle_line,
+        }
+    }
+
     #[test]
     fn defiler_cost_reduction_static_does_not_count_as_silent_drop() {
         let mut face = make_face();
