@@ -2098,10 +2098,14 @@ pub(super) fn target_choice_timing_for_clause(clause_ir: &ClauseIr) -> TargetCho
             scope: EffectScope::Single,
             ..
         }
-    ) && ((clause_ir.multi_target.is_some()
-        && !nom_primitives::scan_contains(&lower, "target "))
+    ) && (clause_ir.multi_target.is_some()
         || clause_ir.parsed.multi_target.is_some()
         || clause_ir.repeat_for.is_some())
+        // CR 115.1d: a printed "target" means the slot is announced when the
+        // spell is cast, so this is not a resolution-time picker. The fork's
+        // counted-tap disjuncts (Tangle Wire's "tap an untapped … for each fade
+        // counter") are non-targeted, so the guard leaves them resolution-time.
+        && !nom_primitives::scan_contains(&lower, "target ")
     {
         return TargetChoiceTiming::Resolution;
     }

@@ -5300,14 +5300,20 @@ fn parse_unless_return_to_hand(rest: &str) -> Option<AbilityCost> {
     // Derive from_zone from FilterProp::InZone that parse_target absorbed from zone suffixes.
     let from_zone = filter.extract_in_zone();
 
-    // Ensure controller scoping — parse_target sets it from "you control" but
-    // some forms omit it (e.g., "a basic land card from your graveyard").
-    let filter = match &filter {
-        TargetFilter::Typed(tf) if tf.controller.is_some() => filter,
-        _ => TargetFilter::And {
-            filters: vec![TargetFilter::Controller, filter],
-        },
-    };
+    // NO additional ownership/controller scoping is applied here — `parse_target`
+    // (specifically its zone-suffix combinator, `parse_zone_suffix` in
+    // `oracle_target.rs`) already encodes exactly the ownership the printed
+    // phrase specifies, per-qualifier: "you control" / "your graveyard" sets
+    // `tf.controller = Some(You)`; "an opponent's graveyard" / "target player's
+    // graveyard" / "their graveyard" stamp `FilterProp::Owned{Opponent /
+    // TargetPlayer / ScopedPlayer}`; a bare/indefinite/definite zone ("a
+    // graveyard", "the graveyard") or no zone at all (Drake Familiar — "an
+    // enchantment to its owner's hand") carries NO ownership restriction and is
+    // left exactly as parsed. A prior version of this function force-added a
+    // controller/owner scope onto every zone-qualified filter, which wrongly
+    // narrowed an unrestricted zone (any player's graveyard) down to only the
+    // payer's — the same class of bug Drake Familiar's battlefield case had,
+    // just one level down in the zone-possessive grammar.
 
     Some(AbilityCost::ReturnToHand {
         count,
