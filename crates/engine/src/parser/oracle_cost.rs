@@ -348,6 +348,7 @@ fn fixup_bare_noun_continuations(costs: &mut [AbilityCost]) {
         Sacrifice,
         Exile { zone: Option<Zone> },
         TapCreatures,
+        Discard,
     }
 
     let mut last_verb: Option<PrecedingVerb> = None;
@@ -359,6 +360,12 @@ fn fixup_bare_noun_continuations(costs: &mut [AbilityCost]) {
                 last_verb = Some(PrecedingVerb::Exile { zone: *zone })
             }
             AbilityCost::TapCreatures { .. } => last_verb = Some(PrecedingVerb::TapCreatures),
+            // CR 118.12 + CR 701.9: "discard an Island card and another card"
+            // (Foil). The conjoined continuation is a second hand discard, and it
+            // must NOT be merged into the first: costs are paid in sequence, so
+            // the second discard sees a hand the first card has already left,
+            // which is what makes the printed "another" hold.
+            AbilityCost::Discard { .. } => last_verb = Some(PrecedingVerb::Discard),
             AbilityCost::Unimplemented { description } if last_verb.is_some() => {
                 if description.trim().is_empty() {
                     continue;
@@ -395,6 +402,14 @@ fn fixup_bare_noun_continuations(costs: &mut [AbilityCost]) {
                                 requirement: TapCreaturesRequirement::count(count),
                                 filter,
                             },
+                            PrecedingVerb::Discard => AbilityCost::Discard {
+                                count: QuantityExpr::Fixed {
+                                    value: count as i32,
+                                },
+                                filter: Some(filter),
+                                selection: crate::types::ability::CardSelectionMode::Chosen,
+                                self_scope: crate::types::ability::DiscardSelfScope::FromHand,
+                            },
                         };
                     }
                     // An explicit-count continuation is terminal: only the
@@ -430,6 +445,12 @@ fn fixup_bare_noun_continuations(costs: &mut [AbilityCost]) {
                     PrecedingVerb::TapCreatures => AbilityCost::TapCreatures {
                         requirement: TapCreaturesRequirement::count(1),
                         filter,
+                    },
+                    PrecedingVerb::Discard => AbilityCost::Discard {
+                        count: QuantityExpr::Fixed { value: 1 },
+                        filter: Some(filter),
+                        selection: crate::types::ability::CardSelectionMode::Chosen,
+                        self_scope: crate::types::ability::DiscardSelfScope::FromHand,
                     },
                 };
             }
