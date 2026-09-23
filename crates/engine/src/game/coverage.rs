@@ -11548,6 +11548,29 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
             }
         });
 
+        // CR 508.1d: old-border printings spell an attack requirement as
+        // "If <attack event>, <subject> [also] attacks if able" (Ekundu Cyclops,
+        // Viashino Bey, Magnetic Web). The document router normalizes that bounded
+        // legacy form into a trigger, so the requirement lives in the trigger's
+        // execute as a `MustAttack` static — there is no `face.abilities` entry for
+        // the analogous predicate above to see. Key on the parsed requirement, not
+        // on the wording: a card whose clause really was dropped must stay reported.
+        let covered_by_trigger_static_mode = (effective_lower.contains("attacks if able")
+            || effective_lower.contains("attack if able"))
+            && face.triggers.iter().any(|trigger| {
+                trigger
+                    .execute
+                    .as_deref()
+                    .is_some_and(|execute| match &*execute.effect {
+                        Effect::GenericEffect {
+                            static_abilities, ..
+                        } => static_abilities
+                            .iter()
+                            .any(|static_def| matches!(static_def.mode, StaticMode::MustAttack)),
+                        _ => false,
+                    })
+            });
+
         // Abilities matched by effect type when they lack a description.
         // Covers "damage can't be prevented" (AddRestriction/DamagePreventionDisabled),
         // "you may cast ... from" (CastFromZone), and similar patterns where the parser
@@ -11840,6 +11863,7 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
             && !covered_by_attraction
             && !covered_by_static_mode
             && !covered_by_ability_static_mode
+            && !covered_by_trigger_static_mode
             && !covered_by_ability_effect_type
             && !covered_by_quoted
         {
@@ -18919,6 +18943,70 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                 "deck-construction line should not count as a runtime oracle line: {oracle}"
             );
         }
+    }
+
+    /// CR 508.1d: old-border printings spell an attack requirement as
+    /// "If <attack event>, <subject> [also] attacks if able" (Ekundu Cyclops,
+    /// Viashino Bey, Magnetic Web). The document router normalizes that bounded
+    /// legacy form into a trigger whose execute installs a `MustAttack` static, so
+    /// the line is expressed. Before the trigger-side arm existed, all three were
+    /// reported as silent drops even though the AST carried the requirement.
+    #[test]
+    fn legacy_if_attack_requirement_lines_are_not_silent_drops() {
+        for (name, types, oracle) in [
+            (
+                "Ekundu Cyclops",
+                vec!["Creature"],
+                "If a creature you control attacks, this creature also attacks if able.",
+            ),
+            (
+                "Viashino Bey",
+                vec!["Creature"],
+                "If this creature attacks, all creatures you control attack if able.",
+            ),
+            (
+                "Magnetic Web",
+                vec!["Artifact"],
+                "If a creature with a magnet counter on it attacks, all creatures with magnet counters on them attack if able.",
+            ),
+        ] {
+            let type_refs: Vec<String> = types.iter().map(|s| s.to_string()).collect();
+            let parsed = crate::parser::parse_oracle_text(oracle, name, &[], &type_refs, &[]);
+            assert!(
+                parsed.triggers.iter().any(|trigger| trigger.execute.is_some()),
+                "{name} should route the legacy form as a trigger"
+            );
+
+            let mut face = make_face();
+            face.name = name.to_string();
+            face.oracle_text = Some(oracle.to_string());
+            face.triggers = parsed.triggers;
+
+            let findings = audit_card_lines(oracle, &face);
+            assert!(
+                !findings
+                    .iter()
+                    .any(|f| matches!(f, SemanticFinding::SilentDrop { .. })),
+                "{name}'s modeled attack requirement is not a drop: {findings:?}"
+            );
+        }
+    }
+
+    /// The trigger-side arm keys on the parsed requirement, never on the wording:
+    /// the same sentence carrying no requirement must still report a drop.
+    #[test]
+    fn legacy_if_attack_requirement_line_without_the_requirement_is_still_a_silent_drop() {
+        const ORACLE: &str = "If this creature attacks, all creatures you control attack if able.";
+        let mut face = make_face();
+        face.oracle_text = Some(ORACLE.to_string());
+
+        let findings = audit_card_lines(ORACLE, &face);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f, SemanticFinding::SilentDrop { .. })),
+            "the wording alone must not cover the line: {findings:?}"
+        );
     }
 
     #[test]
