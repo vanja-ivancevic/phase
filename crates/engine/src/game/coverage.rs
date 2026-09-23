@@ -8509,6 +8509,30 @@ fn is_modal_header_line(lower: &str) -> bool {
     if CHOOSE_PHRASES.iter().any(|p| lower.contains(p)) {
         return true;
     }
+    // Third-person headers ("An opponent chooses one —", "That player chooses two
+    // —") are how a modal with someone other than the caster as chooser prints;
+    // Library of Lat-Nam and Misfortune are written this way. Recognizing the
+    // header only folds the bullets into it, so the line still has to be
+    // represented by the parsed modal for the count to balance.
+    const CHOOSES_PHRASES: &[&str] = &[
+        "chooses one",
+        "chooses two",
+        "chooses three",
+        "chooses four",
+        "chooses five",
+        "chooses six",
+        "chooses seven",
+        "chooses eight",
+        "chooses nine",
+        "chooses ten",
+        "chooses any number",
+        "chooses up to one",
+        "chooses up to two",
+        "chooses up to three",
+    ];
+    if CHOOSES_PHRASES.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
     // CR 700.2 + CR 107.3m: a dynamic modal header ("choose up to X —",
     // "choose up to that many.") plus its bulleted modes is one logical unit;
     // fold the bullets into the header so a parsed modal (1 parent + N
@@ -19096,7 +19120,24 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                     .to_ascii_lowercase()
                     .contains(flagged_fragment)
             }) {
-                failures.push(format!("{name}: {hit:?}"));
+                let details = build_parse_details_for_face(&face);
+                let items: Vec<String> = details
+                    .iter()
+                    .map(|item| {
+                        format!(
+                            "{:?}/{} counted={} source={:?}",
+                            item.category,
+                            item.label,
+                            counts_as_oracle_line(item),
+                            item.source_text
+                        )
+                    })
+                    .collect();
+                failures.push(format!(
+                    "{name}: {hit:?}\n    oracle lines ({}): {:?}\n    items: {items:?}",
+                    effective_oracle_lines(oracle).len(),
+                    effective_oracle_lines(oracle),
+                ));
             }
         }
         assert!(
