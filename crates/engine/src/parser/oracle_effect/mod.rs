@@ -3400,8 +3400,10 @@ pub(crate) fn is_turn_bound_graveyard_play_and_redirect(text: &str) -> bool {
     // router parses line-by-line - so the GRANT sentence alone must arm the
     // chain; its redirect is the constant second half and is emitted with it.
     let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    collapsed.eq_ignore_ascii_case(GRAVEYARD_PLAY_AND_REDIRECT)
-        || collapsed.eq_ignore_ascii_case(GRAVEYARD_PLAY_CLAUSE)
+    // Card-level grant lines only: an activated ability's effect text carries the
+    // activated cost in front (Magus of the Will), and card-level dispatch must
+    // never reach into it.
+    collapsed.eq_ignore_ascii_case(GRAVEYARD_PLAY_CLAUSE)
 }
 
 /// CR 614.1a + CR 514.2 + CR 611.2c: Recognize the one-shot spell/trigger form
@@ -37437,9 +37439,12 @@ pub(crate) fn parse_effect_chain_ir(
     // splitting would divide both clauses at grammar that is essential to their
     // meaning. This is keyed to the complete rules text, not a card name.
     if is_turn_bound_graveyard_play_and_redirect(full_text) {
-        let redirect =
-            try_parse_temporary_own_graveyard_exile_replacement(GRAVEYARD_REDIRECT_CLAUSE)
-                .expect("the canonical graveyard redirect clause must parse");
+        // Card files print the two sentences on separate lines, so a deck-facing
+        // card arms the chain on the grant sentence alone and the redirect
+        // sentence arrives as its own line through the ordinary dispatch. Only
+        // the single-line spelling carries both sentences in one text, and only
+        // then does the chain install the redirect with the grant.
+        let grant_only = full_text.trim() == GRAVEYARD_PLAY_CLAUSE;
         let mut graveyard_builder = ClauseIrBuilder::new(full_text);
         graveyard_builder
             .clause(
@@ -37452,17 +37457,25 @@ pub(crate) fn parse_effect_chain_ir(
                 },
             )
             .push();
-        graveyard_builder
-            .clause(
-                GRAVEYARD_REDIRECT_CLAUSE,
-                parsed_clause(redirect),
-                None,
-                ClauseDisposition::Emit {
-                    followup: None,
-                    intrinsic: None,
-                },
-            )
-            .push();
+        // The redirect sentence travels as its own line for deck-facing cards, and
+        // the ordinary dispatch installs it there; only the single-line spelling
+        // needs the chain to carry it alongside the grant.
+        if !grant_only {
+            let redirect =
+                try_parse_temporary_own_graveyard_exile_replacement(GRAVEYARD_REDIRECT_CLAUSE)
+                    .expect("the canonical graveyard redirect clause must parse");
+            graveyard_builder
+                .clause(
+                    GRAVEYARD_REDIRECT_CLAUSE,
+                    parsed_clause(redirect),
+                    None,
+                    ClauseDisposition::Emit {
+                        followup: None,
+                        intrinsic: None,
+                    },
+                )
+                .push();
+        }
         return EffectChainIr {
             clauses: graveyard_builder.finish(),
             kind,

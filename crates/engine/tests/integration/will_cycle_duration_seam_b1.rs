@@ -496,11 +496,14 @@ fn v4a_this_combat_window_stamps_end_of_combat() {
 }
 
 // ── V5 ────────────────────────────────────────────────────────────────────
-// **REGRESSION GUARD — NOT A DISCRIMINATING TEST.** These four assertions hold
-// identically before AND after U1/U2, by design: B1 makes zero cards supported.
-// The row exists to prove B1 did not accidentally start claiming coverage it
-// has not built. Both of its reach-guards are required, because every assertion
-// here is a negative.
+// **PIN — updated when the grant body shipped.** Written when B1's exact-match
+// recognizer could not fire on the newline-separated card file, so the cards
+// stayed honestly unsupported; that premise is false since the recognizer
+// collapsed whitespace and the chain began emitting the play grant. The row
+// keeps its discriminating duties: the grant must be real, the emblem count
+// must stay zero, the redirect must install exactly once per card, and Magus
+// of the Will must still produce none (its clause sits inside an activated
+// ability's effect text that card-level dispatch never reaches).
 
 const YAWGMOTHS_WILL: &str = "Until end of turn, you may play lands and cast spells from your graveyard.\nIf a card would be put into your graveyard from anywhere this turn, exile that card instead.";
 const GAEAS_WILL: &str = "Suspend 4—{G}\nUntil end of turn, you may play lands and cast spells from your graveyard.\nIf a card would be put into your graveyard from anywhere this turn, exile that card instead.";
@@ -515,28 +518,40 @@ fn v5_will_cycle_cards_remain_honestly_unsupported() {
     // The install count is EXACT, not a presence flag: each card's line 2 is one
     // clause and must install exactly one definition, so a duplicate install is
     // as much a failure as a missing one.
-    for (text, name, types, expected_installs) in [
+    for (text, name, types, expected_installs, expected_grant) in [
         // The two Sorceries expose their line-2 clause to the card-level line
         // dispatch; Magus does not, because its line 2 is inside an activated
-        // ability's effect text.
-        (YAWGMOTHS_WILL, "Yawgmoth's Will", &["Sorcery"][..], 1usize),
-        (GAEAS_WILL, "Gaea's Will", &["Sorcery"][..], 1usize),
+        // ability's effect text. The grant rides the card-level play/redirect
+        // chain, so Magus keeps an honest stub instead.
+        (
+            YAWGMOTHS_WILL,
+            "Yawgmoth's Will",
+            &["Sorcery"][..],
+            1usize,
+            true,
+        ),
+        (GAEAS_WILL, "Gaea's Will", &["Sorcery"][..], 1usize, true),
         (
             MAGUS_OF_THE_WILL,
             "Magus of the Will",
             &["Creature"][..],
             0usize,
+            false,
         ),
     ] {
         let parsed = parse_with_types(text, name, types);
 
-        // (i) coverage stays RED — the permission body is still unimplemented.
-        assert!(
-            parsed
-                .abilities
-                .iter()
-                .any(|a| matches!(&*a.effect, Effect::Unimplemented { .. })),
-            "{name}: must still report an Unimplemented effect"
+        // (i) The permission body's dispatch follows the card-level route: the
+        // two pool Sorceries are granted through the chain, while Magus's
+        // activated ability keeps its honest stub (card-level dispatch does not
+        // reach inside an activated ability's effect text).
+        let granted = parsed
+            .abilities
+            .iter()
+            .any(|a| matches!(&*a.effect, Effect::GrantCastingPermission { .. }));
+        assert_eq!(
+            granted, expected_grant,
+            "{name}: grant/dispatch split per card-level route: {parsed:#?}"
         );
         // (ii) B1 fabricates no emblem.
         assert!(
