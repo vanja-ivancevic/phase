@@ -25388,6 +25388,46 @@ fn foil_alternative_cost_is_a_conjoined_hand_discard() {
     );
 }
 
+/// Yawgmoth's Will prints its two sentences on separate lines; the exact-match
+/// recognizer for the linked graveyard play/redirect pair must therefore compare
+/// with whitespace collapsed, or the grant stubs at "play lands" while the
+/// cast-spells half parses — which is how the card reached the pool worklist.
+#[test]
+fn yawgmoths_will_newline_separated_play_and_redirect_chain() {
+    let oracle = "Until end of turn, you may play lands and cast spells from your \
+                  graveyard.\nIf a card would be put into your graveyard from anywhere this turn, \
+                  exile that card instead.";
+    let parsed = parse(oracle, "Yawgmoth's Will", &[], &["Sorcery"], &[]);
+    assert!(
+        !parsed_has_unimplemented(&parsed),
+        "the linked graveyard play/redirect pair must parse without stubs: {parsed:#?}"
+    );
+
+    let rendered = format!("{:#?}", parsed.abilities);
+    let lowered = rendered.to_lowercase();
+
+    // CR 406.6 + CR 614.1a: the grant permits playing cards from YOUR GRAVEYARD
+    // (the zone rides the filter; the permission enum names the off-battlefield
+    // play mode), and it expires with the turn.
+    assert!(
+        lowered.contains("grantcastingpermission")
+            && lowered.contains("inzone")
+            && lowered.contains("graveyard"),
+        "the grant must carry the graveyard zone: {rendered}"
+    );
+    // CR 614.1a: the exile-instead redirect is modeled as a replacement the
+    // resolving effect installs, with the turn expiry the card's second sentence
+    // demands.
+    assert!(
+        lowered.contains("addtargetreplacement") && lowered.contains("graveyard"),
+        "the exile-instead redirect must be modeled: {rendered}"
+    );
+    assert!(
+        lowered.contains("endofturn"),
+        "the temporary grant and redirect must expire with the turn: {rendered}"
+    );
+}
+
 #[test]
 fn activated_draw_for_each_color_among_permanents_uses_distinct_colors_quantity() {
     let parsed = parse(

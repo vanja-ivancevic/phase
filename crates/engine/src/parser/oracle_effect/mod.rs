@@ -3396,8 +3396,12 @@ const GRAVEYARD_REDIRECT_CLAUSE: &str =
 /// Dispatches the complete text form before the second sentence is classified
 /// as an object-hosted replacement ability.
 pub(crate) fn is_turn_bound_graveyard_play_and_redirect(text: &str) -> bool {
-    text.trim()
-        .eq_ignore_ascii_case(GRAVEYARD_PLAY_AND_REDIRECT)
+    // Card files print the two sentences on separate lines, and the ability
+    // router parses line-by-line - so the GRANT sentence alone must arm the
+    // chain; its redirect is the constant second half and is emitted with it.
+    let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.eq_ignore_ascii_case(GRAVEYARD_PLAY_AND_REDIRECT)
+        || collapsed.eq_ignore_ascii_case(GRAVEYARD_PLAY_CLAUSE)
 }
 
 /// CR 614.1a + CR 514.2 + CR 611.2c: Recognize the one-shot spell/trigger form
