@@ -3396,14 +3396,19 @@ const GRAVEYARD_REDIRECT_CLAUSE: &str =
 /// Dispatches the complete text form before the second sentence is classified
 /// as an object-hosted replacement ability.
 pub(crate) fn is_turn_bound_graveyard_play_and_redirect(text: &str) -> bool {
-    // Card files print the two sentences on separate lines, and the ability
-    // router parses line-by-line - so the GRANT sentence alone must arm the
-    // chain; its redirect is the constant second half and is emitted with it.
+    // Card files print the two sentences on separate lines and the router parses
+    // line-by-line, so two card-level spellings reach this predicate: the grant
+    // sentence alone (the redirect then arrives as its own line and installs
+    // through the ordinary dispatch), and both sentences in one text (the chain
+    // must carry the redirect with the grant). Whitespace is collapsed first
+    // because the pair can also be spelled across a newline.
+    //
+    // Endpoint equality is what keeps an activated ability's effect text out:
+    // Magus of the Will carries its activated cost in front, so its line equals
+    // neither spelling, and card-level dispatch must never reach into it.
     let collapsed: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    // Card-level grant lines only: an activated ability's effect text carries the
-    // activated cost in front (Magus of the Will), and card-level dispatch must
-    // never reach into it.
     collapsed.eq_ignore_ascii_case(GRAVEYARD_PLAY_CLAUSE)
+        || collapsed.eq_ignore_ascii_case(GRAVEYARD_PLAY_AND_REDIRECT)
 }
 
 /// CR 614.1a + CR 514.2 + CR 611.2c: Recognize the one-shot spell/trigger form
