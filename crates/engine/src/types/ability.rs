@@ -6757,6 +6757,29 @@ pub enum FilterProp {
     /// CR 510.1: Object was dealt damage during this turn.
     /// Checks `damage_marked > 0` (damage persists until cleanup step).
     WasDealtDamageThisTurn,
+    /// CR 120.1 + CR 603.4 + CR 608.2i: This object was dealt damage during
+    /// this turn **by the ability's source** — the source-qualified sibling of
+    /// `WasDealtDamageThisTurn`.
+    ///
+    /// Reads the same turn-scoped `state.damage_dealt_this_turn` ledger, but
+    /// additionally requires `record.source_id == <ability source>`. The ledger
+    /// is keyed by the battlefield ObjectId and survives the object's zone
+    /// change (see the `WasDealtDamageThisTurn` note above), so the predicate
+    /// still answers for a card that has since died — which is exactly the
+    /// referent Krovikan Vampire's reanimation names ("put **that card** onto
+    /// the battlefield under your control", where "that card" is the creature
+    /// this Vampire damaged this turn that died).
+    ///
+    /// Deliberately a UNIT variant (no `TargetFilter` payload): the only
+    /// printed form this models binds the source to the ability's own source
+    /// ("dealt damage by this creature / Krovikan Vampire this turn"), and
+    /// `FilterProp` is `Copy`, so a nested filter is not representable here.
+    /// The general source-FILTER form ("dealt damage this turn by a creature
+    /// you controlled") already exists as
+    /// `TriggerCondition::DealtDamageThisTurnBySource { source }` /
+    /// `ReplacementCondition::DealtDamageThisTurnBySource { source }`, which
+    /// carry the filter at the condition layer instead.
+    WasDealtDamageBySourceThisTurn,
     /// CR 120.1: This object *dealt* damage during this turn — i.e. it was the
     /// SOURCE of a damage event ("target creature ... that dealt damage this
     /// turn", Red Guardian, Super-Soldier). The active-voice counterpart of

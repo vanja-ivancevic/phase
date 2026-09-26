@@ -340,6 +340,7 @@ fn filter_prop_uses_object_population(prop: &FilterProp) -> bool {
         | FilterProp::NotHistoric
         | FilterProp::InAnyZone { .. }
         | FilterProp::WasDealtDamageThisTurn
+        | FilterProp::WasDealtDamageBySourceThisTurn
         | FilterProp::DealtDamageThisTurn { .. }
         | FilterProp::EnteredThisTurn
         | FilterProp::ControlledContinuouslySinceTurnBegan
@@ -772,6 +773,7 @@ fn filter_prop_characteristic_reads_at(prop: &FilterProp, depth: u32) -> Charact
         | FilterProp::Goaded
         | FilterProp::InAnyZone { .. }
         | FilterProp::WasDealtDamageThisTurn
+        | FilterProp::WasDealtDamageBySourceThisTurn
         | FilterProp::DealtDamageThisTurn { .. }
         | FilterProp::EnteredThisTurn
         | FilterProp::ZoneChangedThisTurn { .. }
@@ -1017,6 +1019,7 @@ fn entered_object_perturbs_filter_prop(
         | FilterProp::NotHistoric
         | FilterProp::InAnyZone { .. }
         | FilterProp::WasDealtDamageThisTurn
+        | FilterProp::WasDealtDamageBySourceThisTurn
         | FilterProp::DealtDamageThisTurn { .. }
         | FilterProp::EnteredThisTurn
         | FilterProp::ControlledContinuouslySinceTurnBegan
@@ -1891,6 +1894,7 @@ pub(crate) fn filter_prop_contains(
         | FilterProp::NotHistoric
         | FilterProp::InAnyZone { .. }
         | FilterProp::WasDealtDamageThisTurn
+        | FilterProp::WasDealtDamageBySourceThisTurn
         | FilterProp::EnteredThisTurn
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
@@ -2139,6 +2143,7 @@ fn filter_prop_contains_filter_prop(
             | FilterProp::NotHistoric
             | FilterProp::InAnyZone { .. }
             | FilterProp::WasDealtDamageThisTurn
+            | FilterProp::WasDealtDamageBySourceThisTurn
             | FilterProp::EnteredThisTurn
             | FilterProp::ControlledContinuouslySinceTurnBegan
             | FilterProp::ZoneChangedThisTurn { .. }
@@ -2603,6 +2608,7 @@ fn rewrite_filter_prop(
         | FilterProp::NotHistoric
         | FilterProp::InAnyZone { .. }
         | FilterProp::WasDealtDamageThisTurn
+        | FilterProp::WasDealtDamageBySourceThisTurn
         | FilterProp::EnteredThisTurn
         | FilterProp::ControlledContinuouslySinceTurnBegan
         | FilterProp::ZoneChangedThisTurn { .. }
@@ -6340,6 +6346,7 @@ fn spell_record_matches_property(record: &SpellCastRecord, prop: &FilterProp) ->
         | FilterProp::DistinctFrom { .. }
         | FilterProp::SharesQuality { .. }
         | FilterProp::WasDealtDamageThisTurn
+        | FilterProp::WasDealtDamageBySourceThisTurn
         | FilterProp::DealtDamageThisTurn { .. }
         | FilterProp::EnteredThisTurn
         | FilterProp::ControlledContinuouslySinceTurnBegan
@@ -7848,6 +7855,33 @@ fn matches_filter_prop(
             .damage_dealt_this_turn
             .iter()
             .any(|record| matches!(record.target, TargetRef::Object(id) if id == object_id)),
+        // CR 120.1 + CR 608.2i: the source-qualified passive counterpart —
+        // "was dealt damage this turn BY the ability's source" (Krovikan
+        // Vampire's reanimation referent: the printed "put that card onto the
+        // battlefield" names the creature this Vampire damaged this turn that
+        // died). Reads the same turn-scoped ledger as the arm above, with the
+        // extra `source_id` conjunct. CR 608.2i: the ledger survives the
+        // object's zone change, so the predicate still answers for a CARD in a
+        // graveyard — which is the whole point of the source-qualified form.
+        //
+        // CR 400.7: mirror `triggers::damage_record_source_incarnation_matches`
+        // — a source that left and re-entered is a NEW object that dealt no
+        // prior damage, so a recorded incarnation must agree with the source's.
+        // `None` (legacy records, or a source with no live incarnation) stays
+        // lenient exactly as the condition-side helper is.
+        FilterProp::WasDealtDamageBySourceThisTurn => {
+            let source_incarnation = source
+                .trigger_source
+                .map(|ctx| ctx.identity.reference.incarnation)
+                .or_else(|| state.objects.get(&source.id).map(|obj| obj.incarnation));
+            state.damage_dealt_this_turn.iter().any(|record| {
+                matches!(record.target, TargetRef::Object(id) if id == object_id)
+                    && record.source_id == source.id
+                    && record
+                        .source_incarnation
+                        .is_none_or(|recorded| Some(recorded) == source_incarnation)
+            })
+        }
         // CR 120.1: active-voice counterpart — this object DEALT damage this turn,
         // i.e. it was the source of a damage event (Red Guardian, Super-Soldier:
         // "target creature ... that dealt damage this turn"). Reads the same
@@ -8413,6 +8447,26 @@ fn zone_change_record_matches_property(
             .damage_dealt_this_turn
             .iter()
             .any(|r| matches!(r.target, TargetRef::Object(id) if id == record.object_id)),
+        // CR 120.1 + CR 608.2i + CR 608.2h: source-qualified passive look-back —
+        // the object was dealt damage this turn BY this ability's source. The
+        // ledger the arm above reads is the same one, keyed by the battlefield
+        // ObjectId and outliving the zone change, so a graveyard card's snapshot
+        // answers it by `record.object_id`; the extra conjunct is the record's
+        // source identity (mirrors the live arm and its CR 400.7 incarnation
+        // rule, so a re-entered source is not credited with a prior
+        // incarnation's damage).
+        FilterProp::WasDealtDamageBySourceThisTurn => {
+            let source_incarnation = source
+                .trigger_source
+                .map(|ctx| ctx.identity.reference.incarnation)
+                .or_else(|| state.objects.get(&source.id).map(|obj| obj.incarnation));
+            state.damage_dealt_this_turn.iter().any(|r| {
+                matches!(r.target, TargetRef::Object(id) if id == record.object_id)
+                    && r.source_id == source.id
+                    && r.source_incarnation
+                        .is_none_or(|recorded| Some(recorded) == source_incarnation)
+            })
+        }
         // CR 120.1: active-voice look-back — the object DEALT damage this turn.
         // The `damage_dealt_this_turn` ledger is keyed by battlefield ObjectId and
         // survives the object's zone change, so the LKI snapshot reads it by the
@@ -18857,6 +18911,7 @@ mod characteristic_read_classification_tests {
             | FilterProp::InAnyZone { .. }
             | FilterProp::SharesQuality { .. }
             | FilterProp::WasDealtDamageThisTurn
+            | FilterProp::WasDealtDamageBySourceThisTurn
             | FilterProp::DealtDamageThisTurn { .. }
             | FilterProp::EnteredThisTurn
             | FilterProp::ControlledContinuouslySinceTurnBegan

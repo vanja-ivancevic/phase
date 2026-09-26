@@ -1056,6 +1056,13 @@ fn fmt_typed_filter(tf: &TypedFilter) -> String {
             // active-voice arm below reports the label only when unrestricted,
             // for the same reason.
             FilterProp::WasDealtDamageThisTurn => parts.push("dealt damage this turn".into()),
+            // CR 120.1 + CR 608.2i: the source-qualified passive form. Reported
+            // with its own label because the source binding is load-bearing —
+            // the unlabelled elision above is only safe where the variant
+            // carries no extra relation to display.
+            FilterProp::WasDealtDamageBySourceThisTurn => {
+                parts.push("dealt damage this turn by source".into())
+            }
             // CR 120.2a + CR 120.1: the active-voice filter reports its damage
             // class and recipient so a restricted clause is distinguishable from
             // the bare one in coverage output. The unrestricted form keeps the

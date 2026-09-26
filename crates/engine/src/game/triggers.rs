@@ -12343,6 +12343,7 @@ fn filter_prop_binding_diverges(prop: &FilterProp) -> bool {
         | FilterProp::WasPlayed
         | FilterProp::WasKicked
         | FilterProp::WasDealtDamageThisTurn
+        | FilterProp::WasDealtDamageBySourceThisTurn
         | FilterProp::DealtDamageThisTurn { .. }
         | FilterProp::EnteredThisTurn
         | FilterProp::ControlledContinuouslySinceTurnBegan
@@ -14584,6 +14585,20 @@ fn evaluate_trigger_condition_with_source(
                             && damage_record_matches_dying_object(state, r, subj, trigger_event)
                     })
                 }
+                // CR 603.4 + CR 700.4: the SAME printed predicate on a trigger
+                // whose event carries no dying creature — the phase-trigger
+                // form ("At the beginning of each end step, if a creature dealt
+                // damage by this creature this turn died, put that card onto the
+                // battlefield under your control" — Krovikan Vampire). There is
+                // no event object to key on, so the condition is answered
+                // EXISTENTIALLY from the same turn ledgers the event-scoped arm
+                // above reads: some object was dealt damage by this source this
+                // turn AND died this turn. Before this arm the condition failed
+                // closed for that shape, which is why the printed condition was
+                // dropped by the parser rather than mis-fired.
+                (Some(source), None) => {
+                    source_dealt_damage_to_died_this_turn(state, source)
+                }
                 _ => false,
             }
         }
@@ -14596,16 +14611,28 @@ fn evaluate_trigger_condition_with_source(
                 GameEvent::ZoneChanged { object_id, .. } => Some(*object_id),
                 _ => None,
             });
-            let Some(subj) = dying_creature else {
-                return false;
-            };
             let ctx = source_context.map_or_else(
                 || FilterContext::from_source_with_controller(ObjectId(0), controller),
                 |source| FilterContext::from_trigger_source_with_controller(source, controller),
             );
+            if let Some(subj) = dying_creature {
+                return state.damage_dealt_this_turn.iter().any(|record| {
+                    damage_record_matches_dying_object(state, record, subj, trigger_event)
+                        && matches_target_filter_on_damage_record_source(state, record, source, &ctx)
+                });
+            }
+            // CR 603.4 + CR 700.4: phase-trigger sibling of the history arm
+            // above — "if a creature dealt damage this turn by [source filter]
+            // died" evaluated over the turn's damage + zone-change ledgers with
+            // no event object to bind.
             state.damage_dealt_this_turn.iter().any(|record| {
-                damage_record_matches_dying_object(state, record, subj, trigger_event)
-                    && matches_target_filter_on_damage_record_source(state, record, source, &ctx)
+                let TargetRef::Object(target_id) = record.target else {
+                    return false;
+                };
+                object_died_this_turn(state, target_id)
+                    && matches_target_filter_on_damage_record_source(
+                        state, record, source, &ctx,
+                    )
             })
         }
         // CR 701.26 + CR 603.4: "if it's the first time [it] has become tapped this
@@ -15512,6 +15539,46 @@ pub(crate) fn damage_record_matches_dying_object(
         .count() as u64;
 
     current_incarnation.checked_sub(later_moves + 1) == Some(recorded_incarnation)
+}
+
+/// CR 603.4 + CR 700.4: the PHASE-trigger reading of "a creature dealt damage by
+/// this source this turn died" — answered existentially from the turn ledgers
+/// (`state.damage_dealt_this_turn` + `state.zone_changes_this_turn`) because a
+/// phase trigger carries no event object for the event-scoped arm in
+/// `evaluate_trigger_condition_with_source` to key on (Krovikan Vampire).
+///
+/// The source is matched by ObjectId AND incarnation (CR 400.7), reusing
+/// [`damage_record_source_incarnation_matches`] so a leave-and-re-enter source is
+/// a NEW object that dealt no prior damage; the death row must carry the
+/// CREATURE core type from its departure-time snapshot (CR 700.4 — "dies" is a
+/// creature's battlefield→graveyard move, so a damaged planeswalker that later
+/// dies does not satisfy the printed condition).
+fn source_dealt_damage_to_died_this_turn(
+    state: &GameState,
+    source_context: &TriggerSourceContext,
+) -> bool {
+    let source_id = source_context.identity.reference.object_id;
+    state.damage_dealt_this_turn.iter().any(|record| {
+        record.source_id == source_id
+            && damage_record_source_incarnation_matches(record, source_context)
+            && match record.target {
+                TargetRef::Object(target_id) => object_died_this_turn(state, target_id),
+                TargetRef::Player(_) => false,
+            }
+    })
+}
+
+/// CR 700.4: `object_id` was a CREATURE that moved from the battlefield to a
+/// graveyard during this turn, per the turn's zone-change ledger. Reads the
+/// departure row's LKI core types, exactly as `ParsedCondition::CreatureDiedThisTurn`
+/// does, so a non-creature permanent that left the battlefield never counts.
+fn object_died_this_turn(state: &GameState, object_id: ObjectId) -> bool {
+    state.zone_changes_this_turn.iter().any(|change| {
+        change.object_id == object_id
+            && change.from_zone == Some(Zone::Battlefield)
+            && change.to_zone == Zone::Graveyard
+            && change.core_types.contains(&CoreType::Creature)
+    })
 }
 
 fn attackers_declared_count(
@@ -30195,6 +30262,217 @@ pub mod tests {
             !check_trigger_condition(&state, &condition, PlayerId(0), Some(source), Some(&event),),
             "a re-entered source (bumped incarnation) must not match a prior \
              incarnation's damage record (CR 400.7)"
+        );
+    }
+
+    /// CR 603.4 + CR 700.4: the PHASE-trigger reading of "a creature dealt
+    /// damage by this source this turn died" (Krovikan Vampire's end-step
+    /// reanimation gate). The trigger's own event is the step, so the condition
+    /// must be answered existentially from the turn's damage + zone-change
+    /// ledgers instead of from a dying-creature event object.
+    ///
+    /// Discriminating per leg: (a) the damaged-then-died creature satisfies it;
+    /// (b) the SAME damage with no death row does not; (c) a death row without
+    /// this source's damage does not; (d) a non-creature permanent's death row
+    /// does not (CR 700.4 — a damaged planeswalker that dies is not a creature
+    /// death, so it must not arm the printed condition).
+    #[test]
+    fn condition_arms_phase_trigger_damage_death_reads_the_turn_ledgers() {
+        use crate::types::game_state::{DamageRecord, ZoneChangeRecord};
+
+        let mut state = setup();
+        let source = ObjectId(10);
+        let victim = ObjectId(20);
+        state.objects.insert(
+            source,
+            GameObject::new(
+                source,
+                CardId(1),
+                PlayerId(0),
+                "Krovikan Vampire".to_string(),
+                Zone::Battlefield,
+            ),
+        );
+        state.objects.insert(
+            victim,
+            GameObject::new(
+                victim,
+                CardId(2),
+                PlayerId(1),
+                "Dead creature".to_string(),
+                Zone::Graveyard,
+            ),
+        );
+        state.damage_dealt_this_turn.push_back(DamageRecord {
+            source_id: source,
+            source_controller: PlayerId(0),
+            target: TargetRef::Object(victim),
+            target_controller: PlayerId(1),
+            amount: 2,
+            is_combat: false,
+            ..Default::default()
+        });
+
+        let death_row = |object_id: ObjectId, core_types: Vec<CoreType>| ZoneChangeRecord {
+            core_types,
+            ..ZoneChangeRecord::test_minimal(
+                object_id,
+                Some(Zone::Battlefield),
+                Zone::Graveyard,
+            )
+        };
+
+        let condition = TriggerCondition::DealtDamageBySourceThisTurn;
+        // No dying-creature event: the arm under test.
+        let fire = |state: &GameState| {
+            check_trigger_condition(state, &condition, PlayerId(0), Some(source), None)
+        };
+
+        // (b) damaged but still alive → false.
+        assert!(!fire(&state), "damage without a death must not arm the gate");
+
+        // (d) a non-creature permanent's departure row → false.
+        state
+            .zone_changes_this_turn
+            .push_back(death_row(victim, vec![CoreType::Planeswalker]));
+        assert!(
+            !fire(&state),
+            "CR 700.4: 'died' requires a CREATURE departure, not any permanent's"
+        );
+
+        // (a) the creature death → true.
+        state
+            .zone_changes_this_turn
+            .push_back(death_row(victim, vec![CoreType::Creature]));
+        assert!(fire(&state), "damaged-then-died must satisfy the gate");
+
+        // (c) a different creature that died this turn, damaged only by another
+        // source → still false for THIS source.
+        let other_victim = ObjectId(30);
+        state.objects.insert(
+            other_victim,
+            GameObject::new(
+                other_victim,
+                CardId(3),
+                PlayerId(1),
+                "Not ours".to_string(),
+                Zone::Graveyard,
+            ),
+        );
+        state.damage_dealt_this_turn.clear();
+        state.damage_dealt_this_turn.push_back(DamageRecord {
+            source_id: ObjectId(99),
+            source_controller: PlayerId(1),
+            target: TargetRef::Object(other_victim),
+            target_controller: PlayerId(1),
+            amount: 5,
+            is_combat: true,
+            ..Default::default()
+        });
+        state
+            .zone_changes_this_turn
+            .push_back(death_row(other_victim, vec![CoreType::Creature]));
+        assert!(
+            !fire(&state),
+            "only the SOURCE's own damage records may arm the gate"
+        );
+    }
+
+    /// CR 120.1 + CR 400.7 + CR 608.2i: the source-qualified passive damage
+    /// filter — the reanimation referent of Krovikan Vampire. The LEDGER is the
+    /// authority, so the predicate still answers for the card after its
+    /// battlefield→graveyard move; only records dealt by the filtering
+    /// ability's own source count.
+    #[test]
+    fn condition_arms_was_dealt_damage_by_source_filter_reads_dead_cards() {
+        use crate::types::game_state::DamageRecord;
+
+        let mut state = setup();
+        let source = ObjectId(10);
+        let victim = ObjectId(20);
+        state.objects.insert(
+            source,
+            GameObject::new(
+                source,
+                CardId(1),
+                PlayerId(0),
+                "Krovikan Vampire".to_string(),
+                Zone::Battlefield,
+            ),
+        );
+        state.objects.insert(
+            victim,
+            GameObject::new(
+                victim,
+                CardId(2),
+                PlayerId(1),
+                "Dead creature".to_string(),
+                Zone::Graveyard,
+            ),
+        );
+        // `GameObject::new` carries no type line; the referent filter is
+        // "creature CARD", so the candidate needs the creature core type.
+        state
+            .objects
+            .get_mut(&victim)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Creature);
+        state.damage_dealt_this_turn.push_back(DamageRecord {
+            source_id: source,
+            source_controller: PlayerId(0),
+            target: TargetRef::Object(victim),
+            target_controller: PlayerId(1),
+            amount: 2,
+            is_combat: false,
+            ..Default::default()
+        });
+
+        let filter = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+            crate::types::ability::FilterProp::InZone {
+                zone: Zone::Graveyard,
+            },
+            crate::types::ability::FilterProp::WasDealtDamageBySourceThisTurn,
+        ]));
+        let ctx = crate::game::filter::FilterContext::from_source_with_controller(source, PlayerId(0));
+        assert!(
+            crate::game::filter::matches_target_filter(&state, victim, &filter, &ctx),
+            "a graveyard creature card this source damaged this turn is the referent"
+        );
+
+        // Damage dealt by a DIFFERENT source only → not the referent.
+        state.damage_dealt_this_turn.clear();
+        state.damage_dealt_this_turn.push_back(DamageRecord {
+            source_id: ObjectId(99),
+            source_controller: PlayerId(1),
+            target: TargetRef::Object(victim),
+            target_controller: PlayerId(1),
+            amount: 2,
+            is_combat: false,
+            ..Default::default()
+        });
+        assert!(
+            !crate::game::filter::matches_target_filter(&state, victim, &filter, &ctx),
+            "another source's damage must not answer this source's predicate"
+        );
+
+        // A live (battlefield) card is excluded by the zone leg even though the
+        // record matches.
+        state.damage_dealt_this_turn.clear();
+        state.objects.get_mut(&victim).unwrap().zone = Zone::Battlefield;
+        state.damage_dealt_this_turn.push_back(DamageRecord {
+            source_id: source,
+            source_controller: PlayerId(0),
+            target: TargetRef::Object(victim),
+            target_controller: PlayerId(1),
+            amount: 2,
+            is_combat: false,
+            ..Default::default()
+        });
+        assert!(
+            !crate::game::filter::matches_target_filter(&state, victim, &filter, &ctx),
+            "the referent population is graveyard cards"
         );
     }
 

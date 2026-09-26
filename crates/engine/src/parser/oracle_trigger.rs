@@ -2555,6 +2555,21 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
         }
     }
 
+    // CR 603.4 + CR 700.4 + CR 400.7: the PHASE-trigger damage-death reanimation
+    // ("At the beginning of each end step, if a creature dealt damage by this
+    // creature this turn died, put that card onto the battlefield under your
+    // control" — Krovikan Vampire) has no event object for the body's "that
+    // card" anaphor to bind to: the trigger's event is the phase, and the death
+    // the condition looks back on happened earlier in the turn. The body
+    // therefore lowers with an unbound `ParentTarget`, which no target slot can
+    // resolve at announcement — the ability would never reach the stack. Bind
+    // the referent to the predicate the condition answers: the graveyard
+    // creature cards THIS source dealt damage to this turn. That population is
+    // also the printed gate (CR 603.3d: with no legal target the ability is
+    // removed), so the "if … died" reading and the choice agree by
+    // construction.
+    bind_damage_death_reanimation_referent(&mut def);
+
     // CR 303.4 + CR 301.5a + CR 611.2c: On an Aura/Equipment self-trigger whose
     // subject is the attached host (`valid_card == AttachedTo` — "Whenever
     // enchanted/equipped creature attacks/...", Martial Impetus), the anaphoric
@@ -2612,6 +2627,75 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
     }
 
     def
+}
+
+/// CR 603.4 + CR 700.4 + CR 400.7: bind the reanimation referent of the
+/// phase-trigger damage-death form (Krovikan Vampire) — see the call site in
+/// [`lower_trigger_ir`] for the rationale.
+///
+/// Gated on the PHASE mode plus the damage-death condition, which together
+/// identify the one printed shape this rewrite owns:
+///
+/// * the death-EVENT form ("Whenever a creature dealt damage by ~ this turn
+///   dies, put that card …") sets the same condition but is a `ChangesZone`
+///   trigger, and there "that card" legitimately binds to the dying event
+///   object (the event-source lift above), so the mode gate keeps it intact;
+/// * the condition gate keeps every other phase trigger untouched.
+///
+/// Only a `ChangeZone` whose destination is the battlefield and whose target is
+/// the unbound `ParentTarget`/`EventTarget` placeholder is rewritten; an
+/// already-bound target is left exactly as printed.
+fn bind_damage_death_reanimation_referent(def: &mut TriggerDefinition) {
+    if def.mode != TriggerMode::Phase {
+        return;
+    }
+    if !matches!(
+        def.condition,
+        Some(TriggerCondition::DealtDamageBySourceThisTurn)
+            | Some(TriggerCondition::DealtDamageThisTurnBySource { .. })
+    ) {
+        return;
+    }
+    let referent = TargetFilter::Typed(
+        TypedFilter::creature().properties(vec![
+            FilterProp::InZone {
+                zone: Zone::Graveyard,
+            },
+            FilterProp::WasDealtDamageBySourceThisTurn,
+        ]),
+    );
+    if let Some(execute) = def.execute.as_deref_mut() {
+        bind_reanimation_referent_in_ability(execute, &referent);
+    }
+}
+
+fn bind_reanimation_referent_in_ability(ability: &mut AbilityDefinition, referent: &TargetFilter) {
+    for mode in &mut ability.mode_abilities {
+        bind_reanimation_referent_in_ability(mode, referent);
+    }
+    if let Effect::ChangeZone {
+        origin,
+        destination: Zone::Battlefield,
+        target,
+        ..
+    } = &mut *ability.effect
+    {
+        if matches!(
+            target,
+            TargetFilter::ParentTarget | TargetFilter::EventTarget
+        ) {
+            *target = referent.clone();
+            // CR 400.3: the referent's population is the graveyard, so pin the
+            // origin when the printed clause named none ("put that card onto the
+            // battlefield" states no source zone; the condition does).
+            if origin.is_none() {
+                *origin = Some(Zone::Graveyard);
+            }
+        }
+    }
+    if let Some(sub) = ability.sub_ability.as_deref_mut() {
+        bind_reanimation_referent_in_ability(sub, referent);
+    }
 }
 
 /// CR 608.2k + CR 400.7e: Trigger modes whose firing event carries a specific source
@@ -7289,6 +7373,24 @@ fn extract_if_condition_with_card_name(
         }
     }
 
+    // CR 603.4 + CR 700.4: "if a creature dealt damage by <source> this turn
+    // died, …" — the PHASE-trigger damage-death gate (Krovikan Vampire). The
+    // leading-position gate is load-bearing for the same reason as the
+    // dies-head sibling above: a true intervening-if immediately follows the
+    // trigger condition, so a trailing "…, if a creature … died" is a
+    // resolution-time conditional this function must not hoist.
+    if let Some((before, condition, rest)) =
+        scan_preceded(&lower, parse_creature_dealt_damage_by_source_died_intervening_if)
+            .filter(|(before, _, _)| before.trim().is_empty())
+    {
+        let pos = before.len();
+        let clause_len = lower.len() - before.len() - rest.len();
+        return (
+            strip_condition_clause(text, pos, clause_len),
+            Some(condition),
+        );
+    }
+
     // CR 603.4 + CR 205.3: "if it's [not] a <subtype>" on the triggering event's
     // subject (Captain Marvel: "if it's not a Kree"). Registered BEFORE the
     // zone-change filter path so recognized subtypes route to
@@ -7506,6 +7608,42 @@ enum DiesEventObjectPronoun {
 enum PastCopulaPolarity {
     Positive,
     Negative,
+}
+
+/// CR 603.4 + CR 700.4 + CR 400.7: "if a creature dealt damage by <source> this
+/// turn died" — the intervening-if form of the damage-history death predicate
+/// (Krovikan Vampire: "At the beginning of each end step, if a creature dealt
+/// damage by this creature this turn died, put that card onto the battlefield
+/// under your control").
+///
+/// The death-EVENT form ("Whenever a creature dealt damage by ~ this turn dies,
+/// …") is owned by `try_parse_damage_history_death_trigger`, which can hand the
+/// dying creature to the condition through the trigger event. This arm owns the
+/// PHASE form instead: the trigger's event is the phase, so the "died" is a fact
+/// the beginning-of-step check looks BACK on, and the condition must be answered
+/// from the turn ledgers — the history arm of
+/// `TriggerCondition::DealtDamageBySourceThisTurn` in `game/triggers.rs`. The two
+/// arms are disjoint by tense ("died" vs "dies"), and this recognizer requires
+/// that past tense, so it can never claim the event form's phrase.
+///
+/// The source phrase is the shared `parse_damage_history_source` ("this
+/// creature" / "~" / "a [type] you controlled"), so the self form lowers to the
+/// canonical `DealtDamageBySourceThisTurn` and any other source to its filtered
+/// sibling, exactly as the dies-head arm does.
+fn parse_creature_dealt_damage_by_source_died_intervening_if(
+    input: &str,
+) -> OracleResult<'_, TriggerCondition> {
+    let (rest, _) = tag("if a creature dealt damage by ").parse(input)?;
+    let (rest, source) = super::oracle_replacement::parse_damage_history_source(rest)
+        .ok_or_else(|| oracle_err(input))?;
+    let (rest, _) = tag(" this turn died").parse(rest)?;
+    Ok((
+        rest,
+        match source {
+            TargetFilter::SelfRef => TriggerCondition::DealtDamageBySourceThisTurn,
+            other => TriggerCondition::DealtDamageThisTurnBySource { source: other },
+        },
+    ))
 }
 
 fn parse_gendered_dies_event_object_condition<'a>(

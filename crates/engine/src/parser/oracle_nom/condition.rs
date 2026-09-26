@@ -17,7 +17,7 @@ use super::error::{oracle_err, OracleError, OracleResult};
 use super::primitives::{
     parse_article, parse_color, parse_keyword_name, parse_mana_cost, parse_number,
     parse_object_recipient_pronoun, parse_property_keyword, parse_superlative_adjective,
-    scan_at_word_boundaries,
+    peek_clause_terminator, scan_at_word_boundaries,
 };
 use super::quantity as nom_quantity;
 use super::target as nom_target;
@@ -30,10 +30,10 @@ use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
     AbilityCondition, AggregateFunction, CardTypeSetSource, CastManaObjectScope,
     CastManaSpentMetric, CommanderOwnership, Comparator, ControllerRef, CountScope, DamageChannel,
-    DamageGroupKey, DamageKindFilter, FilterProp, ObjectProperty, ObjectScope, PlayerFilter,
-    PlayerRelation, PlayerScope, PropertyAggregate, QuantityExpr, QuantityRef, SharedQuality,
-    SharedQualityRelation, StaticCondition, TargetFilter, TrackedAnaphorSource, TypeFilter,
-    TypedFilter, ZoneRef,
+    DamageGroupKey, DamageKindFilter, FilterProp, ObjectProperty, ObjectScope, Parity, PlayerFilter,
+    PlayerRelation, PlayerScope, PropertyAggregate, QuantityExpr, QuantityRef, RoundingMode,
+    SharedQuality, SharedQualityRelation, StaticCondition, TargetFilter, TrackedAnaphorSource,
+    TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::PlayerActionKind;
@@ -344,8 +344,136 @@ fn parse_it_wasnt_cast_or_no_mana_spent(input: &str) -> OracleResult<'_, StaticC
     ))
 }
 
+/// CR 107.1 + CR 603.4: "if the number of <objects> is even/odd" — the parity
+/// gate Chaos Lord prints ("target opponent gains control of this creature if
+/// the number of permanents is even").
+///
+/// The count is the SHARED type-phrase noun grammar: the phrase after "the
+/// number of " is parsed by `parse_type_phrase_folding` and must be consumed
+/// whole, so "permanents" (all players' — CR 110.1 makes an unqualified
+/// "permanent" a battlefield object by definition) and a filtered phrase like
+/// "creatures you control" both work, while a zone-qualified noun the type
+/// grammar does not own ("cards in your graveyard") declines here instead of
+/// being mis-read as a battlefield count. `inject_battlefield_presence` adds
+/// the explicit battlefield zone when the noun names none, mirroring
+/// `quantity::parse_type_count_on_battlefield_clause`.
+///
+/// PARITY ENCODING (read this before touching the AST shape): parity is not a
+/// comparison against a constant, so it is expressed with the arithmetic
+/// operators the engine already resolves rather than by adding a modulo
+/// operator to `QuantityExpr` — a new `QuantityExpr` variant would have to be
+/// classified by every quantity walker in the crate (dependency, layer,
+/// cast-stability, projection and feature-extraction passes all match that enum
+/// exhaustively) for one card's predicate. With `⌊n/2⌋` and `⌈n/2⌉`:
+///
+/// ```text
+///   n is even  ⟺  ⌊n/2⌋ == ⌈n/2⌉
+///   n is odd   ⟺  ⌊n/2⌋ != ⌈n/2⌉
+/// ```
+///
+/// Counts are never negative (CR 107.1b), so both legs are exact.
+fn parse_number_of_parity_condition(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("the number of ").parse(input)?;
+    let (after_subject, subject) = take_until(" is ").parse(rest)?;
+    let (rest, _) = tag(" is ").parse(after_subject)?;
+    let (rest, parity) = alt((
+        value(Parity::Even, tag("even")),
+        value(Parity::Odd, tag("odd")),
+    ))
+    .parse(rest)?;
+    // CR 608.2c: the predicate is a complete clause — anything other than a
+    // clause boundary means this is not the shape this arm owns, so decline
+    // (rather than commit `alt` to a partial parse) and let the other arms try.
+    peek_clause_terminator(rest)?;
+    let (filter, leftover) = parse_type_phrase_folding(subject.trim());
+    if !leftover.trim().is_empty() || matches!(filter, TargetFilter::Any) {
+        return Err(oracle_err(input));
+    }
+    let count = QuantityExpr::Ref {
+        qty: QuantityRef::ObjectCount {
+            filter: inject_battlefield_presence(filter),
+        },
+    };
+    Ok((rest, parity_comparison(count, parity)))
+}
+
+fn parity_comparison(count: QuantityExpr, parity: Parity) -> StaticCondition {
+    let ceil_half = QuantityExpr::DivideRounded {
+        inner: Box::new(count.clone()),
+        divisor: 2,
+        rounding: RoundingMode::Up,
+    };
+    StaticCondition::QuantityComparison {
+        lhs: QuantityExpr::DivideRounded {
+            inner: Box::new(count),
+            divisor: 2,
+            rounding: RoundingMode::Down,
+        },
+        comparator: match parity {
+            Parity::Even => Comparator::EQ,
+            Parity::Odd => Comparator::NE,
+        },
+        rhs: ceil_half,
+    }
+}
+
+/// CR 105.1 + CR 105.2 + CR 603.4: "if all <objects> are <color>" — the
+/// colour-uniformity gate Zealots en-Dal prints ("if all nonland permanents you
+/// control are white, you gain 1 life").
+///
+/// Lowered as a two-quantity comparison over the SAME population — count of the
+/// subject population vs count of that population restricted to the colour:
+///
+/// ```text
+///   ∀x ∈ S. colour(x) = c   ⟺   |S| == |{x ∈ S : colour(x) = c}|
+/// ```
+///
+/// The right-hand set is a subset of the left by construction, so the two
+/// counts agree exactly when no member lacks the colour. An empty population
+/// gives 0 == 0 — vacuously TRUE, which is the printed reading ("all zero of
+/// them are white"). Expressing it as a handful of `FilterProp::HasColor`
+/// predicates on a new "every object matches" condition variant would be the
+/// other option; the comparison needs no new model surface and the runtime
+/// already evaluates both operands in one instant.
+fn parse_all_are_color_condition(input: &str) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("all ").parse(input)?;
+    let (after_subject, subject) = take_until(" are ").parse(rest)?;
+    let (rest, _) = tag(" are ").parse(after_subject)?;
+    let (rest, color) = parse_color(rest)?;
+    peek_clause_terminator(rest)?;
+    let (filter, leftover) = parse_type_phrase_folding(subject.trim());
+    if !leftover.trim().is_empty() || matches!(filter, TargetFilter::Any) {
+        return Err(oracle_err(input));
+    }
+    let colored = add_filter_property(filter.clone(), FilterProp::HasColor { color });
+    Ok((
+        rest,
+        StaticCondition::QuantityComparison {
+            lhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: inject_battlefield_presence(filter),
+                },
+            },
+            comparator: Comparator::EQ,
+            rhs: QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount {
+                    filter: inject_battlefield_presence(colored),
+                },
+            },
+        },
+    ))
+}
+
 fn parse_state_presence_conditions(input: &str) -> OracleResult<'_, StaticCondition> {
     alt((
+        // CR 107.1 + CR 603.4: "if the number of <objects> is even/odd"
+        // (Chaos Lord) and "if all <objects> are <color>" (Zealots en-Dal).
+        // Both are whole-clause shapes whose own prefix is the strongest
+        // anchor in this group, so they are registered FIRST — every later arm
+        // either requires a different leading token or would consume a
+        // strict prefix of these phrases and commit the `alt`.
+        parse_number_of_parity_condition,
+        parse_all_are_color_condition,
         parse_they_scoped_player_conditions,
         parse_turn_conditions,
         // CR 208.1 + CR 603.4 + CR 109.3: Superlative-comparison gate
@@ -13619,6 +13747,99 @@ mod tests {
                 "controller axis mis-scoped for {text:?}"
             );
         }
+    }
+
+    /// CR 107.1 + CR 105.2 + CR 603.4: the two whole-clause predicate shapes these
+    /// arms add. Parity has no modulo operator in `QuantityExpr`, so it is the
+    /// exact half-rounding pair (⌊n/2⌋ == ⌈n/2⌉ for even, `!=` for odd); colour
+    /// uniformity is a two-quantity comparison of one population against the same
+    /// population restricted to the colour. `rest == ""` pins that each arm owns
+    /// the WHOLE clause — a leftover would make the trigger-side boundary check
+    /// reject the hoist and silently restore the dropped condition.
+    #[test]
+    fn condition_arms_number_of_parity_and_all_are_colour() {
+        fn filter_of(expr: &QuantityExpr) -> &TypedFilter {
+            let QuantityExpr::Ref {
+                qty: QuantityRef::ObjectCount { filter },
+            } = expr
+            else {
+                panic!("expected an object count, got {expr:?}");
+            };
+            let TargetFilter::Typed(tf) = filter else {
+                panic!("expected a typed filter, got {filter:?}");
+            };
+            tf
+        }
+
+        for (text, expected_comparator) in [
+            ("the number of permanents is even", Comparator::EQ),
+            ("the number of permanents is odd", Comparator::NE),
+        ] {
+            let (rest, cond) = parse_inner_condition(text)
+                .unwrap_or_else(|e| panic!("failed to parse {text:?}: {e:?}"));
+            assert_eq!(rest, "", "unconsumed remainder for {text:?}");
+            let StaticCondition::QuantityComparison {
+                lhs,
+                comparator,
+                rhs,
+            } = cond
+            else {
+                panic!("expected a parity comparison for {text:?}, got {cond:?}");
+            };
+            assert_eq!(comparator, expected_comparator, "parity leg for {text:?}");
+            for (expr, rounding) in [(&lhs, RoundingMode::Down), (&rhs, RoundingMode::Up)] {
+                let QuantityExpr::DivideRounded {
+                    inner,
+                    divisor,
+                    rounding: actual,
+                } = expr
+                else {
+                    panic!("expected the half-rounding leg for {text:?}, got {expr:?}");
+                };
+                assert_eq!((*divisor, *actual), (2, rounding), "half for {text:?}");
+                let tf = filter_of(inner.as_ref());
+                assert!(tf.type_filters.contains(&TypeFilter::Permanent));
+                assert!(
+                    tf.properties
+                        .contains(&FilterProp::InZone { zone: Zone::Battlefield })
+                );
+                assert!(
+                    tf.controller.is_none(),
+                    "an unqualified noun counts every player's permanents"
+                );
+            }
+        }
+
+        let (rest, cond) = parse_inner_condition("all nonland permanents you control are white")
+            .expect("the colour-uniformity condition must parse");
+        assert_eq!(rest, "");
+        let StaticCondition::QuantityComparison {
+            lhs,
+            comparator: Comparator::EQ,
+            rhs,
+        } = cond
+        else {
+            panic!("expected the colour-uniformity comparison, got {cond:?}");
+        };
+        let base = filter_of(&lhs);
+        let restricted = filter_of(&rhs);
+        for tf in [base, restricted] {
+            assert_eq!(tf.controller, Some(ControllerRef::You));
+            assert!(tf.type_filters.contains(&TypeFilter::Permanent));
+            assert!(
+                tf.type_filters
+                    .contains(&TypeFilter::Non(Box::new(TypeFilter::Land))),
+                "the printed 'nonland' restriction must survive, got {tf:?}"
+            );
+        }
+        assert!(
+            !base
+                .properties
+                .iter()
+                .any(|p| matches!(p, FilterProp::HasColor { .. })),
+            "the subject leg must stay unrestricted: {base:?}"
+        );
+        assert_has_color(restricted, ManaColor::White);
     }
 
     /// CR 122.1 + CR 611.3a: Hundred-Battle Veteran's "there are three or more

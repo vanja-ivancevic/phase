@@ -4562,6 +4562,11 @@ fn scan_filter_prop(x: &FilterProp, mode: ScanMode) -> Axes {
         // has `damage_marked == 0` yet a persistent journal record, so gate (1) cannot
         // backstop this read — PROVEN projected, fail closed.
         FilterProp::WasDealtDamageThisTurn => Axes::CONSERVATIVE,
+        // CR 120.1: the source-qualified sibling reads the SAME append-only
+        // `state.damage_dealt_this_turn` journal (plus the ability source's
+        // identity), so it inherits the classification verbatim: a
+        // projected-resource read with no gate-(1) backstop, fail closed.
+        FilterProp::WasDealtDamageBySourceThisTurn => Axes::CONSERVATIVE,
         // CR 120.1: reads `state.damage_dealt_this_turn`, the same append-only
         // per-turn journal a loop pumps and `project_out_resources` clears — a
         // projected-resource read, PROVEN projected, fail closed (mirrors the
