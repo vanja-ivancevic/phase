@@ -30,10 +30,10 @@ use crate::parser::oracle_util::parse_subtype;
 use crate::types::ability::{
     AbilityCondition, AggregateFunction, CardTypeSetSource, CastManaObjectScope,
     CastManaSpentMetric, CommanderOwnership, Comparator, ControllerRef, CountScope, DamageChannel,
-    DamageGroupKey, DamageKindFilter, FilterProp, ObjectProperty, ObjectScope, Parity, PlayerFilter,
-    PlayerRelation, PlayerScope, PropertyAggregate, QuantityExpr, QuantityRef, RoundingMode,
-    SharedQuality, SharedQualityRelation, StaticCondition, TargetFilter, TrackedAnaphorSource,
-    TypeFilter, TypedFilter, ZoneRef,
+    DamageGroupKey, DamageKindFilter, FilterProp, ObjectProperty, ObjectScope, Parity,
+    PlayerFilter, PlayerRelation, PlayerScope, PropertyAggregate, QuantityExpr, QuantityRef,
+    RoundingMode, SharedQuality, SharedQualityRelation, StaticCondition, TargetFilter,
+    TrackedAnaphorSource, TypeFilter, TypedFilter, ZoneRef,
 };
 use crate::types::counter::{CounterMatch, CounterType};
 use crate::types::events::PlayerActionKind;
@@ -13799,10 +13799,9 @@ mod tests {
                 assert_eq!((*divisor, *actual), (2, rounding), "half for {text:?}");
                 let tf = filter_of(inner.as_ref());
                 assert!(tf.type_filters.contains(&TypeFilter::Permanent));
-                assert!(
-                    tf.properties
-                        .contains(&FilterProp::InZone { zone: Zone::Battlefield })
-                );
+                assert!(tf.properties.contains(&FilterProp::InZone {
+                    zone: Zone::Battlefield
+                }));
                 assert!(
                     tf.controller.is_none(),
                     "an unqualified noun counts every player's permanents"

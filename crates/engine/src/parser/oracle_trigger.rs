@@ -2656,14 +2656,12 @@ fn bind_damage_death_reanimation_referent(def: &mut TriggerDefinition) {
     ) {
         return;
     }
-    let referent = TargetFilter::Typed(
-        TypedFilter::creature().properties(vec![
-            FilterProp::InZone {
-                zone: Zone::Graveyard,
-            },
-            FilterProp::WasDealtDamageBySourceThisTurn,
-        ]),
-    );
+    let referent = TargetFilter::Typed(TypedFilter::creature().properties(vec![
+        FilterProp::InZone {
+            zone: Zone::Graveyard,
+        },
+        FilterProp::WasDealtDamageBySourceThisTurn,
+    ]));
     if let Some(execute) = def.execute.as_deref_mut() {
         bind_reanimation_referent_in_ability(execute, &referent);
     }
@@ -7379,9 +7377,11 @@ fn extract_if_condition_with_card_name(
     // dies-head sibling above: a true intervening-if immediately follows the
     // trigger condition, so a trailing "…, if a creature … died" is a
     // resolution-time conditional this function must not hoist.
-    if let Some((before, condition, rest)) =
-        scan_preceded(&lower, parse_creature_dealt_damage_by_source_died_intervening_if)
-            .filter(|(before, _, _)| before.trim().is_empty())
+    if let Some((before, condition, rest)) = scan_preceded(
+        &lower,
+        parse_creature_dealt_damage_by_source_died_intervening_if,
+    )
+    .filter(|(before, _, _)| before.trim().is_empty())
     {
         let pos = before.len();
         let clause_len = lower.len() - before.len() - rest.len();

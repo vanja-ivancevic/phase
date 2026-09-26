@@ -14596,9 +14596,7 @@ fn evaluate_trigger_condition_with_source(
                 // turn AND died this turn. Before this arm the condition failed
                 // closed for that shape, which is why the printed condition was
                 // dropped by the parser rather than mis-fired.
-                (Some(source), None) => {
-                    source_dealt_damage_to_died_this_turn(state, source)
-                }
+                (Some(source), None) => source_dealt_damage_to_died_this_turn(state, source),
                 _ => false,
             }
         }
@@ -14618,7 +14616,9 @@ fn evaluate_trigger_condition_with_source(
             if let Some(subj) = dying_creature {
                 return state.damage_dealt_this_turn.iter().any(|record| {
                     damage_record_matches_dying_object(state, record, subj, trigger_event)
-                        && matches_target_filter_on_damage_record_source(state, record, source, &ctx)
+                        && matches_target_filter_on_damage_record_source(
+                            state, record, source, &ctx,
+                        )
                 });
             }
             // CR 603.4 + CR 700.4: phase-trigger sibling of the history arm
@@ -14630,9 +14630,7 @@ fn evaluate_trigger_condition_with_source(
                     return false;
                 };
                 object_died_this_turn(state, target_id)
-                    && matches_target_filter_on_damage_record_source(
-                        state, record, source, &ctx,
-                    )
+                    && matches_target_filter_on_damage_record_source(state, record, source, &ctx)
             })
         }
         // CR 701.26 + CR 603.4: "if it's the first time [it] has become tapped this
@@ -30315,11 +30313,7 @@ pub mod tests {
 
         let death_row = |object_id: ObjectId, core_types: Vec<CoreType>| ZoneChangeRecord {
             core_types,
-            ..ZoneChangeRecord::test_minimal(
-                object_id,
-                Some(Zone::Battlefield),
-                Zone::Graveyard,
-            )
+            ..ZoneChangeRecord::test_minimal(object_id, Some(Zone::Battlefield), Zone::Graveyard)
         };
 
         let condition = TriggerCondition::DealtDamageBySourceThisTurn;
@@ -30329,7 +30323,10 @@ pub mod tests {
         };
 
         // (b) damaged but still alive → false.
-        assert!(!fire(&state), "damage without a death must not arm the gate");
+        assert!(
+            !fire(&state),
+            "damage without a death must not arm the gate"
+        );
 
         // (d) a non-creature permanent's departure row → false.
         state
@@ -30435,7 +30432,8 @@ pub mod tests {
             },
             crate::types::ability::FilterProp::WasDealtDamageBySourceThisTurn,
         ]));
-        let ctx = crate::game::filter::FilterContext::from_source_with_controller(source, PlayerId(0));
+        let ctx =
+            crate::game::filter::FilterContext::from_source_with_controller(source, PlayerId(0));
         assert!(
             crate::game::filter::matches_target_filter(&state, victim, &filter, &ctx),
             "a graveyard creature card this source damaged this turn is the referent"
