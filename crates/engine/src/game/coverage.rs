@@ -10854,11 +10854,11 @@ impl<'a> ParsedElement<'a> {
     /// Check if this element (or any nested ability) has a duration set.
     fn has_duration(&self) -> bool {
         match self {
-            ParsedElement::Ability(a) => ability_tree_any(a, &|d| d.duration.is_some()),
+            ParsedElement::Ability(a) => ability_tree_any(a, &ability_carries_duration),
             ParsedElement::Trigger(t) => t
                 .execute
                 .as_ref()
-                .is_some_and(|e| ability_tree_any(e, &|d| d.duration.is_some())),
+                .is_some_and(|e| ability_tree_any(e, &ability_carries_duration)),
             ParsedElement::Static(s) => s.condition.is_some(), // ForAsLongAs uses condition
             ParsedElement::Replacement(_) => false,
         }
@@ -12003,9 +12003,7 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
             } else {
                 matched.iter().any(|e| e.has_duration())
                     || modal_any(&|d: &AbilityDefinition| d.duration.is_some())
-                    || covered_ability_effect_type_any(&|d: &AbilityDefinition| {
-                        d.duration.is_some()
-                    })
+                    || covered_ability_effect_type_any(&ability_carries_duration)
                     // Fallback: for saga chapter lines, the matched element may be a static
                     // but the duration lives on the trigger's execute ability. Check all triggers.
                     || face.triggers.iter().any(|t| {
@@ -13239,6 +13237,23 @@ pub fn format_semantic_audit_markdown(summary: &SemanticAuditSummary) -> String 
     }
 
     md
+}
+
+/// CR 611.2a + CR 514.2: an ability expresses a window either on its own
+/// `duration` field or inside the permission it grants
+/// (`CastingPermission::PlayFromExile { duration, .. }` — Yawgmoth's Will's
+/// "until end of turn, you may play lands and cast spells from your
+/// graveyard"). The audit must see both, or it reports a dropped duration the
+/// parse does not have.
+fn ability_carries_duration(d: &AbilityDefinition) -> bool {
+    d.duration.is_some()
+        || matches!(
+            &*d.effect,
+            Effect::GrantCastingPermission {
+                permission: crate::types::ability::CastingPermission::PlayFromExile { .. },
+                ..
+            }
+        )
 }
 
 #[cfg(test)]
@@ -17719,6 +17734,37 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                 .iter()
                 .any(|f| matches!(f, SemanticFinding::DroppedDuration { duration_text, .. } if duration_text == "until end of turn")),
             "Should detect dropped duration: {findings:?}"
+        );
+    }
+
+    /// Paired positive for the test above: the same "until end of turn" text IS
+    /// expressed when the window rides the granted permission rather than the
+    /// ability's own `duration` (Yawgmoth's Will lowers to
+    /// `GrantCastingPermission { permission: PlayFromExile { duration, .. } }`),
+    /// so the audit must not report a drop there. Before this arm the pool's
+    /// only remaining new finding was exactly this line.
+    #[test]
+    fn test_audit_accepts_permission_borne_duration() {
+        const ORACLE: &str =
+            "Until end of turn, you may play lands and cast spells from your graveyard.";
+        let parsed = crate::parser::parse_oracle_text(
+            ORACLE,
+            "Yawgmoth's Will",
+            &[],
+            &["Sorcery".to_string()],
+            &[],
+        );
+        let mut face = make_face();
+        face.name = "Yawgmoth's Will".to_string();
+        face.oracle_text = Some(ORACLE.to_string());
+        face.abilities = parsed.abilities;
+
+        let findings = audit_card_lines(ORACLE, &face);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, SemanticFinding::DroppedDuration { .. })),
+            "a permission-borne window must count as expressed: {findings:?}"
         );
     }
 
