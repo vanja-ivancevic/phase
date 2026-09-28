@@ -59,6 +59,55 @@ fn quicksilver_dragon_condition_survives_activated_ability_routing() {
 }
 
 #[test]
+fn meddle_retarget_guard_reads_typed_target_predicate() {
+    // Meddle prints the same "target spell has only one target and that target
+    // is …" guard as Quicksilver Dragon, but with a type phrase ("a creature")
+    // instead of the source anaphor. The guard must stay a resolution-time
+    // condition and name the printed target predicate, not the source.
+    let oracle = "If target spell has only one target and that target is a creature, change that spell's target to another creature.";
+    let parsed = parse_oracle_text(oracle, "Meddle", &[], &["Instant".to_string()], &[]);
+
+    let ability = parsed
+        .abilities
+        .first()
+        .expect("Meddle's effect must parse");
+    let filters = match ability.condition.as_ref() {
+        Some(AbilityCondition::TargetMatchesFilter {
+            filter: TargetFilter::And { filters },
+            use_lki: false,
+            ..
+        }) => filters,
+        other => panic!("Meddle must carry the single-target guard, got {other:#?}"),
+    };
+    let typed = match filters.as_slice() {
+        [TargetFilter::StackSpell, TargetFilter::Typed(typed)] => typed,
+        other => panic!("expected [StackSpell, Typed{{…}}], got {other:?}"),
+    };
+    let targets_only = typed
+        .properties
+        .iter()
+        .find_map(|property| match property {
+            FilterProp::TargetsOnly { filter } => Some((**filter).clone()),
+            _ => None,
+        })
+        .expect("the typed half must carry the target predicate");
+    assert_eq!(
+        targets_only,
+        TargetFilter::Typed(TypedFilter::creature()),
+        "the printed target predicate is a creature"
+    );
+    assert!(
+        typed.properties.contains(&FilterProp::HasSingleTarget),
+        "the guard must also require a single target: {typed:?}"
+    );
+    assert!(
+        matches!(&*ability.effect, Effect::ChangeTargets { .. }),
+        "the retarget effect must survive the guard: {:#?}",
+        ability.effect
+    );
+}
+
+#[test]
 fn teferi_master_of_time_minus_ten_preserves_two_extra_turns() {
     let oracle = "You may activate loyalty abilities of Teferi on any player's turn any time you could cast an instant.\n\
 [+1]: Draw a card, then discard a card.\n\

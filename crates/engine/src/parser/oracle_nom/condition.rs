@@ -943,6 +943,7 @@ fn parse_damage_dealt_this_turn_conditions(input: &str) -> OracleResult<'_, Stat
         // damage this turn" prefix in `parse_source_was_dealt_damage_this_turn`.
         parse_subject_was_dealt_excess_damage_this_turn,
         parse_player_was_dealt_damage_threshold_this_turn,
+        parse_player_was_dealt_damage_by_source_this_turn,
         parse_player_dealt_combat_damage_by_source_this_turn,
         parse_source_dealt_damage_this_turn,
         parse_source_was_dealt_damage_this_turn,
@@ -1213,6 +1214,40 @@ fn parse_player_dealt_combat_damage_by_source_this_turn(
                 group_by: None,
                 damage_kind: DamageKindFilter::CombatOnly,
 
+                channel: DamageChannel::Total,
+            },
+            1,
+        ),
+    ))
+}
+
+/// CR 120.1 + CR 120.3 + CR 603.4 + CR 608.2i: "you were dealt damage this turn
+/// by a <source>" — the caster-relative damage-history predicate of the class
+/// "Cast this spell only if you were dealt damage this turn by a red instant or
+/// sorcery spell." (Suffocation, the printed witness).
+///
+/// The `by` source qualifier is read by `parse_type_phrase_folding`, so any
+/// "by a <type phrase>" is covered ("by a Zombie", "by a creature", "by a red
+/// instant or sorcery spell"); a color leg is a property of that same filter,
+/// which keeps Suffocation's own ruling ("red instant or red sorcery", not
+/// "red instant or any sorcery") in the parsed shape. The recipient is the
+/// ability's controller — for a casting restriction, the caster of the pending
+/// spell — so the singleton player filter applies and no per-recipient
+/// partition (`group_by`) is needed: the subject names exactly one player.
+fn parse_player_was_dealt_damage_by_source_this_turn(
+    input: &str,
+) -> OracleResult<'_, StaticCondition> {
+    let (rest, _) = tag("you were dealt damage this turn by ").parse(input)?;
+    let (rest, source) = parse_type_phrase_nonempty(rest)?;
+    Ok((
+        rest,
+        make_quantity_ge(
+            QuantityRef::DamageDealtThisTurn {
+                source: Box::new(source),
+                target: Box::new(player_recipient_filter(ControllerRef::You)),
+                aggregate: AggregateFunction::Sum,
+                group_by: None,
+                damage_kind: DamageKindFilter::Any,
                 channel: DamageChannel::Total,
             },
             1,

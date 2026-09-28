@@ -990,7 +990,7 @@ mod tests {
     use crate::types::ability::{
         AdditionalCostRepeatability, AggregateFunction, BeholdCostAction, CardSelectionMode,
         Comparator, ControllerRef, CountScope, FilterProp, ParsedCondition, PlayerFilter,
-        PlayerScope, QuantityExpr, QuantityRef, TargetFilter, TypeFilter,
+        PlayerScope, QuantityExpr, QuantityRef, TargetFilter, TypeFilter, TypedFilter,
     };
     use crate::types::keywords::Keyword;
     use crate::types::mana::{ManaColor, ManaCost};
@@ -1093,6 +1093,97 @@ Trample";
                     condition: Some(ParsedCondition::BeenAttackedThisStep),
                 },
             ]
+        );
+    }
+
+    /// Suffocation's caster-relative damage-history gate: "Cast this spell only
+    /// if you were dealt damage this turn by a red instant or sorcery spell."
+    /// The `by` source is the printed color-qualified type disjunction, and the
+    /// card's own ruling ("red instant or red sorcery", not "red instant or any
+    /// sorcery") is carried by the parsed filter — the color must reach every
+    /// leg of the disjunction, not just the first.
+    #[test]
+    fn spell_cast_restriction_reads_damage_from_colored_spell_this_turn() {
+        let restrictions = parse_casting_restriction_line(
+            "Cast this spell only if you were dealt damage this turn by a red instant or sorcery spell.",
+        )
+        .expect("restrictions should parse");
+        assert_eq!(restrictions.len(), 1, "got {restrictions:?}");
+        let (lhs, comparator, rhs) = match &restrictions[0] {
+            CastingRestriction::RequiresCondition {
+                condition:
+                    Some(ParsedCondition::QuantityComparison {
+                        lhs,
+                        comparator,
+                        rhs,
+                    }),
+            } => (lhs, comparator, rhs),
+            other => panic!("expected a damage-history restriction condition, got {other:?}"),
+        };
+        assert_eq!(*comparator, Comparator::GE);
+        assert_eq!(*rhs, QuantityExpr::Fixed { value: 1 });
+        let (source, target, aggregate, group_by) = match lhs {
+            QuantityExpr::Ref {
+                qty:
+                    QuantityRef::DamageDealtThisTurn {
+                        source,
+                        target,
+                        aggregate,
+                        group_by,
+                        ..
+                    },
+            } => (source, target, aggregate, group_by),
+            other => panic!("expected a DamageDealtThisTurn reader, got {other:?}"),
+        };
+        assert_eq!(*aggregate, AggregateFunction::Sum);
+        assert_eq!(*group_by, None);
+        assert_eq!(
+            **target,
+            TargetFilter::And {
+                filters: vec![
+                    TargetFilter::Player,
+                    TargetFilter::Typed(TypedFilter::default().controller(ControllerRef::You)),
+                ],
+            },
+            "the recipient is the caster"
+        );
+
+        // The source phrase's color binds to EVERY leg of its type disjunction.
+        fn typed_legs(filter: &TargetFilter) -> Vec<&TypedFilter> {
+            match filter {
+                TargetFilter::Typed(typed) => vec![typed],
+                TargetFilter::Or { filters } => filters.iter().flat_map(typed_legs).collect(),
+                other => panic!("expected typed spell legs, got {other:?}"),
+            }
+        }
+        let legs = typed_legs(source);
+        assert!(!legs.is_empty());
+        for leg in &legs {
+            assert!(
+                leg.properties.contains(&FilterProp::HasColor {
+                    color: ManaColor::Red
+                }),
+                "every spell leg must be red, got {leg:?}"
+            );
+        }
+        let mut mentions_instant = false;
+        let mut mentions_sorcery = false;
+        for leg in &legs {
+            for type_filter in &leg.type_filters {
+                match type_filter {
+                    TypeFilter::Instant => mentions_instant = true,
+                    TypeFilter::Sorcery => mentions_sorcery = true,
+                    TypeFilter::AnyOf(types) => {
+                        mentions_instant |= types.contains(&TypeFilter::Instant);
+                        mentions_sorcery |= types.contains(&TypeFilter::Sorcery);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(
+            mentions_instant && mentions_sorcery,
+            "the source phrase must keep both spell types: {legs:?}"
         );
     }
 

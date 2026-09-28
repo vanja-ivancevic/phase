@@ -18,7 +18,9 @@ use super::super::oracle_nom::condition::{
 };
 use super::super::oracle_nom::primitives as nom_primitives;
 use super::super::oracle_nom::quantity as nom_quantity;
-use super::super::oracle_quantity::{canonicalize_quantity_ref, parse_cda_quantity};
+use super::super::oracle_quantity::{
+    canonicalize_quantity_ref, is_empty_typed_filter, parse_cda_quantity,
+};
 use super::super::oracle_target::{
     parse_target, parse_type_phrase_folding, parse_type_phrase_folding as parse_type_phrase,
     parse_zone_word, slot_matches_anaphor, slot_zone_class, AnaphorNoun, AnaphorZoneClass,
@@ -6354,24 +6356,45 @@ fn keyword_presence_kind(keyword: &Keyword) -> Option<crate::types::keywords::Ke
 }
 
 /// CR 115.1 + CR 115.9a/c + CR 608.2c: a targeted spell has exactly one
-/// target, and that target is this ability's source. The target spell remains
-/// a normal announced target; this is deliberately a resolution-time rider so
-/// a response may make the condition true or false after the ability is
-/// activated (Quicksilver Dragon).
+/// target, and that target satisfies the printed predicate. The target spell
+/// remains a normal announced target; this is deliberately a resolution-time
+/// rider so a response may make the condition true or false after the ability
+/// is activated (Quicksilver Dragon).
 ///
 /// The target-side constraints reuse the generic stack-entry filter machinery:
 /// `HasSingleTarget` counts declared target instances, while `TargetsOnly`
-/// evaluates every one against `SelfRef` in the resolving ability's context.
-fn parse_target_spell_single_targeting_source_condition(
+/// evaluates every one against the parsed predicate. The predicate is either
+/// the source anaphor ("that target is this creature" / "~" — Quicksilver
+/// Dragon's self-guard) or an ordinary type phrase ("that target is a
+/// creature" — Meddle's retarget rider).
+fn parse_target_spell_single_targeting_filter_condition(
     input: &str,
 ) -> OracleResult<'_, AbilityCondition> {
     let (input, _) = tag("target spell has only one target and that target is ").parse(input)?;
     // `parse_oracle_ir` canonicalizes source references before activated-ability
     // routing, while this parser is also used directly by unnormalized callers.
-    // Both spellings name the same source object; accept either at this shared
-    // condition boundary rather than forcing individual callers to special-case
-    // Quicksilver Dragon's resolution-time guard.
-    let (input, _) = alt((tag("this creature"), tag("~"))).parse(input)?;
+    // Both spellings name the same source object; accept either ahead of the
+    // generic type phrase so a source guard is never misread as a type.
+    let (input, targets_only) =
+        match alt((tag::<_, _, OracleError<'_>>("this creature"), tag("~"))).parse(input) {
+            Ok((rest, _)) => (rest, TargetFilter::SelfRef),
+            Err(_) => {
+                // `parse_type_phrase_folding` is infallible: an unrecognized
+                // phrase comes back as an empty `Typed` leaf plus the whole
+                // input, which this guard (and the caller's `all_consuming`)
+                // rejects. `Any` is refused explicitly — a match-anything
+                // predicate would drop exactly the target restriction the line
+                // prints.
+                let (filter, remainder) = parse_type_phrase_folding(input);
+                if remainder.len() == input.len()
+                    || matches!(filter, TargetFilter::Any)
+                    || is_empty_typed_filter(&filter)
+                {
+                    return Err(oracle_err(input));
+                }
+                (remainder, filter)
+            }
+        };
     Ok((
         input,
         AbilityCondition::TargetMatchesFilter {
@@ -6382,7 +6405,7 @@ fn parse_target_spell_single_targeting_source_condition(
                         properties: vec![
                             FilterProp::HasSingleTarget,
                             FilterProp::TargetsOnly {
-                                filter: Box::new(TargetFilter::SelfRef),
+                                filter: Box::new(targets_only),
                             },
                         ],
                         ..Default::default()
@@ -6395,11 +6418,11 @@ fn parse_target_spell_single_targeting_source_condition(
     ))
 }
 
-fn parse_target_spell_single_targeting_source_condition_text(
+fn parse_target_spell_single_targeting_filter_condition_text(
     text: &str,
 ) -> Option<AbilityCondition> {
     let lower = text.trim().trim_end_matches('.').to_ascii_lowercase();
-    let parsed = all_consuming(parse_target_spell_single_targeting_source_condition)
+    let parsed = all_consuming(parse_target_spell_single_targeting_filter_condition)
         .parse(lower.as_str())
         .ok()
         .map(|(_, condition)| condition);
@@ -6415,7 +6438,7 @@ pub(super) fn try_nom_condition_as_ability_condition(
     let lower = text.to_lowercase();
 
     if let Some(condition) =
-        parse_target_spell_single_targeting_source_condition_text(lower.as_str())
+        parse_target_spell_single_targeting_filter_condition_text(lower.as_str())
     {
         return Some(condition);
     }
@@ -9326,6 +9349,66 @@ mod tests {
             &mut ctx2,
         )
         .is_none());
+    }
+
+    /// CR 115.1 + CR 115.9a/c: the "target spell has only one target and that
+    /// target is <predicate>" guard binds EITHER the source anaphor (Quicksilver
+    /// Dragon) or an ordinary type phrase (Meddle's retarget rider) into the
+    /// same `TargetMatchesFilter` shape. The stricter form must accept exactly
+    /// those two spellings and refuse anything else — a partial or unknown tail
+    /// must not become a match-anything target predicate.
+    #[test]
+    fn target_spell_single_target_predicate_accepts_source_and_type_phrases() {
+        let targets_only = |condition: AbilityCondition| match condition {
+            AbilityCondition::TargetMatchesFilter {
+                filter: TargetFilter::And { filters },
+                use_lki: false,
+                ..
+            } => {
+                let typed = match filters.as_slice() {
+                    [TargetFilter::StackSpell, TargetFilter::Typed(typed)] => typed,
+                    other => panic!("expected [StackSpell, Typed{{…}}], got {other:?}"),
+                };
+                typed
+                    .properties
+                    .iter()
+                    .find_map(|property| match property {
+                        FilterProp::TargetsOnly { filter } => Some((**filter).clone()),
+                        _ => None,
+                    })
+                    .expect("the typed half must carry the target predicate")
+            }
+            other => panic!("expected the single-target guard, got {other:?}"),
+        };
+        let parse = |text: &str| {
+            try_nom_condition_as_ability_condition(text, &mut ParseContext::default())
+                .map(targets_only)
+        };
+
+        for source_anaphor in ["this creature", "~"] {
+            assert_eq!(
+                parse(&format!(
+                    "target spell has only one target and that target is {source_anaphor}"
+                )),
+                Some(TargetFilter::SelfRef),
+                "{source_anaphor:?} must stay the source predicate"
+            );
+        }
+        assert_eq!(
+            parse("target spell has only one target and that target is a creature"),
+            Some(TargetFilter::Typed(TypedFilter::creature())),
+            "Meddle's printed type phrase must become the target predicate"
+        );
+        assert_eq!(
+            parse("target spell has only one target and that target is a frob the wobble"),
+            None,
+            "an unrecognized predicate must stay an honest gap"
+        );
+        assert_eq!(
+            parse("target spell has only one target and that target is a creature and stuff"),
+            None,
+            "a partial parse must not bind a weaker guard"
+        );
     }
 
     /// CR 702.119a-c + CR 702.187b: "[possessive] <emerge|mayhem> cost was paid"

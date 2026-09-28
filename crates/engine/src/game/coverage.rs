@@ -5503,9 +5503,14 @@ impl TokenStaticTraversal {
 /// Visit every executable body owned by a replacement definition. A replacement
 /// decline intentionally retains the token-static exclusion boundary, so all
 /// coverage consumers use the same traversal semantics.
-fn visit_replacement_ability_payloads(
-    replacement: &ReplacementDefinition,
-    mut visit: impl FnMut(TokenStaticTraversal, &AbilityDefinition),
+///
+/// The payload borrow is tied to the replacement (`'a` rather than a
+/// higher-ranked `&AbilityDefinition`): consumers that build owned items do not
+/// care, but the per-line audit's element pool retains `&'a` definitions, and a
+/// higher-ranked payload borrow cannot feed it.
+fn visit_replacement_ability_payloads<'a>(
+    replacement: &'a ReplacementDefinition,
+    mut visit: impl FnMut(TokenStaticTraversal, &'a AbilityDefinition),
 ) {
     if let Some(execute) = &replacement.execute {
         visit(TokenStaticTraversal::Include, execute);
@@ -5531,9 +5536,9 @@ fn visit_replacement_ability_payloads(
 /// coverage surface. Delegate to the replacement visitor so its mode-specific
 /// token-static traversal stays identical to top-level and granted
 /// replacements.
-fn visit_effect_replacement_ability_payloads(
-    effect: &Effect,
-    visit: impl FnMut(TokenStaticTraversal, &AbilityDefinition),
+fn visit_effect_replacement_ability_payloads<'a>(
+    effect: &'a Effect,
+    visit: impl FnMut(TokenStaticTraversal, &'a AbilityDefinition),
 ) {
     if let Effect::AddTargetReplacement { replacement, .. } = effect {
         visit_replacement_ability_payloads(replacement, visit);
@@ -10511,6 +10516,38 @@ fn pump_matches_oracle(
     false
 }
 
+/// CR 508.1a + CR 506.4: `Not(AttackedThisTurn)` — the "that didn't attack this
+/// turn" exclusion of Siren's Call's delayed mass destroy. The predicate is the
+/// only attacker restriction the destroy filter can carry today, so the
+/// recogniser asks for exactly this property by name rather than for any
+/// negation.
+fn is_attacker_exclusion(property: &FilterProp) -> bool {
+    let FilterProp::Not { prop } = property else {
+        return false;
+    };
+    matches!(**prop, FilterProp::AttackedThisTurn { .. })
+}
+
+/// Check whether an ability's own effect carries a nested static ability with a
+/// condition set.
+///
+/// An "if" clause on a continuous static lives on the nested
+/// `StaticDefinition`, not on the ability that owns it (Dominaria's Judgment:
+/// "creatures you control gain protection from white if you control a Plains,
+/// …" lowers to one `GenericEffect` whose five statics each carry an
+/// `IsPresent` condition). A caller asking whether an Oracle "if" clause is
+/// expressed therefore has to consult those nested conditions, exactly as
+/// `has_pump` consults `static_has_pump_modification` for nested P/T.
+fn ability_effect_statics_carry_condition(effect: &Effect) -> bool {
+    matches!(
+        effect,
+        Effect::GenericEffect {
+            static_abilities,
+            ..
+        } if static_abilities.iter().any(|s| s.condition.is_some())
+    )
+}
+
 /// Check if any static ability has AddPower/AddToughness modifications matching the given P/T.
 fn static_has_pump_modification(
     statics: &[StaticDefinition],
@@ -10822,6 +10859,7 @@ impl<'a> ParsedElement<'a> {
         match self {
             ParsedElement::Ability(a) => ability_tree_any(a, &|d| {
                 d.condition.is_some()
+                    || ability_effect_statics_carry_condition(&d.effect)
                     || d.activation_restrictions
                         .iter()
                         .any(|r| matches!(r, ActivationRestriction::RequiresCondition { .. }))
@@ -11020,6 +11058,19 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
             push_ability_tree(else_ab, out);
         }
         visit_direct_effect_ability_payloads(&def.effect, |_, payload| {
+            push_ability_tree(payload, out);
+        });
+        // CR 614.1a: an effect-installed replacement (`AddTargetReplacement`) is a
+        // parsed element of the card in its own right — its `description` carries
+        // the Oracle line even though the definition never appears in
+        // `face.replacements` (Yawgmoth's Will: "If a card would be put into your
+        // graveyard from anywhere this turn, exile that card instead."). Surface
+        // the installed definition and, through the shared replacement walker,
+        // its executable payloads.
+        if let Effect::AddTargetReplacement { replacement, .. } = &*def.effect {
+            out.push(ParsedElement::Replacement(replacement));
+        }
+        visit_effect_replacement_ability_payloads(&def.effect, |_, payload| {
             push_ability_tree(payload, out);
         });
     }
@@ -11713,6 +11764,24 @@ fn audit_card_lines(oracle_text: &str, face: &CardFace) -> Vec<SemanticFinding> 
                     // "If a source would deal damage to you, prevent N of that damage"
                     // Parsed as PreventDamage without a description string.
                     effective_lower.contains("prevent") && effective_lower.contains("damage")
+                }
+                // CR 506.4 + CR 508.1 + CR 608.2c: Siren's Call's delayed mass
+                // destroy names its population as the non-Wall creatures "that
+                // didn't attack this turn", and the delayed trigger carries no
+                // description string, so the line is credited from the parsed
+                // shape. The `Not(AttackedThisTurn)` predicate AND the printed
+                // wording must BOTH be present: an ordinary descriptionless
+                // mass-destroy line ("destroy all creatures") has no such
+                // predicate and stays reported as dropped.
+                Effect::DestroyAll { target, .. } => {
+                    let excludes_attackers = matches!(
+                        target,
+                        TargetFilter::Typed(filter)
+                            if filter.properties.iter().any(is_attacker_exclusion)
+                    );
+                    excludes_attackers
+                        && (effective_lower.contains("didn't attack")
+                            || effective_lower.contains("did not attack"))
                 }
                 Effect::CopySpell { .. } => {
                     // CR 707.5: clone-permanent copies enter "as a copy of ..."
@@ -17765,6 +17834,179 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                 .iter()
                 .any(|f| matches!(f, SemanticFinding::DroppedDuration { .. })),
             "a permission-borne window must count as expressed: {findings:?}"
+        );
+    }
+
+    /// Paired test for the effect-installed replacement arm of the element pool.
+    ///
+    /// Yawgmoth's Will's graveyard replacement is installed BY an effect
+    /// (`AddTargetReplacement`), so it never appears in `face.replacements` —
+    /// only inside `abilities[1].effect` — and the pool used to miss the
+    /// description it carries, reporting the line as a `SilentDrop`. The same
+    /// line with nothing parsed must stay reported.
+    #[test]
+    fn test_audit_accepts_effect_installed_replacement_line() {
+        const ORACLE: &str =
+            "Until end of turn, you may play lands and cast spells from your graveyard.\n\
+If a card would be put into your graveyard from anywhere this turn, exile that card instead.";
+        const REPLACEMENT_LINE: &str =
+            "If a card would be put into your graveyard from anywhere this turn, exile that card instead.";
+        let parsed = crate::parser::parse_oracle_text(
+            ORACLE,
+            "Yawgmoth's Will",
+            &[],
+            &["Sorcery".to_string()],
+            &[],
+        );
+        let mut face = make_face();
+        face.name = "Yawgmoth's Will".to_string();
+        face.oracle_text = Some(ORACLE.to_string());
+        face.abilities = parsed.abilities;
+
+        let findings = audit_card_lines(ORACLE, &face);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                f,
+                SemanticFinding::SilentDrop { oracle_line } if oracle_line == REPLACEMENT_LINE
+            )),
+            "an effect-installed replacement must cover its own Oracle line: {findings:?}"
+        );
+
+        let findings = audit_card_lines(REPLACEMENT_LINE, &make_face());
+        assert!(
+            findings.iter().any(|f| matches!(
+                f,
+                SemanticFinding::SilentDrop { oracle_line } if oracle_line == REPLACEMENT_LINE
+            )),
+            "the same line must stay reported when nothing parsed it: {findings:?}"
+        );
+    }
+
+    /// Paired test for nested-static conditions.
+    ///
+    /// Dominaria's Judgment's five "if you control a Plains/Island/…" guards ride
+    /// the nested `Continuous` statics of a single `GenericEffect`, so the owning
+    /// ability's own `condition` is legitimately `None`. The audit must consult
+    /// those nested conditions — as `has_pump` consults their modifications —
+    /// while clearing them still reports the dropped condition.
+    #[test]
+    fn test_audit_reads_nested_static_condition() {
+        const ORACLE: &str = "Until end of turn, creatures you control gain protection from white if you control a Plains, from blue if you control an Island, from black if you control a Swamp, from red if you control a Mountain, and from green if you control a Forest.";
+        let parsed = crate::parser::parse_oracle_text(
+            ORACLE,
+            "Dominaria's Judgment",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        );
+        let mut face = make_face();
+        face.name = "Dominaria's Judgment".to_string();
+        face.oracle_text = Some(ORACLE.to_string());
+        face.abilities = parsed.abilities;
+
+        let findings = audit_card_lines(ORACLE, &face);
+        assert!(
+            !findings
+                .iter()
+                .any(|f| matches!(f, SemanticFinding::DroppedCondition { .. })),
+            "a nested static's own condition expresses the line's guard: {findings:?}"
+        );
+
+        let static_abilities = face
+            .abilities
+            .iter_mut()
+            .find_map(|ability| match &mut *ability.effect {
+                Effect::GenericEffect {
+                    static_abilities, ..
+                } => Some(static_abilities),
+                _ => None,
+            })
+            .expect("the parsed card carries the continuous GenericEffect");
+        for static_def in static_abilities.iter_mut() {
+            static_def.condition = None;
+        }
+
+        let findings = audit_card_lines(ORACLE, &face);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f, SemanticFinding::DroppedCondition { .. })),
+            "clearing the nested conditions must bring the finding back: {findings:?}"
+        );
+    }
+
+    /// Paired test for the descriptionless delayed mass destroy.
+    ///
+    /// Siren's Call's destroy clause lives inside a `CreateDelayedTrigger` whose
+    /// nested `DestroyAll` carries the `Not(AttackedThisTurn)` predicate — the
+    /// line's whole restriction — without any description string. Crediting that
+    /// parsed shape must be conjunctive with the printed wording, and dropping
+    /// either half must leave a genuinely dropped line reported.
+    #[test]
+    fn test_audit_accepts_delayed_mass_destroy_excluding_attackers() {
+        const ORACLE: &str = "Cast this spell only during an opponent's turn, before attackers are declared.\n\
+Creatures the active player controls attack this turn if able.\n\
+At the beginning of the next end step, destroy all non-Wall creatures that player controls that didn't attack this turn. Ignore this effect for each creature the player didn't control continuously since the beginning of the turn.";
+        const DESTROY_LINE: &str = "At the beginning of the next end step, destroy all non-Wall creatures that player controls that didn't attack this turn. Ignore this effect for each creature the player didn't control continuously since the beginning of the turn.";
+        let parsed = crate::parser::parse_oracle_text(
+            ORACLE,
+            "Siren's Call",
+            &[],
+            &["Instant".to_string()],
+            &[],
+        );
+        let mut face = make_face();
+        face.name = "Siren's Call".to_string();
+        face.oracle_text = Some(ORACLE.to_string());
+        face.abilities = parsed.abilities;
+
+        let findings = audit_card_lines(ORACLE, &face);
+        assert!(
+            !findings.iter().any(|f| matches!(
+                f,
+                SemanticFinding::SilentDrop { oracle_line } if oracle_line == DESTROY_LINE
+            )),
+            "the parsed attacker-excluding destroy must cover its line: {findings:?}"
+        );
+
+        // The wording half of the gate: an ordinary dropped mass-destroy line is
+        // not credited by the same parsed shape.
+        let dropped = "At the beginning of the next end step, destroy all creatures.";
+        let findings = audit_card_lines(dropped, &face);
+        assert!(
+            findings
+                .iter()
+                .any(|f| matches!(f, SemanticFinding::SilentDrop { .. })),
+            "a mass-destroy line without the printed wording must stay reported: {findings:?}"
+        );
+
+        // The shape half of the gate: without the parsed attacker predicate the
+        // real line is reported again.
+        let destroy_target = face
+            .abilities
+            .iter_mut()
+            .find_map(|ability| match &mut *ability.effect {
+                Effect::CreateDelayedTrigger { effect, .. } => match &mut *effect.effect {
+                    Effect::DestroyAll { target, .. } => Some(target),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the parsed card carries the delayed DestroyAll");
+        let TargetFilter::Typed(filter) = destroy_target else {
+            panic!("expected a typed destroy filter, got {destroy_target:?}");
+        };
+        filter
+            .properties
+            .retain(|property| !is_attacker_exclusion(property));
+
+        let findings = audit_card_lines(ORACLE, &face);
+        assert!(
+            findings.iter().any(|f| matches!(
+                f,
+                SemanticFinding::SilentDrop { oracle_line } if oracle_line == DESTROY_LINE
+            )),
+            "without the parsed attacker predicate the line must be reported: {findings:?}"
         );
     }
 
