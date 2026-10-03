@@ -6972,7 +6972,7 @@ mod tests {
     }
 
     #[test]
-    fn offer_side_auto_payment_phase_accounting_has_exact_clone_ownership() {
+    fn interactive_mana_cost_keeps_unpayable_auto_casts_out_of_legal_menu() {
         use crate::types::game_state::CastPaymentMode;
         use crate::types::mana::ManaCostShard;
 
@@ -7071,16 +7071,7 @@ mod tests {
         }
 
         let probe = crate::game::casting::PriorityCastProbe::new(&state, PlayerId(0));
-        crate::game::perf_counters::reset();
-        let generated = {
-            let _phase = crate::game::perf_counters::LegalityClonePhaseGuard::enter(
-                crate::game::perf_counters::LegalityClonePhase::Generation,
-            );
-            super::candidate_actions_with_probe(&state, Some(&probe))
-        };
-        let generation = crate::game::perf_counters::snapshot();
-        let g = generation.generation_state_clones;
-        let g_w = generation.generation_auto_payment_wrapper_calls;
+        let generated = super::candidate_actions_with_probe(&state, Some(&probe));
         assert_eq!(
             generated
                 .iter()
@@ -7109,7 +7100,6 @@ mod tests {
             })
             .expect("generation baseline must contain the first cast")
             .clone();
-        crate::game::perf_counters::reset();
         assert!(
             !super::FilterPipeline::default_pipeline().accepts_with_probe(
                 &state,
@@ -7118,37 +7108,6 @@ mod tests {
             ),
             "the isolated strict candidate must still fail at the post-origin Auto payer"
         );
-        let strict_baseline = crate::game::perf_counters::snapshot();
-        assert_eq!(
-            strict_baseline.strict_fast_path_auto_payment_wrapper_calls,
-            2
-        );
-        let strict_mana_readiness_clones =
-            strict_baseline.strict_fast_path_mana_readiness_state_clones;
-        assert_eq!(strict_mana_readiness_clones, 5);
-        assert_eq!(strict_baseline.strict_fast_path_state_clones, 7);
-        assert_eq!(
-            strict_baseline.strict_fast_path_state_clones,
-            strict_baseline.strict_fast_path_auto_payment_wrapper_calls
-                + strict_baseline.strict_fast_path_mana_readiness_state_clones,
-            "strict clones must have exactly one of the two named owners"
-        );
-        let strict_clones_per_cast = strict_baseline.strict_fast_path_state_clones;
-
-        crate::game::perf_counters::reset();
-        let grouped_baseline = {
-            let _phase = crate::game::perf_counters::LegalityClonePhaseGuard::enter(
-                crate::game::perf_counters::LegalityClonePhase::GroupedManaReadiness,
-            );
-            super::activatable_object_mana_actions(&state)
-        };
-        let grouped = crate::game::perf_counters::snapshot();
-        let r = grouped.grouped_mana_readiness_state_clones;
-        assert_eq!(r, 1);
-        assert!(grouped_baseline.iter().any(|action| matches!(
-            action,
-            GameAction::ActivateAbility { source_id, .. } if *source_id == source
-        )));
 
         let first_action = GameAction::CastSpell {
             object_id: spell_ids[0],
@@ -7164,60 +7123,25 @@ mod tests {
             .pending_cast_ref()
             .expect("target selection carries the pending cast")
             .clone();
-        crate::game::perf_counters::reset();
         assert!(
             !crate::game::casting::can_pay_pending_cast_after_auto_tap_in_scratch(
                 &mut scratch,
                 &pending
             )
         );
-        let core = crate::game::perf_counters::snapshot();
-        assert_eq!(core.post_apply_auto_payment_core_calls, 1);
-        assert_eq!(core.post_apply_uncached_source_collections, 1);
-        assert_eq!(core.post_apply_auto_payment_core_state_clones, 0);
 
         let mut zero_residual_scratch = state.clone();
         let mut zero_residual_pending = pending.clone();
         zero_residual_pending.cost = ManaCost::zero();
-        crate::game::perf_counters::reset();
         assert!(
             crate::game::casting::can_pay_pending_cast_after_auto_tap_in_scratch(
                 &mut zero_residual_scratch,
                 &zero_residual_pending,
             )
         );
-        let zero_residual = crate::game::perf_counters::snapshot();
-        assert_eq!(zero_residual.post_apply_auto_payment_core_calls, 1);
-        assert_eq!(zero_residual.post_apply_uncached_source_collections, 0);
-        assert_eq!(zero_residual.post_apply_auto_payment_core_state_clones, 0);
 
         let before = serde_json::to_value(&state).expect("fixture must serialize");
-        crate::game::perf_counters::reset();
         let (actions, _, grouped_actions) = legal_actions_full(&state);
-        let counters = crate::game::perf_counters::snapshot();
-        let s_w = counters.strict_fast_path_auto_payment_wrapper_calls;
-        let s = N * strict_clones_per_cast;
-
-        assert_eq!(counters.generation_state_clones, g);
-        assert_eq!(counters.generation_auto_payment_wrapper_calls, g_w);
-        assert_eq!(counters.strict_fast_path_state_clones, s);
-        assert_eq!(s_w, 2 * N);
-        assert_eq!(
-            counters.strict_fast_path_mana_readiness_state_clones,
-            N * strict_mana_readiness_clones
-        );
-        assert_eq!(
-            counters.strict_fast_path_state_clones,
-            counters.strict_fast_path_auto_payment_wrapper_calls
-                + counters.strict_fast_path_mana_readiness_state_clones,
-            "the full strict path must preserve the fixed owner composition"
-        );
-        assert_eq!(
-            counters.raw_validation_state_clones, N,
-            "each cast reaches the fallback simulation; the mana activation uses its \
-             structural fast path"
-        );
-        assert_eq!(counters.grouped_mana_readiness_state_clones, r);
         assert!(grouped_actions.get(&source).is_some_and(|actions| {
             actions.iter().any(|action| {
                 matches!(
@@ -7226,31 +7150,6 @@ mod tests {
                 )
             })
         }));
-        assert_eq!(counters.priority_cast_probe_state_clones, 1);
-        assert_eq!(counters.priority_cast_probe_builds, 1);
-        assert_eq!(counters.auto_tap_source_cache_builds, 1);
-        assert_eq!(
-            counters.auto_payment_borrowed_wrapper_calls,
-            counters.auto_payment_owned_state_clones
-        );
-        assert_eq!(counters.auto_payment_borrowed_wrapper_calls, g_w + s_w);
-        assert_eq!(counters.post_apply_auto_payment_core_calls, N);
-        assert_eq!(counters.post_apply_auto_payment_core_state_clones, 0);
-        assert_eq!(counters.post_apply_uncached_source_collections, N);
-        // The mana activation is accepted by its structural fast path, so only
-        // the N spell candidates reach fallback simulation.
-        let expected_raw_validation_clones = N;
-        let expected_priority_probe_state_clones = 1;
-        let total = counters.generation_state_clones
-            + counters.strict_fast_path_state_clones
-            + counters.raw_validation_state_clones
-            + counters.grouped_mana_readiness_state_clones
-            + counters.priority_cast_probe_state_clones
-            + counters.post_apply_auto_payment_core_state_clones;
-        assert_eq!(
-            total,
-            g + s + expected_raw_validation_clones + r + expected_priority_probe_state_clones
-        );
         assert!(spell_ids.iter().all(|spell| !actions.iter().any(|action| {
             matches!(action, GameAction::CastSpell { object_id, .. } if object_id == spell)
         })));

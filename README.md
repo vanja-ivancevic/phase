@@ -419,6 +419,24 @@ pnpm lint                                  # ESLint
 pnpm test                                  # Vitest
 ```
 
+### Native AI mana-board benchmark
+
+With `CARGO_TARGET_DIR` set to your host's approved reusable cache and a complete,
+current-schema card export in `client/public`, run:
+
+```bash
+cargo run --locked --profile server-release -p phase-ai \
+  --features scenario-benches --bin mana-board-bench -- \
+  --cards client/public --iters 5
+```
+
+The benchmark rebuilds a real filter-land/Reflecting Pool board and reports
+legal-action and AI-decision latency plus legality-clone counts. Priority probes
+reuse exact producer-to-filter routes within one immutable state; mana submissions
+still validate the named source's live rows. Unspent-mana effects retain the layer
+system's zone-of-function rules. Compare identical card bytes, seeds, profiles and
+hosts; these timings measure decision cost, not playing strength.
+
 ### Cargo Aliases
 
 ```
