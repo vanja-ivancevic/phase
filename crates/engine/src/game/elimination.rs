@@ -227,6 +227,25 @@ pub fn eliminate_players_simultaneously(
         }
     }
 
+    // CR 800.4a: a staged resolution-payment descriptor is a continuation
+    // owned by its payer/root owner. Retire it before the leave sweep when that
+    // owner departs; an unrelated player's concession must leave the payment
+    // live for its surviving owner. `GameAction::Concede` reaches this normal
+    // elimination path rather than the payment transcript authority.
+    let abandoned_payment = if let Some(owner) = state
+        .payment_transaction
+        .as_ref()
+        .map(|transaction| transaction.owner)
+    {
+        if leaving_set.contains(&owner) {
+            super::payment_transaction::abandon_for_owner_departure(state, owner)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     // CR 800.4a: elimination can remove frozen stack entries and a session's
     // canonical representative. Restore the pre-overlay preferences before
     // `do_eliminate` removes the departing player's own state, so teardown
@@ -447,6 +466,23 @@ pub fn eliminate_players_simultaneously(
         }
         state.waiting_for = WaitingFor::GameOver { winner };
     } else {
+        // CR 800.4a + CR 608.2m + CR 800.4g/800.4h: once every departure,
+        // control-effect end and stack removal above has settled, reconcile an
+        // active per-player zone choice against the final set of living
+        // players. The resolution keeps going: order candidates and the pending
+        // pool are recomputed, and a choice whose maker left goes to the player
+        // the rules name. Runs before the generic dead-actor repoint below,
+        // which would otherwise hand priority on while leaving the frame
+        // parked. Acts only when that frame owns `waiting_for`; a refusal is
+        // reported and leaves the frame parked rather than guessing.
+        if let Err(refusal) =
+            super::effects::choose_from_zone::reconcile_per_player_choice_after_departure(
+                state, events,
+            )
+        {
+            tracing::error!(%refusal, "per-player zone choice was not reconciled after a departure");
+        }
+
         if let Some(frame) = staged_optional_sacrifice_decline {
             state.push_optional_effect_frame(frame);
             super::engine_payment_choices::handle_optional_effect_choice(state, false, events)
@@ -538,6 +574,23 @@ pub fn eliminate_players_simultaneously(
             if !players::is_alive(state, recipient) {
                 state.pending_trigger_construction_priority_recipient =
                     Some(players::next_player_in_turn_order(state, recipient));
+            }
+        }
+
+        // CR 800.4a + CR 608.2c: a payer who leaves cannot finish the staged
+        // payment, but a surviving ability controller still owns the printed
+        // continuation. The transaction descriptor was retired before the
+        // leave sweep; resume only its failure tail after all topology cleanup
+        // so unconditional siblings see the final living-player set.
+        if let Some(transaction) = abandoned_payment.as_ref() {
+            if players::is_alive(state, transaction.root.controller) {
+                if let Err(error) = super::payment_transaction::resolve_abandoned_continuation(
+                    state,
+                    transaction,
+                    events,
+                ) {
+                    debug_assert!(false, "abandoned payment continuation failed: {error}");
+                }
             }
         }
     }
@@ -1858,7 +1911,8 @@ mod tests {
                 },
             },
             Some(TriggerFiring::ReceiptEligible(origin)),
-        );
+        )
+        .expect("the fixture begins with no carrier installed");
         let continuation = PendingContinuation::new(
             Box::new(ResolvedAbility::new(
                 Effect::NoOp,
@@ -1874,6 +1928,7 @@ mod tests {
             trigger_event: None,
             trigger_events: Vec::new(),
             trigger_match_count: None,
+            return_result_occurrence: None,
         });
         state.waiting_for = WaitingFor::PayCost {
             player: payer,
@@ -1980,6 +2035,7 @@ mod tests {
         controller: PlayerId,
     ) -> crate::types::game_state::PendingChangeZoneIteration {
         crate::types::game_state::PendingChangeZoneIteration {
+            pending_return_result_producer: None,
             logical_zone_change_group: group,
             paused_current,
             remaining,
@@ -1995,6 +2051,7 @@ mod tests {
             conditional_enter_with_counters: Vec::new(),
             duration: None,
             track_exiled_by_source: false,
+            face_down_in_exile: crate::types::ability::ExileConcealment::Public,
             moved_count: None,
             face_down_profile: None,
             library_placement: None,
@@ -2062,12 +2119,13 @@ mod tests {
                     face_down_profile: None,
                     chain_referent: crate::types::zones::ChainReferentIntent::Silent,
                     attach_to: None,
+                    performed_by: None,
                     library_placement: None,
                     exile_duration: None,
                     exile_controller: None,
                     exile_tracking: crate::types::game_state::ZoneDeliveryExileTracking::None,
                     replacement_applied: HashSet::new(),
-                    face_down_in_exile: false,
+                    face_down_in_exile: crate::types::ability::ExileConcealment::Public,
                 },
                 crate::types::game_state::PendingBatchZoneMoveRequest {
                     object_id: surviving,
@@ -2082,12 +2140,13 @@ mod tests {
                     face_down_profile: None,
                     chain_referent: crate::types::zones::ChainReferentIntent::Silent,
                     attach_to: None,
+                    performed_by: None,
                     library_placement: None,
                     exile_duration: None,
                     exile_controller: None,
                     exile_tracking: crate::types::game_state::ZoneDeliveryExileTracking::None,
                     replacement_applied: HashSet::new(),
-                    face_down_in_exile: false,
+                    face_down_in_exile: crate::types::ability::ExileConcealment::Public,
                 },
             ],
             attempted: vec![leaving, surviving],
@@ -4649,6 +4708,7 @@ mod tests {
             is_activated: false,
             ability_index: None,
             ability_cost: None,
+            activation_cost_snapshot: None,
             unavailable_modes: Vec::new(),
         };
         entry

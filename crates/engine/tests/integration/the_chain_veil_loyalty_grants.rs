@@ -161,7 +161,12 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         target_incarnations: Vec::new(),
         selected_target_incarnations: Vec::new(),
         illegal_target_slots: Vec::new(),
+        illegal_local_target_slots: Vec::new(),
         targets: vec![],
+        declares_chosen_group: None,
+        reads_chosen_group: None,
+        declares_return_result: None,
+        reads_return_result: None,
         kind: AbilityKind::Activated,
         sub_ability: None,
         else_ability: None,
@@ -203,10 +208,13 @@ fn make_grant_ability(controller: PlayerId, source: ObjectId) -> ResolvedAbility
         chosen_players: Vec::new(),
         repeat_until: None,
         sub_link: SubAbilityLink::ContinuationStep,
+        target_reads: Default::default(),
         sibling_condition: SiblingCondition::Dependent,
         modal: None,
         mode_abilities: vec![],
         parent_target_missing_reason: None,
+        activation_cost_reduction: None,
+        activation_record: None,
     }
 }
 

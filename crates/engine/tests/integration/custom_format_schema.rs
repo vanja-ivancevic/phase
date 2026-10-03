@@ -1340,9 +1340,9 @@ fn companion_candidates_returns_empty_for_custom_format_without_panicking() {
 // representations of the same state with nothing cross-checking them. Phase
 // 1c builds that resolver (FormatConfig::for_custom_rules), so the boundary
 // now accepts a Custom payload exactly when it equals what the resolver
-// derives from the payload's own custom_rules (allow_debug_actions excepted,
-// being a session capability rather than a format rule), and rejects
-// anything else. Each value below is constructed directly in Rust (bypassing
+// derives from the payload's own custom_rules (allow_debug_actions
+// excepted, being a session capability rather than a format rule), and
+// rejects anything else. Each value below is constructed directly in Rust (bypassing
 // Deserialize, which has no reason to reject it going the other way) and
 // round-tripped through `serde_json` — the only way to exercise
 // FormatConfig's real Deserialize impl without hand-guessing its full field
@@ -1523,6 +1523,28 @@ fn format_config_deserialization_ignores_allow_debug_actions_in_the_custom_equal
             .unwrap_or_else(|error| panic!("allow_debug_actions={allow_debug_actions}: {error}"));
         assert_eq!(back, config);
         assert_eq!(back.allow_debug_actions, allow_debug_actions);
+    }
+}
+
+#[test]
+fn format_config_deserialization_ignores_the_removed_experimental_dungeons_key() {
+    // Back-compat: saves, replays, and persisted setups written before the
+    // per-session experimental-dungeons flag was removed still carry the
+    // `allow_experimental_dungeons` key. The derived `Deserialize` impl sets
+    // no `deny_unknown_fields`, so the stale key must be ignored — not
+    // rejected — and the pool must come from the format alone. Both stale
+    // values must load; a `true` on a non-freeform config must NOT smuggle
+    // the Wilderness into its pool.
+    for stale_value in [true, false] {
+        let mut json = serde_json::to_value(FormatConfig::standard()).unwrap();
+        json.as_object_mut().unwrap().insert(
+            "allow_experimental_dungeons".to_string(),
+            serde_json::Value::Bool(stale_value),
+        );
+        let back = serde_json::from_value::<FormatConfig>(json)
+            .unwrap_or_else(|error| panic!("stale flag={stale_value}: {error}"));
+        assert_eq!(back, FormatConfig::standard());
+        assert!(!back.format.offers_baldurs_gate_wilderness());
     }
 }
 

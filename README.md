@@ -89,6 +89,11 @@ Full procedure, two tracks (developer / non-developer), and copy-paste prompts f
 - wasm-bindgen-cli: `cargo install wasm-bindgen-cli@0.2.114`
 - wasm-opt (optional): `brew install binaryen` or `apt install binaryen`
 - [Node.js](https://nodejs.org/) 22+ and [pnpm](https://pnpm.io/): `npm i -g pnpm`
+- `unzip` for native AI community-scenario tests (`apt install unzip` on Ubuntu;
+  macOS supplies `/usr/bin/unzip`)
+
+Run native workspace gates as an unprivileged user. Bootstrap failure-path tests
+deliberately deny filesystem permissions; root bypasses those checks.
 
 #### Windows
 

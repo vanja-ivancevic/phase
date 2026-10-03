@@ -496,21 +496,16 @@ fn v4a_this_combat_window_stamps_end_of_combat() {
 }
 
 // ── V5 ────────────────────────────────────────────────────────────────────
-// **PIN — updated when the grant body shipped.** Written when B1's exact-match
-// recognizer could not fire on the newline-separated card file, so the cards
-// stayed honestly unsupported; that premise is false since the recognizer
-// collapsed whitespace and the chain began emitting the play grant. The row
-// keeps its discriminating duties: the grant must be real, the emblem count
-// must stay zero, the redirect must install exactly once per card, and Magus
-// of the Will must still produce none (its clause sits inside an activated
-// ability's effect text that card-level dispatch never reaches).
+// The grant must be real, the emblem count must stay zero, and the redirect
+// must install exactly once with its printed duration on all three arrival
+// shapes, including the clause inside Magus of the Will's activated ability.
 
 const YAWGMOTHS_WILL: &str = "Until end of turn, you may play lands and cast spells from your graveyard.\nIf a card would be put into your graveyard from anywhere this turn, exile that card instead.";
 const GAEAS_WILL: &str = "Suspend 4—{G}\nUntil end of turn, you may play lands and cast spells from your graveyard.\nIf a card would be put into your graveyard from anywhere this turn, exile that card instead.";
 const MAGUS_OF_THE_WILL: &str = "{2}{B}, {T}, Exile this creature: Until end of turn, you may play lands and cast spells from your graveyard. If a card would be put into your graveyard from anywhere this turn, exile that card instead.";
 
 #[test]
-fn v5_will_cycle_cards_remain_honestly_unsupported() {
+fn v5_will_cycle_permission_body_is_no_longer_refused() {
     // MULTI-AUTHORITY hostile fixture: three different arrival shapes — a bare
     // sorcery, a sorcery preceded by a Suspend line, and a creature's activated
     // ability. All three must yield the SAME verdict, proving the outcome keys
@@ -518,40 +513,33 @@ fn v5_will_cycle_cards_remain_honestly_unsupported() {
     // The install count is EXACT, not a presence flag: each card's line 2 is one
     // clause and must install exactly one definition, so a duplicate install is
     // as much a failure as a missing one.
-    for (text, name, types, expected_installs, expected_grant) in [
-        // The two Sorceries expose their line-2 clause to the card-level line
-        // dispatch; Magus does not, because its line 2 is inside an activated
-        // ability's effect text. The grant rides the card-level play/redirect
-        // chain, so Magus keeps an honest stub instead.
-        (
-            YAWGMOTHS_WILL,
-            "Yawgmoth's Will",
-            &["Sorcery"][..],
-            1usize,
-            true,
-        ),
-        (GAEAS_WILL, "Gaea's Will", &["Sorcery"][..], 1usize, true),
+    for (text, name, types, expected_installs) in [
+        // Sorceries use card-level dispatch; Magus carries the same sentences
+        // inside its activated ability's effect chain.
+        (YAWGMOTHS_WILL, "Yawgmoth's Will", &["Sorcery"][..], 1usize),
+        (GAEAS_WILL, "Gaea's Will", &["Sorcery"][..], 1usize),
         (
             MAGUS_OF_THE_WILL,
             "Magus of the Will",
             &["Creature"][..],
-            0usize,
-            false,
+            1usize,
         ),
     ] {
         let parsed = parse_with_types(text, name, types);
 
-        // (i) The permission body's dispatch follows the card-level route: the
-        // two pool Sorceries are granted through the chain, while Magus's
-        // activated ability keeps its honest stub (card-level dispatch does not
-        // reach inside an activated ability's effect text).
-        let granted = parsed
-            .abilities
-            .iter()
-            .any(|a| matches!(&*a.effect, Effect::GrantCastingPermission { .. }));
-        assert_eq!(
-            granted, expected_grant,
-            "{name}: grant/dispatch split per card-level route: {parsed:#?}"
+        assert!(
+            !parsed
+                .abilities
+                .iter()
+                .any(|a| matches!(&*a.effect, Effect::Unimplemented { .. })),
+            "{name}: the permission body must not be refused"
+        );
+        assert!(
+            parsed
+                .abilities
+                .iter()
+                .any(ability_installs_graveyard_permission),
+            "{name}: the coordinated sentence must deliver a GraveyardCastPermission"
         );
         // (ii) B1 fabricates no emblem.
         assert!(
@@ -570,9 +558,10 @@ fn v5_will_cycle_cards_remain_honestly_unsupported() {
         // card-hosted definition was never consulted; the resolution install
         // (CR 611.2a) is where it can actually apply.
         //
-        // Magus of the Will produces neither, because its line 2 sits INSIDE an
-        // activated ability's effect text, which the card-level line dispatch
-        // does not reach.
+        // Magus of the Will produces its install through the effect chain
+        // rather than the card-level line dispatch, because its sentence sits
+        // INSIDE an activated ability's effect text: the chain-position
+        // redirect authority lowers it as the delivered grant's tail.
         //
         // The load-bearing invariant is that NOTHING PERMANENT escapes. Every
         // replacement these cards produce, by EITHER route and however many
@@ -618,8 +607,8 @@ fn v5_will_cycle_cards_remain_honestly_unsupported() {
     );
 
     // REACH-GUARD (beta) for assertion (iii): the install path IS live for this
-    // exact sentence in isolation, so Magus's absence is a real absence rather
-    // than a dead instrument.
+    // exact sentence in isolation, so every row's count measures its own
+    // route rather than a dead instrument.
     let live = parse_sorcery(CASE_B, "Window Probe");
     assert_eq!(
         windowed_installs(&live).len(),
@@ -655,4 +644,39 @@ fn v5b_the_same_grammar_on_a_permanent_host_is_stamped_not_permanent() {
              PERMANENT replacement on a permanent host"
         );
     }
+}
+
+/// Does this chain grant Play authority over the controller's live graveyard?
+fn ability_installs_graveyard_permission(ability: &AbilityDefinition) -> bool {
+    use engine::types::ability::ContinuousModification;
+    use engine::types::statics::GraveyardPermissionPool;
+
+    if let Effect::GenericEffect {
+        static_abilities, ..
+    } = &*ability.effect
+    {
+        let grants = static_abilities.iter().any(|static_def| {
+            static_def.modifications.iter().any(|modification| {
+                matches!(
+                    modification,
+                    ContinuousModification::GrantStaticAbility { definition }
+                        if matches!(
+                            &definition.mode,
+                            StaticMode::GraveyardCastPermission {
+                                play_mode: CardPlayMode::Play,
+                                pool: GraveyardPermissionPool::OwnGraveyard,
+                                ..
+                            }
+                        )
+                )
+            })
+        });
+        if grants {
+            return true;
+        }
+    }
+    ability
+        .sub_ability
+        .as_deref()
+        .is_some_and(ability_installs_graveyard_permission)
 }

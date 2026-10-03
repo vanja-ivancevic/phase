@@ -390,10 +390,19 @@ mod tests {
             GameAction::SelectCards { cards: vec![ours] },
         )
         .expect("the first owner must choose a permanent");
-        assert!(matches!(
+        assert!(
+            matches!(
+                state.waiting_for,
+                WaitingFor::ChooseFromZoneChoice { player: P1, .. }
+            ),
+            "next player choice: waiting={:?}; frames={:?}",
             state.waiting_for,
-            WaitingFor::ChooseFromZoneChoice { player: P1, .. }
-        ));
+            state
+                .resolution_stack
+                .iter()
+                .map(|frame| frame.kind())
+                .collect::<Vec<_>>()
+        );
         crate::game::engine::apply(
             &mut state,
             P1,

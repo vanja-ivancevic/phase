@@ -81,6 +81,10 @@ mod tests {
 
     fn make_ability(amount: QuantityExpr, controller: PlayerId) -> ResolvedAbility {
         ResolvedAbility {
+            declares_chosen_group: None,
+            reads_chosen_group: None,
+            declares_return_result: None,
+            reads_return_result: None,
             detached_remainder: crate::types::ability::DetachedRemainder::NoProducer,
             effect: Effect::GrantExtraLoyaltyActivations {
                 amount,
@@ -99,6 +103,7 @@ mod tests {
             target_incarnations: Vec::new(),
             selected_target_incarnations: Vec::new(),
             illegal_target_slots: Vec::new(),
+            illegal_local_target_slots: Vec::new(),
             targets: vec![],
             kind: AbilityKind::Activated,
             sub_ability: None,
@@ -141,10 +146,13 @@ mod tests {
             repeat_until: None,
             replacement_applied: Default::default(),
             sub_link: SubAbilityLink::ContinuationStep,
+            target_reads: Default::default(),
             sibling_condition: SiblingCondition::Dependent,
             modal: None,
             mode_abilities: vec![],
             parent_target_missing_reason: None,
+            activation_cost_reduction: None,
+            activation_record: None,
         }
     }
 

@@ -311,6 +311,10 @@
     "eligibleCount": "{{count}} legales",
     "attackingCount": "atq {{count}}",
     "selectedCount": "sel {{count}}",
+    "directBlockTargetCount": "objetivos de bloqueo {{count}}",
+    "blockingWith": "Bloqueando con {{name}}",
+    "blockedBy": "Bloqueado por {{names}}",
+    "unblocked": "Sin bloquear",
     "pickAll": "Todas",
     "pickNone": "Ninguna",
     "underAttack_one": "Atacado por {{count}} criatura",
@@ -769,6 +773,8 @@
     "mustAttackSatisfiedBadge": "Attacking ✓",
     "mustBlockBadge": "Must block",
     "mustBlockExactBadge": "Debe bloquear a {{attacker}}",
+    "mustBeBlockedBadge": "Debe ser bloqueado",
+    "bandBadge": "Bandada {{n}}",
     "mustBlockSatisfiedBadge": "Blocking ✓",
     "cantAttackBadge": "Can't attack",
     "cantBlockBadge": "Can't block",
@@ -803,6 +809,7 @@
     "titleTargets": "Objetivos: {{targets}}",
     "titlePaid": "Pagado: {{paid}}",
     "titleContext": "Contexto: {{context}}",
+    "revealedCards": "Revelada: {{cards}}",
     "paidXValue": "X={{value}}",
     "paidManaSpent": "{{amount}} de maná",
     "paidColorsSpent": "{{count}} colores",
@@ -1377,6 +1384,7 @@
       "target": "Objetivo",
       "return": "Devolver",
       "discard": "Descartar",
+      "reveal": "Mostrar",
       "evidence": "Prueba",
       "manifest": "Manifestar",
       "untap": "Enderezar",
@@ -1427,7 +1435,16 @@
       "subtitleUpTo_other": "Selecciona hasta {{count}} cartas para poner {{destination}}",
       "destinationTop": "en la parte superior de tu biblioteca",
       "destinationBattlefield": "en el campo de batalla",
-      "destinationHand": "en tu mano"
+      "destinationHand": "en tu mano",
+      "titleSplit": "Reparte las cartas restantes",
+      "subtitleSplit_one": "Ordena las cartas: {{count}} va a la parte superior de tu biblioteca; las otras {{remaining}} van al fondo",
+      "subtitleSplit_other": "Ordena las cartas: {{count}} van a la parte superior de tu biblioteca; las otras {{remaining}} van al fondo",
+      "badgeTop": "Arriba {{order}}",
+      "badgeBottom": "Fondo",
+      "hintSplit": "Arrastra para reordenar · las verdes van arriba (la primera es la superior), las grises al fondo",
+      "moveEarlier": "Mover {{card}} antes",
+      "moveLater": "Mover {{card}} después",
+      "hintSplitOrderOnly": "Arrastra o usa las flechas para reordenar dentro de cada montón · otro jugador eligió qué cartas van arriba"
     },
     "surveil": {
       "title": "Vigilar",
@@ -1798,6 +1815,14 @@
       "subtitle_one": "Put {{count}} revealed card on the bottom of your library",
       "subtitle_other": "Put {{count}} revealed cards on the bottom of your library, in any order",
       "hint": "Drag to reorder · position 1 ends up on top of this pile"
+    },
+    "revealUntilBottom": {
+      "title": "Pon el resto en el fondo",
+      "subtitle_one": "Pon {{count}} carta mostrada en el fondo de tu biblioteca",
+      "subtitle_other": "Pon {{count}} cartas mostradas en el fondo de tu biblioteca en cualquier orden",
+      "hint": "Arrastra para reordenar · la posición 1 queda arriba de este montón",
+      "moveLeft": "Mover a la izquierda",
+      "moveRight": "Mover a la derecha"
     }
   },
   "specializeColor": {
@@ -1909,6 +1934,10 @@
     "prowlNormalLabel": "Lanzar normalmente",
     "prowlAltLabel": "Lanzar con Prowl",
     "prowlSubtitle": "Lanza {{name}} normalmente, o paga su coste de Prowl (disponible porque una criatura correspondiente hizo daño de combate a un jugador este turno).",
+    "surgeEyebrow": "Surge",
+    "surgeNormalLabel": "Lanzar normalmente",
+    "surgeAltLabel": "Lanzar con Surge",
+    "surgeSubtitle": "Lanza {{name}} normalmente, o paga su coste de Surge (disponible porque tú o un compañero de equipo lanzasteis otro hechizo este turno).",
     "overloadEyebrow": "Sobrecargar",
     "overloadNormalLabel": "Lanzar normalmente",
     "overloadAltLabel": "Lanzar con Sobrecargar",
@@ -1932,6 +1961,8 @@
     "additionalExile": "+ Exiliar una carta",
     "additionalSacrifice": "+ Sacrificar un permanente",
     "additionalPayLife": "+ Pagar vidas",
+    "additionalPayLifeAmount": "+ Pagar {{amount}} vidas",
+    "additionalCollectEvidence": "+ Reunir pruebas {{amount}}",
     "additionalDiscard": "+ Descartar una carta",
     "additionalTapCreatures": "+ Girar criaturas",
     "additionalGeneric": "+ {{type}}"
@@ -1976,7 +2007,11 @@
   },
   "zoneOpponentChooser": {
     "title": "Elegir oponente",
-    "subtitle": "Elige qué oponente hace la elección."
+    "subtitle": "Elige qué oponente hace la elección.",
+    "orderTitle": "Elegir siguiente jugador",
+    "orderSubtitle": "Elige para quién harás la siguiente selección.",
+    "substituteTitle": "Elegir jugador",
+    "substituteSubtitle": "Elige quién hace esta elección."
   },
   "pileOpponent": {
     "title": "Choose Opponent",
@@ -2059,6 +2094,7 @@
     "variantForetell": "Lanzar desde Predecir",
     "variantOverload": "Lanzar con Sobrecargar",
     "variantBestow": "Lanzar con Otorgar",
+    "variantBlitz": "Lanzar con Blitz",
     "variantFreerunning": "Lanzar con Freerunning",
     "variantFuse": "Lanzar con Fusión",
     "variantMutate": "Lanzar con Mutate",
@@ -2068,7 +2104,14 @@
     "variantMoreThanMeetsTheEye": "Cast Converted",
     "variantPrototype": "Lanzar con Prototipo",
     "variantFaceDown": "Lanzar boca abajo",
-    "variantFallback": "Lanzar con {{type}}"
+    "variantFallback": "Lanzar con {{type}}",
+    "viaSource": "mediante {{name}}",
+    "extraCostAdditional": "+ {{cost}}",
+    "extraCostAlternative": "en lugar de su coste de maná: {{cost}}",
+    "entersWithCounter": "entra con un contador de {{counter}}",
+    "slotPerType": "usa su espacio de {{type}}",
+    "slotChooseType": "elige un tipo de permanente",
+    "slotOncePerTurn": "una vez este turno"
   },
   "categoryChoice": {
     "title": "Elegir permanentes a conservar",
@@ -2236,6 +2279,12 @@
     "dontAskAgain": "No volver a preguntar en esta partida",
     "dontAskAgainForSameCard": "Usar esta elección para cada copia de esta carta en esta partida"
   },
+  "keywordDetail": {
+    "selfManaCost": "su coste de maná",
+    "selfManaValue": "su valor de maná",
+    "manaCostReduced": "su coste de maná reducido en {{reduction}}",
+    "spliceOnto": "a {{subtype}} {{cost}}"
+  },
   "resolutionOptionalPayment": {
     "title": "Elige un pago opcional",
     "pay": "Pagar {{cost}}",
@@ -2253,7 +2302,8 @@
       "zoneExile": "el exilio",
       "zoneHand": "tu mano",
       "discard": "Descarta {{count}} {{cards}}",
-      "exile": "Exilia {{count}} {{cards}} de {{zone}}"
+      "exile": "Exilia {{count}} {{cards}} de {{zone}}",
+      "reveal": "Muestra {{count}} {{cards}} de {{zone}}"
     }
   },
   "topOrBottom": {
@@ -2381,10 +2431,11 @@
     "reachSpills": "Puede reducir maná genérico",
     "multiplier": "×{{count}}",
     "confirmOrder": "Confirmar orden",
-    "cancelCast": "Cancelar el lanzamiento",
+    "cancel": "Cancelar",
     "moveUp": "Subir",
     "moveDown": "Bajar",
-    "reductionFallback": "Reducción {{number}}"
+    "reductionFallback": "Reducción {{number}}",
+    "floor": "No puede reducir el coste por debajo de {{count}} de maná"
   },
   "unhandledWaitingFor": {
     "title": "Se requiere una acción, pero falta la interfaz",

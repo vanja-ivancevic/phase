@@ -15,9 +15,9 @@
 
 use crate::types::ability::ManaSpendRestriction;
 use crate::types::ability::{
-    AbilityCost, AbilityDefinition, AbilityKind, ControllerRef, Effect, ManaProduction,
-    PlayerFilter, QuantityExpr, ResolvedAbility, SacrificeCost, SacrificeRequirement, TargetFilter,
-    TriggerDefinition, TriggerDefinitionRef, TypedFilter,
+    AbilityCost, AbilityDefinition, AbilityKind, ActivationRestriction, ControllerRef, Effect,
+    ManaProduction, PlayerFilter, QuantityExpr, ResolvedAbility, SacrificeCost,
+    SacrificeRequirement, TargetFilter, TriggerDefinition, TriggerDefinitionRef, TypedFilter,
 };
 use crate::types::actions::GameAction;
 use crate::types::card_type::CoreType;
@@ -960,6 +960,18 @@ pub(crate) fn activate_mana_source_option_with_output(
             object_id: option.object_id,
             caused_by: None,
         });
+        // CR 305.6 + CR 605.3: tapping a basic land for mana activates its
+        // intrinsic mana ability; observe its triggers at that boundary.
+        let activation_event = super::casting_targets::emit_ability_activated(
+            state,
+            player,
+            option.object_id,
+            crate::types::events::ActivatedAbilityKind::Mana,
+            crate::types::zones::Zone::Battlefield,
+            events,
+        );
+        super::triggers::collect_activation_event_at_boundary(state, events, activation_event)
+            .map_err(|error| EngineError::InvalidAction(error.to_string()))?;
         // The atomic combination is planning metadata: Aura-trigger bonuses are
         // produced by their own TapsForMana abilities after this single source
         // event. Producing the combination here would add those bonuses twice.
@@ -993,13 +1005,61 @@ pub(crate) fn activate_mana_source_option_with_output(
     };
 
     if option.penalty.is_undoable() {
-        state
-            .lands_tapped_for_mana
-            .entry(player)
-            .or_default()
-            .push(option.object_id);
+        record_undoable_mana_tap(state, player, option.object_id, events);
     }
     Ok(waiting_for)
+}
+
+/// CR 605.3b: the single authority for offering an undo of a mana tap
+/// (`UntapLandForMana`). Undo is an engine convenience, not a rules action, so
+/// it is offered only when it can reverse everything the tap did: the mana and
+/// the tap itself. It is recorded only for an activation that completed in
+/// `events` and whose boundary observation bound nothing
+/// (`ActivationObservers::Unbound`). An activation still paused mid-cost (a
+/// replacement choice) has not been observed yet, so it is never recorded;
+/// one an activation trigger observed (CR 603.10) queued an ability or spent
+/// a "triggers only once each turn" limit, which undo cannot reverse. Callers
+/// decide the penalty axis (`ManaSourcePenalty::is_undoable`) first.
+pub(crate) fn record_undoable_mana_tap(
+    state: &mut GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+    events: &[GameEvent],
+) {
+    let completed_unobserved = events.iter().any(|event| {
+        matches!(
+            event,
+            GameEvent::AbilityActivated {
+                player_id,
+                source_id: activated,
+                kind: crate::types::events::ActivatedAbilityKind::Mana,
+                trigger_state: crate::types::events::ActivationTriggerState::CollectedAtActivation {
+                    observers: crate::types::events::ActivationObservers::Unbound,
+                },
+                ..
+            } if *player_id == player && *activated == source_id
+        )
+    });
+    if !completed_unobserved {
+        return;
+    }
+    state
+        .lands_tapped_for_mana
+        .entry(player)
+        .or_default()
+        .push(source_id);
+}
+
+/// CR 605.3b: withdraw any undo recorded for `player`'s tap of `source_id` once
+/// observing its activation bound a trigger.
+pub(crate) fn revoke_undoable_mana_tap(
+    state: &mut GameState,
+    player: PlayerId,
+    source_id: ObjectId,
+) {
+    if let Some(tapped) = state.lands_tapped_for_mana.get_mut(&player) {
+        tapped.retain(|tapped_id| *tapped_id != source_id);
+    }
 }
 
 /// CR 605.3a-b: Revalidate and activate a generic mana capability. The caller
@@ -1996,7 +2056,7 @@ pub fn max_mana_yield(state: &GameState, object_id: ObjectId, controller: Player
 /// CR 117.1d + CR 601.2g: Maximum net mana this permanent could contribute via
 /// **any** mana ability the controller could currently activate, including
 /// non-tap-cost mana abilities (Sacrifice — KCI, Phyrexian Altar, Ashnod's
-/// Altar; Discard — Lion's Eye Diamond; Pay Life; etc.).
+/// Altar; unrestricted discard costs; Pay Life; etc.).
 ///
 /// Unlike [`max_mana_yield`], this is NOT restricted to abilities that include
 /// `{T}` in their cost. It exists so the castability gate
@@ -2015,11 +2075,19 @@ pub fn max_mana_yield(state: &GameState, object_id: ObjectId, controller: Player
 // activate mana abilities before paying. Affordability must reflect what the
 // player COULD pay manually, not only what the engine could auto-tap.
 fn mana_ability_allowed_for_payment(
+    ability: &AbilityDefinition,
     restrictions: &[ManaSpendRestriction],
     state: &GameState,
     object_id: ObjectId,
     payment_context: Option<&PaymentContext<'_>>,
 ) -> bool {
+    // CR 304.5 + CR 605.1: Mana classification does not override printed timing limits.
+    if ability
+        .activation_restrictions
+        .contains(&ActivationRestriction::AsInstant)
+    {
+        return false;
+    }
     let Some(ctx) = payment_context else {
         return true;
     };
@@ -2070,6 +2138,7 @@ pub(crate) fn feasible_mana_capacity(
             // the restriction permits it (issue #2011: Eldrazi Temple).
             match &*ability.effect {
                 Effect::Mana { restrictions, .. } => mana_ability_allowed_for_payment(
+                    ability,
                     restrictions,
                     state,
                     object_id,
@@ -2113,21 +2182,12 @@ pub(crate) fn feasible_mana_capacity(
         })
         .max();
 
-    match explicit_max {
-        Some(amount) => amount,
-        // CR 305.1: Subtype-only basic-land fallback (same as `max_mana_yield`).
-        None if obj.card_types.core_types.contains(&CoreType::Land)
-            && !activatable_mana_options(state, object_id, controller).is_empty() =>
-        {
-            1
-        }
-        None => 0,
-    }
+    explicit_max.unwrap_or(0)
 }
 
 /// CR 117.1d + CR 601.2g: True when cost payment can involve a currently
 /// activatable non-tap mana ability that auto-tap cannot choose for the player
-/// (Treasure/Spawn/KCI-style sacrifice mana, Lion's Eye Diamond discard mana,
+/// (Treasure/Spawn/KCI-style sacrifice mana, unrestricted discard mana,
 /// pay-life mana abilities, etc.).
 pub(crate) fn has_activatable_non_tap_mana_ability_for_payment(
     state: &GameState,
@@ -2168,6 +2228,7 @@ pub(crate) fn has_activatable_non_tap_mana_ability_for_payment(
             }
             match &*ability.effect {
                 Effect::Mana { restrictions, .. } => mana_ability_allowed_for_payment(
+                    ability,
                     restrictions,
                     state,
                     object_id,
@@ -2333,7 +2394,13 @@ fn activatable_mana_profiles_for_object(
             else {
                 return None;
             };
-            if !mana_ability_allowed_for_payment(restrictions, state, object_id, payment_context) {
+            if !mana_ability_allowed_for_payment(
+                ability,
+                restrictions,
+                state,
+                object_id,
+                payment_context,
+            ) {
                 return None;
             }
             let resolved =
@@ -2563,7 +2630,7 @@ fn assign_profiles_to_shards(
 
 /// CR 117.1d + CR 601.2g: Whether residual mana shards could be paid by
 /// activating currently legal mana abilities (non-tap sources like Vivi
-/// Ornitier's {0} combination mana, Lion's Eye Diamond, etc.).
+/// Ornitier's {0} combination mana, unrestricted discard mana, etc.).
 ///
 /// Returns `(covered, consumed_pips)` where `consumed_pips` is the total mana
 /// produced by activations used for shard coverage — callers must subtract
@@ -2922,7 +2989,8 @@ fn emit_source_rows(
         // the same source (issue #2011).
         ManaProduction::Fixed { .. }
         | ManaProduction::Colorless { .. }
-        | ManaProduction::Mixed { .. } => {
+        | ManaProduction::Mixed { .. }
+        | ManaProduction::NotedTypeAndAmount => {
             let resolved =
                 super::ability_utils::build_resolved_from_def(ability, object_id, controller);
             let types =
@@ -3732,6 +3800,33 @@ mod tests {
             },
         )
         .cost(AbilityCost::Tap)
+    }
+
+    #[test]
+    fn instant_only_land_cannot_supply_payment_capacity() {
+        let mut state = GameState::new_two_player(42);
+        let controller = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority { player: controller };
+        let land = create_object(
+            &mut state,
+            CardId(901),
+            controller,
+            "Restricted Forest".to_string(),
+            Zone::Battlefield,
+        );
+        let object = state.objects.get_mut(&land).unwrap();
+        object.card_types.core_types.push(CoreType::Land);
+        Arc::make_mut(&mut object.abilities).push(
+            verge_ability(ManaColor::Green)
+                .activation_restrictions(vec![ActivationRestriction::AsInstant]),
+        );
+
+        assert!(!activatable_mana_options(&state, land, controller).is_empty());
+        assert_eq!(feasible_mana_capacity(&state, land, controller, None), 0);
+
+        Arc::make_mut(&mut state.objects.get_mut(&land).unwrap().abilities)
+            .push(verge_ability(ManaColor::Blue));
+        assert_eq!(feasible_mana_capacity(&state, land, controller, None), 1);
     }
 
     use crate::game::test_fixtures::brushland_colored_ability;
@@ -5657,6 +5752,43 @@ mod tests {
             full, indexed,
             "indexed arity is byte-identical to the full wrapper"
         );
+    }
+
+    /// The fork's noted-payment producer uses upstream's atomic source rows:
+    /// one activation returns the whole payment, not a choice of unit types.
+    #[test]
+    fn noted_payment_source_row_preserves_all_units_as_one_atomic_output() {
+        let mut state = GameState::new_two_player(42);
+        let source = create_object(
+            &mut state,
+            CardId(900),
+            PlayerId(0),
+            "Noted Payment Source".to_string(),
+            Zone::Battlefield,
+        );
+        let units = vec![ManaType::Red, ManaType::Red, ManaType::Colorless];
+        state
+            .objects
+            .get_mut(&source)
+            .unwrap()
+            .chosen_attributes
+            .push(crate::types::ability::ChosenAttribute::NotedManaSpent(
+                units.clone(),
+            ));
+        let ability = AbilityDefinition::new(
+            AbilityKind::Activated,
+            Effect::Mana {
+                produced: ManaProduction::NotedTypeAndAmount,
+                restrictions: vec![],
+                grants: vec![],
+                expiry: None,
+                target: None,
+            },
+        );
+        let rows = emit_source_rows(&state, PlayerId(0), source, 0, &ability, true);
+        assert_eq!(rows.len(), 1, "the source can be activated only once");
+        assert_eq!(rows[0].mana_type, ManaType::Red);
+        assert_eq!(rows[0].atomic_combination, Some(units));
     }
 
     /// Issue #4265 regression: `auto_tap_land_mana_options` for a Forest

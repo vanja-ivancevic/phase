@@ -10,7 +10,7 @@ use super::ability::{
     ContinuousModification, CopiableValues, DieRollIgnoreRule, Duration, FaceDownProfile,
     StaticDefinition, TargetRef,
 };
-use super::card::{PrintedCardRef, TokenImageRef};
+use super::card::{PrintedCardRef, TokenArtDescriptor, TokenImageRef};
 use super::card_type::{CoreType, Supertype};
 use super::events::EventObjectSnapshot;
 use super::identifiers::{ObjectId, ObjectIncarnationRef};
@@ -478,6 +478,16 @@ pub struct CopyTokenSpec {
     /// back to a name+filter Scryfall search. `None` for printed-card sources.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_image_ref: Option<TokenImageRef>,
+    /// Intrinsic token-art body of the copy source, captured alongside
+    /// `token_image_ref` by the enter-as-copy replacement selection. Carried
+    /// so an enter-as-copy recipient (which keeps its own base and never
+    /// runs the token creation injectors) renders from the source's printed
+    /// shape even when no exact ref matched. `None` for printed-card
+    /// sources, departed (LKI) sources, and created copy-tokens — the
+    /// latter derive their descriptor from their own base at injection,
+    /// which also reflects copy exceptions the source never had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_art: Option<TokenArtDescriptor>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_keywords: Vec<Keyword>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -558,6 +568,13 @@ pub enum ProposedEvent {
         /// `ProposedEvent` (and the `Result<_, ProposedEvent>` pipeline).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         face_down_profile: Option<Box<FaceDownProfile>>,
+        /// Typed SearchLibrary intent. This is delivery metadata, not a
+        /// battlefield `FaceDownProfile`, and survives replacement pauses.
+        #[serde(
+            default,
+            skip_serializing_if = "crate::types::ability::ExileConcealment::is_public"
+        )]
+        face_down_in_exile: crate::types::ability::ExileConcealment,
         /// CR 608.2c: whether this entry is the producer a following
         /// demonstrative anaphor binds to. Rides the event so a CR 616.1
         /// pause/resume delivers the same answer the effect asked for.
@@ -575,6 +592,14 @@ pub enum ProposedEvent {
         /// choices. Unrelated zone changes omit it from the wire.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         discard_frame: Option<crate::types::identifiers::DiscardFrameId>,
+        /// CR 608.2c: the player performing the instruction that moves this
+        /// object ("that player exiles that card" names the drawer; a
+        /// controller-worded instruction names the controller). Rides the
+        /// event through replacement and CR 616.1 pause/resume so delivery can
+        /// record, per CR 406.6 + CR 400.8, who exiled the new exile object.
+        /// `None` for moves no player performs (rules processes, raw movers).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        performed_by: Option<PlayerId>,
         #[serde(serialize_with = "crate::types::deterministic_serde::hash_set")]
         applied: HashSet<AppliedReplacementKey>,
     },
@@ -952,9 +977,11 @@ impl ProposedEvent {
             controller_override: None,
             enter_transformed: false,
             face_down_profile: None,
+            face_down_in_exile: crate::types::ability::ExileConcealment::Public,
             chain_referent: ChainReferentIntent::default(),
             enter_as_copy: None,
             discard_frame: None,
+            performed_by: None,
             applied: HashSet::new(),
         }
     }

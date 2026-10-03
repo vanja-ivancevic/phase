@@ -31,6 +31,7 @@ import {
   PACING_MAX,
   PACING_MIN,
   PACING_STEP,
+  type CardAnimationStyle,
   type PacingCategory,
   type VfxQuality,
 } from "../../animation/types.ts";
@@ -52,6 +53,7 @@ import { ConfirmDialog } from "../ui/ConfirmDialog.tsx";
 import { ModalPanelShell } from "../ui/ModalPanelShell";
 import { MenuSelect } from "../ui/MenuSelect";
 import { downloadBackup, importBackupFromFile, type ImportMode } from "../../services/backup.ts";
+import { attemptSavedDeckWrite } from "../../services/savedDeckWriteFailure.ts";
 import { isDesktopTauri } from "../../services/platform.ts";
 import { useCloudSyncStore } from "../../stores/cloudSyncStore.ts";
 import { useSetCatalog } from "../../hooks/useSetSymbols.ts";
@@ -92,6 +94,7 @@ const DRAFT_CARD_PREVIEW_MODES: DraftCardPreviewMode[] = ["none", ...CARD_PREVIE
 const DRAFT_DOUBLE_CLICK_CONFIRM_PICK_OPTIONS: Array<"disabled" | "enabled"> = ["disabled", "enabled"];
 const SPELL_PAYMENT_MODES: SpellPaymentMode[] = ["auto", "autoExceptSacrificialMana", "manual"];
 const VFX_QUALITIES: VfxQuality[] = ["full", "reduced", "minimal"];
+const CARD_ANIMATION_STYLES: CardAnimationStyle[] = ["webgl", "classic"];
 const MULTIPLAYER_BOARD_LAYOUTS: MultiplayerBoardLayout[] = ["auto", "focused", "split"];
 
 /** Format a speed value as a user-facing label. The slider goes 0→max where
@@ -190,6 +193,7 @@ export function PreferencesModal({
   const experimentalTournamentsEnabled = usePreferencesStore((s) => s.experimentalTournamentsEnabled);
   const boardBackground = usePreferencesStore((s) => s.boardBackground);
   const vfxQuality = usePreferencesStore((s) => s.vfxQuality);
+  const cardAnimationStyle = usePreferencesStore((s) => s.cardAnimationStyle);
   const animationSpeedMultiplier = usePreferencesStore((s) => s.animationSpeedMultiplier);
   const pacingMultipliers = usePreferencesStore((s) => s.pacingMultipliers);
   const setCardSize = usePreferencesStore((s) => s.setCardSize);
@@ -204,6 +208,7 @@ export function PreferencesModal({
   const customBackgroundUrl = usePreferencesStore((s) => s.customBackgroundUrl);
   const setCustomBackgroundUrl = usePreferencesStore((s) => s.setCustomBackgroundUrl);
   const setVfxQuality = usePreferencesStore((s) => s.setVfxQuality);
+  const setCardAnimationStyle = usePreferencesStore((s) => s.setCardAnimationStyle);
   const setPacingMultiplier = usePreferencesStore((s) => s.setPacingMultiplier);
   const resetPacing = usePreferencesStore((s) => s.resetPacing);
   const resetAllPreferences = usePreferencesStore((s) => s.resetAllPreferences);
@@ -545,6 +550,15 @@ export function PreferencesModal({
                       value={vfxQuality}
                       onChange={setVfxQuality}
                       renderLabel={(opt) => t(`visual.vfxQualityOptions.${opt}`)}
+                    />
+                  </SettingGroup>
+
+                  <SettingGroup label={t("visual.cardAnimationStyle")}>
+                    <SegmentedControl
+                      options={CARD_ANIMATION_STYLES}
+                      value={cardAnimationStyle}
+                      onChange={setCardAnimationStyle}
+                      renderLabel={(opt) => t(`visual.cardAnimationStyleOptions.${opt}`)}
                     />
                   </SettingGroup>
 
@@ -1183,7 +1197,9 @@ function DataSection() {
       setError(null);
       setStatus(null);
       try {
-        const result = await importBackupFromFile(file, mode);
+        const restored = await attemptSavedDeckWrite("restore", () => importBackupFromFile(file, mode));
+        if (!restored.ok) return;
+        const result = restored.value;
         const base = result.preferencesReplaced
           ? t("data.importedWithPreferences", { count: result.decksImported })
           : t("data.imported", { count: result.decksImported });

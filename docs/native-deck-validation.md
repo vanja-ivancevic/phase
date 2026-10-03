@@ -7,6 +7,10 @@ card-data export. Stdout is an ordered JSON result array; stderr carries input o
 output failures. Exit 0 means evaluation succeeded, including incompatible decks;
 exit 2 means the operation failed. An empty request array produces `[]`.
 
+Regenerate the complete export with the matching parser after a parser or
+serialization-schema change. An older export is not a compatibility format;
+do not patch tagged enum fields by hand or replace it with a reduced card pool.
+
 For example, save this as `requests.json`:
 
 ```json
@@ -26,6 +30,13 @@ not a CLI failure. Card copies are repeated names. Format values use the existin
 DTO's case-sensitive spelling. All supported request fields and result semantics
 remain owned by `crates/engine/src/game/deck_validation.rs`; the executable does
 not add legality or coverage rules.
+
+Names resolve against the export's actual face and layout metadata. A valid
+multi-face spelling such as `Front // Back` or `Front / Back` identifies one
+card. Resolving single-slash split shorthand from only an indexed front
+requires that front's split-card metadata. Hidden storage aliases for the same Oracle ID,
+face position and printed name remain searchable but do not add a third face
+to a two-faced card's canonical name.
 
 POD-Lab's `pod_lab.fields.validate` is the external consumer: it validates complete
 candidate/opponent decks against the exact gameplay dataset before freezing a run.

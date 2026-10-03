@@ -6,8 +6,12 @@ use std::process::Command;
 
 use serde_json::Value;
 
-// Fixtures are gzipped to keep the repo small; regenerating via
-// scripts/cr733_mutation_census.py requires re-gzipping (`gzip -9 -n`).
+// Fixtures are gzipped to keep the repo small (`gzip -9 -n`).
+// The authority matrix combines upstream and fork field classifications while
+// retaining their shared historical census receipt. It is not a fresh merged
+// census: scripts/cr733_mutation_census.py generates source sites, not authority
+// classifications. CR733_CENSUS_STRICT requires separately adjudicated fresh
+// receipts for all four fixtures, not a mechanical change to their count pins.
 fn gunzip(gz: &[u8]) -> String {
     let mut json = String::new();
     flate2::read::GzDecoder::new(gz)

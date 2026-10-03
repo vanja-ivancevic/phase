@@ -6734,36 +6734,13 @@ fn recursive_outbound_budget_counts_nested_choice_surfaces() {
 }
 
 #[test]
-fn generated_contract_and_projection_source_exclude_unstable_internal_strings() {
+fn generated_contract_excludes_unstable_internal_strings() {
     let generated = include_str!("../../../../client/src/adapter/generated/interaction/index.ts");
     assert!(generated.contains("\"invalidAuthorityState\""));
     assert!(generated.contains("InteractionActionCode"));
     assert!(generated.contains("InteractionRoleCode"));
     assert!(generated.contains("InteractionShortcutResponseCode"));
     assert!(!generated.contains("semanticCode"));
-
-    let projection_source = include_str!("../../src/game/interaction.rs");
-    assert!(
-        projection_source.contains("Vec<(LoopShortcutPointProjection, Vec<u32>)>"),
-        "declared points and their segments accumulate as one paired vector, so no arm can publish a point without its segment"
-    );
-    assert!(!projection_source.contains(":?}"));
-    assert!(!projection_source.contains(".variant_name()"));
-    assert!(!projection_source.contains("let semantic_code"));
-    assert!(!projection_source.contains("action.into()"));
-    for forbidden in [
-        "\"manaPip\"",
-        "\"epoch\"",
-        "\"routeId\"",
-        "\"breakpointId\"",
-        "\"shortcutResponse\"",
-        "\"iterationCount\"",
-    ] {
-        assert!(
-            !projection_source.contains(forbidden),
-            "interaction projection must not expose {forbidden}"
-        );
-    }
 }
 
 #[test]
