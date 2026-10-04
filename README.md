@@ -437,6 +437,12 @@ still validate the named source's live rows. Unspent-mana effects retain the lay
 system's zone-of-function rules. Compare identical card bytes, seeds, profiles and
 hosts; these timings measure decision cost, not playing strength.
 
+Automatic mana-source completion preserves the caller's live payment prompt.
+Only a returned non-priority pause transfers prompt ownership; a synchronous
+nested source does not become the suspended outer cost root. The
+`mana_prompt_auto_resolved_source_preserves_live_payment` engine regression
+exercises that boundary with a source tap, its mana output, and no parked cursor.
+
 ### Cargo Aliases
 
 ```

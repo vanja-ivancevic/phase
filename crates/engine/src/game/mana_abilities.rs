@@ -663,7 +663,9 @@ pub(super) fn resolve_mana_ability_excluding(
         events,
         cost_event_start,
     )?;
-    if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+    // A synchronous completion returns Priority; the ambient prompt still
+    // belongs to the caller. Only a returned pause transfers that ownership.
+    if !matches!(waiting_for, WaitingFor::Priority { .. }) {
         state.waiting_for = waiting_for;
     } else {
         state.waiting_for = waiting_before;
@@ -12214,6 +12216,181 @@ mod tests {
             pool.mana[0].restrictions,
             vec![ManaRestriction::OnlyForSpell]
         );
+    }
+
+    fn mana_prompt_forest(state: &mut GameState, card_id: u64) -> ObjectId {
+        let forest = create_object(
+            state,
+            CardId(card_id),
+            PlayerId(0),
+            "Forest".to_string(),
+            Zone::Battlefield,
+        );
+        let object = state.objects.get_mut(&forest).unwrap();
+        object.card_types.core_types.push(CoreType::Land);
+        object.card_types.subtypes.push("Forest".to_string());
+        forest
+    }
+
+    #[test]
+    fn mana_prompt_auto_resolved_source_preserves_live_payment() {
+        let mut state = GameState::new_two_player(42);
+        let forest = mana_prompt_forest(&mut state, 990_001);
+        let payment = WaitingFor::ManaPayment {
+            player: PlayerId(0),
+            convoke_mode: None,
+        };
+        state.waiting_for = payment.clone();
+        let ability = make_mana_ability(ManaProduction::Fixed {
+            colors: vec![ManaColor::Green],
+            contribution: ManaContribution::Base,
+        });
+        let mut events = Vec::new();
+
+        resolve_mana_ability(&mut state, forest, PlayerId(0), &ability, &mut events, None)
+            .expect("a completed automatic source must return to its live cost owner");
+
+        assert_eq!(state.waiting_for, payment);
+        assert!(state.pending_cost_move_resume.is_none());
+        assert!(state.objects[&forest].tapped);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Green), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::TappedForMana { source_id, .. } if *source_id == forest
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mana_prompt_skyshroud_elf_filters_for_master_decoy_without_false_pause() {
+        use crate::game::engine::apply_as_current;
+        use crate::types::actions::GameAction;
+
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 12;
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let forests: Vec<_> = (990_002..990_005)
+            .map(|card_id| mana_prompt_forest(&mut state, card_id))
+            .collect();
+        let elf = create_object(
+            &mut state,
+            CardId(990_005),
+            PlayerId(0),
+            "Skyshroud Elf".to_string(),
+            Zone::Battlefield,
+        );
+        let filter = make_mana_ability(ManaProduction::AnyOneColor {
+            count: QuantityExpr::Fixed { value: 1 },
+            color_options: vec![ManaColor::White, ManaColor::Red],
+            contribution: ManaContribution::Base,
+        })
+        .cost(AbilityCost::Mana {
+            cost: ManaCost::generic(1),
+        });
+        {
+            let object = state.objects.get_mut(&elf).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.power = Some(1);
+            object.toughness = Some(1);
+            Arc::make_mut(&mut object.abilities).extend([
+                make_mana_ability(ManaProduction::Fixed {
+                    colors: vec![ManaColor::Green],
+                    contribution: ManaContribution::Base,
+                }),
+                filter,
+            ]);
+        }
+        let decoy = create_object(
+            &mut state,
+            CardId(990_006),
+            PlayerId(0),
+            "Master Decoy".to_string(),
+            Zone::Hand,
+        );
+        {
+            let object = state.objects.get_mut(&decoy).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.power = Some(1);
+            object.toughness = Some(2);
+            object.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::White],
+                generic: 1,
+            };
+        }
+        // Bind printed fixture characteristics before the layer-based cast probe.
+        for (_, object) in state.objects.iter_mut() {
+            object.sync_missing_base_characteristics();
+        }
+        crate::game::layers::mark_layers_full(&mut state);
+        crate::game::layers::flush_layers(&mut state);
+        let cast = crate::ai_support::legal_actions(&state)
+            .into_iter()
+            .find(|action| {
+                matches!(
+                    action,
+                    GameAction::CastSpell { object_id, .. } if *object_id == decoy
+                )
+            })
+            .expect("the real menu must offer the filter-payable creature");
+        let cast_result = apply_as_current(&mut state, cast).expect("begin the offered cast");
+        assert!(matches!(
+            cast_result.waiting_for,
+            WaitingFor::ManaPayment { .. }
+        ));
+        assert_eq!(state.players[0].mana_pool.total(), 0);
+        assert!(state.pending_cost_move_resume.is_none());
+
+        let activation = crate::ai_support::legal_actions(&state)
+            .into_iter()
+            .find(|action| {
+                matches!(
+                    action,
+                    GameAction::ActivateAbility { source_id, ability_index: 1 } if *source_id == elf
+                )
+            })
+            .expect("the real payment menu must offer Skyshroud Elf's filter");
+        let result = apply_as_current(&mut state, activation).expect("pay the filter's sub-cost");
+        assert!(matches!(
+            result.waiting_for,
+            WaitingFor::ChooseManaColor { .. }
+        ));
+        assert!(
+            state.pending_cost_move_resume.is_none(),
+            "synchronous funding must not fabricate a replacement-paused cursor: {:?}",
+            state.pending_cost_move_resume
+        );
+        assert_eq!(
+            forests.iter().filter(|id| state.objects[id].tapped).count(),
+            1
+        );
+        assert_eq!(state.players[0].mana_pool.total(), 0);
+
+        let chosen = apply_as_current(
+            &mut state,
+            GameAction::ChooseManaColor {
+                choice: ManaChoice::SingleColor(ManaType::White),
+                count: 1,
+            },
+        )
+        .expect("finish the filter's single white output");
+        assert!(matches!(chosen.waiting_for, WaitingFor::ManaPayment { .. }));
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::White), 1);
+        apply_as_current(&mut state, GameAction::PassPriority)
+            .expect("the outer cast must spend its filtered mana and finish");
+        assert_eq!(state.objects[&decoy].zone, Zone::Stack);
+        assert!(state.pending_cast.is_none());
+        assert!(state.pending_cost_move_resume.is_none());
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::White), 0);
     }
 
     #[test]
