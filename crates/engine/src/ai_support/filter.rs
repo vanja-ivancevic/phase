@@ -363,9 +363,9 @@ fn structurally_valid_priority_activation(state: &GameState, action: &GameAction
 }
 
 // CR 117.1a + CR 601.2: a player may cast a spell when they have priority;
-// `can_cast_object_now` / `effective_spell_cost` below are the engine's
-// structural authorities for the cast — this fast path only avoids
-// re-simulating the full cast to discard the clone.
+// `castable_spell_auto_payable_with_probe` below is the engine's structural
+// authority for the cast and its admitting face's payment — this fast path
+// only avoids re-simulating the full cast to discard the clone.
 fn structurally_valid_priority_cast(state: &GameState, action: &GameAction) -> bool {
     structurally_valid_priority_cast_with_probe(state, action, None)
 }
@@ -407,20 +407,12 @@ fn structurally_valid_priority_cast_with_probe(
     let Some(obj) = state.objects.get(object_id) else {
         return false;
     };
-    if obj.card_id != *card_id
-        || !casting::can_cast_object_now_with_probe(state, *player, *object_id, probe)
-    {
-        return false;
-    }
-
-    // CR 601.2a: a graveyard cast with several permissions has no single exact
-    // cost until one is announced; it is payable when some option is.
-    match casting::effective_spell_cost(state, *player, *object_id) {
-        Some(cost) => casting::can_pay_cost_after_auto_tap_with_probe(
-            state, *player, *object_id, &cost, probe,
-        ),
-        None => casting::graveyard_cast_payable_by_some_option(state, *player, *object_id, probe),
-    }
+    // CR 601.2a + CR 712.11c / CR 715.3a: the cost checked is the prepared
+    // cost of the face that admits the cast; a graveyard cast with several
+    // permissions has no single exact cost until one is announced, and is
+    // payable when some option is.
+    obj.card_id == *card_id
+        && casting::castable_spell_auto_payable_with_probe(state, *player, *object_id, probe)
 }
 
 /// A pipeline of filters run in the order they're registered. Candidates pass

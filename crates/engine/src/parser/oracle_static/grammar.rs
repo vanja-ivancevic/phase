@@ -1886,32 +1886,32 @@ pub(crate) fn extract_keyword_clause(text: &str) -> Option<&str> {
     None
 }
 
-/// Extract the keyword text from "lose [keyword]" / "loses [keyword]" clauses.
-/// Mirrors `extract_keyword_clause` but for keyword removal.
+/// Extract an outer loss list, stopping before a subsequent grant predicate.
+/// Callers mask or remove quoted spans first, so verbs inside granted abilities
+/// cannot claim the loss or terminate a quoted keyword-family reference.
 pub(crate) fn extract_lose_keyword_clause(text: &str) -> Option<&str> {
-    let lower = text.to_lowercase();
+    use nom::bytes::complete::tag_no_case;
 
-    for needle in [" and loses ", " and lose "] {
-        if let Some(pos) = lower.find(needle) {
-            let after = &text[pos + needle.len()..];
-            // Stop before "and gains" to avoid consuming the gain clause
-            let end = lower[pos + needle.len()..]
-                .find(" and gain") // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-                .unwrap_or(after.len());
-            return Some(&after[..end]);
-        }
-    }
-
-    for prefix in ["loses ", "lose "] {
-        if let Some(rest) = nom_tag_lower(&lower, &lower, prefix) {
-            let after = &text[prefix.len()..];
-            // Stop before "and gains"/"and gain" to avoid consuming the gain clause
-            let end = rest.find(" and gain").unwrap_or(after.len()); // allow-noncombinator: moved legacy static parser code; refactor-only split preserves behavior.
-            return Some(&after[..end]);
-        }
-    }
-
-    None
+    let after = nom_primitives::scan_at_word_boundaries(text, |i| {
+        preceded(alt((tag_no_case("loses "), tag_no_case("lose "))), rest).parse(i)
+    })?;
+    let clause = nom_primitives::scan_split_at_phrase(after, |i| {
+        (
+            tag_no_case("and "),
+            opt(alt((tag_no_case("it "), tag_no_case("they ")))),
+            alt((
+                tag_no_case("gains "),
+                tag_no_case("gain "),
+                tag_no_case("has "),
+                tag_no_case("have "),
+            )),
+        )
+            .parse(i)
+    })
+    .map_or(after, |(before, _)| before);
+    // Preserve trailing masked quote bytes when there is no comma: callers
+    // recover this exact span from the original to reject unsupported losses.
+    Some(clause.trim_end().strip_suffix(',').unwrap_or(clause))
 }
 
 /// Parse a leading P/T pair from Oracle text, returning values and remainder.

@@ -5,7 +5,7 @@ use super::prelude::*;
 #[allow(unused_imports)]
 use super::support::*;
 use nom::character::complete::alphanumeric1;
-use nom::combinator::not;
+use nom::combinator::{map_opt, not};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuleStaticPredicate {
@@ -1271,19 +1271,106 @@ fn parse_last_chosen_characteristic_list(
     .parse(input)
 }
 
+/// CR 702 + CR 613.1f: a loss list may name a quoted keyword family rather
+/// than grant the quoted text as an ability. Each member must consume its
+/// complete span; the enclosing parser owns conjunctions and punctuation.
+fn parse_keyword_loss_member(input: &str) -> OracleResult<'_, ContinuousModification> {
+    let parse_keyword = |word: &str| {
+        let word = word.trim();
+        let keyword = super::oracle_keyword::parse_router_keyword_fragment(word)?;
+        // The legacy core's colon-form fallback can treat prose after a unit
+        // keyword as a discarded parameter. A loss member names the keyword
+        // itself, so require its canonical Oracle spelling as well.
+        (super::oracle_keyword::keyword_display_name(&keyword) == word).then_some(keyword)
+    };
+    let (remaining, keyword) = if let Ok((remaining, (_, kind, _))) = (
+        tag::<_, _, OracleError<'_>>("all \""),
+        take_until("\""),
+        tag("\" abilities"),
+    )
+        .parse(input)
+    {
+        let keyword = if all_consuming(tag::<_, _, OracleError<'_>>("bands with other"))
+            .parse(kind)
+            .is_ok()
+        {
+            // RemoveKeyword compares discriminants, not qualities. An empty
+            // payload denotes the family ONLY here; it is never a granted
+            // BandsWithOther ability or a fabricated creature quality.
+            Some(Keyword::BandsWithOther(String::new()))
+        } else {
+            parse_keyword(kind).filter(|keyword| !matches!(keyword, Keyword::BandsWithOther(_)))
+        };
+        (remaining, keyword)
+    } else {
+        let (remaining, keyword) = alt((
+            map_opt(take_until(", and "), parse_keyword),
+            map_opt(take_until(" and "), parse_keyword),
+            map_opt(take_until(", "), parse_keyword),
+            map_opt(rest, parse_keyword),
+        ))
+        .parse(input)?;
+        (remaining, Some(keyword))
+    };
+    let Some(keyword) = keyword else {
+        return Err(nom::Err::Error(OracleError::new(
+            input,
+            nom::error::ErrorKind::Tag,
+        )));
+    };
+    Ok((remaining, ContinuousModification::RemoveKeyword { keyword }))
+}
+
+fn parse_quoted_keyword_loss_list(text: &str) -> Option<Vec<ContinuousModification>> {
+    let lower = text.trim().trim_end_matches('.').trim().to_lowercase();
+    nom_parse_lower(&lower, |i| {
+        all_consuming(separated_list1(
+            alt((tag(", and "), tag(" and "), tag(", "))),
+            parse_keyword_loss_member,
+        ))
+        .parse(i)
+    })
+}
+
 pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModification> {
     // Strip "where X is [quantity]" before parsing modifications,
     // but only if the text doesn't contain quoted abilities (which have their
     // own "where X is" handling inside the quote).
     let text_lower = text.to_lowercase();
     let text_tp = TextPair::new(text, &text_lower);
-    let (stripped_tp, where_x_expression) = if text.contains('"') {
+    let has_quotes = text.contains('"');
+    let (stripped_tp, where_x_expression) = if has_quotes {
         (text_tp, None)
     } else {
         super::oracle_effect::strip_trailing_where_x(text_tp)
     };
     let tp = nom_tag_tp(&stripped_tp, "also ").unwrap_or(stripped_tp);
     let text_stripped = tp.original;
+    // Locate the outer loss on a length-preserving quote mask, then recover
+    // its original slice. Inner loss/gain verbs in a granted ability cannot
+    // steal the outer clause or truncate its quoted family references.
+    let quoted_loss = if has_quotes {
+        let masked = nom_primitives::mask_double_quoted_spans_preserving_len(text_stripped);
+        extract_lose_keyword_clause(&masked).and_then(|clause| {
+            let start = clause.as_ptr() as usize - masked.as_ptr() as usize;
+            let original_clause = &text_stripped[start..start + clause.len()];
+            original_clause
+                .contains('"')
+                .then_some((start, original_clause))
+        })
+    } else {
+        None
+    };
+    let quoted_loss = if let Some((start, clause)) = quoted_loss {
+        let Some(modifications) = parse_quoted_keyword_loss_list(clause) else {
+            // An unsupported quoted loss must not become a partial loss plus
+            // an unrelated grant merely because the quotes were stripped.
+            return Vec::new();
+        };
+        Some((start, clause.len(), modifications))
+    } else {
+        None
+    };
     let unquoted_text = strip_quoted_segments(text_stripped);
     let unquoted_lower = unquoted_text.to_lowercase();
     let unquoted_tp = TextPair::new(&unquoted_text, &unquoted_lower);
@@ -1596,8 +1683,13 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
         }
     }
 
-    for modification in parse_quoted_ability_modifications(text_stripped) {
-        modifications.push(modification);
+    if let Some((start, length, _)) = &quoted_loss {
+        modifications.extend(parse_quoted_ability_modifications(&text_stripped[..*start]));
+        modifications.extend(parse_quoted_ability_modifications(
+            &text_stripped[*start + *length..],
+        ));
+    } else {
+        modifications.extend(parse_quoted_ability_modifications(text_stripped));
     }
 
     if let Some(additive_modifications) = parse_additive_type_clause_modifications(&unquoted_text) {
@@ -1661,8 +1753,11 @@ pub(crate) fn parse_continuous_modifications(text: &str) -> Vec<ContinuousModifi
         }
     }
 
-    // CR 702: "lose [keyword]" / "loses [keyword]" — keyword removal.
-    if let Some(keyword_text) = extract_lose_keyword_clause(&unquoted_text) {
+    // CR 702: quoted family references and bare keywords share the existing
+    // removal representation, but only the unquoted path may strip quotes.
+    if let Some((_, _, loss_modifications)) = quoted_loss {
+        modifications.extend(loss_modifications);
+    } else if let Some(keyword_text) = extract_lose_keyword_clause(&unquoted_text) {
         let keyword_text = keyword_text.trim().trim_end_matches('.').trim();
         if keyword_text.eq_ignore_ascii_case("all landwalk abilities")
             || keyword_text.eq_ignore_ascii_case("all landwalk")

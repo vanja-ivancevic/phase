@@ -1428,6 +1428,18 @@ pub fn resolve(
     // Other implicit-target filters (`Controller`) keep the pre-existing
     // "fall back when targets are empty" semantic.
     let effective_targets = damage_recipients(state, ability);
+    // Fireball divides at resolution over the still-legal recipients. Fix the
+    // share once here; replacement-choice continuations retain these amounts.
+    let num_dmg = if ability.distribute
+        == Some(crate::types::game_state::DistributionUnit::EvenSplitDamage)
+    {
+        u32::try_from(effective_targets.len())
+            .ok()
+            .and_then(|count| num_dmg.checked_div(count))
+            .unwrap_or(0)
+    } else {
+        num_dmg
+    };
 
     // CR 601.2d: If the caster distributed damage among targets at cast time,
     // apply per-target amounts from ability.distribution instead of uniform damage.

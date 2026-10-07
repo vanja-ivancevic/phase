@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
-use engine::types::ability::TargetRef;
+use engine::types::ability::{CoinFlipResult, TargetRef};
 use engine::types::actions::GameAction;
 use engine::types::counter::CounterType;
 use engine::types::events::GameEvent;
@@ -400,7 +400,13 @@ fn flock_of_rabid_sheep_flips_x_coins() {
         matches!(e, GameEvent::CoinFlipped { .. })
     });
     let wins = count_events(outcome.events(), |e| {
-        matches!(e, GameEvent::CoinFlipped { won: true, .. })
+        matches!(
+            e,
+            GameEvent::CoinFlipped {
+                result: CoinFlipResult::Won,
+                ..
+            }
+        )
     });
     assert_eq!(flips, 3);
     assert_eq!(count_of(&runner, "Rabid Sheep(token)"), wins);

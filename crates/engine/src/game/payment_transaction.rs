@@ -923,6 +923,7 @@ mod tests {
                             count: 1,
                             zone: Some(Zone::Graveyard),
                             filter: None,
+                            same_zone_owner: false,
                         },
                     ],
                 },

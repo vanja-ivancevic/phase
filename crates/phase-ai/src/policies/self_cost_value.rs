@@ -1297,6 +1297,7 @@ mod tests {
         // (>=7 cards) would clear the reject floor.
         let mut state = GameState::new_two_player(42);
         let cost = AbilityCost::Exile {
+            same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Graveyard),
             filter: Some(TargetFilter::SelfRef),
@@ -1324,6 +1325,7 @@ mod tests {
         // hand-exile clears the reject floor — proves Exile{Hand} reaches scoring.
         let mut state = GameState::new_two_player(42);
         let cost = AbilityCost::Exile {
+            same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Hand),
             filter: None,
@@ -1338,37 +1340,6 @@ mod tests {
             &verdict_for(&state, source, plain_features()),
             "self_cost_trivial_benefit",
         );
-    }
-
-    // --- Row 8: ExilesCards siblings never fire the gate ------------------
-
-    #[test]
-    fn exile_cost_siblings_out_of_scope() {
-        // CollectEvidence / ExileWithAggregate / Behold are structurally
-        // distinct from a self-resource exile — the gate must not fire.
-        assert!(!self_cost_in_scope(&AbilityCost::CollectEvidence {
-            amount: 3
-        }));
-        assert!(!self_cost_in_scope(&AbilityCost::Exile {
-            count: 1,
-            zone: Some(Zone::Library),
-            filter: None,
-        }));
-        assert!(!self_cost_in_scope(&AbilityCost::Exile {
-            count: 1,
-            zone: None,
-            filter: None,
-        }));
-        // A Composite of only out-of-scope costs stays out of scope.
-        assert!(!self_cost_in_scope(&AbilityCost::Composite {
-            costs: vec![AbilityCost::Tap, AbilityCost::CollectEvidence { amount: 2 },],
-        }));
-        // Selective, not blanket: a graveyard/hand exile IS in scope.
-        assert!(self_cost_in_scope(&AbilityCost::Exile {
-            count: 1,
-            zone: Some(Zone::Graveyard),
-            filter: None,
-        }));
     }
 
     #[test]

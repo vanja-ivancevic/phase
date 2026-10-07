@@ -627,15 +627,10 @@ pub fn additional_cost_instead_spell_has_legal_targets(
     let mut resolved = build_resolved_from_def(ability_def, object_id, player);
     resolved.context.additional_cost_paid = true;
     resolved.set_context_recursive(resolved.context.clone());
-    // CR 601.2c: a queue-synthesized "instead" cost only broadens castability when the
-    // override re-selects a REAL (non-context-ref) target — mirror the cast-time gate
-    // (requires_additional_cost_declaration_before_targets). A context-ref override
-    // ("that permanent" = ParentTarget, e.g. Torch the Tower / Bargain) does NOT broaden;
-    // it inherits the base clause's target requirement, so fall through to the base
-    // castability check. Kicker is unaffected (has_kicker_cost short-circuits).
-    if !has_kicker_cost
-        && !crate::game::casting::requires_additional_cost_declaration_before_targets(&resolved)
-    {
+    // CR 601.2c: only an override that re-selects a real target broadens
+    // castability. ParentTarget inherits the base target requirement, including
+    // for kicker (Prohibit).
+    if !crate::game::casting::requires_additional_cost_declaration_before_targets(&resolved) {
         return false;
     }
     match build_target_slots(state, &resolved) {
@@ -1515,6 +1510,16 @@ pub fn simple_legal_target_assignment_exists_for_ability(
         return None;
     }
 
+    // CR 601.2c: a failed grouped-target bound produces no flattened specs
+    // for that group. A satisfiable single-target tail is not proof that the
+    // omitted mandatory prefix can be chosen. Quantity groups must use the
+    // fallible slot builder, which preserves minimum-count and chosen-X errors.
+    if std::iter::successors(Some(ability), |node| node.sub_ability.as_deref())
+        .any(|node| node.multi_target.is_some())
+    {
+        return None;
+    }
+
     let specs = target_slot_specs(state, ability);
     let [spec] = specs.as_slice() else {
         return None;
@@ -1600,9 +1605,6 @@ pub fn execute_targets_satisfiable(
     // (`build_resolved_from_def`) so a sub-ability chain's own target slots are
     // preflighted too — not just the root effect's.
     let resolved = build_resolved_from_def(execute, source.id, source.controller);
-    if target_slot_specs(state, &resolved).is_empty() {
-        return true; // the effect requires no target
-    }
     // CR 115.1 + CR 601.2c: preflight against the SAME cross-target constraints
     // the live trigger carries (`PendingTrigger::target_constraints`), so a
     // constrained multi-target execute is not judged against a broader target
@@ -2480,6 +2482,141 @@ pub fn distribution_targets(ability: &ResolvedAbility) -> Vec<TargetRef> {
     }
 }
 
+/// CR 601.2d: The amount a distributing node divides among its targets.
+fn distributed_amount(effect: &Effect) -> Option<&QuantityExpr> {
+    match effect {
+        Effect::DealDamage { amount, .. } => Some(amount),
+        Effect::PutCounter { count, .. } => Some(count),
+        _ => None,
+    }
+}
+
+/// CR 601.2d: Whether the controller announces how `unit` is divided. Damage,
+/// counters and life "divided as you choose" are announced by the controller,
+/// and each chosen target must receive at least one. Damage "divided evenly,
+/// rounded down" is fixed by the card itself: the controller makes no division
+/// choice and a target may receive zero.
+fn distribution_is_announced_by_controller(
+    unit: &crate::types::game_state::DistributionUnit,
+) -> bool {
+    use crate::types::game_state::DistributionUnit;
+    match unit {
+        DistributionUnit::Damage | DistributionUnit::Counters(_) | DistributionUnit::Life => true,
+        DistributionUnit::EvenSplitDamage => false,
+    }
+}
+
+/// CR 601.2b + CR 601.2d: The resolved size of the pool `ability` divides among
+/// its targets, peeling any "up to" wrapper. `None` when the pool still
+/// references an unannounced X. NOTE: this resolves the pool of ANY damage or
+/// counter effect — dividing or not. Establishing that a distributing context
+/// exists (a non-empty `pending.distribute`) is the CALLER's precondition;
+/// `announce_cast_distribution` guards on it before calling here. A resolved
+/// pool of zero is a real pool (Fireball cast for X=0), not an absent one.
+pub(crate) fn resolved_distribution_pool(
+    state: &GameState,
+    ability: &ResolvedAbility,
+) -> Option<u32> {
+    let (inner, _) = distributed_amount(&ability.effect)?.peel_up_to();
+    if quantity_expr_has_unresolved_x(ability, inner) {
+        return None;
+    }
+    Some(u32::try_from(resolve_quantity_with_targets(state, inner, ability)).unwrap_or(0))
+}
+
+/// CR 601.2d: How a division among already-declared targets is announced.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DistributionAnnouncement {
+    /// No controller choice: `Some` records an empty announcement; `None`
+    /// leaves an even split to resolution over the then-legal targets.
+    Automatic(Option<Vec<(TargetRef, u32)>>),
+    /// The controller announces the division of `total` among `targets`.
+    Choice { total: u32, targets: Vec<TargetRef> },
+}
+
+/// CR 601.2d: Controller-chosen division is announced during casting.
+/// Even division is determined at resolution, not during casting (Fireball's
+/// 2017-11-17 ruling), and therefore stores no announced allocation.
+pub(crate) fn announce_distribution(
+    unit: &crate::types::game_state::DistributionUnit,
+    total: u32,
+    targets: Vec<TargetRef>,
+) -> DistributionAnnouncement {
+    if !distribution_is_announced_by_controller(unit) {
+        return DistributionAnnouncement::Automatic(None);
+    }
+    if targets.is_empty() {
+        DistributionAnnouncement::Automatic(Some(Vec::new()))
+    } else {
+        DistributionAnnouncement::Choice { total, targets }
+    }
+}
+
+/// CR 601.2d: Validate an announced division of `total` among `targets`.
+///
+/// Every target appears exactly once, receives at least one, and the amounts
+/// sum to `total`. Even division is not a controller announcement.
+pub(crate) fn validate_distribution(
+    unit: &crate::types::game_state::DistributionUnit,
+    total: u32,
+    targets: &[TargetRef],
+    distribution: &[(TargetRef, u32)],
+) -> Result<(), EngineError> {
+    if !distribution_is_announced_by_controller(unit) {
+        return Err(EngineError::InvalidAction(
+            "Even division is determined at resolution".to_string(),
+        ));
+    }
+    if distribution.len() != targets.len() {
+        return Err(EngineError::InvalidAction(format!(
+            "Distribution covers {} targets, expected {}",
+            distribution.len(),
+            targets.len()
+        )));
+    }
+    for (index, (target, _)) in distribution.iter().enumerate() {
+        if !targets.contains(target) {
+            return Err(EngineError::InvalidAction(
+                "Distribution target not in legal set".to_string(),
+            ));
+        }
+        if distribution[..index].iter().any(|(seen, _)| seen == target) {
+            return Err(EngineError::InvalidAction(
+                "Distribution assigns a target more than once".to_string(),
+            ));
+        }
+    }
+    if distribution.iter().any(|(_, amount)| *amount == 0) {
+        return Err(EngineError::InvalidAction(
+            "Each target must receive at least 1".to_string(),
+        ));
+    }
+    let actual = distribution
+        .iter()
+        .try_fold(0u32, |sum, (_, amount)| sum.checked_add(*amount));
+    if actual != Some(total) {
+        return Err(EngineError::InvalidAction(format!(
+            "Distribution total {} != required {total}",
+            actual.map_or_else(|| "overflow".to_string(), |sum| sum.to_string()),
+        )));
+    }
+    Ok(())
+}
+
+/// CR 608.2b + CR 601.2d: Illegal targets are not affected, and the division
+/// announced while casting is not redone — each surviving target keeps exactly
+/// the share it was assigned. Call after `ability.targets` has been revalidated.
+fn retain_distribution_for_surviving_targets(ability: &mut ResolvedAbility) {
+    let ResolvedAbility {
+        targets,
+        distribution,
+        ..
+    } = ability;
+    if let Some(distribution) = distribution.as_mut() {
+        distribution.retain(|(target, _)| targets.contains(target));
+    }
+}
+
 /// CR 608.2b: Re-validate targets on resolution — remove any that are no longer legal.
 fn target_is_current(ability: &ResolvedAbility, target: &TargetRef, state: &GameState) -> bool {
     match target {
@@ -3040,6 +3177,7 @@ pub fn validate_targets_in_chain(state: &GameState, ability: &ResolvedAbility) -
                 .collect(),
         }
     };
+    retain_distribution_for_surviving_targets(&mut validated);
     if let Some(sub_ability) = validated.sub_ability.as_mut() {
         **sub_ability = validate_targets_in_chain(state, sub_ability);
     }
@@ -4208,12 +4346,13 @@ pub(crate) fn distribution_pool_cap(
     ability: &ResolvedAbility,
     distribute: Option<&crate::types::game_state::DistributionUnit>,
 ) -> Option<usize> {
-    distribute?;
-    let amount = match &ability.effect {
-        Effect::DealDamage { amount, .. } => amount,
-        Effect::PutCounter { count, .. } => count,
-        _ => return None,
-    };
+    // CR 601.2d: only a controller-announced division requires at least one
+    // unit per target. An even split may assign zero, so its pool never bounds
+    // how many targets may be chosen.
+    if !distribution_is_announced_by_controller(distribute?) {
+        return None;
+    }
+    let amount = distributed_amount(&ability.effect)?;
     // CR 601.2d: "up to N divided as you choose" still divides the *resolved*
     // amount; peel the cap so the pool is the concrete number to distribute.
     let (inner, _) = amount.peel_up_to();
@@ -4994,12 +5133,8 @@ fn quantity_expr_has_unresolved_x(ability: &ResolvedAbility, expr: &QuantityExpr
     ability.chosen_x.is_none() && expr.contains_x()
 }
 
-/// CR 601.2c + CR 601.2d: True when `ability` divides a damage/counter pool
-/// whose amount still references an unannounced X. The number of targets such a
-/// spell may have is `min(printed cap, pool)`, so the pool — and therefore X —
-/// must be known before target slots are built. Used to route Shatterskull-class
-/// X-divided spells through `ChooseXValue` ahead of target selection even though
-/// their `multi_target.max` is a fixed printed value.
+/// CR 601.2b–d: Announce a distributed spell's X before its targets. A manual
+/// division also bounds target count by that pool; an even split does not.
 fn ability_distribution_pool_needs_chosen_x(
     ability: &ResolvedAbility,
     distribute: Option<&crate::types::game_state::DistributionUnit>,
@@ -5007,10 +5142,8 @@ fn ability_distribution_pool_needs_chosen_x(
     if distribute.is_none() {
         return false;
     }
-    let amount = match &ability.effect {
-        Effect::DealDamage { amount, .. } => amount,
-        Effect::PutCounter { count, .. } => count,
-        _ => return false,
+    let Some(amount) = distributed_amount(&ability.effect) else {
+        return false;
     };
     let (inner, _) = amount.peel_up_to();
     quantity_expr_has_unresolved_x(ability, inner)
@@ -8590,6 +8723,27 @@ pub fn walk_target_completions<V: CompletionVisitor>(
     visitor: &mut V,
     budget: &mut WorkBudget,
 ) -> WalkOutcome {
+    walk_target_completions_from_prefix(
+        state,
+        ability,
+        target_slots,
+        constraints,
+        &[],
+        visitor,
+        budget,
+    )
+}
+
+/// Complete an already-validated announcement prefix using the same walk.
+pub(crate) fn walk_target_completions_from_prefix<V: CompletionVisitor>(
+    state: &GameState,
+    ability: &ResolvedAbility,
+    target_slots: &[TargetSelectionSlot],
+    constraints: &[TargetSelectionConstraint],
+    prefix: &[Option<TargetRef>],
+    visitor: &mut V,
+    budget: &mut WorkBudget,
+) -> WalkOutcome {
     let specs = target_slot_specs(state, ability);
     TargetCompletionWalk {
         state,
@@ -8600,7 +8754,7 @@ pub fn walk_target_completions<V: CompletionVisitor>(
         visitor,
         budget,
     }
-    .frame(0, &[], false)
+    .frame(prefix.len(), prefix, false)
 }
 
 struct TargetCompletionWalk<'a, V> {
@@ -8632,16 +8786,19 @@ impl<V: CompletionVisitor> TargetCompletionWalk<'_, V> {
             if empty_remainder_refused {
                 return WalkOutcome::Rejected;
             }
-            return self.leaf(selected_slots);
+            return self.leaf(selected_slots).0;
         }
         if !empty_remainder_refused && target_slots[index..].iter().all(|slot| slot.optional) {
             let mut completed_slots = selected_slots.to_vec();
             completed_slots.resize(target_slots.len(), None);
             match self.leaf(&completed_slots) {
-                WalkOutcome::Rejected if self.visitor.explores_past_refused_empty_completion() => {
+                (WalkOutcome::Rejected, visitor_refused)
+                    if !visitor_refused
+                        || self.visitor.explores_past_refused_empty_completion() =>
+                {
                     empty_remainder_refused = true;
                 }
-                outcome => return outcome,
+                (outcome, _) => return outcome,
             }
         }
 
@@ -8703,9 +8860,11 @@ impl<V: CompletionVisitor> TargetCompletionWalk<'_, V> {
         WalkOutcome::Rejected
     }
 
-    fn leaf(&mut self, completed_slots: &[Option<TargetRef>]) -> WalkOutcome {
+    // A validator rejection is not a visitor refusal: adding optional targets
+    // can repair a target constraint even when a visitor's cost is monotone.
+    fn leaf(&mut self, completed_slots: &[Option<TargetRef>]) -> (WalkOutcome, bool) {
         if !self.budget.charge(WalkOp::LeafValidation) {
-            return WalkOutcome::BudgetExhausted;
+            return (WalkOutcome::BudgetExhausted, false);
         }
         record_walk_work(WalkOp::LeafValidation);
         if validate_selected_slots_with_specs(
@@ -8718,12 +8877,12 @@ impl<V: CompletionVisitor> TargetCompletionWalk<'_, V> {
         )
         .is_err()
         {
-            return WalkOutcome::Rejected;
+            return (WalkOutcome::Rejected, false);
         }
         if self.visitor.accept(completed_slots) {
-            WalkOutcome::Accepted
+            (WalkOutcome::Accepted, false)
         } else {
-            WalkOutcome::Rejected
+            (WalkOutcome::Rejected, true)
         }
     }
 }
@@ -18526,6 +18685,56 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn mandatory_group_execute_requires_complete_assignment() {
+        use crate::game::scenario::{GameScenario, P0, P1};
+
+        for count in 0..=2 {
+            let mut scenario = GameScenario::new();
+            let source = scenario.add_creature(P0, "Source", 0, 1).id();
+            scenario.add_artifact_from_oracle(P1, "Sol Ring", "{T}: Add {C}{C}.");
+            for index in 0..count {
+                scenario.add_creature_to_graveyard(P1, &format!("Eligible {index}"), 2, 2);
+            }
+            let runner = scenario.build();
+            let source = &runner.state().objects[&source];
+            let mut execute = AbilityDefinition::new(
+                AbilityKind::Database,
+                Effect::Bounce {
+                    target: TargetFilter::Typed(TypedFilter::creature().properties(vec![
+                        FilterProp::InZone {
+                            zone: Zone::Graveyard,
+                        },
+                    ])),
+                    destination: None,
+                    selection: BounceSelection::Targeted,
+                },
+            );
+            execute.multi_target = Some(MultiTargetSpec::fixed(2, 2));
+            assert_eq!(
+                execute_targets_satisfiable(runner.state(), source, &execute),
+                count == 2,
+                "an unavailable required group is not an untargeted execute"
+            );
+            execute.sub_ability = Some(Box::new(AbilityDefinition::new(
+                AbilityKind::Database,
+                Effect::Destroy {
+                    target: TargetFilter::Typed(TypedFilter {
+                        type_filters: vec![TypeFilter::Artifact],
+                        controller: None,
+                        properties: vec![],
+                    }),
+                    cant_regenerate: false,
+                },
+            )));
+            assert_eq!(
+                execute_targets_satisfiable(runner.state(), source, &execute),
+                count == 2,
+                "a legal tail cannot replace the unavailable required prefix"
+            );
         }
     }
 

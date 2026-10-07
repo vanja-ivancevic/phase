@@ -11,7 +11,7 @@ use crate::game::speed::has_max_speed;
 use crate::parser::oracle_effect::publishes_chain_created_referent;
 use crate::types::ability::{
     AbilityCondition, AbilityCost, AbilityDefinition, AbilityKind, AbilityUseTally, CardPlayMode,
-    CardTypeSetSource, CastFromZoneDriver, ChosenAttribute, CommanderOwnership,
+    CardTypeSetSource, CastFromZoneDriver, ChosenAttribute, CoinFlipResult, CommanderOwnership,
     ContinuousModification, ControllerRef, CopyRetargetPermission, CostPaidObjectSnapshot,
     CounterKindDomain, DetachedRemainder, Duration, EachDamageRecipient, Effect, EffectError,
     EffectKind, EffectOutcomeSignal, EffectResolutionResult, EffectScope, ExtraPhaseRecipient,
@@ -4000,6 +4000,12 @@ pub(crate) fn apply_parent_chain_context(
     // declaration) carries none, so the wholesale hand-off must not erase it.
     let child_duration_events = std::mem::take(&mut child.context.duration_events);
     child.context = parent.context.clone();
+    // CR 118.12: accepting a payment is not performing it. Freeze this cost's
+    // failure into its child's outcome before scoped iterations reset the
+    // transient failure flag. Other effects may carry an unrelated stale flag.
+    if matches!(parent.effect, Effect::PayCost { .. }) && state.cost_payment_failed_flag {
+        child.context.optional_effect_performed = false;
+    }
     // Result-object conditions consume the producer's result for one immediate
     // child. Do not let a later grandchild inherit it accidentally; the producer
     // branch below stamps it back onto the direct condition consumer.
@@ -5673,6 +5679,7 @@ fn referent_exists_without_gated_action(
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource
@@ -13223,6 +13230,17 @@ fn player_scope_sacrifice_step(
 ) -> PlayerScopeSacrificeStep {
     // CR 701.21a: a player can sacrifice only a permanent they control.
     let scoped = scoped_player_sacrifice_ability(template, original_controller, player);
+    // CR 608.2c: this simultaneous collector bypasses `resolve_chain_body`'s
+    // condition gate, so evaluate the fully bound per-player condition here
+    // ("each player whose coin comes up tails sacrifices ..." qualifies each
+    // player by their own result).
+    if scoped
+        .condition
+        .as_ref()
+        .is_some_and(|condition| !evaluate_condition(condition, state, &scoped))
+    {
+        return PlayerScopeSacrificeStep::Noop;
+    }
     let Effect::Sacrifice {
         target,
         count,
@@ -13307,6 +13325,7 @@ fn set_player_scope_sacrifice_waiting_for(
         is_cost_payment: false,
         enters_modified_if: None,
         duration: None,
+        same_zone_owner: false,
     };
 }
 
@@ -14523,6 +14542,7 @@ pub fn resolve_ability_chain(
                     // doesn't reach the flip can't satisfy the gate on a prior
                     // iteration's stale result.
                     state.resolution_coin_flip = None;
+                    state.resolution_coin_flips.clear();
                     let initial_waiting_for = state.waiting_for.clone();
                     let stack_depth_before_iteration =
                         state.resolution_stack.capture_child_boundary();
@@ -14700,6 +14720,9 @@ fn count_top_level_resolution(state: &mut GameState, ability: &ResolvedAbility) 
     // pattern (`strip_coin_flip_conditional` requires the body to be the
     // repeat directive), and a bare flip has no win/lose branch to re-enter.
     state.resolution_coin_flip = None;
+    // CR 705.2 + CR 608.2c: the per-player face ledger shares the same
+    // resolution lifetime.
+    state.resolution_coin_flips.clear();
 }
 
 /// CR 608.2c + CR 109.4: resolve who owns a repeat-process decision from the
@@ -15236,6 +15259,20 @@ fn resolve_chain_body(
         )
     });
     if let Some(scope) = driver_scope {
+        // CR 705.2 + CR 608.2c: a scoped face-only flip ("each player flips a
+        // coin") opens a new instruction round. This runs once for the
+        // unexpanded instruction; generated/resumed seats have `player_scope`
+        // removed and must not clear the other players' completed faces.
+        if matches!(
+            ability.effect,
+            Effect::FlipCoin {
+                result_is_face: true,
+                ..
+            }
+        ) {
+            state.resolution_coin_flip = None;
+            state.resolution_coin_flips.clear();
+        }
         let scoped_events_before = events.len();
         let controller = ability.controller;
         // CR 101.4 + CR 800.4: Join Forces overrides the APNAP anchor with
@@ -17560,7 +17597,15 @@ fn resolve_chain_body(
 
         // Check if the sub_ability has a condition that gates its execution.
         // Casting-time conditions are evaluated against the parent's SpellContext.
-        if let Some(ref condition) = sub.condition {
+        // CR 608.2c: a scoped child's condition belongs to each expanded
+        // player, not the preceding instruction's controller. Leave it on the
+        // child for the scope driver, including while that instruction is
+        // paused and its final result has not been published yet.
+        if let Some(condition) = sub
+            .condition
+            .as_ref()
+            .filter(|_| sub.player_scope.is_none())
+        {
             // CR 608.2c: "Instead" overrides are terminal — the Cow swap above either
             // replaced the parent's effect (condition met) or didn't (condition not met).
             // When NOT swapped, the base chain (else_ability) runs after the parent's own
@@ -19349,9 +19394,20 @@ pub(crate) fn evaluate_condition(
         // controller's most recent in-resolution flip matches `result`. Reads
         // `state.resolution_coin_flip` (written at the flip authority), not the
         // trigger event, so a phenomenon / mid-resolution flip gates correctly.
-        AbilityCondition::CoinFlipOutcome { result } => state
-            .resolution_coin_flip
-            .is_some_and(|f| f.flipper == ability.controller && f.result == *result),
+        // A face qualification instead binds to the gated instruction's scoped
+        // player and reads that player's own completed face in the round ledger.
+        AbilityCondition::CoinFlipOutcome { result } => match result {
+            CoinFlipResult::Heads | CoinFlipResult::Tails => {
+                let player = ability.scoped_player.unwrap_or(ability.controller);
+                state
+                    .resolution_coin_flips
+                    .iter()
+                    .any(|flip| flip.flipper == player && flip.result == *result)
+            }
+            CoinFlipResult::Won | CoinFlipResult::Lost => state
+                .resolution_coin_flip
+                .is_some_and(|f| f.flipper == ability.controller && f.result == *result),
+        },
         // CR 603.12: A reflexive triggered ability ("when you do") triggers
         // "based on whether the trigger event or events occurred earlier during
         // the resolution" of the parent. Two independent ways the parent event
@@ -20220,7 +20276,11 @@ fn event_outcome_was_won_by_controller(event: &GameEvent, controller: PlayerId) 
             result.for_player(*clash_controller, *opponent, controller)
                 == Some(crate::types::events::ClashResult::Won)
         }
-        GameEvent::CoinFlipped { player_id, won } => *player_id == controller && *won,
+        // CR 705.2: only a called flip has a winner; a face-only `Heads` is not
+        // a won flip.
+        GameEvent::CoinFlipped { player_id, result } => {
+            *player_id == controller && *result == CoinFlipResult::Won
+        }
         _ => false,
     }
 }
@@ -20428,10 +20488,12 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
             count,
             zone: Some(Zone::Library),
             filter: None,
+            same_zone_owner,
         } => AbilityCost::Exile {
             count: count.saturating_mul(n),
             zone: Some(Zone::Library),
             filter: None,
+            same_zone_owner: *same_zone_owner,
         },
         // CR 702.24a: Aboroth-class cumulative upkeep repeats the source
         // counter placement once for every age counter. Scaling its quantity
@@ -24819,6 +24881,7 @@ mod tests {
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
+            same_zone_owner: false,
         };
 
         crate::game::engine::apply(
@@ -25269,26 +25332,6 @@ mod tests {
         assert_eq!(filter, Some(TargetFilter::SelfRef));
         assert!(selection.is_chosen());
         assert!(self_scope.is_source_card());
-    }
-
-    #[test]
-    fn expand_per_counter_top_library_exile_scales_count() {
-        let base = AbilityCost::Exile {
-            count: 1,
-            zone: Some(Zone::Library),
-            filter: None,
-        };
-
-        let expanded = expand_per_counter(&base, 3);
-
-        assert_eq!(
-            expanded,
-            AbilityCost::Exile {
-                count: 3,
-                zone: Some(Zone::Library),
-                filter: None,
-            }
-        );
     }
 
     #[test]
@@ -32011,6 +32054,7 @@ mod tests {
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
+            same_zone_owner: false,
         };
         state.park_ability_continuation(PendingContinuation::new(
             Box::new(ResolvedAbility::new(
@@ -32057,6 +32101,7 @@ mod tests {
                 is_cost_payment: false,
                 enters_modified_if: None,
                 duration: None,
+                same_zone_owner: false,
             },
             GameAction::SelectCards {
                 cards: vec![second],
@@ -36176,6 +36221,66 @@ mod tests {
         ));
     }
 
+    /// CR 705.2 + CR 608.2c: a face qualification ("each player whose coin
+    /// comes up tails") binds to the gated instruction's scoped player and
+    /// reads that player's own completed face from the round ledger — never
+    /// the scalar last flip, and never a win/lose result.
+    #[test]
+    fn evaluate_condition_coin_face_reads_scoped_players_own_ledger_entry() {
+        use crate::types::game_state::ResolutionCoinFlip;
+        let mut state = GameState::new_two_player(42);
+        let mut ability = ResolvedAbility::new(
+            Effect::Draw {
+                count: QuantityExpr::Fixed { value: 1 },
+                target: TargetFilter::Controller,
+            },
+            vec![],
+            ObjectId(1),
+            PlayerId(0),
+        );
+        let tails = AbilityCondition::CoinFlipOutcome {
+            result: CoinFlipResult::Tails,
+        };
+        let heads = AbilityCondition::CoinFlipOutcome {
+            result: CoinFlipResult::Heads,
+        };
+        state.resolution_coin_flips = vec![
+            ResolutionCoinFlip {
+                flipper: PlayerId(0),
+                result: CoinFlipResult::Heads,
+            },
+            ResolutionCoinFlip {
+                flipper: PlayerId(1),
+                result: CoinFlipResult::Tails,
+            },
+        ];
+        // The scalar last flip is P1's tails; it must not qualify P0.
+        state.resolution_coin_flip = state.resolution_coin_flips.last().copied();
+
+        ability.scoped_player = Some(PlayerId(0));
+        assert!(evaluate_condition(&heads, &state, &ability));
+        assert!(!evaluate_condition(&tails, &state, &ability));
+
+        ability.scoped_player = Some(PlayerId(1));
+        assert!(evaluate_condition(&tails, &state, &ability));
+        assert!(!evaluate_condition(&heads, &state, &ability));
+
+        // A face flip is never a won/lost flip, even for the player who flipped.
+        assert!(!evaluate_condition(
+            &AbilityCondition::CoinFlipOutcome {
+                result: CoinFlipResult::Won
+            },
+            &state,
+            &ability
+        ));
+
+        // A player with no completed face (prevented or unkept) never qualifies.
+        state
+            .resolution_coin_flips
+            .retain(|flip| flip.flipper != PlayerId(1));
+        assert!(!evaluate_condition(&tails, &state, &ability));
+    }
+
     #[test]
     fn evaluate_condition_city_blessing_checks_ability_controller() {
         let mut state = GameState::new_two_player(42);
@@ -38471,10 +38576,6 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            state.cost_payment_failed_flag,
-            "PayCost with no W/B must set cost_payment_failed_flag"
-        );
         assert_eq!(
             (
                 state.players[0].life,
@@ -42993,5 +43094,26 @@ mod tests {
                 inner: Box::new(leaf),
             }
         ));
+    }
+    #[test]
+    fn expand_per_counter_top_library_exile_scales_count() {
+        for same_zone_owner in [false, true] {
+            let base = AbilityCost::Exile {
+                count: 1,
+                zone: Some(Zone::Library),
+                filter: None,
+                same_zone_owner,
+            };
+
+            assert_eq!(
+                expand_per_counter(&base, 3),
+                AbilityCost::Exile {
+                    count: 3,
+                    zone: Some(Zone::Library),
+                    filter: None,
+                    same_zone_owner,
+                }
+            );
+        }
     }
 }

@@ -194,6 +194,11 @@ pub(crate) fn apply_zone_exit_cleanup(
         .get(&object_id)
         .map(ObjectIncarnationRef::from_object)
         .expect("zone-exit cleanup must reference a live object");
+    if from == Zone::Battlefield && to != Zone::Battlefield {
+        state
+            .battlefield_return_links
+            .retain(|link| link.source != occurrence);
+    }
     state.clear_revealed_information_on_zone_exit(occurrence);
     // CR 400.7 + CR 702.187b: The "discarded this turn" mark (Mayhem's gate)
     // belongs to the old object. Clear it on any zone change so a card that
@@ -1518,6 +1523,13 @@ pub(crate) fn move_to_zone_with_entry_flags(
     // with" cards here, before CR 400.7 cleanup prunes `TrackedBySource`.
     zone_change_record.linked_exile_snapshot =
         capture_linked_exile_snapshot(state, object_id, from);
+    if let Some(source) = zone_change_record.trigger_source_context.as_mut() {
+        source.linked_battlefield_returns =
+            super::effects::change_zone::linked_battlefield_return_snapshot(
+                state,
+                source.identity.reference,
+            );
+    }
     zone_change_record.sync_trigger_source_exiled_cards(
         state
             .cards_exiled_with_source_this_turn
@@ -2961,6 +2973,8 @@ pub(crate) fn stamp_battlefield_entry_provenance(
         object: reference,
         expected_old_source,
         resulting_source: source_id,
+        linked_battlefield_return_source:
+            super::effects::change_zone::linked_battlefield_return_source(state, source_id),
         cause: state.current_or_begin_rules_execution_node(),
     };
     apply_resolved_entry_provenance(state, &command)
@@ -3000,6 +3014,15 @@ pub fn apply_resolved_entry_provenance(
         .get_mut(&object_id)
         .expect("the validated object must remain present")
         .entered_via_ability_source = Some(command.resulting_source);
+    if let Some(source) = command.linked_battlefield_return_source {
+        let link = crate::types::game_state::BattlefieldReturnLink {
+            source,
+            recipient: command.object,
+        };
+        if !state.battlefield_return_links.contains(&link) {
+            state.battlefield_return_links.push(link);
+        }
+    }
     Ok(())
 }
 

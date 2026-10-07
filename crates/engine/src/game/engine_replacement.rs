@@ -944,16 +944,18 @@ fn handle_replacement_choice_inner(
                         return Ok(state.waiting_for.clone());
                     }
                 }
-                // CR 705.1 + CR 614.1a: Coin-flip replacements (Krark's Thumb)
-                // are always Mandatory and applied inline by
-                // `flip_coin::flip_through_replacement`; they never reach the
-                // optional replacement-choice resume path. Unreachable in
-                // practice — present only for match exhaustiveness.
-                ProposedEvent::CoinFlip { .. } => {
-                    debug_assert!(
-                        false,
-                        "CoinFlip replacement reached the optional-choice resume path"
-                    );
+                // CR 705.1 + CR 616.1: coin-flip replacements (Krark's Thumb) are
+                // Mandatory, but two applying to the same flip is a CR 616.1
+                // ordering choice. Delegate to the coin-flip authority with the
+                // bound modified event: it consumes the already-modified count
+                // without re-proposing the flip, then resumes the parked
+                // instruction (which may itself suspend on a keep choice).
+                event @ ProposedEvent::CoinFlip { .. } => {
+                    match effects::flip_coin::resume_after_replacement(state, Some(event), events) {
+                        Ok(Some(waiting)) => return Ok(waiting),
+                        Ok(None) => {}
+                        Err(error) => return Err(EngineError::InvalidAction(format!("{error}"))),
+                    }
                 }
                 // CR 706.1 + CR 616.1: die-roll replacements (Barbarian Class,
                 // Pixie Guide, Wyll) are Mandatory, but being mandatory does NOT
@@ -993,6 +995,17 @@ fn handle_replacement_choice_inner(
                             Err(error)
                         }
                     };
+                }
+            }
+
+            // CR 614.6: a parked coin instruction whose original flip was
+            // replaced by a different event never flips; settle it (no result)
+            // so its caller's loop and continuation resume.
+            if state.pending_coin_flip_instruction.is_some() {
+                match effects::flip_coin::resume_after_replacement(state, None, events) {
+                    Ok(Some(waiting)) => return Ok(waiting),
+                    Ok(None) => {}
+                    Err(error) => return Err(EngineError::InvalidAction(format!("{error}"))),
                 }
             }
 
@@ -1501,6 +1514,16 @@ fn handle_replacement_choice_inner(
                 )
             {
                 return Ok(state.waiting_for.clone());
+            }
+            // CR 614.6: the chosen replacement prevented the parked coin flip,
+            // so it contributes no result; resume its caller's loop and fall
+            // through to the common continuation epilogue.
+            if state.pending_coin_flip_instruction.is_some() {
+                match effects::flip_coin::resume_after_replacement(state, None, events) {
+                    Ok(Some(waiting)) => return Ok(waiting),
+                    Ok(None) => {}
+                    Err(error) => return Err(EngineError::InvalidAction(format!("{error}"))),
+                }
             }
             if let Some(loser) = pending_phase_drain_life_loser {
                 // CR 614.1a: the chosen replacement prevented the loss outright,

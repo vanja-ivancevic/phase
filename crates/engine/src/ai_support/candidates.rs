@@ -1020,6 +1020,7 @@ pub fn candidate_actions_broad_with_probe(
             player,
             target_slots,
             selection,
+            pending_cast,
             ..
         } => {
             let mut actions = target_step_actions(
@@ -1028,6 +1029,18 @@ pub fn candidate_actions_broad_with_probe(
                 selection.current_slot,
                 &selection.current_legal_targets,
             );
+            actions.retain(|candidate| {
+                let GameAction::ChooseTarget { target } = &candidate.action else {
+                    return true;
+                };
+                casting::pending_target_choice_is_payable(
+                    state,
+                    pending_cast,
+                    target_slots,
+                    selection,
+                    target.clone(),
+                )
+            });
             if state.waiting_for.allows_cancel_cast() {
                 actions.push(candidate(
                     GameAction::CancelCast,
@@ -1673,14 +1686,18 @@ pub fn candidate_actions_broad_with_probe(
             count,
             min_count,
             up_to,
+            zone,
+            same_zone_owner,
             ..
         } => {
-            let sizes = if *up_to {
-                (*min_count..=*count).collect()
+            let minimum = if *up_to { *min_count } else { *count };
+            if *same_zone_owner {
+                bounded_same_zone_owner_select_card_candidates(
+                    state, *player, *zone, cards, minimum, *count,
+                )
             } else {
-                vec![*count]
-            };
-            bounded_select_card_candidates(*player, cards, sizes)
+                bounded_select_card_candidates(*player, cards, minimum..=*count)
+            }
         }
         WaitingFor::DrawnThisTurnTopdeckChoice {
             player,
@@ -2371,12 +2388,24 @@ pub fn candidate_actions_broad_with_probe(
         } => bounded_select_card_candidates(*player, choices, [*count]),
         WaitingFor::PayCost {
             player,
-            kind: PayCostKind::Sacrifice | PayCostKind::ExileFromZone { .. },
+            kind:
+                PayCostKind::Sacrifice
+                | PayCostKind::ExileFromZone { .. }
+                | PayCostKind::ExileFromManaZone { .. },
             choices,
             count,
             min_count,
             ..
-        } => bounded_select_card_candidates(*player, choices, *min_count..=*count),
+        } => {
+            if let Some(zone) = crate::game::casting_costs::exile_cost_prompt_same_zone_owner(state)
+            {
+                bounded_same_zone_owner_select_card_candidates(
+                    state, *player, zone, choices, *min_count, *count,
+                )
+            } else {
+                bounded_select_card_candidates(*player, choices, *min_count..=*count)
+            }
+        }
         // CR 601.2f + CR 208.1: The aggregate Crew/Saddle/Teamwork tap cost is
         // paid by ANY creature subset whose summed current power satisfies the
         // advertised comparator — not a fixed cardinality. Enumerate minimal-cover
@@ -2556,10 +2585,9 @@ pub fn candidate_actions_broad_with_probe(
             })
             .collect(),
         // CR 712.11b-c / CR 709.3-3a: a face election exposes only faces whose
-        // own characteristics can be cast. Ordinary MDFC land/spell prompts
-        // retain both actions. A resolution-owned prompt, however, exposes
-        // only faces the exact temporary permission can still cast; the handler
-        // independently enforces the same policy for forged direct submissions.
+        // own characteristics can be cast. A resolution-owned prompt retains
+        // the exact indexed temporary permission; ordinary prompts judge each
+        // selected face's full target, timing and payment authority.
         WaitingFor::ModalFaceChoice {
             player,
             object_id,
@@ -2570,37 +2598,17 @@ pub fn candidate_actions_broad_with_probe(
                 crate::game::casting::current_resolution_cast_permission_index(
                     state, *player, *object_id, *card_id,
                 );
-            let legal_faces = resolution_permission.and_then(|index| {
-                state
-                    .objects
-                    .get(object_id)
-                    .and_then(|object| object.casting_permissions.get(index.0))
-                    .and_then(|permission| match permission {
-                        crate::types::ability::CastingPermission::ExileWithAltCost {
-                            resolution_cleanup: Some(cleanup),
-                            ..
-                        } => Some(crate::game::casting::resolution_spell_face_legality_for_current_permission(
-                            state,
-                            *player,
-                            *object_id,
-                            &cleanup.face_policy,
-                            index,
-                        )),
-                        _ => None,
-                    })
-            });
+            let legal_faces = crate::game::casting::modal_face_choice_legality(
+                state, *player, *object_id, *card_id,
+            );
             let mut actions: Vec<_> = [false, true]
                 .into_iter()
                 .filter(|back_face| {
-                    legal_faces.is_none_or(
-                        |faces| {
-                            if *back_face {
-                                faces.back
-                            } else {
-                                faces.front
-                            }
-                        },
-                    )
+                    if *back_face {
+                        legal_faces.back
+                    } else {
+                        legal_faces.front
+                    }
                 })
                 .map(|back_face| {
                     candidate(
@@ -3353,9 +3361,13 @@ pub fn candidate_actions_broad_with_probe(
             player,
             total,
             targets,
-            ..
+            unit,
         } => {
-            if targets.is_empty() {
+            if *unit == crate::types::game_state::DistributionUnit::EvenSplitDamage
+                || targets.len() > *total as usize
+            {
+                Vec::new()
+            } else if targets.is_empty() {
                 // No targets — submit an empty distribution.
                 vec![candidate(
                     GameAction::DistributeAmong {
@@ -3608,31 +3620,33 @@ pub fn candidate_actions_broad_with_probe(
             ));
             v
         }
-        // CR 702.35a: Madness cast offer — cast if the madness cost is affordable,
-        // otherwise decline and put the card into its owner's graveyard.
+        // CR 702.35a + CR 601.2: The live madness offer is a whole cast:
+        // current exile ownership, legal targets and the prepared total cost.
         WaitingFor::CastOffer {
             player,
-            kind: CastOfferKind::Madness { object_id, cost },
+            kind: CastOfferKind::Madness { object_id, .. },
         } => {
-            let card_id = state
-                .objects
-                .get(object_id)
-                .map(|o| o.card_id)
-                .unwrap_or(crate::types::identifiers::CardId(0));
-            let can_pay =
-                crate::game::casting::can_pay_cost_after_auto_tap(state, *player, *object_id, cost);
             let mut v: Vec<CandidateAction> = Vec::new();
-            if can_pay {
-                v.push(candidate(
-                    GameAction::CastSpellAsMadness {
-                        object_id: *object_id,
-                        card_id,
-
-                        payment_mode: CastPaymentMode::Auto,
-                    },
-                    TacticalClass::Spell,
-                    Some(*player),
-                ));
+            if let Some(object) = state.objects.get(object_id) {
+                let card_id = object.card_id;
+                let selections = mana_sources::activatable_mana_source_selections(state, *player);
+                if let Some(payment_mode) = crate::game::casting::madness_offer_payment_mode(
+                    state,
+                    *player,
+                    *object_id,
+                    card_id,
+                    &selections,
+                ) {
+                    v.push(candidate(
+                        GameAction::CastSpellAsMadness {
+                            object_id: *object_id,
+                            card_id,
+                            payment_mode,
+                        },
+                        TacticalClass::Spell,
+                        Some(*player),
+                    ));
+                }
             }
             v.push(candidate(
                 GameAction::DecideOptionalEffect { accept: false },
@@ -5341,6 +5355,35 @@ fn bounded_select_card_candidates(
             )
         })
         .collect()
+}
+
+fn bounded_same_zone_owner_select_card_candidates(
+    state: &GameState,
+    player: PlayerId,
+    zone: crate::types::zones::Zone,
+    cards: &[ObjectId],
+    min_count: usize,
+    count: usize,
+) -> Vec<CandidateAction> {
+    let mut piles: BTreeMap<PlayerId, Vec<ObjectId>> = BTreeMap::new();
+    for &id in cards {
+        if let Some(owner) = crate::game::cost_payability::exile_cost_zone_owner(state, zone, id) {
+            piles.entry(owner).or_default().push(id);
+        }
+    }
+    let mut actions = if min_count == 0 {
+        bounded_select_card_candidates(player, &[], [0])
+    } else {
+        Vec::new()
+    };
+    for pile in piles.values() {
+        actions.extend(bounded_select_card_candidates(
+            player,
+            pile,
+            min_count.max(1)..=count,
+        ));
+    }
+    actions
 }
 
 /// CR 401.4 + CR 608.2d + CR 702.60a: The bottom-order response is a full
@@ -7794,6 +7837,7 @@ mod tests {
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
+            same_zone_owner: false,
         };
 
         let actions = candidate_actions_broad(&state);

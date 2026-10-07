@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use super::counter::CounterType;
 
 use super::ability::{
-    AbilityTag, AttachmentKind, CostPaidObjectSnapshot, EffectKind, FilterProp, TargetFilter,
-    TargetRef, ThisWayCause, TypeFilter, TypedFilter,
+    AbilityTag, AttachmentKind, CoinFlipResult, CostPaidObjectSnapshot, EffectKind, FilterProp,
+    TargetFilter, TargetRef, ThisWayCause, TypeFilter, TypedFilter,
 };
 use super::card::PrintedCardRef;
 use super::card_type::{CardType, CoreType, Supertype};
@@ -612,6 +612,7 @@ impl EventObjectSnapshot {
             | TargetFilter::CostPaidObject
             | TargetFilter::AmassedArmy
             | TargetFilter::ChosenCard
+            | TargetFilter::LinkedBattlefieldReturn
             | TargetFilter::TrackedSet { .. }
             | TargetFilter::ExiledCardByIndex { .. }
             | TargetFilter::TriggeringSource
@@ -1699,10 +1700,12 @@ pub enum GameEvent {
         rounds: Vec<ContestRound>,
         winner: PlayerId,
     },
-    /// CR 705: A coin was flipped.
+    /// CR 705: one completed logical flip, after replacement/ignore selection.
+    /// CR 705.2: `result` is `Won`/`Lost` for a called flip and `Heads`/`Tails`
+    /// for a face-only flip, which no player wins or loses.
     CoinFlipped {
         player_id: PlayerId,
-        won: bool,
+        result: CoinFlipResult,
     },
     /// CR 701.54: The Ring tempted a player.
     RingTemptsYou {

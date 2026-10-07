@@ -786,6 +786,7 @@ pub fn synthesize_craft(face: &mut CardFace) {
                         count: 1,
                         zone: Some(Zone::Battlefield),
                         filter: Some(TargetFilter::SelfRef),
+                        same_zone_owner: false,
                     },
                     // CR 702.167a/b: "Exile [materials] from among permanents you
                     // control and/or cards in your graveyard."
@@ -2227,6 +2228,7 @@ pub(crate) fn scavenge_ability_for_keyword(keyword: &Keyword) -> Option<AbilityD
                 count: 1,
                 zone: Some(Zone::Graveyard),
                 filter: Some(TargetFilter::SelfRef),
+                same_zone_owner: false,
             },
         ],
     };
@@ -9061,6 +9063,7 @@ pub fn synthesize_suspend(face: &mut CardFace) {
                     count: 1,
                     zone: Some(Zone::Hand),
                     filter: Some(TargetFilter::SelfRef),
+                    same_zone_owner: false,
                 },
             ],
         };
@@ -9216,6 +9219,7 @@ pub(crate) fn build_plot_activation(
                 count: 1,
                 zone: Some(exile_zone),
                 filter: Some(TargetFilter::SelfRef),
+                same_zone_owner: false,
             },
         ],
     };
@@ -17010,6 +17014,7 @@ mod cumulative_upkeep_synthesis_tests {
         // once the per-counter discard payment chain landed — CR 702.24a — so
         // Exile is now the canonical still-unsupported non-mana base shape.)
         let exile_kw = Keyword::CumulativeUpkeep(AbilityCost::Exile {
+            same_zone_owner: false,
             count: 1,
             zone: None,
             filter: None,
@@ -17031,6 +17036,7 @@ mod cumulative_upkeep_synthesis_tests {
                     count: 1,
                     zone: None,
                     filter: None,
+                    same_zone_owner: false,
                 },
             ],
         });
@@ -17045,6 +17051,7 @@ mod cumulative_upkeep_synthesis_tests {
         let mut face = CardFace::default();
         face.keywords
             .push(Keyword::CumulativeUpkeep(AbilityCost::Exile {
+                same_zone_owner: false,
                 count: 1,
                 zone: None,
                 filter: None,
@@ -17348,6 +17355,7 @@ mod scavenge_synthesis_tests {
                         count: 1,
                         zone: Some(Zone::Graveyard),
                         filter: Some(TargetFilter::SelfRef),
+                        ..
                     }
                 ));
             }
@@ -18397,6 +18405,7 @@ mod plot_synthesis_tests {
                         count: 1,
                         zone: Some(Zone::Hand),
                         filter: Some(TargetFilter::SelfRef),
+                        ..
                     }
                 ));
             }

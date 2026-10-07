@@ -2498,24 +2498,6 @@ fn escape_mana_cost(kw: &Keyword) -> ManaCost {
         .expect("compound escape cost must contain a mana sub-cost")
 }
 
-/// Test helper: the granted-escape `EscapeCost` (card's mana cost plus exile
-/// N other cards from your graveyard) produced by the "The escape cost is
-/// equal to ... plus exile N other cards" continuation.
-fn granted_escape_cost(exile_count: u32) -> Keyword {
-    Keyword::Escape(EscapeCost::NonMana(AbilityCost::Composite {
-        costs: vec![
-            AbilityCost::Mana {
-                cost: ManaCost::SelfManaCost,
-            },
-            AbilityCost::Exile {
-                count: exile_count,
-                zone: Some(Zone::Graveyard),
-                filter: None,
-            },
-        ],
-    }))
-}
-
 /// CR 601.2c (#2344): a single "target opponent" governs the whole verb list
 /// ("sacrifices …, discards …, and loses 3 life") — the player is chosen once
 /// and every conjugated continuation shares that target via `ParentTarget`,
@@ -17887,6 +17869,7 @@ fn self_exile_from_hand_mana_ability_activates_from_hand() {
             filter: Some(TargetFilter::SelfRef),
             zone: Some(Zone::Hand),
             count: 1,
+            ..
         })
     ));
 }
@@ -20918,67 +20901,6 @@ fn same_line_static_flashback_grant_stays_on_graveyard_cards() {
 }
 
 #[test]
-fn top_level_static_escape_grant_stays_on_graveyard_cards() {
-    let result = parse(
-            "Each nonland card in your graveyard has escape.\nThe escape cost is equal to the card's mana cost plus exile three other cards from your graveyard.",
-            "Underworld Breach",
-            &[],
-            &["Enchantment"],
-            &[],
-        );
-    assert!(result.extracted_keywords.is_empty());
-    assert_eq!(result.statics.len(), 1);
-    let static_def = &result.statics[0];
-    let TargetFilter::Typed(tf) = static_def
-        .affected
-        .as_ref()
-        .expect("expected affected filter")
-    else {
-        panic!("expected typed affected filter");
-    };
-    assert_eq!(
-        tf.controller,
-        Some(crate::types::ability::ControllerRef::You)
-    );
-    assert!(
-        tf.properties.contains(&FilterProp::InZone {
-            zone: Zone::Graveyard
-        }),
-        "missing graveyard filter: {:?}",
-        tf.properties
-    );
-    assert!(
-        static_def
-            .modifications
-            .contains(&ContinuousModification::AddKeyword {
-                keyword: granted_escape_cost(3),
-            }),
-        "missing escape grant: {:?}",
-        static_def.modifications
-    );
-}
-
-#[test]
-fn same_line_static_escape_grant_stays_on_graveyard_cards() {
-    let result = parse(
-            "Each nonland card in your graveyard has escape. The escape cost is equal to the card's mana cost plus exile three other cards from your graveyard.",
-            "Underworld Breach",
-            &[],
-            &["Enchantment"],
-            &[],
-        );
-    assert!(result.extracted_keywords.is_empty());
-    assert_eq!(result.statics.len(), 1);
-    assert!(result.statics.iter().any(|static_def| {
-        static_def
-            .modifications
-            .contains(&ContinuousModification::AddKeyword {
-                keyword: granted_escape_cost(3),
-            })
-    }));
-}
-
-#[test]
 fn top_level_static_mayhem_grant_stays_on_graveyard_cards() {
     // CR 702.187b: Green Goblin's "Goblin Formula" grants Mayhem to every
     // nonland card in the controller's graveyard, with the mayhem cost equal
@@ -21193,33 +21115,6 @@ fn green_goblin_goblin_formula_line_grants_mayhem() {
         "Green Goblin's Goblin Formula must grant Mayhem to graveyard cards; got {:?}",
         result.statics
     );
-}
-
-#[test]
-fn helper_parses_same_line_escape_grant_continuation() {
-    let static_def = try_parse_graveyard_keyword_static_with_continuation(
-            "Each nonland card in your graveyard has escape. The escape cost is equal to the card's mana cost plus exile three other cards from your graveyard.",
-        )
-        .expect("helper should parse same-line escape continuation");
-    assert!(
-        static_def
-            .modifications
-            .contains(&ContinuousModification::AddKeyword {
-                keyword: granted_escape_cost(3),
-            }),
-        "missing escape grant: {:?}",
-        static_def.modifications
-    );
-}
-
-#[test]
-fn escape_continuation_parser_accepts_self_mana_cost_clause() {
-    let keyword = parse_graveyard_keyword_continuation(
-            "The escape cost is equal to the card's mana cost plus exile three other cards from your graveyard.",
-            GrantedCastKeywordKind::Escape,
-        )
-        .expect("continuation should parse");
-    assert_eq!(keyword, granted_escape_cost(3));
 }
 
 #[test]
@@ -30536,6 +30431,7 @@ fn demote_net_reaches_every_ability_carrier() {
         win_effect: Some(Box::new(refused())),
         lose_effect: Some(Box::new(refused())),
         flipper: TargetFilter::Controller,
+        result_is_face: false,
     }));
 
     // 7 — ChooseOneOf's branches.
@@ -30575,6 +30471,7 @@ fn demote_net_reaches_every_ability_carrier() {
                 win_effect: Some(Box::new(refused())),
                 lose_effect: None,
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             }),
             player_scope: None,
         }
@@ -32369,6 +32266,7 @@ fn render_net_reaches_every_nested_description_carrier() {
         win_effect: Some(Box::new(ability("flip_coin_win"))),
         lose_effect: Some(Box::new(ability("flip_coin_lose"))),
         flipper: TargetFilter::Controller,
+        result_is_face: false,
     }));
     tags.extend(["flip_coin_win", "flip_coin_lose"]);
 
@@ -34769,4 +34667,109 @@ fn lich_as_enters_life_loss_parses_as_moved_self_replacement() {
         .statics
         .iter()
         .any(|def| matches!(def.mode, StaticMode::CantLoseTheGame)));
+}
+
+/// Test helper: the granted-escape `EscapeCost` (card's mana cost plus exile
+/// N other cards from your graveyard) produced by the "The escape cost is
+/// equal to ... plus exile N other cards" continuation.
+fn granted_escape_cost(exile_count: u32) -> Keyword {
+    Keyword::Escape(EscapeCost::NonMana(AbilityCost::Composite {
+        costs: vec![
+            AbilityCost::Mana {
+                cost: ManaCost::SelfManaCost,
+            },
+            AbilityCost::Exile {
+                count: exile_count,
+                zone: Some(Zone::Graveyard),
+                filter: None,
+                same_zone_owner: false,
+            },
+        ],
+    }))
+}
+#[test]
+fn top_level_static_escape_grant_stays_on_graveyard_cards() {
+    let result = parse(
+            "Each nonland card in your graveyard has escape.\nThe escape cost is equal to the card's mana cost plus exile three other cards from your graveyard.",
+            "Underworld Breach",
+            &[],
+            &["Enchantment"],
+            &[],
+        );
+    assert!(result.extracted_keywords.is_empty());
+    assert_eq!(result.statics.len(), 1);
+    let static_def = &result.statics[0];
+    let TargetFilter::Typed(tf) = static_def
+        .affected
+        .as_ref()
+        .expect("expected affected filter")
+    else {
+        panic!("expected typed affected filter");
+    };
+    assert_eq!(
+        tf.controller,
+        Some(crate::types::ability::ControllerRef::You)
+    );
+    assert!(
+        tf.properties.contains(&FilterProp::InZone {
+            zone: Zone::Graveyard
+        }),
+        "missing graveyard filter: {:?}",
+        tf.properties
+    );
+    assert!(
+        static_def
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: granted_escape_cost(3),
+            }),
+        "missing escape grant: {:?}",
+        static_def.modifications
+    );
+}
+
+#[test]
+fn same_line_static_escape_grant_stays_on_graveyard_cards() {
+    let result = parse(
+            "Each nonland card in your graveyard has escape. The escape cost is equal to the card's mana cost plus exile three other cards from your graveyard.",
+            "Underworld Breach",
+            &[],
+            &["Enchantment"],
+            &[],
+        );
+    assert!(result.extracted_keywords.is_empty());
+    assert_eq!(result.statics.len(), 1);
+    assert!(result.statics.iter().any(|static_def| {
+        static_def
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: granted_escape_cost(3),
+            })
+    }));
+}
+#[test]
+fn helper_parses_same_line_escape_grant_continuation() {
+    let static_def = try_parse_graveyard_keyword_static_with_continuation(
+            "Each nonland card in your graveyard has escape. The escape cost is equal to the card's mana cost plus exile three other cards from your graveyard.",
+        )
+        .expect("helper should parse same-line escape continuation");
+    assert!(
+        static_def
+            .modifications
+            .contains(&ContinuousModification::AddKeyword {
+                keyword: granted_escape_cost(3),
+            }),
+        "missing escape grant: {:?}",
+        static_def.modifications
+    );
+}
+
+#[test]
+fn escape_continuation_parser_accepts_self_mana_cost_clause() {
+    let keyword = parse_graveyard_keyword_continuation(
+            "The escape cost is equal to the card's mana cost plus exile three other cards from your graveyard.",
+            GrantedCastKeywordKind::Escape,
+        )
+        .expect("continuation should parse");
+    assert_eq!(keyword, granted_escape_cost(3));
 }

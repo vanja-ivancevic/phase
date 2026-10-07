@@ -1329,6 +1329,7 @@ fn parse_as_enters_exile_any_number_from_graveyard(
         count: EXILE_COST_ANY_NUMBER,
         zone: Some(Zone::Graveyard),
         filter: Some(filter),
+        same_zone_owner: false,
     };
 
     Some(
@@ -1440,6 +1441,7 @@ fn parse_as_enters_exile_from_graveyards(
         count,
         zone: Some(Zone::Graveyard),
         filter: Some(filter),
+        same_zone_owner: false,
     };
 
     // CR 607.2a: Manually construct the continuation for Mimeoplasm-style effects.
@@ -16168,7 +16170,7 @@ mod tests {
         match &def.mode {
             ReplacementMode::MayCost { cost, decline, .. } => {
                 assert!(
-                    matches!(cost, AbilityCost::Exile { count, zone, filter } if *count == 2 && *zone == Some(Zone::Graveyard) && filter.is_some()),
+                    matches!(cost, AbilityCost::Exile { count, zone, filter, .. } if *count == 2 && *zone == Some(Zone::Graveyard) && filter.is_some()),
                     "expected Exile count 2 from Graveyard, got {cost:?}"
                 );
                 assert!(decline.is_none(), "The Mimeoplasm has no decline branch");
@@ -18537,6 +18539,7 @@ mod tests {
                         count: EXILE_COST_ANY_NUMBER,
                         zone: Some(Zone::Graveyard),
                         filter: Some(TargetFilter::Typed(_)),
+                        ..
                     }
                 ));
             }

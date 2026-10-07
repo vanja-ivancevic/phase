@@ -14019,6 +14019,7 @@ mod tests {
                     count: EXILE_COST_ANY_NUMBER,
                     zone: Some(Zone::Graveyard),
                     filter: Some(TargetFilter::Typed(_)),
+                    ..
                 },
                 decline: None,
                 ..

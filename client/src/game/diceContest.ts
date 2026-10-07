@@ -86,7 +86,7 @@ export function flashInGameRolls(events: GameEvent[]): void {
     });
   }
   for (const coin of coins) {
-    flash({ kind: "coin", playerId: coin.data.player_id, won: coin.data.won, context: "ability" });
+    flash({ kind: "coin", playerId: coin.data.player_id, result: coin.data.result, context: "ability" });
   }
 }
 

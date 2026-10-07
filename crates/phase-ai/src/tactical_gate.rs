@@ -4124,6 +4124,7 @@ mod tests {
             .with_mana_cost(ManaCost::zero())
             .from_oracle_text("Draw a card.")
             .with_additional_cost(AdditionalCost::Required(AbilityCost::Exile {
+                same_zone_owner: false,
                 count: 1,
                 zone: Some(Zone::Graveyard),
                 filter: None,
@@ -4131,6 +4132,7 @@ mod tests {
             .id();
         scenario.with_mana_pool(P0, pooled_mana(ManaType::Colorless, 4));
         scenario.with_mana_pool(P0, pooled_mana(ManaType::Green, 1));
+        scenario.add_card_to_library_top(P0, "Drawn Card");
         let mut runner = scenario.build();
         let state = runner.state_mut();
         state.active_player = P0;
@@ -4138,45 +4140,13 @@ mod tests {
         state.waiting_for = WaitingFor::Priority { player: P0 };
 
         assert_eq!(harvest_amount(state, harvest), Some(0));
-        let pre_harvest_cast = engine::ai_support::candidate_actions(state)
-            .into_iter()
-            .find(|candidate| {
-                matches!(candidate.action, GameAction::CastSpell { object_id, .. } if object_id == held_draw)
-            })
-            .expect("the engine issues a held-spell cast before resource payment preflight")
-            .action;
-        let pre_harvest_state = state.clone();
-        let mut rejected_state = state.clone();
-        let rejected =
-            engine::game::engine::apply_as_current(&mut rejected_state, pre_harvest_cast);
         assert!(
-            matches!(
-                rejected,
-                Err(engine::game::engine::EngineError::ActionNotAllowed(_))
-            ),
-            "the casting authority rejects the unpayable graveyard-exile cost"
-        );
-        assert_eq!(
-            rejected_state.players[P0.0 as usize].hand,
-            pre_harvest_state.players[P0.0 as usize].hand,
-            "the rejected cast rolls back the held spell"
-        );
-        assert_eq!(
-            rejected_state.players[P0.0 as usize].graveyard,
-            pre_harvest_state.players[P0.0 as usize].graveyard,
-            "the rejected cast rolls back graveyard payment state"
-        );
-        assert_eq!(
-            rejected_state.stack, pre_harvest_state.stack,
-            "the rejected cast does not commit a stack entry"
-        );
-        assert_eq!(
-            rejected_state.pending_cast, pre_harvest_state.pending_cast,
-            "the rejected cast restores the pending-cast boundary"
-        );
-        assert_eq!(
-            rejected_state.waiting_for, pre_harvest_state.waiting_for,
-            "the rejected cast restores the priority boundary"
+            !engine::ai_support::candidate_actions(state)
+                .iter()
+                .any(|candidate| {
+                    matches!(candidate.action, GameAction::CastSpell { object_id, .. } if object_id == held_draw)
+                }),
+            "the required graveyard-exile resource is unavailable before Harvest resolves"
         );
         assert!(
             zero_cast_is_retained(state, harvest),
@@ -4228,6 +4198,16 @@ mod tests {
                 .iter()
                 .any(|entry| entry.id == held_draw),
             "the held Draw spell reaches the stack after the production payment"
+        );
+        runner.resolve_top();
+        assert_eq!(runner.state().objects[&held_draw].zone, Zone::Graveyard);
+        assert_eq!(runner.state().players[P0.0 as usize].life, 20);
+        assert!(
+            runner.state().players[P0.0 as usize]
+                .hand
+                .iter()
+                .any(|id| runner.state().objects[id].name == "Drawn Card"),
+            "the enabled cast pays its cost and resolves its draw"
         );
     }
 
@@ -5635,6 +5615,7 @@ mod tests {
                 }
                 MetadataCase::GraveyardExileCost => {
                     definition.cost = Some(AbilityCost::Exile {
+                        same_zone_owner: false,
                         count: 1,
                         zone: Some(Zone::Graveyard),
                         filter: None,

@@ -5363,6 +5363,7 @@ mod tests {
             count,
             zone,
             filter,
+            ..
         })) = kw
         else {
             panic!("expected Evoke(NonMana(Exile)), got {:?}", kw);

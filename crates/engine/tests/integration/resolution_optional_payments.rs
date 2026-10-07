@@ -663,6 +663,7 @@ fn resolution_optional_oneof_surfaces_only_live_immediate_branches() {
                 count: 1,
                 zone: Some(Zone::Hand),
                 filter: None,
+                same_zone_owner: false,
             },
         ],
     );
@@ -766,6 +767,7 @@ fn selecting_root_branch_does_not_substitute_nested_oneof() {
                 count: 1,
                 zone: Some(Zone::Hand),
                 filter: None,
+                same_zone_owner: false,
             },
         ],
     )));
@@ -959,6 +961,7 @@ fn resolution_optional_oneof_routes_exile_through_existing_payment() {
             count: 1,
             zone: Some(Zone::Hand),
             filter: None,
+            same_zone_owner: false,
         }],
     );
     resolve_ability_chain(runner.state_mut(), &ability, &mut Vec::new(), 0).unwrap();

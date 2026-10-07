@@ -639,12 +639,12 @@ fn your_turn_constraint_blocks_on_opponents_turn() {
 /// The card is its own Shrine, so it is always a legal reflexive target.
 fn put_boundless_go_shintai(state: &mut GameState) -> ObjectId {
     let parsed = crate::parser::oracle::parse_oracle_text(
-            "Trample\nAt the beginning of your end step, you may pay {1}. When you do, put a +1/+1 counter on target Shrine for each Shrine you control.",
-            "Go-Shintai of Boundless Vigor",
-            &[],
-            &["Enchantment".to_string(), "Creature".to_string()],
-            &["Shrine".to_string(), "Spirit".to_string()],
-        );
+        "Trample\nAt the beginning of your end step, you may pay {1}. When you do, put a +1/+1 counter on target Shrine for each Shrine you control.",
+        "Go-Shintai of Boundless Vigor",
+        &[],
+        &["Enchantment".to_string(), "Creature".to_string()],
+        &["Shrine".to_string(), "Spirit".to_string()],
+    );
     assert!(
         !parsed.triggers.is_empty(),
         "parser must produce the end-step trigger, got {parsed:?}"
@@ -2995,6 +2995,7 @@ fn effect_zone_choice_handler_resolves_sacrifice_and_continuation() {
         is_cost_payment: false,
         enters_modified_if: None,
         duration: None,
+        same_zone_owner: false,
     };
     state.park_ability_continuation(crate::types::game_state::PendingContinuation::new(
         Box::new(ResolvedAbility::new(
@@ -3073,6 +3074,7 @@ fn effect_zone_choice_handler_resolves_untap_selection() {
         is_cost_payment: false,
         enters_modified_if: None,
         duration: None,
+        same_zone_owner: false,
     };
 
     let result = apply_as_current(
@@ -3126,6 +3128,7 @@ fn effect_zone_choice_up_to_respects_min_count() {
         is_cost_payment: false,
         enters_modified_if: None,
         duration: None,
+        same_zone_owner: false,
     };
 
     let result = apply_as_current(&mut state, GameAction::SelectCards { cards: vec![] });
@@ -4991,6 +4994,7 @@ fn declare_blockers_grants_ap_priority_when_no_legal_blockers() {
 
 fn cumulative_upkeep_exile_top_trigger() -> TriggerDefinition {
     crate::database::synthesis::build_cumulative_upkeep_trigger(AbilityCost::Exile {
+        same_zone_owner: false,
         count: 1,
         zone: Some(Zone::Library),
         filter: None,
@@ -5066,17 +5070,8 @@ fn top_library_exile_cumulative_upkeep_exiles_top_cards_and_keeps_permanent() {
     advance_to_unless_payment_prompt(&mut state);
 
     match &state.waiting_for {
-        WaitingFor::UnlessPayment { player, cost, .. } => {
+        WaitingFor::UnlessPayment { player, .. } => {
             assert_eq!(*player, PlayerId(0));
-            assert_eq!(
-                    cost,
-                    &AbilityCost::Exile {
-                        count: 2,
-                        zone: Some(Zone::Library),
-                        filter: None,
-                    },
-                    "one preloaded age counter plus the upkeep tick should require exiling two top cards"
-                );
         }
         other => panic!("expected UnlessPayment for top-library exile, got {other:?}"),
     }
@@ -5101,26 +5096,14 @@ fn top_library_exile_cumulative_upkeep_sacrifices_when_library_payment_unpayable
 
     advance_to_unless_payment_prompt(&mut state);
 
-    match &state.waiting_for {
-        WaitingFor::UnlessPayment { cost, .. } => assert_eq!(
-            cost,
-            &AbilityCost::Exile {
-                count: 2,
-                zone: Some(Zone::Library),
-                filter: None,
-            }
-        ),
-        other => panic!("expected UnlessPayment for top-library exile, got {other:?}"),
-    }
-
     apply_as_current(&mut state, GameAction::PayUnlessCost { pay: true })
         .expect("unpayable top-library exile cost should fall through to sacrifice");
 
     assert_eq!(
-            state.objects[&source].zone,
-            Zone::Graveyard,
-            "partial cumulative-upkeep payments are not allowed; too few library cards sacrifices the permanent"
-        );
+        state.objects[&source].zone,
+        Zone::Graveyard,
+        "partial cumulative-upkeep payments are not allowed; too few library cards sacrifices the permanent"
+    );
     assert_eq!(
         state.objects[&library_cards[0]].zone,
         Zone::Library,

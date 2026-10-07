@@ -3203,6 +3203,8 @@ export function manaRestrictionLabel(
       return t("gamePage.manaRestrictions.impossible");
     case "convokePayment":
       return t("gamePage.manaRestrictions.convokePayment");
+    case "onlyForSpellObject":
+      return t("manaPool.onlyForSpellObject");
   }
 }
 

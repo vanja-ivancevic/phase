@@ -4103,6 +4103,7 @@ mod tests {
             win_effect: Some(Box::new(conjure_ability("flip_win", Zone::Hand))),
             lose_effect: Some(Box::new(conjure_ability("flip_lose", Zone::Hand))),
             flipper: crate::types::ability::TargetFilter::Controller,
+            result_is_face: false,
         };
         walk_effect(&flip, &mut names);
 

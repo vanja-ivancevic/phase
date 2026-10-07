@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 use crate::types::ability::{
-    AbilityTag, CoinFlipResult, ControllerRef, DamageKindFilter, DestinationConstraint,
-    DieResultFilter, EffectKind, ManaAbilityProducedFilter, OriginConstraint, TargetFilter,
-    TargetRef, TriggerDefinition, TypedFilter,
+    AbilityTag, ControllerRef, DamageKindFilter, DestinationConstraint, DieResultFilter,
+    EffectKind, ManaAbilityProducedFilter, OriginConstraint, TargetFilter, TargetRef,
+    TriggerDefinition, TypedFilter,
 };
 use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::game_state::{GameState, TriggerSourceContext};
@@ -924,6 +924,7 @@ pub(super) fn target_filter_matches_object(
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource
@@ -4636,17 +4637,16 @@ pub(super) fn match_flipped_coin(
     source_context: &TriggerSourceContext,
     state: &GameState,
 ) -> bool {
-    if let GameEvent::CoinFlipped { player_id, won } = event {
-        // CR 705.2: If the trigger specifies a result filter, check it.
-        if let Some(required) = &trigger.coin_flip_result {
-            let event_won = *won;
-            let matches = match required {
-                CoinFlipResult::Won => event_won,
-                CoinFlipResult::Lost => !event_won,
-            };
-            if !matches {
-                return false;
-            }
+    if let GameEvent::CoinFlipped { player_id, result } = event {
+        // CR 705.2: If the trigger specifies a result filter, check it. A
+        // face-only `Heads`/`Tails` flip has no winner, so it never satisfies
+        // a `Won`/`Lost` filter; an unfiltered "whenever you flip" still sees it.
+        if trigger
+            .coin_flip_result
+            .as_ref()
+            .is_some_and(|required| required != result)
+        {
+            return false;
         }
         valid_player_matches(trigger, state, *player_id, source_context)
     } else {
@@ -5592,9 +5592,9 @@ mod tests {
     use crate::game::zones::create_object;
     use crate::parser::oracle_trigger::parse_trigger_line;
     use crate::types::ability::{
-        Comparator, ControllerRef, DamageAmountScope, DamageAmountThreshold, FilterProp,
-        QuantityExpr, ResolvedAbility, TargetFilter, TriggerCondition, TriggerDefinition,
-        TypeFilter, TypedFilter,
+        CoinFlipResult, Comparator, ControllerRef, DamageAmountScope, DamageAmountThreshold,
+        FilterProp, QuantityExpr, ResolvedAbility, TargetFilter, TriggerCondition,
+        TriggerDefinition, TypeFilter, TypedFilter,
     };
     use crate::types::card_type::CoreType;
     use crate::types::events::{ClashResult, GameEvent, ManaTapState, PlayerActionKind};
@@ -6628,7 +6628,7 @@ mod tests {
         assert!(match_flipped_coin(
             &GameEvent::CoinFlipped {
                 player_id: PlayerId(0),
-                won: true,
+                result: CoinFlipResult::Won,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -6637,7 +6637,7 @@ mod tests {
         assert!(!match_flipped_coin(
             &GameEvent::CoinFlipped {
                 player_id: PlayerId(0),
-                won: false,
+                result: CoinFlipResult::Lost,
             },
             &trigger,
             &test_trigger_source_context(&state, source),
@@ -6646,7 +6646,29 @@ mod tests {
         assert!(!match_flipped_coin(
             &GameEvent::CoinFlipped {
                 player_id: PlayerId(1),
-                won: true,
+                result: CoinFlipResult::Won,
+            },
+            &trigger,
+            &test_trigger_source_context(&state, source),
+            &state,
+        ));
+        // CR 705.2: a face-only flip has no winner — `Heads` is not `Won`.
+        assert!(!match_flipped_coin(
+            &GameEvent::CoinFlipped {
+                player_id: PlayerId(0),
+                result: CoinFlipResult::Heads,
+            },
+            &trigger,
+            &test_trigger_source_context(&state, source),
+            &state,
+        ));
+
+        // An unfiltered "whenever you flip a coin" still sees a face-only flip.
+        trigger.coin_flip_result = None;
+        assert!(match_flipped_coin(
+            &GameEvent::CoinFlipped {
+                player_id: PlayerId(0),
+                result: CoinFlipResult::Tails,
             },
             &trigger,
             &test_trigger_source_context(&state, source),

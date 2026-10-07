@@ -812,6 +812,17 @@ pub fn resolve(
     let track_exiled_by_source =
         crate::game::exile_links::should_track_exiled_by_source(state, ability.source_id, ability);
 
+    // A linked referent with no frozen recipient (for example, an illegal ETB
+    // target) is an empty relation, never an implicit source or zone population.
+    if matches!(target_filter, TargetFilter::LinkedBattlefieldReturn) {
+        events.push(GameEvent::EffectResolved {
+            kind: EffectKind::from(&ability.effect),
+            source_id: ability.source_id,
+            subject: None,
+        });
+        return Ok(completed_result(0));
+    }
+
     // CR 608.2c + CR 609.3 (issue #8798): the immediate parent handed this
     // "that card" move nothing to act on (an ExileTop/Dig on an empty library,
     // an empty ChooseFromZone or reveal-choice). Resolve as a no-op here,
@@ -1267,6 +1278,7 @@ pub fn resolve(
             // same `UntilSourceLeaves` exile link the single-candidate
             // shortcut does (Cloak and Dagger, Entwined — issue #4235 review).
             duration: ability.duration.clone(),
+            same_zone_owner: false,
         };
         // EffectResolved is emitted by the EffectZoneChoice handler after the player chooses
         // (matching the DiscardChoice pattern — single authority for the event).
@@ -1584,6 +1596,91 @@ pub(crate) fn enter_with_counters_for_object(
     counters
 }
 
+/// CR 607.2c + CR 400.7: Source-local links preserve the returned battlefield
+/// incarnation, even after that recipient dies or is blinked.
+pub(crate) fn linked_battlefield_return_snapshot(
+    state: &GameState,
+    source: ObjectIncarnationRef,
+) -> Vec<ObjectIncarnationRef> {
+    state
+        .battlefield_return_links
+        .iter()
+        .filter(|link| link.source == source)
+        .map(|link| link.recipient)
+        .collect()
+}
+
+fn filter_reads_linked_battlefield_return(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::LinkedBattlefieldReturn => true,
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            filters.iter().any(filter_reads_linked_battlefield_return)
+        }
+        TargetFilter::Not { filter } => filter_reads_linked_battlefield_return(filter),
+        _ => false,
+    }
+}
+
+fn ability_reads_linked_battlefield_return(
+    definition: &crate::types::ability::AbilityDefinition,
+) -> bool {
+    matches!(
+        definition.effect.as_ref(),
+        Effect::ChangeZone { target, .. } if filter_reads_linked_battlefield_return(target)
+    ) || definition
+        .sub_ability
+        .as_deref()
+        .is_some_and(ability_reads_linked_battlefield_return)
+        || definition
+            .else_ability
+            .as_deref()
+            .is_some_and(ability_reads_linked_battlefield_return)
+}
+
+/// Resolve link provenance before the entry-provenance command is journaled.
+/// Never read a later same-id source: an old ETB ability whose source left the
+/// battlefield must not install its returned creature on a blinked source.
+pub(crate) fn linked_battlefield_return_source(
+    state: &GameState,
+    source_id: ObjectId,
+) -> Option<ObjectIncarnationRef> {
+    let ability = state
+        .resolving_stack_entry
+        .as_ref()
+        .filter(|entry| entry.id == source_id || entry.source_id == source_id)
+        .and_then(|entry| entry.ability())
+        .or_else(|| {
+            state
+                .stack
+                .iter()
+                .find(|entry| entry.id == source_id || entry.source_id == source_id)
+                .and_then(|entry| entry.ability())
+        })?;
+    let source = ability.trigger_source.as_ref()?;
+    if source.identity.reference.object_id != source_id
+        || source.identity.expected_zone != Zone::Battlefield
+        || !state.objects.get(&source_id).is_some_and(|object| {
+            object.zone == Zone::Battlefield
+                && ObjectIncarnationRef::from_object(object) == source.identity.reference
+        })
+        || !source.trigger_entries.iter().any(|entry| {
+            entry
+                .definition
+                .valid_card
+                .as_ref()
+                .is_some_and(filter_reads_linked_battlefield_return)
+                || entry
+                    .definition
+                    .execute
+                    .as_deref()
+                    .is_some_and(ability_reads_linked_battlefield_return)
+        })
+    {
+        return None;
+    }
+    Some(source.identity.reference)
+}
+
 /// Resolve the ability currently driving a `ChangeZone` pause/resume for
 /// `source_id`, preferring the popped `resolving_stack_entry` over the live stack.
 pub(crate) fn resolving_stack_ability_for_source(
@@ -1858,6 +1955,7 @@ fn mass_library_order_effect_zone_choice(
         is_cost_payment: false,
         enters_modified_if: None,
         duration,
+        same_zone_owner: false,
     }
 }
 
@@ -10564,6 +10662,7 @@ mod tests {
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
+            same_zone_owner: false,
         };
 
         let _ = apply_as_current(

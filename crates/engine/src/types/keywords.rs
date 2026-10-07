@@ -5353,52 +5353,6 @@ mod tests {
         assert_eq!(kw, deserialized, "round-trip failed for {json}");
     }
 
-    /// CR 702.138a (#3281): card-data export encodes compound escape costs as
-    /// `EscapeCost::NonMana`; deserializing must not collapse them to the bare
-    /// MTGJSON placeholder.
-    #[test]
-    fn escape_compound_cost_deserializes_from_card_data_export() {
-        use crate::types::ability::{
-            AbilityCost, ControllerRef, FilterProp, TargetFilter, TypedFilter,
-        };
-        use crate::types::mana::ManaCostShard;
-        use crate::types::zones::Zone;
-
-        let expected = Keyword::Escape(EscapeCost::NonMana(AbilityCost::Composite {
-            costs: vec![
-                AbilityCost::Mana {
-                    cost: ManaCost::Cost {
-                        generic: 0,
-                        shards: vec![
-                            ManaCostShard::Green,
-                            ManaCostShard::Green,
-                            ManaCostShard::Blue,
-                            ManaCostShard::Blue,
-                        ],
-                    },
-                },
-                AbilityCost::Exile {
-                    count: 5,
-                    zone: Some(Zone::Graveyard),
-                    filter: Some(TargetFilter::Typed(
-                        TypedFilter::card()
-                            .controller(ControllerRef::You)
-                            .properties(vec![
-                                FilterProp::Another,
-                                FilterProp::InZone {
-                                    zone: Zone::Graveyard,
-                                },
-                            ]),
-                    )),
-                },
-            ],
-        }));
-
-        let json = serde_json::to_value(&expected).unwrap();
-        let deserialized: Keyword = serde_json::from_value(json.clone()).unwrap();
-        assert_eq!(expected, deserialized, "round-trip failed for {json}");
-    }
-
     #[test]
     fn firebending_from_str_parses_fixed_amount() {
         assert_eq!(

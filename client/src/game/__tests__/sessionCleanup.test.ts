@@ -99,8 +99,8 @@ describe("clearPromptOverlayState", () => {
 
   it("clears active and queued roll overlays at a game boundary", () => {
     useUiStore.setState({
-      diceRoll: { kind: "coin", playerId: 1, won: true, context: "ability" },
-      diceRollQueue: [{ kind: "coin", playerId: 1, won: false, context: "ability" }],
+      diceRoll: { kind: "coin", playerId: 1, result: "Won", context: "ability" },
+      diceRollQueue: [{ kind: "coin", playerId: 1, result: "Heads", context: "ability" }],
     });
 
     clearPromptOverlayState();

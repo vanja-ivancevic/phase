@@ -2644,6 +2644,7 @@ pub(crate) fn lower_trigger_ir(ir: &TriggerIr) -> TriggerDefinition {
             lift_counter_count_self_scope_to_event_source_in_ability(execute);
         }
     }
+    bind_linked_battlefield_return_referents(&mut def, &modifiers.effect_lower);
 
     // CR 603.4 + CR 700.4 + CR 400.7: the PHASE-trigger damage-death reanimation
     // ("At the beginning of each end step, if a creature dealt damage by this
@@ -4981,6 +4982,7 @@ fn parse_unless_tap_untapped_cost(rest: &str) -> Option<AbilityCost> {
 fn parse_unless_exile_cost(rest: &str) -> Option<AbilityCost> {
     let (count, filter) = parse_unless_counted_target_filter(rest)?;
     Some(AbilityCost::Exile {
+        same_zone_owner: false,
         count,
         zone: filter.extract_in_zone(),
         filter: Some(filter),
@@ -12934,8 +12936,95 @@ fn find_clause_verb_boundary(text: &str) -> Option<(&str, &str)> {
     }
 }
 
+/// CR 607.2c: The object put onto the battlefield by a linked ability is
+/// distinct from a chosen target and from the source of the later trigger.
+fn parse_linked_battlefield_return_subject(input: &str) -> OracleResult<'_, TargetFilter> {
+    let (input, _) = tag("the ").parse(input)?;
+    let (input, subject) = alt((
+        value(
+            TargetFilter::Typed(TypedFilter::creature()),
+            tag("creature"),
+        ),
+        value(
+            TargetFilter::Typed(TypedFilter::permanent()),
+            tag("permanent"),
+        ),
+    ))
+    .parse(input)?;
+    let (input, _) = tag(" put onto the battlefield with ").parse(input)?;
+    let (input, _) = parse_self_reference_subject(input)?;
+    let (input, _) = peek(alt((
+        value((), space1),
+        value((), tag(".")),
+        value((), eof),
+    )))
+    .parse(input)?;
+    Ok((
+        input,
+        TargetFilter::And {
+            filters: vec![subject, TargetFilter::LinkedBattlefieldReturn],
+        },
+    ))
+}
+
+fn filter_names_linked_battlefield_return(filter: &TargetFilter) -> bool {
+    match filter {
+        TargetFilter::LinkedBattlefieldReturn => true,
+        TargetFilter::And { filters } | TargetFilter::Or { filters } => {
+            filters.iter().any(filter_names_linked_battlefield_return)
+        }
+        _ => false,
+    }
+}
+
+/// Bind the death anaphor and the explicit linked-object exile instruction.
+/// Source self-references in later instructions remain source self-references.
+fn bind_linked_battlefield_return_referents(def: &mut TriggerDefinition, body: &str) {
+    let linked_subject = def
+        .valid_card
+        .as_ref()
+        .is_some_and(filter_names_linked_battlefield_return);
+    let explicit_linked_exile = preceded(
+        tag::<_, _, OracleError<'_>>("exile "),
+        parse_linked_battlefield_return_subject,
+    )
+    .parse(body)
+    .is_ok();
+    if !linked_subject && !explicit_linked_exile {
+        return;
+    }
+    let Some(execute) = def.execute.as_deref_mut() else {
+        return;
+    };
+    if let Effect::ChangeZone {
+        target,
+        origin,
+        destination: Zone::Exile,
+        ..
+    } = execute.effect.as_mut()
+    {
+        if matches!(
+            target,
+            TargetFilter::ParentTarget | TargetFilter::TriggeringSource
+        ) {
+            *target = TargetFilter::LinkedBattlefieldReturn;
+            *origin = if linked_subject {
+                Some(Zone::Graveyard)
+            } else {
+                Some(Zone::Battlefield)
+            };
+        }
+    }
+}
+
 /// Parse a single (non-compound) trigger subject.
 fn parse_single_subject<'a>(text: &'a str, ctx: &mut ParseContext) -> (TargetFilter, &'a str) {
+    if let Ok((rest, subject)) =
+        terminated(parse_linked_battlefield_return_subject, peek(space1)).parse(text)
+    {
+        return (subject, rest.trim_start());
+    }
+
     // Self-reference: "~"
     if let Ok((rest, ())) = value((), tag::<_, _, OracleError<'_>>("~ ")).parse(text) {
         return (TargetFilter::SelfRef, rest);

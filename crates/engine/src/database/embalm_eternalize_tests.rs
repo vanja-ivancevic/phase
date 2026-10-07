@@ -57,6 +57,7 @@ fn assert_token_copy_ability_shape(
                     count: 1,
                     zone: Some(Zone::Graveyard),
                     filter: Some(TargetFilter::SelfRef),
+                    ..
                 }
             ));
         }
@@ -193,6 +194,7 @@ fn synthesize_eternalize_nonmana_composite_keeps_discard_and_appends_exile_self(
             count: 1,
             zone: Some(Zone::Graveyard),
             filter: Some(TargetFilter::SelfRef),
+            ..
         }
     ));
 }

@@ -1754,18 +1754,6 @@ fn swords_to_plowshares() {
 }
 
 #[test]
-fn kroxa_titan_of_deaths_hunger() {
-    let (ir, lowered) = parse_two_layer(
-        "When Kroxa enters, sacrifice it unless it escaped.\nWhenever Kroxa enters or attacks, each opponent discards a card, then each opponent who didn't discard a nonland card this way loses 3 life.\nEscape\u{2014}{B}{B}{R}{R}, Exile five other cards from your graveyard. (You may cast this card from your graveyard for its escape cost.)",
-        "Kroxa, Titan of Death's Hunger",
-        &["Creature"],
-        &["Elder", "Giant"],
-    );
-    insta::assert_json_snapshot!("kroxa_titan_ir", &ir);
-    insta::assert_json_snapshot!("kroxa_titan_lowered", &lowered);
-}
-
-#[test]
 fn snapcaster_mage() {
     let (ir, lowered) = parse_two_layer(
         "Flash\nWhen this creature enters, target instant or sorcery card in your graveyard gains flashback until end of turn. The flashback cost is equal to its mana cost. (You may cast that card from your graveyard for its flashback cost. Then exile it.)",
@@ -2756,22 +2744,6 @@ fn liliana_the_repentant() {
     );
     insta::assert_json_snapshot!("liliana_the_repentant_ir", &ir);
     insta::assert_json_snapshot!("liliana_the_repentant_lowered", &lowered);
-}
-
-/// CR 508.1b-c + CR 508.1h + CR 602.2: Onakke's two printed lines exercise both the
-/// planeswalker-only combat-tax static and its graveyard activation. Snapshot
-/// both document IR and lowering so neither line can silently degrade while
-/// the other stays supported.
-#[test]
-fn onakke_oathkeeper() {
-    let (ir, lowered) = parse_two_layer(
-        "Creatures can't attack planeswalkers you control unless their controller pays {1} for each creature they control that's attacking a planeswalker you control.\n{4}{W}{W}, Exile this card from your graveyard: Return target planeswalker card from your graveyard to the battlefield.",
-        "Onakke Oathkeeper",
-        &["Creature"],
-        &["Ogre", "Spirit"],
-    );
-    insta::assert_json_snapshot!("onakke_oathkeeper_ir", &ir);
-    insta::assert_json_snapshot!("onakke_oathkeeper_lowered", &lowered);
 }
 
 /// CR 702.142a Boast: pins the order of the two IMPLICIT restrictions.

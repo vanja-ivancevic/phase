@@ -1909,6 +1909,34 @@ pub(super) fn strip_coin_flip_conditional(text: &str) -> (Option<AbilityConditio
     }
 }
 
+/// CR 705 + CR 608.2c: Peel a coin-face qualification after the existing
+/// each-player subject peel. The condition belongs to the second instruction's
+/// scoped player, not the source controller or the final player who flipped.
+/// Keeping this as a sibling instruction lets the APNAP driver finish every
+/// flip (including replacement keep choices) before any sacrifice is chosen.
+pub(super) fn strip_scoped_coin_face_qualification(
+    text: &str,
+) -> Option<(AbilityCondition, String)> {
+    let lower = text.to_lowercase();
+    let (result, body) = nom_on_lower(text, &lower, |input| {
+        let (input, _) = tag::<_, _, OracleError<'_>>("whose coin comes up ").parse(input)?;
+        let (input, result) = alt((
+            value(CoinFlipResult::Heads, tag("heads")),
+            value(CoinFlipResult::Tails, tag("tails")),
+        ))
+        .parse(input)?;
+        let (input, _) = tag(" ").parse(input)?;
+        Ok((input, result))
+    })?;
+    if body.trim().is_empty() {
+        return None;
+    }
+    Some((
+        AbilityCondition::CoinFlipOutcome { result },
+        super::subject::deconjugate_verb(body),
+    ))
+}
+
 /// CR 608.2c + CR 701.17a: Strip "if [N] cards that share a [quality] were
 /// milled this way," ahead of a "repeat this process" directive →
 /// `QuantityCheck` over `ObjectCountBySharedQuality { LastZoneChanged, Max }`.

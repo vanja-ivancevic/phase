@@ -2741,6 +2741,7 @@ impl GameObject {
                 attached_to: self.attached_to,
                 attachments: Vec::new(),
                 linked_exile_snapshot: Vec::new(),
+                linked_battlefield_returns: Vec::new(),
                 cards_exiled_this_turn: Vec::new(),
                 combat_status: Default::default(),
                 cast_from_zone: self.cast_from_zone,
@@ -3472,6 +3473,9 @@ impl GameObject {
     /// by `apply_zone_exit_cleanup` in zones.rs.
     pub fn reset_for_battlefield_exit(&mut self) {
         self.base_controller = Some(self.owner);
+        // CR 110.5d: tapped status ends on battlefield exit. Departure LKI
+        // is captured before this reset, so it retains the old status.
+        self.tapped = false;
         // CR 701.37b: Monstrous designation clears when a permanent leaves the battlefield.
         self.monstrous = false;
         // CR 701.64b: Harnessed designation clears when a permanent leaves the battlefield.

@@ -1459,6 +1459,7 @@ fn scope_of(target: &TargetFilter, chain_root: Option<WriteScope>) -> WriteScope
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource
@@ -2453,6 +2454,7 @@ fn legacy_target_filter(f: &TargetFilter) -> bool {
         // `ObjectScope::AmassedArmy`'s `legacy_object_scope` classification.
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::ExiledCardByIndex { .. }
@@ -2648,6 +2650,7 @@ fn member_bound_target_filter(f: &TargetFilter) -> bool {
         | TargetFilter::ExiledBySource
         | TargetFilter::ExiledCardByIndex { .. }
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::HasChosenName
         | TargetFilter::SourceChosenPlayer
         | TargetFilter::ChosenDamageSource { .. }
@@ -3648,6 +3651,7 @@ fn legacy_effect(x: &Effect) -> bool {
             win_effect,
             lose_effect,
             flipper,
+            result_is_face: _,
         } => odef(win_effect) || odef(lose_effect) || legacy_target_filter(flipper),
         Effect::FlipCoins {
             count,
@@ -5928,6 +5932,7 @@ fn rw_effect(
             win_effect,
             lose_effect,
             flipper: _,
+            result_is_face: _,
         } => {
             let mut p = RwProfile::empty();
             if let Some(w) = win_effect {
@@ -6776,8 +6781,9 @@ fn rw_ability_condition(x: &AbilityCondition) -> RwProfile {
         | AbilityCondition::PostReplacementDamageSourceMatchesFilter { filter: _ }
         | AbilityCondition::CostPaidObjectMatchesFilter { filter: _ } => reads_event_live(),
         AbilityCondition::EventOutcomeWon => reads_event_live(),
-        // CR 705.2: reads resolution-local `state.resolution_coin_flip` — a live
-        // in-resolution signal, same read-bucket as `EventOutcomeWon`.
+        // CR 705.2: reads resolution-local `state.resolution_coin_flip` (or the
+        // per-player `resolution_coin_flips` face ledger) — a live in-resolution
+        // signal, same read-bucket as `EventOutcomeWon`.
         AbilityCondition::CoinFlipOutcome { result: _ } => reads_event_live(),
         // Both `AbilityUseCountThisTurn` tallies read a per-turn journal keyed
         // by this ability's own `(source_id, ability_index)` — the same read
@@ -7234,6 +7240,7 @@ fn rw_target_filter(x: &TargetFilter) -> RwProfile {
         // (mirrors `ObjectScope::AmassedArmy`, which carries no event axis).
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::ExiledCardByIndex { .. }
@@ -8212,6 +8219,7 @@ mod tests {
             win_effect: Some(Box::new(def(put_counter(qfix(1), TargetFilter::SelfRef)))),
             lose_effect: Some(Box::new(def(remove_counter(TargetFilter::SelfRef)))),
             flipper: TargetFilter::Controller,
+            result_is_face: false,
         };
         let p = ability_rw_profile(&ra(e));
         assert!(
@@ -8240,6 +8248,7 @@ mod tests {
                 excess: None,
             }))),
             flipper: TargetFilter::Controller,
+            result_is_face: false,
         };
         assert!(!conflicts(&ra(e), &se_phase()));
     }

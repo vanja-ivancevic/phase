@@ -14,12 +14,12 @@ use crate::types::player::PlayerId;
 use crate::types::zones::Zone;
 
 use super::ability_utils::{
-    ability_target_legality_needs_chosen_x, assign_selected_slots_in_chain,
+    ability_target_legality_needs_chosen_x, announce_distribution, assign_selected_slots_in_chain,
     assign_targets_in_chain, auto_select_targets_for_ability, begin_target_selection_for_ability,
     build_chained_resolved, build_target_slots_labelled, choose_target_for_ability,
     distribution_targets, ordered_selected_mode_indices, random_select_targets_for_ability,
-    selected_mode_labels, validate_modal_indices, validate_selected_targets_for_ability,
-    TargetSelectionAdvance,
+    resolved_distribution_pool, selected_mode_labels, validate_modal_indices,
+    validate_selected_targets_for_ability, DistributionAnnouncement, TargetSelectionAdvance,
 };
 use super::casting_costs::{
     cost_has_x, drain_deferred_triggers_after_stack_object_announcement, enter_payment_step,
@@ -226,8 +226,14 @@ pub(crate) fn handle_select_modes(
                 controller,
                 events,
             );
-            return finish_pending_cast_cost_or_pay(
-                state, controller, pending, resolved, total_cost, events,
+            return finish_modal_declaration(
+                state,
+                controller,
+                pending,
+                resolved,
+                total_cost,
+                sorted_indices,
+                events,
             );
         }
 
@@ -246,8 +252,14 @@ pub(crate) fn handle_select_modes(
                 controller,
                 events,
             );
-            return finish_pending_cast_cost_or_pay(
-                state, controller, pending, resolved, total_cost, events,
+            return finish_modal_declaration(
+                state,
+                controller,
+                pending,
+                resolved,
+                total_cost,
+                sorted_indices,
+                events,
             );
         }
 
@@ -257,20 +269,14 @@ pub(crate) fn handle_select_modes(
             &target_slots,
             &pending.target_constraints,
         )?;
-        let mut pending_sel =
-            PendingCast::new(pending.object_id, pending.card_id, resolved, total_cost);
-        pending_sel.base_cost = pending.base_cost.clone();
-        pending_sel.declared_mana_additions = pending.declared_mana_additions.clone();
-        pending_sel.target_constraints = pending.target_constraints;
-        pending_sel.casting_variant = pending.casting_variant;
-        pending_sel.casting_permission_index = pending.casting_permission_index;
-        pending_sel.origin_zone = pending.origin_zone;
-        pending_sel.additional_cost_flow = pending.additional_cost_flow;
-        pending_sel.deferred_target_selection = pending.deferred_target_selection;
-        pending_sel.chosen_modes = sorted_indices.clone();
-        pending_sel.additional_cost_decided = pending.additional_cost_decided;
-        pending_sel.declared_kickers_to_pay = pending.declared_kickers_to_pay;
-        pending_sel.declined_kickers = pending.declined_kickers;
+        // CR 601.2a-c: the target prompt carries the whole announced cast —
+        // permission, timing permission, variant, payment mode, cost
+        // announcements and division unit — exactly as the unprompted
+        // declarations above hand it to `finish_pending_cast_cost_or_pay`.
+        let mut pending_sel = pending;
+        pending_sel.ability = Box::new(resolved);
+        pending_sel.cost = total_cost;
+        pending_sel.chosen_modes = sorted_indices;
         // CR 601.2c + CR 115.1: target declaration belongs to the controller by
         // default, but the FIRST slot may route its announcement to another player
         // ("of an opponent's choice"). For this card class slot 0 is the
@@ -280,12 +286,6 @@ pub(crate) fn handle_select_modes(
             .first()
             .and_then(|slot| slot.chooser)
             .unwrap_or(controller);
-        pending_sel.activation_cost = pending.activation_cost;
-        pending_sel.activation_ability_index = pending.activation_ability_index;
-        pending_sel.activation_cost_snapshot = pending.activation_cost_snapshot;
-        pending_sel.pending_loyalty_activation_player = pending.pending_loyalty_activation_player;
-        pending_sel.activation_residual = pending.activation_residual;
-        pending_sel.activation_target_selection = pending.activation_target_selection;
         return Ok(WaitingFor::TargetSelection {
             player: initial_player,
             pending_cast: Box::new(pending_sel),
@@ -296,41 +296,93 @@ pub(crate) fn handle_select_modes(
     }
 
     // No targets needed -- check additional cost, then pay
+    finish_modal_declaration(
+        state,
+        controller,
+        pending,
+        resolved,
+        total_cost,
+        sorted_indices,
+        events,
+    )
+}
+
+/// CR 700.2 + CR 601.2c-d + CR 601.2f: Complete a modal cast whose target
+/// declaration finished without a target prompt (random, single legal choice,
+/// or no target slot). The division is announced among the declared targets
+/// before the total cost — including any per-target surcharge — is determined.
+fn finish_modal_declaration(
+    state: &mut GameState,
+    controller: PlayerId,
+    mut pending: PendingCast,
+    mut resolved: ResolvedAbility,
+    total_cost: ManaCost,
+    chosen_modes: Vec<usize>,
+    events: &mut Vec<GameEvent>,
+) -> Result<WaitingFor, EngineError> {
+    pending.cost = total_cost.clone();
+    pending.chosen_modes = chosen_modes;
+    if let Some(waiting_for) =
+        announce_cast_distribution(state, controller, &pending, &mut resolved, events)?
+    {
+        return Ok(waiting_for);
+    }
     finish_pending_cast_cost_or_pay(state, controller, pending, resolved, total_cost, events)
 }
 
-/// CR 601.2d: After targets are committed on a pending cast, pause for
-/// `WaitingFor::DistributeAmong` when the spell divides a fixed pool among
-/// those targets. Shared by bulk `SelectTargets` and slot-by-slot
-/// `ChooseTarget` completion paths — the client drives the latter.
-fn maybe_pause_for_cast_distribution(
+/// CR 601.2d: After targets are declared on a pending cast or activation,
+/// announce how its divided effect is split among them. This is the single
+/// cast-side distribution announcement for every target-declaration route
+/// (bulk `SelectTargets`, slot-by-slot `ChooseTarget`, random, automatic and
+/// slotless deferred declarations).
+///
+/// - A division fixed without a player choice (no targets, or an even split)
+///   is written to `ability.distribution` and `Ok(None)` is returned, so the
+///   caller continues to total-cost determination with its targets and
+///   division committed (CR 601.2f).
+/// - A controller-announced division stores the pending cast — with `ability`
+///   and every chosen permission, variant and cost announcement intact — and
+///   returns `WaitingFor::DistributeAmong`.
+/// - A pool that still depends on an unannounced X, or on a cost that is paid
+///   later (Captain America's Throw divides the unattached Equipment's mana
+///   value), leaves the division to the post-payment announcement.
+pub(crate) fn announce_cast_distribution(
     state: &mut GameState,
     player: PlayerId,
     pending: &PendingCast,
-    ability: &ResolvedAbility,
+    ability: &mut ResolvedAbility,
     events: &[GameEvent],
 ) -> Result<Option<WaitingFor>, EngineError> {
     let Some(unit) = &pending.distribute else {
         return Ok(None);
     };
-    let Some(total) = extract_distribution_total(state, ability, &ability.effect) else {
-        // X-spell: distribution deferred to after mana payment.
-        return Ok(None);
-    };
-    let assigned_targets = distribution_targets(ability);
-    if assigned_targets.is_empty() {
+    if ability.distribution.is_some() {
         return Ok(None);
     }
-    let mut pending_dist = pending.clone();
-    pending_dist.ability = Box::new(ability.clone());
-    stage_activation_target_events_before_distribution(state, &mut pending_dist, events);
-    state.pending_cast = Some(Box::new(pending_dist));
-    Ok(Some(WaitingFor::DistributeAmong {
-        player,
-        total,
-        targets: assigned_targets,
-        unit: unit.clone(),
-    }))
+    let Some(total) = resolved_distribution_pool(state, ability) else {
+        return Ok(None);
+    };
+    match announce_distribution(unit, total, distribution_targets(ability)) {
+        DistributionAnnouncement::Automatic(distribution) => {
+            ability.distribution = distribution;
+            Ok(None)
+        }
+        // CR 601.2d: a controller-announced division gives each target at least
+        // one, so a zero pool here is one whose size a later cost determines.
+        DistributionAnnouncement::Choice { total: 0, .. } => Ok(None),
+        DistributionAnnouncement::Choice { total, targets } => {
+            let mut pending_dist = pending.clone();
+            pending_dist.ability = Box::new(ability.clone());
+            stage_activation_target_events_before_distribution(state, &mut pending_dist, events);
+            state.pending_cast = Some(Box::new(pending_dist));
+            Ok(Some(WaitingFor::DistributeAmong {
+                player,
+                total,
+                targets,
+                unit: unit.clone(),
+            }))
+        }
+    }
 }
 
 /// CR 602.2b + CR 603.3b: A target-bearing activation keeps target-declaration
@@ -404,7 +456,7 @@ pub(crate) fn handle_select_targets(
     );
 
     if let Some(waiting_for) =
-        maybe_pause_for_cast_distribution(state, player, &pending, &ability, events)?
+        announce_cast_distribution(state, player, &pending, &mut ability, events)?
     {
         return Ok(waiting_for);
     }
@@ -509,7 +561,7 @@ pub(crate) fn handle_choose_target(
             );
 
             if let Some(waiting_for) =
-                maybe_pause_for_cast_distribution(state, controller, &pending, &ability, events)?
+                announce_cast_distribution(state, controller, &pending, &mut ability, events)?
             {
                 return Ok(waiting_for);
             }

@@ -274,6 +274,7 @@ fn park_prompt(
         is_cost_payment: false,
         enters_modified_if: None,
         duration: None,
+        same_zone_owner: false,
     };
 }
 

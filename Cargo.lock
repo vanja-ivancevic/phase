@@ -1920,6 +1920,7 @@ name = "patina-old-border-smoke"
 version = "0.100.0"
 dependencies = [
  "phase-engine",
+ "serde_json",
 ]
 
 [[package]]

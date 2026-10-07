@@ -3435,9 +3435,40 @@ pub(crate) fn try_split_compound_and(text: &str) -> Option<StaticCondition> {
 /// - "it's your turn" → DuringYourTurn
 /// - "you control a/an [type]" → IsPresent with filter
 pub(crate) fn parse_static_condition(text: &str) -> Option<StaticCondition> {
+    parse_static_condition_for_affected(text, None)
+}
+
+fn parse_static_condition_for_affected(
+    text: &str,
+    affected: Option<&TargetFilter>,
+) -> Option<StaticCondition> {
     let text = text.trim().trim_end_matches('.');
     let lower = text.to_lowercase();
     let tp = TextPair::new(text, &lower);
+
+    // CR 611.3a: a creature anthem's "it" is each affected creature, not
+    // the source. Keep the gate for conditional companion consumers.
+    if matches!(
+        affected,
+        Some(TargetFilter::Typed(filter))
+            if filter.type_filters.contains(&TypeFilter::Creature)
+    ) {
+        if let Some(rest) = lower.strip_prefix("it") {
+            if let Ok(("attacking", negated)) = nom_condition::parse_it_copula(rest) {
+                let prop = FilterProp::Attacking { defender: None };
+                let prop = if negated {
+                    FilterProp::Not {
+                        prop: Box::new(prop),
+                    }
+                } else {
+                    prop
+                };
+                return Some(StaticCondition::RecipientMatchesFilter {
+                    filter: TargetFilter::Typed(TypedFilter::creature().properties(vec![prop])),
+                });
+            }
+        }
+    }
 
     // Delegate to shared nom condition combinator (prefix already stripped by callers).
     // Callers like parse_conditional_static strip "As long as " before calling us,
@@ -3859,7 +3890,7 @@ pub(crate) fn parse_affected_scoped_static_condition(
     if matches!(affected, Some(TargetFilter::SelfRef)) {
         parse_static_condition(&rewrite_self_pronoun_subject(text))
     } else {
-        parse_static_condition(text)
+        parse_static_condition_for_affected(text, affected)
     }
 }
 

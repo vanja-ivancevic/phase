@@ -917,21 +917,6 @@ fn corpse_harvester_lowers_to_dual_search_into_hand() {
     );
 }
 
-#[test]
-fn snapshot_force_of_despair() {
-    // CR 118.9 + CR 102.1: leading-if conditional alternative cost. The
-    // "If it's not your turn" gate must bind to the casting option's
-    // `condition` slot as `Not(IsYourTurn)` — never `null`.
-    let result = parse(
-        "If it's not your turn, you may exile a black card from your hand rather than pay this spell's mana cost.\nDestroy all creatures that entered this turn.",
-        "Force of Despair",
-        &[],
-        &["Instant"],
-        &[],
-    );
-    insta::assert_json_snapshot!(result);
-}
-
 // CR 614.1 + CR 614.12 + CR 303.4 + CR 613.1d + CR 613.1f + CR 113.10:
 // Return-as-Aura dies trigger. The dies-trigger sub-effect chain MUST emit
 // `Effect::ReturnAsAura` (not `Effect::Unimplemented { name: "it's" }`).

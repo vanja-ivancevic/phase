@@ -878,6 +878,7 @@ pub(crate) fn parse_graveyard_keyword_continuation(
                             count: exile_count,
                             zone: Some(Zone::Graveyard),
                             filter: None,
+                            same_zone_owner: false,
                         },
                     ],
                 },
@@ -12953,6 +12954,7 @@ mod has_unimplemented_wrapper_recursion_tests {
                 win_effect: Some(Box::new(failure())),
                 lose_effect: Some(Box::new(clean())),
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             },
         );
         let lose_bad = AbilityDefinition::new(
@@ -12961,6 +12963,7 @@ mod has_unimplemented_wrapper_recursion_tests {
                 win_effect: Some(Box::new(clean())),
                 lose_effect: Some(Box::new(failure())),
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             },
         );
         let until_lose_bad = AbilityDefinition::new(
@@ -13221,6 +13224,7 @@ mod has_unimplemented_wrapper_recursion_tests {
                 win_effect: Some(payload("flip_win")),
                 lose_effect: Some(payload("flip_lose")),
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             },
             Effect::FlipCoins {
                 count: QuantityExpr::Fixed { value: 2 },
@@ -13286,6 +13290,7 @@ mod has_unimplemented_wrapper_recursion_tests {
             win_effect: None,
             lose_effect: None,
             flipper: TargetFilter::Controller,
+            result_is_face: false,
         };
         let mut edges = Vec::new();
         empty.for_each_nested_definition(&mut |edge, _| edges.push(edge));

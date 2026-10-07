@@ -1445,6 +1445,7 @@ pub(super) fn handle_unless_payment(
                 count,
                 zone: Some(Zone::Library),
                 filter: None,
+                ..
             } => {
                 if !pay_top_library_exile_cost(
                     state,

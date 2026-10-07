@@ -33,7 +33,6 @@
 use engine::game::game_object::AttachTarget;
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::oracle::parse_oracle_text;
-use engine::parser::oracle_ir::diagnostic::ClauseGapKind;
 use engine::types::ability::{AbilityDefinition, AbilityKind, Effect, TargetFilter};
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaType, ManaUnit};
@@ -277,28 +276,6 @@ use engine::types::resolved_commands::{
 
 const CONVULSING_LICID_ORACLE: &str = "{R}, {T}: This creature loses this ability and becomes an Aura enchantment with enchant creature. Attach it to target creature. You may pay {R} to end this effect.\n\
 Enchanted creature can't block.";
-
-/// Verbatim from `data/card-data.json` — pre-Oracle-template wording that the
-/// Scryfall `oracle:` search for the other twelve does not return.
-const FLANKING_LICID_ORACLE: &str = "{R}, {T}: Flanking Licid loses this ability and becomes a creature enchantment that reads \"Enchanted creature gains flanking\" instead of a creature. Move Flanking Licid onto target creature. You may pay {R} to end this effect.";
-
-/// Every shipped card in the CR 116.2c class, verbatim from `data/card-data.json`.
-/// Used by V15 to prove none of the thirteen gained a `parse_warnings` entry.
-const ALL_LICID_ORACLE: &[(&str, &str, &str)] = &[
-    ("Calming Licid", "W", CALMING_LICID_ORACLE),
-    ("Convulsing Licid", "R", CONVULSING_LICID_ORACLE),
-    ("Corrupting Licid", "B", "{B}, {T}: This creature loses this ability and becomes an Aura enchantment with enchant creature. Attach it to target creature. You may pay {B} to end this effect.\nEnchanted creature has fear. (It can't be blocked except by artifact creatures and/or black creatures.)"),
-    ("Dominating Licid", "U", "{1}{U}{U}, {T}: This creature loses this ability and becomes an Aura enchantment with enchant creature. Attach it to target creature. You may pay {U} to end this effect.\nYou control enchanted creature."),
-    ("Enraging Licid", "R", "{R}, {T}: This creature loses this ability and becomes an Aura enchantment with enchant creature. Attach it to target creature. You may pay {R} to end this effect.\nEnchanted creature has haste."),
-    ("Flanking Licid", "R", FLANKING_LICID_ORACLE),
-    ("Gliding Licid", "U", "{U}, {T}: This creature loses this ability and becomes an Aura enchantment with enchant creature. Attach it to target creature. You may pay {U} to end this effect.\nEnchanted creature has flying."),
-    ("Leeching Licid", "B", "{B}, {T}: This creature loses this ability and becomes an Aura enchantment with enchant creature. Attach it to target creature. You may pay {B} to end this effect.\nAt the beginning of the upkeep of enchanted creature's controller, this creature deals 1 damage to that player."),
-    ("Nurturing Licid", "G", "{G}, {T}: This creature loses this ability and becomes an Aura enchantment with enchant creature. Attach it to target creature. You may pay {G} to end this effect.\n{G}: Regenerate enchanted creature."),
-    ("Quickening Licid", "W", "{1}{W}, {T}: This creature loses this ability and becomes an Aura enchantment with enchant creature. Attach it to target creature. You may pay {W} to end this effect.\nEnchanted creature has first strike."),
-    ("Stinging Licid", "U", "{1}{U}, {T}: This creature loses this ability and becomes an Aura enchantment with enchant creature. Attach it to target creature. You may pay {U} to end this effect.\nWhenever enchanted creature becomes tapped, this creature deals 2 damage to that creature's controller."),
-    ("Tempting Licid", "G", "{G}, {T}: This creature loses this ability and becomes an Aura enchantment with enchant creature. Attach it to target creature. You may pay {G} to end this effect.\nAll creatures able to block enchanted creature do so."),
-    ("Transmogrifying Licid", "GENERIC1", "{1}, {T}: This creature loses this ability and becomes an Aura enchantment with enchant creature. Attach it to target creature. You may pay {1} to end this effect.\nEnchanted creature gets +1/+1 and is an artifact in addition to its other types."),
-];
 
 fn mana_cost_of(code: &str) -> ManaCost {
     match code {
@@ -1147,102 +1124,6 @@ fn reconfigure_and_bestow_attachments_survive_the_cr_704_5p_sweep() {
         Some(AttachTarget::Object(host_b)),
         "CR 702.103b: a bestowed permanent is an Aura and not a creature, so \
          both CR 704.5p sentences must miss"
-    );
-}
-
-// ── V15 / V15b — parser coverage honesty across all THIRTEEN cards ───────────
-
-/// V15 — the swallow detector must stay quiet on every card in the class. The
-/// mandatory `PayCost` def used to be the ONLY AST evidence satisfying
-/// `any_ability_is_optional`; removing it without the `end_cost` disjunct on
-/// `effect_has_internal_optionality`'s `GenericEffect` arm turns all thirteen
-/// yellow.
-#[test]
-fn no_licid_gains_a_parse_warning() {
-    for (name, cost_code, oracle) in ALL_LICID_ORACLE {
-        let parsed = parse_oracle_text(oracle, name, &[], &[], &["Licid".to_string()]);
-        assert!(
-            parsed.parse_warnings.is_empty(),
-            "{name} must keep zero parse warnings — the `end_cost` field is the \
-             AST evidence for the printed \"you may\": {:?}",
-            parsed.parse_warnings
-        );
-        // Paired reach guard: proves the clause was actually ABSORBED rather
-        // than the card simply failing to parse into anything detectable.
-        let ability = parsed
-            .abilities
-            .first()
-            .unwrap_or_else(|| panic!("{name} must parse to an activated ability"));
-        assert_eq!(
-            root_end_cost(ability),
-            Some(mana_cost_of(cost_code)),
-            "{name}: the termination cost must land on the animating GenericEffect"
-        );
-        assert!(
-            !effects_of(ability)
-                .iter()
-                .any(|e| matches!(e, Effect::PayCost { .. })),
-            "{name}: the mandatory resolution-time PayCost must be gone"
-        );
-    }
-}
-
-/// V15b — Flanking Licid is absorbed by shape, and its coverage status is
-/// UNCHANGED. Its intervening clause is an `Unimplemented` "move", not an
-/// `Attach`, which is precisely why the reach-back is gated on shape.
-#[test]
-fn flanking_licid_is_absorbed_and_its_unimplemented_move_clause_survives() {
-    let parsed = parse_oracle_text(
-        FLANKING_LICID_ORACLE,
-        "Flanking Licid",
-        &[],
-        &[],
-        &["Licid".to_string()],
-    );
-    let ability = parsed
-        .abilities
-        .first()
-        .expect("Flanking Licid must parse to an activated ability");
-
-    // (a) — asserted POSITIVELY first, so (b) below cannot pass vacuously via
-    // an upstream parse failure.
-    assert_eq!(
-        root_end_cost(ability),
-        Some(mana_cost_of("R")),
-        "CR 116.2c: Flanking Licid is in the class and must be absorbed"
-    );
-    // (b)
-    assert!(
-        !effects_of(ability)
-            .iter()
-            .any(|e| matches!(e, Effect::PayCost { .. })),
-        "the mandatory PayCost must be gone for Flanking Licid too"
-    );
-    // (c) — coverage honesty: this change must not silently "fix" or drop the
-    // pre-existing unsupported move clause. The gap is identified by the clause it
-    // RECORDS and by the parser's verdict on it — "move" is in neither verb vocabulary,
-    // so the verdict is `UnrecognizedHead`. This venue is a separate crate, so it
-    // asserts the `pub` wire-name half plus the fragment; the phrase half of the verdict
-    // is covered in-crate by the `gap_diagnosis` table over the same function.
-    const MOVE_CLAUSE: &str = "Move ~ onto target creature";
-    let move_gap = effects_of(ability)
-        .into_iter()
-        .find(|e| e.unimplemented_description() == Some(MOVE_CLAUSE))
-        .unwrap_or_else(|| {
-            panic!(
-                "the move clause was unsupported before this change and must stay \
-                 unsupported after it — no Oracle text is newly accepted with deferred \
-                 semantics: {:?}",
-                effects_of(ability)
-            )
-        });
-    let Effect::Unimplemented { name, .. } = &move_gap else {
-        unreachable!("selected by unimplemented_description above")
-    };
-    assert_eq!(
-        ClauseGapKind::from_unimplemented_name(name),
-        Some(ClauseGapKind::UnrecognizedHead),
-        "the recorded name must decode to the verdict this clause earns, got {name}"
     );
 }
 

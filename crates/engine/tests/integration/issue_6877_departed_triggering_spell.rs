@@ -10,7 +10,7 @@ use engine::game::game_object::GameObject;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::game::scenario_db::GameScenarioDbExt;
 use engine::game::visibility::filter_state_for_viewer;
-use engine::types::ability::{CastingPermission, ResolutionCastCleanup, TargetRef};
+use engine::types::ability::{CastingPermission, CoinFlipResult, ResolutionCastCleanup, TargetRef};
 use engine::types::actions::{CastChoice, GameAction};
 use engine::types::events::GameEvent;
 use engine::types::game_state::{
@@ -132,9 +132,10 @@ fn reseed(runner: &mut GameRunner, seed: u64) {
 }
 
 fn saw_coin(events: &[GameEvent], won: bool) -> bool {
+    let expected = CoinFlipResult::from_won(won);
     events
         .iter()
-        .any(|event| matches!(event, GameEvent::CoinFlipped { won: w, .. } if *w == won))
+        .any(|event| matches!(event, GameEvent::CoinFlipped { result, .. } if *result == expected))
 }
 
 fn saw_spell_copied(events: &[GameEvent]) -> bool {

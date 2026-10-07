@@ -19023,142 +19023,6 @@ fn self_cost_graveyard_keyword_grants_absorb_cost_clarification() {
     }
 }
 
-/// CR 702.138a + CR 601.2f–h: the targeted/triggered one-shot grant of a
-/// COMPOUND-cost graveyard keyword (escape: "mana cost plus exile N other
-/// cards from your graveyard") is the compound-cost twin of the self-mana-cost
-/// graveyard-keyword grant. Confession Dial's `{T}` ability and Desdemona's
-/// attack trigger are the class. Build the escape `AddKeyword` grant with the
-/// compound cost (parameterized over exile count), `affected: ParentTarget`,
-/// and no leftover `Unimplemented` sub-ability. Builds for the class.
-#[test]
-fn effect_target_graveyard_card_gains_escape_compound_cost() {
-    use crate::types::keywords::{EscapeCost, Keyword};
-
-    fn expected_escape(count: u32) -> Keyword {
-        Keyword::Escape(EscapeCost::NonMana(AbilityCost::Composite {
-            costs: vec![
-                AbilityCost::Mana {
-                    cost: ManaCost::SelfManaCost,
-                },
-                AbilityCost::Exile {
-                    count,
-                    zone: Some(Zone::Graveyard),
-                    filter: None,
-                },
-            ],
-        }))
-    }
-
-    // Assert the escape `AddKeyword` grant + compound cost is built and no
-    // `Unimplemented` sub-ability leaks, independent of the target's filter
-    // shape. Returns the parsed target so each case asserts its own filter.
-    let assert_escape_grant = |text: &str, count: u32| -> TargetFilter {
-        let def = parse_effect_chain(text, AbilityKind::Spell);
-        let Effect::GenericEffect {
-            static_abilities,
-            duration,
-            target: Some(target),
-            end_cost: _,
-        } = &*def.effect
-        else {
-            panic!(
-                "expected GenericEffect with a target for {text:?}, got {:?}",
-                def.effect
-            );
-        };
-        assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
-        let grant = static_abilities
-            .iter()
-            .find(|s| {
-                s.modifications
-                    .contains(&ContinuousModification::AddKeyword {
-                        keyword: expected_escape(count),
-                    })
-            })
-            .unwrap_or_else(|| panic!("missing escape grant for {text:?}: {static_abilities:?}"));
-        assert_eq!(grant.affected, Some(TargetFilter::ParentTarget));
-        assert!(
-            def.sub_ability.is_none(),
-            "compound escape cost must be absorbed for {text:?}, got {:?}",
-            def.sub_ability
-        );
-        target.clone()
-    };
-
-    // Confession Dial's `{T}` ability: "Target legendary creature card in
-    // your graveyard gains escape ... exile three other cards ...". A single
-    // typed filter (no relative-clause disjunction).
-    let target = assert_escape_grant(
-            "target legendary creature card in your graveyard gains escape until end of turn. The escape cost is equal to its mana cost plus exile three other cards from your graveyard.",
-            3,
-        );
-    let TargetFilter::Typed(tf) = &target else {
-        panic!("Confession Dial expects a typed target, got {target:?}");
-    };
-    assert_eq!(tf.controller, Some(ControllerRef::You));
-    assert!(tf.type_filters.contains(&TypeFilter::Creature));
-    assert!(tf.properties.contains(&FilterProp::InZone {
-        zone: Zone::Graveyard
-    }));
-    assert!(tf.properties.contains(&FilterProp::HasSupertype {
-        value: Supertype::Legendary
-    }));
-
-    // Desdemona, Freedom's Edge — VERBATIM Oracle subject. The heterogeneous
-    // disjunction "that's an artifact or that has mana value 3 or less"
-    // (card type OR mana-value bound) distributes over the typed graveyard
-    // filter as `TargetFilter::Or` (CR 115.1 + CR 608.2c). Exercising the
-    // verbatim subject is load-bearing: the simplified text used previously
-    // hid the production misparse this change fixes.
-    let target = assert_escape_grant(
-            "target creature card in your graveyard that's an artifact or that has mana value 3 or less gains escape until end of turn. The escape cost is equal to its mana cost plus exile two other cards from your graveyard.",
-            2,
-        );
-    let TargetFilter::Or { filters } = &target else {
-        panic!("Desdemona expects a disjunctive (Or) target, got {target:?}");
-    };
-    assert_eq!(
-        filters.len(),
-        2,
-        "Desdemona disjunction has two legs: {filters:?}"
-    );
-    // Every leg is a creature card in your graveyard.
-    for leg in filters {
-        let TargetFilter::Typed(tf) = leg else {
-            panic!("Desdemona leg must be a typed filter, got {leg:?}");
-        };
-        assert_eq!(tf.controller, Some(ControllerRef::You));
-        assert!(
-            tf.type_filters.contains(&TypeFilter::Creature),
-            "leg missing creature type: {tf:?}"
-        );
-        assert!(
-            tf.properties.contains(&FilterProp::InZone {
-                zone: Zone::Graveyard
-            }),
-            "leg missing graveyard filter: {tf:?}"
-        );
-    }
-    // One leg restricts to artifacts, the other to mana value 3 or less.
-    assert!(
-        filters.iter().any(|leg| matches!(
-            leg,
-            TargetFilter::Typed(tf) if tf.type_filters.contains(&TypeFilter::Artifact)
-        )),
-        "Desdemona missing artifact leg: {filters:?}"
-    );
-    assert!(
-        filters.iter().any(|leg| matches!(
-            leg,
-            TargetFilter::Typed(tf) if tf.properties.iter().any(|p| matches!(
-                p,
-                FilterProp::Cmc { comparator: Comparator::LE, .. }
-            ))
-        )),
-        "Desdemona missing mana-value leg: {filters:?}"
-    );
-}
-
 /// The compound-cost front door must DECLINE the self-mana-cost siblings
 /// (flashback/embalm/harmonize) so they keep flowing through their existing
 /// absorber — the two mechanisms partition the class by cost shape.
@@ -64641,6 +64505,7 @@ fn filter_has_chosen_color(f: &TargetFilter) -> bool {
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::ExiledCardByIndex { .. }
@@ -69916,6 +69781,7 @@ fn counter_gate_rebind_reaches_flip_coin_and_flip_coins_both_branches() {
             event_context_put_counter(TargetFilter::Any),
         ))),
         flipper: TargetFilter::Controller,
+        result_is_face: false,
     };
     rebind_event_context_amount_counts(&mut coin, &gate_qty);
     let Effect::FlipCoin {
@@ -80648,4 +80514,141 @@ fn prevention_declared_prefixes_keep_full_filters_and_counts() {
             "{text}: announced count"
         );
     }
+}
+
+/// CR 702.138a + CR 601.2f–h: the targeted/triggered one-shot grant of a
+/// COMPOUND-cost graveyard keyword (escape: "mana cost plus exile N other
+/// cards from your graveyard") is the compound-cost twin of the self-mana-cost
+/// graveyard-keyword grant. Confession Dial's `{T}` ability and Desdemona's
+/// attack trigger are the class. Build the escape `AddKeyword` grant with the
+/// compound cost (parameterized over exile count), `affected: ParentTarget`,
+/// and no leftover `Unimplemented` sub-ability. Builds for the class.
+#[test]
+fn effect_target_graveyard_card_gains_escape_compound_cost() {
+    use crate::types::keywords::{EscapeCost, Keyword};
+
+    fn expected_escape(count: u32) -> Keyword {
+        Keyword::Escape(EscapeCost::NonMana(AbilityCost::Composite {
+            costs: vec![
+                AbilityCost::Mana {
+                    cost: ManaCost::SelfManaCost,
+                },
+                AbilityCost::Exile {
+                    count,
+                    zone: Some(Zone::Graveyard),
+                    filter: None,
+                    same_zone_owner: false,
+                },
+            ],
+        }))
+    }
+
+    // Assert the escape `AddKeyword` grant + compound cost is built and no
+    // `Unimplemented` sub-ability leaks, independent of the target's filter
+    // shape. Returns the parsed target so each case asserts its own filter.
+    let assert_escape_grant = |text: &str, count: u32| -> TargetFilter {
+        let def = parse_effect_chain(text, AbilityKind::Spell);
+        let Effect::GenericEffect {
+            static_abilities,
+            duration,
+            target: Some(target),
+            end_cost: _,
+        } = &*def.effect
+        else {
+            panic!(
+                "expected GenericEffect with a target for {text:?}, got {:?}",
+                def.effect
+            );
+        };
+        assert_eq!(*duration, Some(Duration::UntilEndOfTurn));
+        let grant = static_abilities
+            .iter()
+            .find(|s| {
+                s.modifications
+                    .contains(&ContinuousModification::AddKeyword {
+                        keyword: expected_escape(count),
+                    })
+            })
+            .unwrap_or_else(|| panic!("missing escape grant for {text:?}: {static_abilities:?}"));
+        assert_eq!(grant.affected, Some(TargetFilter::ParentTarget));
+        assert!(
+            def.sub_ability.is_none(),
+            "compound escape cost must be absorbed for {text:?}, got {:?}",
+            def.sub_ability
+        );
+        target.clone()
+    };
+
+    // Confession Dial's `{T}` ability: "Target legendary creature card in
+    // your graveyard gains escape ... exile three other cards ...". A single
+    // typed filter (no relative-clause disjunction).
+    let target = assert_escape_grant(
+            "target legendary creature card in your graveyard gains escape until end of turn. The escape cost is equal to its mana cost plus exile three other cards from your graveyard.",
+            3,
+        );
+    let TargetFilter::Typed(tf) = &target else {
+        panic!("Confession Dial expects a typed target, got {target:?}");
+    };
+    assert_eq!(tf.controller, Some(ControllerRef::You));
+    assert!(tf.type_filters.contains(&TypeFilter::Creature));
+    assert!(tf.properties.contains(&FilterProp::InZone {
+        zone: Zone::Graveyard
+    }));
+    assert!(tf.properties.contains(&FilterProp::HasSupertype {
+        value: Supertype::Legendary
+    }));
+
+    // Desdemona, Freedom's Edge — VERBATIM Oracle subject. The heterogeneous
+    // disjunction "that's an artifact or that has mana value 3 or less"
+    // (card type OR mana-value bound) distributes over the typed graveyard
+    // filter as `TargetFilter::Or` (CR 115.1 + CR 608.2c). Exercising the
+    // verbatim subject is load-bearing: the simplified text used previously
+    // hid the production misparse this change fixes.
+    let target = assert_escape_grant(
+            "target creature card in your graveyard that's an artifact or that has mana value 3 or less gains escape until end of turn. The escape cost is equal to its mana cost plus exile two other cards from your graveyard.",
+            2,
+        );
+    let TargetFilter::Or { filters } = &target else {
+        panic!("Desdemona expects a disjunctive (Or) target, got {target:?}");
+    };
+    assert_eq!(
+        filters.len(),
+        2,
+        "Desdemona disjunction has two legs: {filters:?}"
+    );
+    // Every leg is a creature card in your graveyard.
+    for leg in filters {
+        let TargetFilter::Typed(tf) = leg else {
+            panic!("Desdemona leg must be a typed filter, got {leg:?}");
+        };
+        assert_eq!(tf.controller, Some(ControllerRef::You));
+        assert!(
+            tf.type_filters.contains(&TypeFilter::Creature),
+            "leg missing creature type: {tf:?}"
+        );
+        assert!(
+            tf.properties.contains(&FilterProp::InZone {
+                zone: Zone::Graveyard
+            }),
+            "leg missing graveyard filter: {tf:?}"
+        );
+    }
+    // One leg restricts to artifacts, the other to mana value 3 or less.
+    assert!(
+        filters.iter().any(|leg| matches!(
+            leg,
+            TargetFilter::Typed(tf) if tf.type_filters.contains(&TypeFilter::Artifact)
+        )),
+        "Desdemona missing artifact leg: {filters:?}"
+    );
+    assert!(
+        filters.iter().any(|leg| matches!(
+            leg,
+            TargetFilter::Typed(tf) if tf.properties.iter().any(|p| matches!(
+                p,
+                FilterProp::Cmc { comparator: Comparator::LE, .. }
+            ))
+        )),
+        "Desdemona missing mana-value leg: {filters:?}"
+    );
 }

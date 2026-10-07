@@ -6160,11 +6160,21 @@ pub(super) fn handle_resolution_choice(
                 library_position,
                 mass_library_order,
                 is_cost_payment,
+                same_zone_owner,
                 enters_modified_if,
                 duration,
             },
             GameAction::SelectCards { cards: chosen },
         ) => {
+            if same_zone_owner
+                && !super::cost_payability::exile_selection_has_same_zone_owner(
+                    state, zone, &chosen,
+                )
+            {
+                return Err(EngineError::InvalidAction(
+                    "Exile cost must be paid from a single player's zone".to_string(),
+                ));
+            }
             let legacy_optional_attach_empty = chosen.is_empty()
                 && matches!(effect_kind, EffectKind::Attach)
                 && !up_to
@@ -13382,6 +13392,7 @@ mod tests {
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
+            same_zone_owner: false,
         };
         state.waiting_for = waiting.clone();
 
@@ -13493,6 +13504,7 @@ mod tests {
                     is_cost_payment: false,
                     enters_modified_if: None,
                     duration: None,
+                    same_zone_owner: false,
                 };
                 state.waiting_for = waiting.clone();
                 let life_before = state.players[0].life;

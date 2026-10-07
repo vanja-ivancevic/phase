@@ -5726,6 +5726,7 @@ fn node_reads_mutable_resolution_local_state(node: &crate::types::ability::Targe
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::CostPaidObject
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::HasChosenName
         | TargetFilter::ExiledBySource
         | TargetFilter::ExiledCardByIndex { .. }
@@ -5924,6 +5925,7 @@ fn node_has_non_arrival_invariant_property(node: &crate::types::ability::TargetF
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::CostPaidObject
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::HasChosenName
         | TargetFilter::ExiledBySource
         | TargetFilter::ExiledCardByIndex { .. } => false,
@@ -32497,6 +32499,7 @@ mod tests {
                     win_effect: Some(Box::new(hostile.clone())),
                     lose_effect: None,
                     flipper: TargetFilter::Controller,
+                    result_is_face: false,
                 },
             ),
             (

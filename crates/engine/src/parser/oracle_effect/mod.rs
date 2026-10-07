@@ -10218,6 +10218,7 @@ fn rebind_controller_scope(filter: &mut TargetFilter, from: ControllerRef, to: C
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource
@@ -11239,12 +11240,14 @@ fn parse_effect_clause_inner(text: &str, ctx: &mut ParseContext) -> ParsedEffect
                 // CR 705.2: branch-only flip stub; `consolidate_die_and_coin_defs`
                 // merges it into the preceding flip, which carries the flipper.
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             })
         } else {
             parsed_clause(Effect::FlipCoin {
                 win_effect: None,
                 lose_effect: Some(Box::new(branch_def)),
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             })
         };
     }
@@ -41304,12 +41307,14 @@ fn parse_effect_chain_ir_body(
                     win_effect: Some(Box::new(branch_def)),
                     lose_effect: None,
                     flipper: TargetFilter::Controller,
+                    result_is_face: false,
                 }
             } else {
                 Effect::FlipCoin {
                     win_effect: None,
                     lose_effect: Some(Box::new(branch_def)),
                     flipper: TargetFilter::Controller,
+                    result_is_face: false,
                 }
             };
             builder
@@ -42061,6 +42066,45 @@ fn parse_effect_chain_ir_body(
             // CR 101.4 + CR 608.2f: forward-carry from a preceding
             // "Repeat the following process for each <scope> [in turn order]."
             .or(pending_player_scope_for_clause);
+
+        // CR 705.2 + CR 608.2c: "Each player whose coin comes up tails
+        // sacrifices ..." qualifies each scoped player by their OWN face from
+        // the immediately preceding bare flip instruction, which becomes a
+        // face-only (no winner) flip. The preceding Sentence boundary is kept,
+        // so this clause stays a sequential sibling: every player's flip, keep
+        // choice, and replacement ordering completes before any sacrifice.
+        let text = if player_scope.is_some() {
+            if let Some((coin_condition, body)) = strip_scoped_coin_face_qualification(&text) {
+                let producer =
+                    builder
+                        .last_mut()
+                        .and_then(|previous| match &mut previous.parsed.effect {
+                            Effect::FlipCoin {
+                                win_effect: None,
+                                lose_effect: None,
+                                result_is_face,
+                                ..
+                            } => Some(result_is_face),
+                            _ => None,
+                        });
+                if let Some(result_is_face) = producer {
+                    *result_is_face = true;
+                    condition = Some(match condition {
+                        Some(previous) => AbilityCondition::And {
+                            conditions: vec![previous, coin_condition],
+                        },
+                        None => coin_condition,
+                    });
+                    body
+                } else {
+                    text
+                }
+            } else {
+                text
+            }
+        } else {
+            text
+        };
 
         // CR 608.2e + CR 608.2c + CR 101.3: A decline-tail strips one of four
         // shapes (prepositional vs subject-only × optional `doesn't` vs

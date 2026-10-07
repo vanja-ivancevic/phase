@@ -184,6 +184,7 @@ pub(crate) fn affected_filter_uses_object_population(filter: &TargetFilter) -> b
         // population (mirrors `CostPaidObject`).
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource
@@ -466,6 +467,7 @@ pub(crate) fn target_filter_characteristic_reads_at(
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::ExiledCardByIndex { .. }
@@ -851,6 +853,7 @@ pub(crate) fn entered_object_perturbs_affected_filter(
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource
@@ -1762,6 +1765,7 @@ pub(crate) fn filter_contains(filter: &TargetFilter, leaf: &dyn Fn(&TargetFilter
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::ExiledCardByIndex { .. }
@@ -2015,6 +2019,7 @@ pub(crate) fn filter_contains_filter_prop(
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::ExiledCardByIndex { .. }
@@ -2539,6 +2544,7 @@ fn rewrite_filter_props(
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::ExiledCardByIndex { .. }
@@ -4444,6 +4450,30 @@ fn filter_inner(
     )
 }
 
+/// CR 607.2c + CR 400.7: Read a frozen triggered-source relation, or the
+/// current exact source's live relation for a non-trigger filter. No allocation.
+fn linked_battlefield_return_matches(
+    state: &GameState,
+    recipient: ObjectIncarnationRef,
+    source_id: ObjectId,
+    trigger_source: Option<&TriggerSourceContext>,
+) -> bool {
+    if let Some(source) = trigger_source {
+        return source.linked_battlefield_returns.contains(&recipient);
+    }
+    let Some(source) = state.objects.get(&source_id) else {
+        return false;
+    };
+    if source.zone != Zone::Battlefield {
+        return false;
+    }
+    let source = ObjectIncarnationRef::from_object(source);
+    state
+        .battlefield_return_links
+        .iter()
+        .any(|link| link.source == source && link.recipient == recipient)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn filter_inner_for_object(
     state: &GameState,
@@ -4857,6 +4887,15 @@ fn filter_inner_for_object(
         TargetFilter::AmassedArmy => ability
             .and_then(|ability| ability.amassed_army_object.as_ref())
             .is_some_and(|snapshot| snapshot.object_id == object_id),
+        // CR 607.2c + CR 400.7: only the exact battlefield incarnation this
+        // source's linked ability put onto the battlefield.
+        TargetFilter::LinkedBattlefieldReturn => obj.zone == Zone::Battlefield
+            && linked_battlefield_return_matches(
+                state,
+                ObjectIncarnationRef::from_object(obj),
+                source_id,
+                trigger_source,
+            ),
         // CR 607.2d + CR 608.2c + CR 613.1f + CR 400.7: the FILTER source's
         // last-remembered object (`ChosenAttribute::Card`, written by
         // `Effect::RememberCard`). Read live each layer pass against `source_id`
@@ -5385,6 +5424,19 @@ fn zone_change_filter_inner(
             );
             chosen_name_matches(state, &source_ctx, &record.name)
         }
+        // CR 607.2c + CR 400.7: a departure matches only when the departing
+        // battlefield incarnation is one this source's linked ability put there.
+        TargetFilter::LinkedBattlefieldReturn => record
+            .trigger_source_context()
+            .is_some_and(|departed| {
+                departed.identity.expected_zone == Zone::Battlefield
+                    && linked_battlefield_return_matches(
+                        state,
+                        departed.identity.reference,
+                        source_id,
+                        trigger_source,
+                    )
+            }),
         // CR 607.2d + CR 603.10a + CR 400.7: the remembered object on the
         // leaves-the-battlefield look-back path. The candidate occurrence is the
         // record's OWN pre-change authority —
@@ -5782,6 +5834,7 @@ pub fn spell_record_matches_filter(
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource
@@ -6105,6 +6158,7 @@ fn spell_object_matches_filter_inner(
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource

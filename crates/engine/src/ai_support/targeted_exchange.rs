@@ -1610,6 +1610,7 @@ mod tests {
                     win_effect: Some(Box::new(fight_def())),
                     lose_effect: None,
                     flipper: TargetFilter::Controller,
+                    result_is_face: false,
                 },
             ),
         ));
@@ -1621,6 +1622,7 @@ mod tests {
                     win_effect: None,
                     lose_effect: Some(Box::new(fight_def())),
                     flipper: TargetFilter::Controller,
+                    result_is_face: false,
                 },
             ),
         ));

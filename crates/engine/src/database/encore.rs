@@ -70,6 +70,7 @@ fn encore_ability(mana_cost: ManaCost) -> AbilityDefinition {
                 count: 1,
                 zone: Some(Zone::Graveyard),
                 filter: Some(crate::types::ability::TargetFilter::SelfRef),
+                same_zone_owner: false,
             },
         ],
     };

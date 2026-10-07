@@ -456,6 +456,7 @@ fn open_private_zone_cast_selection(
         is_cost_payment: false,
         enters_modified_if: None,
         duration: None,
+        same_zone_owner: false,
     };
     Ok(())
 }
@@ -1478,6 +1479,7 @@ pub(crate) fn freeze_resolution_cast_filter(
         | TargetFilter::AttachedTo
         | TargetFilter::LastCreated
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::ExiledCardByIndex { .. }

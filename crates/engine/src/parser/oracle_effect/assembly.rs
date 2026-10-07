@@ -1841,6 +1841,7 @@ fn subject_anchored_optional_actor(
             | TargetFilter::CostPaidObject
             | TargetFilter::AmassedArmy
             | TargetFilter::ChosenCard
+            | TargetFilter::LinkedBattlefieldReturn
             | TargetFilter::TrackedSet { .. }
             | TargetFilter::TrackedSetFiltered { .. }
             | TargetFilter::ExiledBySource
@@ -1969,6 +1970,7 @@ fn subject_anchored_optional_actor(
             | TargetFilter::CostPaidObject
             | TargetFilter::AmassedArmy
             | TargetFilter::ChosenCard
+            | TargetFilter::LinkedBattlefieldReturn
             | TargetFilter::TrackedSet { .. }
             | TargetFilter::TrackedSetFiltered { .. }
             | TargetFilter::ExiledBySource
@@ -4181,6 +4183,33 @@ pub(crate) fn assemble_effect_chain(ir: &EffectChainIr) -> AbilityDefinition {
     if matches!(ir.player_scope_rewrite, PlayerScopeRewrite::Apply) {
         apply_player_scope_rewrites(&mut result);
     }
+
+    // The prior zone-change ledger belongs to the printed compound clause,
+    // not to each player's result. Scope is fully known only after rewriting.
+    fn guard_prior_zone_change_body(def: &mut AbilityDefinition) {
+        if def.player_scope.is_some()
+            && matches!(
+                def.condition,
+                Some(AbilityCondition::ZoneChangedThisWay { .. })
+            )
+            && def.sub_ability.is_some()
+        {
+            let condition = def.condition.take().unwrap();
+            let parent_link = def.sub_link;
+            let kind = def.kind;
+            let mut body = std::mem::replace(
+                def,
+                AbilityDefinition::new(kind, Effect::NoOp).condition(condition),
+            );
+            body.sub_link = SubAbilityLink::ContinuationStep;
+            def.sub_link = parent_link;
+            def.sub_ability = Some(Box::new(body));
+        }
+        if let Some(sub) = def.sub_ability.as_deref_mut() {
+            guard_prior_zone_change_body(sub);
+        }
+    }
+    guard_prior_zone_change_body(&mut result);
 
     // CR 107.1a: Apply the chain-level rounding annotation (captured above)
     // to every DivideRounded in the built tree. No-op when the sentence was

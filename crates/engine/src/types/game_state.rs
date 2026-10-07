@@ -541,6 +541,11 @@ pub struct TriggerSourceContext {
     pub attachments: Vec<AttachmentSnapshot>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub linked_exile_snapshot: Vec<LinkedExileSnapshot>,
+    /// CR 607.2c + CR 400.7: Frozen recipients put onto the battlefield by
+    /// this exact source incarnation. Stale recipient pins remain meaningful
+    /// for death-event LKI, but cannot authorize a later same-id object.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub linked_battlefield_returns: Vec<ObjectIncarnationRef>,
     /// CR 607.2a: Ordered cards this source exiled during the current turn.
     /// This separate projection preserves ordinal references such as "the first
     /// card exiled with it" after the source leaves its observed zone.
@@ -642,6 +647,12 @@ impl std::fmt::Debug for TriggerSourceContext {
             .field("attached_to", &self.attached_to)
             .field("attachments", &self.attachments)
             .field("linked_exile_snapshot", &self.linked_exile_snapshot);
+        if !self.linked_battlefield_returns.is_empty() {
+            debug.field(
+                "linked_battlefield_returns",
+                &self.linked_battlefield_returns,
+            );
+        }
         if !self.cards_exiled_this_turn.is_empty() {
             debug.field("cards_exiled_this_turn", &self.cards_exiled_this_turn);
         }
@@ -2595,6 +2606,14 @@ pub enum LookGrant {
     /// CR 406.3: the player instructed to look at the card and exile it face
     /// down; admitted at creation and carried by the latch alone.
     Player { player: PlayerId },
+}
+
+/// CR 607.2c: A source-linked battlefield return, keyed on both exact
+/// incarnations. Recipients are not chased across later zone changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BattlefieldReturnLink {
+    pub source: ObjectIncarnationRef,
+    pub recipient: ObjectIncarnationRef,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -7447,8 +7466,8 @@ pub struct PendingCast {
     pub casting_permission_index: Option<CastingPermissionIndex>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cast_timing_permission: Option<crate::types::ability::CastTimingPermission>,
-    /// CR 601.2d: When set, after target selection the caster must distribute this
-    /// resource (damage, counters, life) among the chosen targets via DistributeAmong.
+    /// Division rule retained through casting. Controller-chosen division opens
+    /// DistributeAmong after targets; even division waits until resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distribute: Option<DistributionUnit>,
     /// CR 601.2a + CR 601.2i: Zone the spell was in before announcement. The spell
@@ -14828,6 +14847,10 @@ pub enum WaitingFor {
         /// handling for exile-link tracking (push_exiled_with_source_this_turn).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         is_cost_payment: bool,
+        /// The selected cost requires one zone owner for the complete payment.
+        /// Kept with the prompt across pauses; ordinary zone effects leave it false.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        same_zone_owner: bool,
         /// CR 614.12: gates the `enter_tapped`/`enters_attacking` riders on the
         /// chosen object's type, carried across the `EffectZoneChoice` round-trip
         /// so the gate is evaluated per chosen object at resume (Summoner's
@@ -16501,17 +16524,8 @@ pub struct DamageSlot {
 #[serde(tag = "type", content = "data")]
 pub enum DistributionUnit {
     Damage,
-    /// CR 601.2d: Even split — engine auto-computes `total / num_targets` (rounded down).
-    /// No player *choice* in HOW it's split, but whether the flow pauses at
-    /// `WaitingFor::DistributeAmong` depends on the casting route:
-    /// - Non-deferred-target-selection flow (inside `finalize_mana_payment`):
-    ///   the split is applied inline and `WaitingFor::DistributeAmong` is bypassed.
-    /// - Deferred-target-selection flow (e.g. Fireball, gated by
-    ///   `ability_utils::ability_distribution_pool_needs_chosen_x`): the cast still
-    ///   pauses at `WaitingFor::DistributeAmong` via
-    ///   `casting_targets::maybe_pause_for_cast_distribution` — the split itself is
-    ///   automatic, but the pause is needed so cost (CR 601.2f) and target legality
-    ///   can re-resolve once targets are known.
+    /// Even division is computed at resolution over the still-legal targets,
+    /// rounded down. It never opens a controller distribution choice.
     EvenSplitDamage,
     Counters(String),
     Life,
@@ -20403,6 +20417,11 @@ declare_game_state! {
     #[serde(default)]
     pub exile_links: Vec<ExileLink>,
 
+    /// CR 607.2c: Allocated only for sources with a parsed linked-return
+    /// consumer. Cleared for the exact source when it leaves the battlefield.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub battlefield_return_links: Vec<BattlefieldReturnLink>,
+
     /// CR 702.xxx: Paradigm (Strixhaven) — first-resolution gate.
     ///
     /// Each entry records the `(player, card_name)` pair for which Paradigm
@@ -21512,6 +21531,18 @@ declare_game_state! {
     /// resolution can never satisfy a later gate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolution_coin_flip: Option<ResolutionCoinFlip>,
+    /// CR 705.2 + CR 608.2c: completed face-only flips in the current
+    /// instruction round, bound to each player. No entry for a prevented or
+    /// unkept flip. Populated only by face-only flips, so a called win/lose
+    /// flip allocates nothing here.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resolution_coin_flips: Vec<ResolutionCoinFlip>,
+    /// CR 616.1: a coin instruction waiting for replacement ordering before
+    /// any coin exists. Mirrors `pending_die_roll_instruction` ownership: it is
+    /// not a `ResolutionStack` frame, so no keep-choice frame is parked over
+    /// the `ReplacementChoice` prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_coin_flip_instruction: Option<Box<PendingCoinFlip>>,
 
     /// CR 101.4 + CR 608.2c: Per-player `ChooseFromZone { EachPlayer }`
     /// iteration paused by the current player's interactive choice. Drained
@@ -24419,10 +24450,10 @@ impl GameState {
     ///   after the mana ability that triggered it, without waiting for
     ///   priority".
     ///
-    /// Prompts owned by a resolution are deliberately not counted, so the
-    /// #962 safety net still ends a game stuck waiting on a player who has
-    /// already lost. Wider than [`WaitingFor::has_pending_cast`], the display
-    /// and `CancelCast` predicate.
+    /// Resolution-owned prompts are checked separately by the shared CR 704.4
+    /// SBA pause guard; player-loss and object checks wait until resolution
+    /// finishes. This predicate is wider than [`WaitingFor::has_pending_cast`],
+    /// the display and `CancelCast` predicate.
     pub fn withholds_priority(&self) -> bool {
         self.pending_cast.is_some()
             || self.waiting_for.has_pending_cast()
@@ -27558,6 +27589,7 @@ impl GameState {
             pending_trigger_order: None,
             consumed_before_priority_trigger_events: Vec::new(),
             exile_links: Vec::new(),
+            battlefield_return_links: Vec::new(),
             paradigm_primed: Vec::new(),
             delayed_triggers: Vec::new(),
             tracked_object_sets: HashMap::new(),
@@ -27688,6 +27720,8 @@ impl GameState {
             resolving_player_scope_linked_exile: None,
             merged_card_component_route: None,
             resolution_coin_flip: None,
+            resolution_coin_flips: Vec::new(),
+            pending_coin_flip_instruction: None,
             pending_player_scope_sacrifice_choice: None,
             pending_player_scope_unless_payment: None,
             pending_discard_batch: None,
@@ -29959,6 +29993,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         pending_trigger_order: _,
         consumed_before_priority_trigger_events: _,
         exile_links: _,
+        battlefield_return_links: _,
         paradigm_primed: _,
         delayed_triggers: _,
         tracked_object_sets: _,
@@ -30103,6 +30138,8 @@ fn _gamestate_partition_is_total(s: &GameState) {
         resolving_player_scope_linked_exile: _,
         merged_card_component_route: _,
         resolution_coin_flip: _,
+        resolution_coin_flips: _,
+        pending_coin_flip_instruction: _,
         may_trigger_auto_choices: _,
         decision_templates: _,
         priority_yields: _,
@@ -30328,6 +30365,7 @@ impl PartialEq for GameState {
             && self.deferred_triggers == other.deferred_triggers
             && self.pending_trigger_order == other.pending_trigger_order
             && self.exile_links == other.exile_links
+            && self.battlefield_return_links == other.battlefield_return_links
             && self.paradigm_primed == other.paradigm_primed
             && self.delayed_triggers == other.delayed_triggers
             && self.epic_effects == other.epic_effects
@@ -30464,6 +30502,8 @@ impl PartialEq for GameState {
             // advances `state.rng`, so iterations differ regardless; comparing
             // this field never masks a real repeat (safe to include).
             && self.resolution_coin_flip == other.resolution_coin_flip
+            && self.resolution_coin_flips == other.resolution_coin_flips
+            && self.pending_coin_flip_instruction == other.pending_coin_flip_instruction
             && self.pending_player_scope_sacrifice_choice
                 == other.pending_player_scope_sacrifice_choice
             && self.pending_player_scope_unless_payment
@@ -40460,6 +40500,7 @@ mod tests {
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
+            same_zone_owner: false,
         }));
         variants.push(Box::new(WaitingFor::DefilerPayment {
             player: PlayerId(0),
@@ -41019,6 +41060,7 @@ mod tests {
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
+            same_zone_owner: false,
         };
         let json = serde_json::to_string(&wf).unwrap();
         let deserialized: WaitingFor = serde_json::from_str(&json).unwrap();
@@ -41617,6 +41659,7 @@ mod tests {
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
+            same_zone_owner: false,
         };
         let json = serde_json::to_string(&wf).expect("serialize");
         // Modern shape must be emitted, NOT the legacy bool field.

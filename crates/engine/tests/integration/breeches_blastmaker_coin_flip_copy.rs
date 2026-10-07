@@ -158,6 +158,9 @@ fn breeches_reflexive_flip_clauses_become_delayed_triggers() {
                 );
                 assert_eq!(t.valid_target, Some(TargetFilter::Controller));
             }
+            Some(face @ (CoinFlipResult::Heads | CoinFlipResult::Tails)) => panic!(
+                "CR 705.2: a win/lose reflexive must not filter on a face result, got {face:?}"
+            ),
             None => panic!("reflexive flip trigger must carry a coin_flip_result filter"),
         },
         Effect::FlipCoin {
@@ -407,11 +410,11 @@ fn breeches_won_flip_copy_goes_on_stack_as_separate_object() {
         .events
         .iter()
         .find_map(|e| match e {
-            GameEvent::CoinFlipped { won, .. } => Some(*won),
+            GameEvent::CoinFlipped { result, .. } => Some(*result),
             _ => None,
         })
         .expect("a coin was flipped during the trigger resolution");
-    assert!(won, "seed 0 must win the flip");
+    assert_eq!(won, CoinFlipResult::Won, "seed 0 must win the flip");
 
     // CR 603.12 + CR 603.3: the won-flip reflexive ("copy that spell") must now
     // be a SEPARATE triggered-ability object on the stack. The original Breeches
@@ -494,11 +497,11 @@ fn breeches_lost_flip_damage_goes_on_stack_and_uses_spell_mana_value() {
         .events
         .iter()
         .find_map(|e| match e {
-            GameEvent::CoinFlipped { won, .. } => Some(*won),
+            GameEvent::CoinFlipped { result, .. } => Some(*result),
             _ => None,
         })
         .expect("a coin was flipped");
-    assert!(!won, "seed 1 must lose the flip");
+    assert_eq!(won, CoinFlipResult::Lost, "seed 1 must lose the flip");
 
     // CR 603.3: the lost-flip reflexive damage must be on the stack as its own
     // object now — NOT yet resolved (P1 has taken no damage).
@@ -619,7 +622,7 @@ fn nonmatching_reflexive_coin_flip_trigger_is_discarded_not_left_pending() {
         &mut state,
         &[GameEvent::CoinFlipped {
             player_id: PlayerId(0),
-            won: false,
+            result: CoinFlipResult::Lost,
         }],
     );
     assert!(
@@ -641,7 +644,7 @@ fn nonmatching_reflexive_coin_flip_trigger_is_discarded_not_left_pending() {
         &mut state,
         &[GameEvent::CoinFlipped {
             player_id: PlayerId(0),
-            won: true,
+            result: CoinFlipResult::Won,
         }],
     );
     assert!(

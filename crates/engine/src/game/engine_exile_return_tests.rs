@@ -489,11 +489,11 @@ fn until_source_leaves_return_brings_back_all_merge_components() {
     // non-merged objects — not just the survivor.
     for id in [host, rider] {
         assert!(
-                state.battlefield.contains(&id),
-                "component {id:?} must return to the battlefield (CR 730.3c); battlefield={:?}, exile={:?}",
-                state.battlefield,
-                state.exile,
-            );
+            state.battlefield.contains(&id),
+            "component {id:?} must return to the battlefield (CR 730.3c); battlefield={:?}, exile={:?}",
+            state.battlefield,
+            state.exile,
+        );
         let o = state.objects.get(&id).unwrap();
         assert!(
             o.merged_components.is_empty(),

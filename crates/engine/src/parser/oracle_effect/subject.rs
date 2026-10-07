@@ -6705,6 +6705,7 @@ fn build_restriction_clause(
             | TargetFilter::CostPaidObject
             | TargetFilter::AmassedArmy
             | TargetFilter::ChosenCard
+            | TargetFilter::LinkedBattlefieldReturn
             | TargetFilter::TrackedSetFiltered { .. }
             | TargetFilter::ExiledBySource
             | TargetFilter::ExiledCardByIndex { .. }

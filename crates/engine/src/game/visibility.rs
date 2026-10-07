@@ -2648,6 +2648,7 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
         ref library_position,
         mass_library_order: _,
         is_cost_payment: _,
+        same_zone_owner,
         enters_modified_if: _,
         ref duration,
     } = state.waiting_for
@@ -2687,6 +2688,7 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
                 // The bounded-move duration is a public effect parameter, not
                 // private hand info — pass it through the redaction.
                 duration: duration.clone(),
+                same_zone_owner,
             };
         }
     }

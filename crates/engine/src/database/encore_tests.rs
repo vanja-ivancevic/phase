@@ -68,6 +68,7 @@ fn synthesize_encore_builds_graveyard_sorcery_speed_ability() {
                     count: 1,
                     zone: Some(Zone::Graveyard),
                     filter: Some(TargetFilter::SelfRef),
+                    ..
                 }
             ));
         }

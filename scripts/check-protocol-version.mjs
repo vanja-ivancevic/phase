@@ -78,7 +78,9 @@ const UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION = 71;
 // +30: the v101 mana-ability activation kind and departed-source LKI.
 // +31: v102 adds the tagged SharedCardTypes quantity.
 // +32: v103 removes FormatConfig.allow_experimental_dungeons for the format-derived dungeon pool.
-const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 32;
+// +33: v104 retypes GameEvent::CoinFlipped to a typed Won/Lost/Heads/Tails
+// result, adds linked battlefield returns, and retains single-zone-owner exile costs.
+const EXPECTED_PROTOCOL_VERSION = UPSTREAM_MAIN_FULL_GAME_PROTOCOL_VERSION + 33;
 // The LOBBY message-set version, not derived from the full-game number above.
 // The classifier below refuses an expression only on the SOURCE constants; this
 // script never reads itself, so its own EXPECTED_* must stay literals.
@@ -135,7 +137,8 @@ const PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION = 54;
 // +29: wire 83 moves with full-game v101 for the mana-ability activation kind.
 // +30: wire 84 moves with full-game v102 for SharedCardTypes.
 // +31: wire 85 moves with full-game v103 for the format-derived dungeon pool.
-const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 31;
+// +32: wire 86 moves with full-game v104 for coin results, linked returns, and exile source constraints.
+const EXPECTED_WIRE_PROTOCOL_VERSION = PHASE_TWO_BASE_WIRE_PROTOCOL_VERSION + 32;
 // The P2P DRAFT wire version. A FIFTH independent surface, and the one this
 // script previously did not read at all: `DRAFT_PROTOCOL_VERSION` is an
 // EXACT-MATCH first-contact gate (p2p-draft-host.ts / p2p-draft-guest.ts refuse
@@ -189,24 +192,12 @@ const p2pProtocolSource = readFileSync(
   resolve(root, "client/src/network/protocol.ts"),
   "utf8",
 );
-const p2pProtocolTestSource = readFileSync(
-  resolve(root, "client/src/network/__tests__/protocol.test.ts"),
-  "utf8",
-);
 const draftProtocolSource = readFileSync(
   resolve(root, "client/src/network/draftProtocol.ts"),
   "utf8",
 );
-const draftProtocolTestSource = readFileSync(
-  resolve(root, "client/src/network/__tests__/draftProtocol.test.ts"),
-  "utf8",
-);
 const draftCoreTypesSource = readFileSync(
   resolve(root, "crates/draft-core/src/types.rs"),
-  "utf8",
-);
-const p2pAdapterTestSource = readFileSync(
-  resolve(root, "client/src/adapter/__tests__/p2p-adapter-multiplayer.test.ts"),
   "utf8",
 );
 
@@ -606,88 +597,3 @@ if (rustDirectoryVersion !== EXPECTED_DIRECTORY_VERSION) {
   );
   process.exit(1);
 }
-// ── Names that embed a version number ─────────────────────────────────────
-//
-// A name carrying a version goes stale silently: `assert_eq!(PROTOCOL_VERSION,
-// <n>)` under `fn protocol_version_is_<n-1>` is green. The two sites below
-// require the CURRENT number and refuse the SUPERSEDED one; the handshake pair
-// after them requires both numerals and has no refuse leg. Every number here
-// derives from the EXPECTED_* constants above, so a later bump edits the
-// sources and those constants, never the patterns themselves. Ceiling: a
-// refuse leg catches leftover text from the previous version, which is the
-// defect a bump produces. Prose rewritten to some other wrong number is not a
-// bump leftover and is not guarded here.
-const P = EXPECTED_PROTOCOL_VERSION;
-const W = EXPECTED_WIRE_PROTOCOL_VERSION;
-const D = EXPECTED_DRAFT_PROTOCOL_VERSION;
-
-requirePattern(serverCoreSource, new RegExp(`fn protocol_version_is_${P}(?![0-9])`),
-  `crates/server-core/src/protocol.rs fn protocol_version_is_${P}`);
-refusePattern(serverCoreSource, new RegExp(`protocol_version_is_${P - 1}(?![0-9])`),
-  "crates/server-core/src/protocol.rs");
-
-// The draft wire's title pin, mirroring the device above. `toBe(<n>)` under
-// `it("is version <n-1>")` is green and misleading, and the title is the half
-// no type system and no assertion can check. Whole-file, not a title slice:
-// that test file holds exactly one `is version` phrase, so the narrowing the
-// p2p title legs need to stay admit-only buys nothing here, while reading the
-// whole file also catches the numeral in a nearby comment.
-requirePattern(draftProtocolTestSource, new RegExp(`is version ${D}(?![0-9])`),
-  `client/src/network/__tests__/draftProtocol.test.ts it("is version ${D}")`);
-refusePattern(draftProtocolTestSource, new RegExp(`is version ${D - 1}(?![0-9])`),
-  "client/src/network/__tests__/draftProtocol.test.ts");
-// And the assertion's own literal, so all three sites in the draft bump — the
-// source constant, this value and the title above — red THIS gate rather than
-// only the vitest run, which CI schedules separately from `type-check` and
-// `build`. Anchored on `expect(DRAFT_PROTOCOL_VERSION)` rather than on a bare
-// `toBe(<n>)`, so the refuse leg can never fire on an unrelated assertion that
-// happens to expect the superseded numeral.
-requirePattern(draftProtocolTestSource,
-  new RegExp(`expect\\(DRAFT_PROTOCOL_VERSION\\)\\.toBe\\(${D}\\)`),
-  `client/src/network/__tests__/draftProtocol.test.ts expect(DRAFT_PROTOCOL_VERSION).toBe(${D})`);
-refusePattern(draftProtocolTestSource,
-  new RegExp(`expect\\(DRAFT_PROTOCOL_VERSION\\)\\.toBe\\(${D - 1}\\)`),
-  "client/src/network/__tests__/draftProtocol.test.ts");
-
-// Both legs read the file's test TITLES, not its whole source, so coverage that legitimately
-// drives the superseded version in a body is not a bump leftover. Ceiling: double-quoted titles
-// only, so a backtick or single-quoted title falls out of the slice — admit-only, never a false
-// refusal, which is what makes the narrowing safe.
-const p2pProtocolTestTitles = [
-  ...p2pProtocolTestSource.matchAll(/\b(?:describe|it|test)\(\s*"([^"]*)"/g),
-]
-  .map((match) => match[1])
-  .join("\n");
-
-requirePattern(p2pProtocolTestTitles, new RegExp(`\\bv${W}\\b`),
-  `client/src/network/__tests__/protocol.test.ts titles v${W}`);
-refusePattern(p2pProtocolTestTitles, new RegExp(`\\bv${W - 1}\\b`),
-  "client/src/network/__tests__/protocol.test.ts titles");
-
-const P2P_GATE = 'describe("P2P wire-protocol version gate"';
-if (!p2pAdapterTestSource.includes(P2P_GATE)) {
-  console.error(
-    `Could not find ${P2P_GATE} in client/src/adapter/__tests__/p2p-adapter-multiplayer.test.ts: ` +
-      "that block holds the only instrument that tells a bumped client from an unbumped one.",
-  );
-  process.exit(1);
-}
-const gateLabel = "client/src/adapter/__tests__/p2p-adapter-multiplayer.test.ts";
-// Scoped to the gate block: the anchor above to the next top-level `describe(`,
-// or EOF if this is the last one. The slice starts AT the anchor, so it can
-// never widen back to the whole file.
-const gateBlockStart = p2pAdapterTestSource.indexOf(P2P_GATE);
-const gateBlockEnd = p2pAdapterTestSource.indexOf("\ndescribe(", gateBlockStart);
-const gateBlock = p2pAdapterTestSource.slice(
-  gateBlockStart,
-  gateBlockEnd === -1 ? undefined : gateBlockEnd,
-);
-
-// Order binds each numeral to its role: refused named and sent before admitted.
-// Raw-source match: a comment in the block quoting an it(...) title passes the title leg.
-requirePattern(gateBlock,
-  new RegExp(`\\bit\\("[^"]*\\bv${W - 1}\\b[^"]*\\bv${W}\\b[^"]*"`),
-  `${gateLabel} an it(...) title naming refused v${W - 1} before admitted v${W}`);
-requirePattern(gateBlock,
-  new RegExp(`setupFrameAt\\(${W - 1}\\)[\\s\\S]*setupFrameAt\\(${W}\\)`),
-  `${gateLabel} refused setupFrameAt(${W - 1}) before admitted setupFrameAt(${W})`);

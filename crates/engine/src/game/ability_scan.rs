@@ -3352,6 +3352,7 @@ fn scan_target_filter(x: &TargetFilter, ctx: FilterReadContext, mode: ScanMode) 
             projected: false,
         },
         TargetFilter::ChosenCard => Axes::NONE,
+        TargetFilter::LinkedBattlefieldReturn => Axes::CONSERVATIVE,
         TargetFilter::TrackedSet { id: _ } => Axes::NONE,
         TargetFilter::TrackedSetFiltered {
             filter,
@@ -9131,6 +9132,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             flipper: TargetFilter::Controller,
+            result_is_face: false,
         }));
         assert!(effect_is_randomness_bearing(&Effect::RollDie {
             count: QuantityExpr::Fixed { value: 1 },
@@ -9240,6 +9242,7 @@ mod tests {
                 win_effect: None,
                 lose_effect: None,
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             },
         );
         assert!(spell_ability_bears_randomness(&coin_body));

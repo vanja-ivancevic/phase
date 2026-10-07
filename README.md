@@ -437,6 +437,28 @@ still validate the named source's live rows. Unspent-mana effects retain the lay
 system's zone-of-function rules. Compare identical card bytes, seeds, profiles and
 hosts; these timings measure decision cost, not playing strength.
 
+Automatic mana-source completion preserves the caller's live payment prompt.
+Only a returned non-priority pause transfers prompt ownership; a synchronous
+nested source does not become the suspended outer cost root. The
+`mana_prompt_auto_resolved_source_preserves_live_payment` engine regression
+exercises that boundary with a source tap, its mana output, and no parked cursor.
+
+### Native deck checks and corpus runs
+
+`cargo deck-check` evaluates deck admission requests. The `phase-ai`
+`deck-corpus` binary plays bounded, seeded native Freeform games with the same
+name-deck requests and writes JSONL reports plus `ReplayLog` v3 replays:
+
+```bash
+cargo run --locked --profile tool -p phase-ai --bin deck-corpus -- --help
+```
+
+[docs/native-deck-validation.md](docs/native-deck-validation.md) has the full
+CLI contract, the current evidence boundary (three starter decks finished all
+six games; the 683-duel `--action-cap 1` run shows only admission; whole-deck
+gameplay and the Forge differential are not yet demonstrated), and the
+old-border mechanism batches in `crates/patina-old-border-smoke`.
+
 ### Cargo Aliases
 
 ```

@@ -60,6 +60,21 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
+/// 104 — `GameEvent::CoinFlipped` replaces `won: bool` with a typed
+///      `result: CoinFlipResult`, which gains `Heads`/`Tails` (CR 705.2: a
+///      face-only flip has no winner); `Effect::FlipCoin` gains
+///      `result_is_face`, `PendingCoinFlipKind` gains `SingleFace`, and
+///      `GameState` gains `resolution_coin_flips` and
+///      `pending_coin_flip_instruction`. `TargetFilter` gains
+///      `LinkedBattlefieldReturn` (CR 607.2c), with exact-incarnation
+///      `GameState.battlefield_return_links` and
+///      `TriggerSourceContext.linked_battlefield_returns`. `AbilityCost::Exile`
+///      also gains the cost-owned `same_zone_owner` collective constraint;
+///      older authority would drop it when resuming a serialized payment.
+///      A PARSE and capability bump: a v103 peer cannot deserialize the new
+///      event shape or tags. No `won` compatibility decoder exists. Full-game
+///      peers and P2P move in lockstep (wire 86); no lobby message changed,
+///      so `LOBBY_PROTOCOL_VERSION` stays 15.
 /// 103 — `FormatConfig` loses `allow_experimental_dungeons`: the per-session
 ///      capability flag behind the experimental dungeon pool is gone, and
 ///      the pool is now format-derived — Baldur's Gate Wilderness joins the
@@ -861,7 +876,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 103;
+pub const PROTOCOL_VERSION: u32 = 104;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the
@@ -2112,16 +2127,6 @@ mod tests {
                 "a floor above the current version would refuse every client"
             )
         };
-    }
-
-    #[test]
-    fn protocol_version_tracks_full_game_wire_additions() {
-        assert_eq!(PROTOCOL_VERSION, 103);
-        // Lobby keeps its one-version rollout window; full-game servers stay
-        // current-only (`server_core::MIN_SUPPORTED_PROTOCOL == PROTOCOL_VERSION`),
-        // which refuses an older full-game peer that cannot preserve the exact
-        // Full-session identity across draft match attachment and follow-ups.
-        assert_eq!(MIN_SUPPORTED_PROTOCOL, 102);
     }
 
     #[test]

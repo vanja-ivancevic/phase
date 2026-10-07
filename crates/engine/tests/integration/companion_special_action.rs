@@ -243,6 +243,7 @@ fn paused_companion_payment_resumes_the_locked_cost_and_commits_once() {
                             count: 1,
                             zone: None,
                             filter: Some(TargetFilter::SelfRef),
+                            same_zone_owner: false,
                         },
                     ],
                 }),

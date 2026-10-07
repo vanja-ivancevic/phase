@@ -528,6 +528,10 @@ pub struct ResolvedEntryProvenanceCommand {
     pub object: ObjectIncarnationRef,
     pub expected_old_source: Option<ObjectId>,
     pub resulting_source: ObjectId,
+    /// CR 607.2c: Resolved source pin for an entry that establishes a link.
+    /// None for all ordinary entries and pre-extension serialized commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linked_battlefield_return_source: Option<ObjectIncarnationRef>,
     pub cause: RulesExecutionNodeRef,
 }
 

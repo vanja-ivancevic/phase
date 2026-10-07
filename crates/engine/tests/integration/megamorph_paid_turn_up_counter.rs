@@ -338,6 +338,7 @@ fn a_paused_megamorph_payment_still_places_the_counter() {
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
+                        same_zone_owner: false,
                     },
                 ],
             }),

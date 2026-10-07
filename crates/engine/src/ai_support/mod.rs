@@ -765,6 +765,7 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
             selection_mismatch(chosen, choices, None)
                 || chosen.len() < *min_count
                 || chosen.len() > *count
+                || !crate::game::casting_costs::exile_cost_prompt_selection_is_legal(state, chosen)
         }
         // CR 601.2f + CR 208.1: the aggregate Crew/Saddle/Teamwork tap cost
         // accepts ANY creature subset (drawn from `choices`, no duplicates)
@@ -812,6 +813,7 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
         // CR 118.3 + CR 605.3b: every other PayCost kind selects exactly `count`.
         (WaitingFor::PayCost { choices, count, .. }, GameAction::SelectCards { cards: chosen }) => {
             selection_mismatch(chosen, choices, Some(*count))
+                || !crate::game::casting_costs::exile_cost_prompt_selection_is_legal(state, chosen)
         }
         // CR 701.68a: Blight always selects exactly one creature, regardless of N.
         (WaitingFor::BlightChoice { creatures, .. }, GameAction::SelectCards { cards: chosen }) => {
@@ -7014,6 +7016,7 @@ mod tests {
             },
         )
         .cost(AbilityCost::Exile {
+            same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Graveyard),
             filter: Some(TargetFilter::Typed(
