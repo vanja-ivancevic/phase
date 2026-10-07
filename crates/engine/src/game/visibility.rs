@@ -1585,6 +1585,7 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
                 );
             }
             IdentityProjection::FaceDownRedacted => {
+                hidden_zone_change_ids.insert(obj_id);
                 if let Some(obj) = filtered.objects.get_mut(&obj_id) {
                     redact_face_down_identity_from_observer(obj);
                     record_hidden_replacement_candidate_source(
@@ -1680,17 +1681,25 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
             }
         }
     }
-    filtered.zone_changes_this_turn = filtered
-        .zone_changes_this_turn
-        .iter()
-        .cloned()
-        .map(|mut record| {
-            if hidden_zone_change_ids.contains(&record.object_id) {
-                redact_zone_change_record(&mut record);
-            }
-            record
-        })
-        .collect();
+    for record in filtered.zone_changes_this_turn.iter_mut() {
+        if hidden_zone_change_ids.contains(&record.object_id) {
+            redact_zone_change_record(record);
+        }
+    }
+    // CR 708.5: the entry journal snapshots identity independently of both
+    // the current object and the zone-change journal. A manifest's entry may
+    // have been recorded before its face-down characteristics were applied.
+    // Retain the public occurrence/controller, never the hidden printed face.
+    for record in &mut filtered.battlefield_entries_this_turn {
+        if hidden_zone_change_ids.contains(&record.object_id) {
+            record.name = HIDDEN_CARD_NAME.to_string();
+            record.core_types.clear();
+            record.subtypes.clear();
+            record.supertypes.clear();
+            record.colors.clear();
+            record.keywords.clear();
+        }
+    }
 
     // Source-bound named choices carry complete source contexts in authoritative
     // state. The client needs only the exact public prompt projection, never its
@@ -7168,6 +7177,46 @@ mod tests {
         );
         assert_eq!(opponent_obj.power, Some(2));
         assert_eq!(opponent_obj.toughness, Some(2));
+
+        // Object redaction alone is not a privacy boundary: independent
+        // entry/zone-change snapshots and their nested LKI serialize too.
+        for observer_view in [opponent_view, filter_state_for_unseated_viewer(&state)] {
+            let wire = serde_json::to_value(&observer_view).unwrap();
+            assert!(
+                !wire.to_string().contains("Secret Manifest"),
+                "the complete viewer projection must not carry the hidden identity"
+            );
+            assert_eq!(
+                wire.pointer("/battlefield_entries_this_turn/0/name"),
+                Some(&serde_json::json!(HIDDEN_CARD_NAME))
+            );
+            assert_eq!(
+                wire.pointer("/zone_changes_this_turn/0/name"),
+                Some(&serde_json::json!(HIDDEN_CARD_NAME))
+            );
+            assert_eq!(
+                observer_view.battlefield_entries_this_turn[0].object_id,
+                secret
+            );
+            assert_eq!(
+                observer_view.battlefield_entries_this_turn[0].controller,
+                controller
+            );
+        }
+
+        // The same journals remain readable to the controller entitled to
+        // look at the face; do not make secrecy a blanket history deletion.
+        let controller_wire = serde_json::to_value(&controller_view).unwrap();
+        for path in [
+            "/battlefield_entries_this_turn/0/name",
+            "/zone_changes_this_turn/0/name",
+            "/zone_changes_this_turn/0/trigger_source_context/lki/name",
+        ] {
+            assert_eq!(
+                controller_wire.pointer(path),
+                Some(&serde_json::json!("Secret Manifest"))
+            );
+        }
     }
 
     #[test]

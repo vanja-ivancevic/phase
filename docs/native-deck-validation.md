@@ -570,3 +570,45 @@ All Vast instances have been destroyed; no paid worker is retained or restarted
 for this M4-only gate. Collector qualification and launch remain independent:
 the first genuinely qualified deck-hash-bound subset suffices, and these
 mechanism fixtures are not a blanket admission.
+
+### Face-down battlefield journal privacy (2026-10-07)
+
+The shared viewer projection now includes `FaceDownRedacted` objects in the
+existing hidden journal/event/LKI identity mask. Battlefield-entry journal
+records also redact printed identity and characteristics under that same mask.
+Object IDs, controller, entry occurrence, and zone-change routing remain intact;
+this does not anonymize stable IDs in teacher presentation or change canonical
+rules state. Controller-authorized face-down identity remains available.
+
+The single named native regression
+`game::visibility::tests::face_down_battlefield_permanent_identity_visible_only_to_controller`
+passed (1 passed, 0 failed, 23,359 filtered). A standalone native smoke used
+`create_object` in the opponent's library, the real `morph::manifest` transition,
+the shared viewer filter, and `serde_json` serialization. Its actual opponent
+values are `Hidden Card` for `/battlefield_entries_this_turn/0/name` and
+`/zone_changes_this_turn/0/name`; the private
+`/zone_changes_this_turn/0/trigger_source_context/lki/name` is absent.
+Neither opponent nor unseated serialization contains `Private Morph`. All
+three controller paths retain it, the battlefield object remains publicly 2/2,
+and authoritative state is unchanged after filtering.
+
+M4 verification used jobs1 / codegen1 / debug0 / incremental0 / unsafe0 and the
+explicit one-attempt 0.5 GiB swap exception, with other preflight guards
+unchanged. The named test and necessary production library build passed; the
+throwaway smoke harness was corrected for emitted host/target dependency
+variants and actual public API names without rerunning Cargo. The smoke linked
+the exact Cargo-emitted engine artifact, SHA256
+`55c2f368672a727410902b39980c218bceee4e8afba2de5e31fe5c05cedeee53`.
+All 2,822 native source inputs matched before and after. This is focused privacy
+verification, not a new full-workspace gate or a deck qualification.
+
+Actual results, emitted Cargo records, source bindings, and artifact bindings
+are retained under
+`/Fast/Shared/artifacts/analyses/phase-provider-zen5-20261003/native-privacy-attempt1-20261007/`;
+publication is bound by `face-down-journal-privacy-repair-draft-20261007.json`
+in its parent. The retained C2 card export is unchanged at SHA256
+`febe761967ead1670372d6ca8960c55d97044ee6f1ffdb9ef59798edfb14dda5`;
+no new export was run. Qualified deck hashes: none. Collection and labeling
+remain unreleased, with independent actual-evidence review and teacher
+presentation qualification still separate.
+
