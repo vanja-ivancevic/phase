@@ -656,3 +656,56 @@ hint as accepted selection. Qualification, replay/privacy, and labeling remain
 consumer-owned. Qualified deck hashes: none; no blanket subset admission or
 transfer of prior verdicts to this source/export binding.
 
+### Empty-attack priority and immediate duel termination (2026-10-07)
+
+Declaring no attackers now completes the declaration and grants CR 508.2
+priority in `DeclareAttackers`. The ordinary no-live-attacker skip occurs
+only after that priority window closes, before blocker/damage step entry.
+Empty and nonempty declarations share trigger construction and the final
+priority handoff, including exert/enlist continuations. `CombatState` now
+serializes `attackers_declared` (boolean, default false): completion is
+independent of whether any declared attacker remains on the battlefield.
+
+A loss in a two-player game records every simultaneous loser before
+determining the winner or draw, then ends the game under CR 104.1. It does
+not run CR 800.4's continuing multiplayer zone, control, stack, or planar
+handoff sweeps. Already-paid costs remain paid: Windswept Heath sacrificed
+while paying the last life remains in the graveyard at `GameOver`, including
+with Worship and a creature in play. Paused-work/lifecycle retirement remains
+intact; the existing multiplayer departure regressions still pass.
+
+The focused M4 run passed 91 tests across 13 nonempty filters, including
+terminal zones/control/stack, simultaneous losses, Worship/Fetch, summoning-
+sick Savannah Lions, declaration completion after the last attacker leaves,
+snapshot restoration, trigger ordering, and the public combat/exert paths.
+Incorrect immediate-end-combat and post-terminal initiative expectations were
+removed; stack-removal coverage uses a continuing three-player fixture.
+Source-text phase census/handoff assertions were removed, not re-pinned.
+
+The same external native public-API probe failed on published `b589494b` and
+passed on the repair: empty declaration changed from premature `EndCombat`
+to declaration priority; duel terminal zone-change events changed from five
+to zero, with the terminal zones retained. It linked the actual Cargo-emitted
+production engine, SHA256
+`d03b24f84bcd1c19a556629792dca2855ae8847b9a3a4d8462e4c5b71900ff4e`,
+without a test-support fallback. All 2,822 native input hashes matched before
+and after compilation. Commands, metadata, bindings and actual outputs:
+`/Fast/Shared/artifacts/analyses/phase-provider-zen5-20261003/combat-terminal-native-20261007/verified/`.
+
+The newly compiled production exporter SHA256 is
+`2b45f9140ada4eb8550b60565b1dbb5e20646961ac32eecb42964a42559b16eb`.
+It exported all 339 pinned inputs (663,765,907 bytes), hashed before and
+after from a Mac-local snapshot. Card export bytes remain
+`d7d3ef839c3fbd0424e12edf995fcb46cfbc6be66e770a90d52f6234e7e4603a`;
+unchanged data bytes do not transfer an older source's gameplay verdicts.
+An initial SMB input-read failure was retained, not accepted as a verified
+export; the local snapshot avoided that input-read failure. Normal pressure,
+load8, free RAM20%, and disk20GiB safeguards remained enforced, with only the
+explicitly authorized invocation-local minimum free swap of zero.
+
+No full-workspace gate, broad corpus run, or review campaign was performed.
+The adapter/consumer SDK and product gitlink are unchanged. OptionalEffect/
+search consumer fixes and the unattributed Armageddon ordering discrepancy
+remain separate. Qualified deck hashes: none; admitted decks and production
+labels: zero. Prior semantic/runtime verdicts do not transfer to this source.
+

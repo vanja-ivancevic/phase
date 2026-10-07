@@ -13,7 +13,6 @@ use crate::types::zones::Zone;
 use super::engine::{begin_pending_trigger_target_selection, EngineError};
 use super::priority;
 use super::triggers;
-use super::turns;
 
 pub(super) fn handle_declare_attackers(
     state: &mut GameState,
@@ -89,7 +88,7 @@ fn continue_declare_attackers_after_commit(
         return Ok(waiting_for);
     }
 
-    finish_declare_attackers(state, events, attacks.is_empty())
+    finish_declare_attackers(state, events)
 }
 
 /// CR 701.43d: Attackers carrying an "exert as it attacks" ability (a
@@ -313,14 +312,11 @@ fn process_declaration_triggers_with_delayed_phase(
     })
 }
 
-/// Post-declaration tail of `handle_declare_attackers`, shared with the exert
-/// prompt resumption: process attack/exert triggers, then route to trigger
-/// ordering, pending trigger-target selection, the no-attackers end-of-combat
-/// path, or priority.
+/// Post-declaration tail shared with exert/enlist resumption: process buffered
+/// triggers, then offer their construction choices or CR 508.2 priority.
 pub(super) fn finish_declare_attackers(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
-    attacks_empty: bool,
 ) -> Result<WaitingFor, EngineError> {
     // CR 508.2: process the buffered declaration events together with any
     // `CreatureExerted` events from the exert sub-step. In the common (no-exert)
@@ -351,14 +347,10 @@ pub(super) fn finish_declare_attackers(
         return Ok(waiting_for);
     }
 
-    if attacks_empty {
-        Ok(turns::advance_after_empty_attackers(state, events))
-    } else {
-        priority::reset_priority(state);
-        Ok(WaitingFor::Priority {
-            player: state.active_player,
-        })
-    }
+    priority::reset_priority(state);
+    Ok(WaitingFor::Priority {
+        player: state.active_player,
+    })
 }
 
 pub(super) fn handle_declare_blockers(
@@ -806,40 +798,16 @@ pub(super) fn handle_assign_blocker_damage(
     })
 }
 
-/// CR 508.8: If no creatures are declared as attackers, skip declare blockers and combat damage steps.
-///
-/// This helper is intentionally asymmetric with `handle_empty_blockers`:
-/// - CR 508.8 *explicitly* skips declare blockers and combat damage when there
-///   are no attackers — no priority window is owed during skipped steps.
-/// - CR 509.1 (handled by `handle_empty_blockers`) says the declare blockers
-///   step still runs even if no blockers are declared, and CR 117.1c requires
-///   AP priority during it (required for instants and CR 702.49 Ninjutsu-family
-///   activations — notably Sneak, which is restricted to this step).
-///
-/// Do not "harmonize" the two paths: collapsing them reintroduces the Sneak bug.
+/// A forced empty declaration still completes the CR 508.1 turn-based action
+/// and gives the active player priority under CR 508.2. CR 508.8 skips only the
+/// later declare-blockers/combat-damage steps after this priority window closes.
 pub(super) fn handle_empty_attackers(
     state: &mut GameState,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
     super::combat::declare_attackers(state, &[], events).map_err(EngineError::InvalidAction)?;
 
-    let trigger_events = events.clone();
-    if let Some(prompt) =
-        process_declaration_triggers_with_delayed_phase(state, &trigger_events, events)
-    {
-        return Ok(prompt);
-    }
-    // CR 603.3b (#531): if process_triggers paused on OrderTriggers (the
-    // active player has 2+ simultaneous triggers awaiting their ordering
-    // choice), surface that prompt instead of overwriting it with Priority.
-    if matches!(state.waiting_for, WaitingFor::OrderTriggers { .. }) {
-        return Ok(state.waiting_for.clone());
-    }
-    if let Some(waiting_for) = begin_pending_trigger_target_selection(state)? {
-        return Ok(waiting_for);
-    }
-
-    Ok(turns::advance_after_empty_attackers(state, events))
+    finish_declare_attackers(state, events)
 }
 
 pub(super) fn handle_empty_blockers(

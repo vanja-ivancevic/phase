@@ -1,14 +1,12 @@
 //! Public-API positive controls for the `(EndCombat, DeclareAttackers)` wedge
-//! fix (CR 508.8 / CR 511.1 / CR 514.3a).
+//! fix (CR 508.2 / CR 508.8 / CR 511.1 / CR 514.3a).
 //!
-//! **All three tests here pass BOTH before and after the fix.** That is their
-//! entire purpose: they prove the discriminating assertions in
-//! `crates/engine/src/game/turns_declare_attackers_wedge_tests.rs` are not
-//! trivially true, and that the healthy paths are unchanged by the fix.
+//! Empty declarations receive CR 508.2 priority before CR 508.8 skips the
+//! declare-blockers and combat-damage steps. The remaining controls cover
+//! pipeline-free game start and ordinary cleanup.
 //!
-//! * `declare_no_attackers_reaches_end_combat_priority` — non-vacuity for the
-//!   drain rows: with an EMPTY deferred queue the empty declaration already
-//!   reaches `Priority` at `Phase::EndCombat`.
+//! * `declare_no_attackers_retains_declaration_then_end_combat_priority` —
+//!   declaration priority closes before end-combat priority begins.
 //! * `start_game_skip_mulligan_with_empty_queue_reaches_upkeep_priority` —
 //!   non-vacuity for row A11: the pipeline-free game-start walk reaches
 //!   `Upkeep` with an empty stack when nothing is parked.
@@ -23,9 +21,9 @@ use engine::types::phase::Phase;
 
 /// Row A4 — positive control / non-vacuity.
 ///
-/// CR 508.8: declaring no attackers skips the declare blockers and combat
-/// damage steps. CR 511.1: end of combat has no turn-based actions and the
-/// active player gets priority.
+/// CR 508.2 gives priority after declaring attackers, even when there are none.
+/// Once it closes, CR 508.8 skips blockers and damage; CR 511.1 gives priority
+/// again in the end-of-combat step.
 ///
 /// FIXTURE NOTE: the declaration prompt is installed by walking the real turn
 /// machinery from `BeginCombat`, not by `at_phase(Phase::DeclareAttackers)` —
@@ -34,7 +32,7 @@ use engine::types::phase::Phase;
 /// also keeps it clear of the draw step, whose empty scenario library would end
 /// the game (CR 704.5b).
 #[test]
-fn declare_no_attackers_reaches_end_combat_priority() {
+fn declare_no_attackers_retains_declaration_then_end_combat_priority() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::BeginCombat);
     scenario.add_vanilla(P0, 2, 2);
@@ -62,6 +60,18 @@ fn declare_no_attackers_reaches_end_combat_priority() {
         })
         .expect("declaring no attackers must succeed");
 
+    assert_eq!(runner.state().phase, Phase::DeclareAttackers, "CR 508.2");
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P0 }
+    ));
+    runner.act(GameAction::PassPriority).unwrap();
+    assert_eq!(runner.state().phase, Phase::DeclareAttackers);
+    assert!(matches!(
+        runner.state().waiting_for,
+        WaitingFor::Priority { player: P1 }
+    ));
+    runner.act(GameAction::PassPriority).unwrap();
     let state = runner.state();
     assert_eq!(state.phase, Phase::EndCombat, "CR 508.8");
     assert!(

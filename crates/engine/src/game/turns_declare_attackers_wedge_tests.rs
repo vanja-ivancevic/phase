@@ -12,7 +12,7 @@
 //! by `zones::create_object`. **Everything downstream of seeding is the
 //! unmodified production pipeline** — `apply()` / `start_game_skip_mulligan()`
 //! → reducer → `handle_declare_attackers` / `handle_priority_pass` →
-//! `advance_after_empty_attackers` / `advance_phase_once` → `auto_advance` →
+//! `finish_declare_attackers` / `advance_phase_once` → `auto_advance` →
 //! `execute_cleanup` → `sync_waiting_for`.
 //!
 //! Why a fully-public seeding path is not used: `run_post_action_pipeline`
@@ -149,11 +149,11 @@ fn sole_stack_trigger_source(state: &GameState) -> ObjectId {
 /// Rows A1 / A2 / A3.
 ///
 /// A1 (CR 603.3 + CR 117.5): a parked `deferred_triggers` batch is put on the
-/// stack when the phase interpreter crosses a phase boundary.
+/// stack before declaration priority is given.
 /// A2: the queue is **drained, not cleared** — a `deferred_triggers.clear()`
 /// band-aid leaves the stack empty and fails here.
-/// A3 (CR 508.8 + CR 511.1): the stale `DeclareAttackers` prompt does not
-/// survive the advance past `Phase::DeclareAttackers`.
+/// A3 (CR 508.2): the stale `DeclareAttackers` prompt does not survive the
+/// completed turn-based action.
 ///
 /// DISCRIMINATION BOUNDARY (mandatory — do not relabel this test).
 /// This test reds when **A-2** (the `current_trigger_prompt` narrowing) is
@@ -164,7 +164,7 @@ fn sole_stack_trigger_source(state: &GameState) -> ObjectId {
 /// **not** A-1's discriminating test —
 /// `parked_queue_drains_at_first_upkeep_from_start_game` is.
 #[test]
-fn declare_no_attackers_with_parked_triggers_drains_and_leaves_declare_attackers() {
+fn declare_no_attackers_with_parked_triggers_drains_at_priority() {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::DeclareAttackers);
     let altar = add_altar(&mut scenario, PlayerId(0));
@@ -214,23 +214,16 @@ fn declare_no_attackers_with_parked_triggers_drains_and_leaves_declare_attackers
     );
 
     let state = runner.state();
-    // CR 508.8: with no attackers, declare blockers and combat damage are
-    // skipped and the game advances to the end of combat step.
-    assert_eq!(
-        state.phase,
-        Phase::EndCombat,
-        "CR 508.8: an empty declaration advances past combat"
-    );
-    // A3 — CR 511.1: end of combat has no turn-based actions; the active player
-    // gets priority. The stale declaration prompt must be gone.
+    // A3 — CR 508.2: after declaring no attackers, the active player receives
+    // priority. The stale declaration prompt must be gone.
     assert!(
         !matches!(state.waiting_for, WaitingFor::DeclareAttackers { .. }),
-        "the CR 508.1 declaration prompt must not survive the CR 508.8 advance, got {:?}",
+        "the completed CR 508.1 declaration must not be prompted again, got {:?}",
         state.waiting_for
     );
     assert!(
         matches!(state.waiting_for, WaitingFor::Priority { player } if player == state.active_player),
-        "CR 511.1: expected Priority for the active player, got {:?}",
+        "CR 508.2: expected Priority for the active player, got {:?}",
         state.waiting_for
     );
     // A1 — CR 603.3: the parked batch was put on the stack.
@@ -256,10 +249,8 @@ fn declare_no_attackers_with_parked_triggers_drains_and_leaves_declare_attackers
 
 /// Row A5 — hostile, non-empty declaration.
 ///
-/// A parked queue plus a **real** attack declaration (`attacks_empty == false`)
-/// also drains and reaches `Priority` at `Phase::DeclareAttackers` (CR 508.2).
-/// This exercises `finish_declare_attackers`'s `else` arm, which never reaches
-/// `advance_after_empty_attackers`.
+/// A parked queue plus a real attack declaration also drains and reaches
+/// `Priority` at `Phase::DeclareAttackers` through the shared CR 508.2 tail.
 ///
 /// **Non-regression row, not revert-failing.** This path returns `Priority`
 /// directly, so the drain it exercises is `run_post_action_pipeline`'s —
@@ -350,7 +341,6 @@ fn two_parked_triggers_surface_cr_603_3b_ordering() {
     );
 
     let state = runner.state();
-    assert_eq!(state.phase, Phase::EndCombat, "CR 508.8");
     // CR 603.3b: two simultaneous triggers under one controller — that player
     // chooses the order they go on the stack.
     match &state.waiting_for {

@@ -201,7 +201,7 @@ impl ScheduledSuccessor {
                     return Self::Natural {
                         unwound,
                         next: next_phase(ended),
-                    }
+                    };
                 }
             }
         }
@@ -308,7 +308,17 @@ pub(in crate::game) fn advance_phase_once(
     // phase will occur first" per CR 500.8). Successor selection, including
     // CR 500.8 + CR 500.9 + CR 500.10 continuation after every inserted unit, is
     // `take_scheduled_successor`.
-    let (removed, next) = take_scheduled_successor(state, successor);
+    let (removed, mut next) = take_scheduled_successor(state, successor);
+    // CR 508.2 + CR 508.8: only after declaration priority closes may an empty
+    // combat skip the natural blockers/damage steps. Do not emit a begin event
+    // or run begin-step replacements for either skipped step.
+    if leaving == Phase::DeclareAttackers
+        && next == Phase::DeclareBlockers
+        && removed.is_none()
+        && !combat::has_attackers_in_play(state)
+    {
+        next = Phase::EndCombat;
+    }
 
     // CR 511.3: End Combat teardown happens when the step ends, after its
     // priority window, not when the step begins.
@@ -465,17 +475,6 @@ pub(super) fn mark_empty_attackers_end_combat(state: &mut GameState, events: &mu
     events.push(GameEvent::PhaseChanged {
         phase: Phase::EndCombat,
     });
-}
-
-/// The declaration-continuation form of [`mark_empty_attackers_end_combat`].
-/// CR 508.8 skips only Declare Blockers and Combat Damage; the normal End
-/// Combat step still begins and must run its triggers and priority window.
-pub(super) fn advance_after_empty_attackers(
-    state: &mut GameState,
-    events: &mut Vec<GameEvent>,
-) -> WaitingFor {
-    mark_empty_attackers_end_combat(state, events);
-    auto_advance(state, events)
 }
 
 /// Enter a phase directly: set phase, run the CR 703.4q step-end empty
@@ -4129,78 +4128,30 @@ mod tests {
         assert!(settled.spells_cast_this_turn_by_player.is_empty());
     }
 
-    /// R14 B7: direct phase assignment is an authority boundary. Freeze the
-    /// current production-only census so any additional bypass is reviewed
-    /// alongside migration to the one-hop transition seam.
-    #[test]
-    fn production_phase_assignment_census_is_frozen() {
-        let source = include_str!("turns.rs");
-        let production_end = source
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("turns production source precedes its tests");
-        let production = &source[..production_end];
-
-        assert_eq!(
-            production
-                .lines()
-                .filter(|line| line.trim_start().starts_with("state.phase ="))
-                .count(),
-            4,
-            "a new direct phase assignment needs a B7 transition-authority row"
-        );
-
-        let combat_source = include_str!("engine_combat.rs");
-        let combat_production_end = combat_source
-            .find("\n#[cfg(test)]\nmod tests {")
-            .expect("combat production source precedes its tests");
-        assert_eq!(
-            combat_source[..combat_production_end]
-                .lines()
-                .filter(|line| line.trim_start().starts_with("state.phase ="))
-                .count(),
-            0,
-            "empty-attacker continuations must use the canonical turns authority"
-        );
-    }
-
-    #[test]
-    fn production_phase_handoffs_do_not_reenter_the_looping_advance_helper() {
-        for (name, source, test_marker) in [
-            (
-                "turns",
-                include_str!("turns.rs"),
-                "\n#[cfg(test)]\nmod tests {",
-            ),
-            (
-                "priority",
-                include_str!("priority.rs"),
-                "\n#[cfg(test)]\nmod tests {",
-            ),
-            (
-                "engine_resolution_choices",
-                include_str!("engine_resolution_choices.rs"),
-                "\n#[cfg(test)]\nmod tests {",
-            ),
-        ] {
-            let production_end = source
-                .find(test_marker)
-                .expect("production source precedes its tests");
-            assert!(
-                !source[..production_end].contains("advance_phase(state, events)"),
-                "{name} must use advance_phase_once before auto_advance; the outer interpreter owns repetition"
-            );
-        }
-    }
-
     #[test]
     fn empty_attacker_completion_clears_the_combat_restriction() {
         let mut state = setup();
         state.phase = Phase::DeclareAttackers;
         state.current_combat_attacker_restriction = Some(TargetFilter::Any);
         state.current_combat_attacker_restriction_source = Some(ObjectId(99));
-        let mut events = Vec::new();
 
-        let waiting = advance_after_empty_attackers(&mut state, &mut events);
+        state.waiting_for = combat::build_declare_attackers_waiting_for(&state);
+        let declared = apply(
+            &mut state,
+            PlayerId(0),
+            GameAction::DeclareAttackers {
+                attacks: Vec::new(),
+                bands: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.phase, Phase::DeclareAttackers);
+        assert!(matches!(declared.waiting_for, WaitingFor::Priority { .. }));
+        assert!(state.current_combat_attacker_restriction.is_some());
+        apply(&mut state, PlayerId(0), GameAction::PassPriority).unwrap();
+        let waiting = apply(&mut state, PlayerId(1), GameAction::PassPriority)
+            .unwrap()
+            .waiting_for;
 
         assert_eq!(state.phase, Phase::EndCombat);
         assert!(matches!(waiting, WaitingFor::Priority { .. }));

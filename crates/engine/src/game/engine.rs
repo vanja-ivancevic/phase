@@ -14143,7 +14143,7 @@ fn apply_non_priority_pass_action(
             {
                 waiting_for
             } else {
-                engine_combat::finish_declare_attackers(state, &mut events, false)?
+                engine_combat::finish_declare_attackers(state, &mut events)?
             }
         }
         // CR 508.1g + CR 702.154a: the active player may tap up to one eligible
@@ -14178,7 +14178,7 @@ fn apply_non_priority_pass_action(
             {
                 waiting_for
             } else {
-                engine_combat::finish_declare_attackers(state, &mut events, false)?
+                engine_combat::finish_declare_attackers(state, &mut events)?
             }
         }
         (WaitingFor::ReplacementChoice { .. }, GameAction::ChooseReplacement { index }) => {

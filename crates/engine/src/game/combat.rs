@@ -320,6 +320,10 @@ pub struct BlockHistoryPair {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CombatState {
     pub attackers: Vec<AttackerInfo>,
+    /// CR 508.1 + CR 508.2: the declaration turn-based action has completed,
+    /// including an empty declaration. Live attacker membership is not this fact.
+    #[serde(default)]
+    pub attackers_declared: bool,
     /// attacker_id -> list of blocker ids
     #[serde(serialize_with = "crate::types::deterministic_serde::hash_map")]
     pub blocker_assignments: HashMap<ObjectId, Vec<ObjectId>>,
@@ -389,6 +393,7 @@ pub struct CombatState {
 impl PartialEq for CombatState {
     fn eq(&self, other: &Self) -> bool {
         self.attackers == other.attackers
+            && self.attackers_declared == other.attackers_declared
             && self.blocker_assignments == other.blocker_assignments
             && self.blocker_to_attacker == other.blocker_to_attacker
             && self.blockers_declared_by == other.blockers_declared_by
@@ -5032,15 +5037,12 @@ fn declaration_pending_at_current_phase(state: &GameState) -> bool {
         Phase::Untap | Phase::Upkeep | Phase::Draw | Phase::PreCombatMain | Phase::BeginCombat => {
             true
         }
-        // CR 508.1k: the chosen creatures become attacking creatures, so an
-        // attacking creature is the mark that the turn-based action has run.
-        // CR 508.8 keeps the empty declaration out of this arm: the engine
-        // leaves the step immediately when nothing is declared (pinned by
-        // `declaration_pending_at_current_phase_survives_an_empty_declaration`).
+        // CR 508.1 + CR 508.2: an empty declaration and a declaration whose
+        // creatures later leave combat are still completed turn-based actions.
         Phase::DeclareAttackers => state
             .combat
             .as_ref()
-            .is_none_or(|combat| combat.attackers.is_empty()),
+            .is_none_or(|combat| !combat.attackers_declared),
         Phase::DeclareBlockers
         | Phase::CombatDamage
         | Phase::EndCombat
@@ -6412,6 +6414,7 @@ pub(super) fn commit_attack_declaration(
         .collect();
     let combat = state.combat.get_or_insert_with(CombatState::default);
     combat.attackers = attackers;
+    combat.attackers_declared = true;
     state.players_attacked_this_step = combat
         .attackers
         .iter()
@@ -15197,6 +15200,7 @@ mod tests {
         state.phase = Phase::DeclareAttackers;
         state.combat = Some(CombatState {
             attackers: vec![AttackerInfo::attacking_player(declared, PlayerId(1))],
+            attackers_declared: true,
             ..Default::default()
         });
         assert!(!declaration_pending_at_current_phase(&state));
@@ -15218,35 +15222,123 @@ mod tests {
         }
     }
 
-    /// CR 508.8: an empty declaration is a legal declare-attackers turn-based
-    /// action, and the engine leaves the step immediately when it happens --
-    /// this drives that through the real engine rather than assuming it.
+    /// CR 508.2 gives priority after an empty declaration; CR 508.8 skips
+    /// only the following declare-blockers and combat-damage steps.
     #[test]
-    fn declaration_pending_at_current_phase_survives_an_empty_declaration() {
+    fn empty_declaration_keeps_priority_until_all_players_pass() {
         use crate::game::scenario::GameScenario;
+        use crate::types::actions::GameAction;
+        use crate::types::game_state::WaitingFor;
 
         let mut scenario = GameScenario::new();
         scenario.at_phase(Phase::PreCombatMain);
-        // A legal potential attacker must exist, or
-        // `WaitingFor::DeclareAttackers` is never surfaced to the caller --
-        // there would be nothing for `declare_attackers(&[])` to decline.
         scenario.add_creature(PlayerId(0), "Ready Non-Attacker", 2, 2);
         let mut runner = scenario.build();
         runner.advance_to_phase(Phase::DeclareAttackers);
+        let declared = runner.declare_attackers(&[]).unwrap();
+        assert_eq!(runner.state().phase, Phase::DeclareAttackers);
         assert!(matches!(
             runner.state().waiting_for,
-            crate::types::game_state::WaitingFor::DeclareAttackers { .. }
+            WaitingFor::Priority {
+                player: PlayerId(0)
+            }
         ));
-        runner
-            .declare_attackers(&[])
-            .expect("CR 508.8: an empty declaration must be legal");
-
-        assert_ne!(
-            runner.state().phase,
-            Phase::DeclareAttackers,
-            "CR 508.8: an empty declaration must skip past declare-attackers"
-        );
         assert!(!declaration_pending_at_current_phase(runner.state()));
+        assert!(!declared.events.iter().any(|event| matches!(
+            event,
+            GameEvent::PhaseChanged {
+                phase: Phase::EndCombat
+            }
+        )));
+
+        let first =
+            crate::game::engine::apply(runner.state_mut(), PlayerId(0), GameAction::PassPriority)
+                .unwrap();
+        assert_eq!(runner.state().phase, Phase::DeclareAttackers);
+        assert!(matches!(
+            first.waiting_for,
+            WaitingFor::Priority {
+                player: PlayerId(1)
+            }
+        ));
+        let second =
+            crate::game::engine::apply(runner.state_mut(), PlayerId(1), GameAction::PassPriority)
+                .unwrap();
+        assert_eq!(runner.state().phase, Phase::EndCombat);
+        assert!(!second.events.iter().any(|event| matches!(
+            event,
+            GameEvent::PhaseChanged {
+                phase: Phase::DeclareBlockers | Phase::CombatDamage
+            }
+        )));
+        assert!(!declaration_pending_at_current_phase(runner.state()));
+    }
+
+    #[test]
+    fn attacker_declaration_stays_complete_when_its_last_creature_leaves() {
+        let mut state = setup();
+        let attacker = create_creature(&mut state, PlayerId(0), "Declared", 2, 2);
+        state.phase = Phase::DeclareAttackers;
+        state.combat = Some(CombatState::default());
+        let mut events = Vec::new();
+        declare_attackers(
+            &mut state,
+            &[(attacker, AttackTarget::Player(PlayerId(1)))],
+            &mut events,
+        )
+        .unwrap();
+        crate::game::zones::move_to_zone(&mut state, attacker, Zone::Graveyard, &mut events);
+        prune_attackers_not_in_play(&mut state);
+        assert!(state.combat.as_ref().unwrap().attackers.is_empty());
+        assert!(!declaration_pending_at_current_phase(&state));
+        let restored: GameState =
+            serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        assert!(!declaration_pending_at_current_phase(&restored));
+    }
+
+    #[test]
+    fn summoning_sick_savannah_lions_rejection_still_allows_empty_declaration_priority() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::actions::GameAction;
+        use crate::types::game_state::WaitingFor;
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::DeclareAttackers);
+        let lions = scenario
+            .add_creature(PlayerId(0), "Savannah Lions", 2, 1)
+            .with_summoning_sickness()
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        state.combat = Some(CombatState::default());
+        state.waiting_for = build_declare_attackers_waiting_for(state);
+        assert!(crate::game::engine::apply(
+            state,
+            PlayerId(0),
+            GameAction::DeclareAttackers {
+                attacks: vec![(lions, AttackTarget::Player(PlayerId(1)))],
+                bands: Vec::new(),
+            }
+        )
+        .is_err());
+        assert!(!state.combat.as_ref().unwrap().attackers_declared);
+        assert!(!state.objects[&lions].tapped);
+        crate::game::engine::apply(
+            state,
+            PlayerId(0),
+            GameAction::DeclareAttackers {
+                attacks: Vec::new(),
+                bands: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(state.phase, Phase::DeclareAttackers);
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::Priority {
+                player: PlayerId(0)
+            }
+        ));
+        assert!(!declaration_pending_at_current_phase(state));
     }
 
     /// CR 508.1c + CR 611.2c + CR 500.8: `attacker_declaration_pending_for`

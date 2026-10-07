@@ -178,14 +178,10 @@ fn stage_resolution_optional_sacrifice_decline_for_departing_payer(
     Some(frame)
 }
 
-/// Eliminate a player from the game per CR 800.4.
-///
-/// - Marks the player as eliminated
-/// - Removes their spells from the stack
-/// - Exiles all objects they own (all zones)
-/// - Emits PlayerEliminated event
-/// - For team-based formats (2HG): also eliminates all teammates
-/// - Checks if the game is over (1 or fewer living players/teams remain)
+/// Record a player loss. CR 104.1 ends a two-player game immediately without
+/// changing card zones, existing stack objects, or their controllers. CR 800.4
+/// additionally performs leave-game teardown in multiplayer games, including
+/// shared-team departures, before determining whether the game continues.
 pub fn eliminate_player(state: &mut GameState, player: PlayerId, events: &mut Vec<GameEvent>) {
     eliminate_players_simultaneously(state, &[player], events);
 }
@@ -197,8 +193,7 @@ pub fn eliminate_player(state: &mut GameState, player: PlayerId, events: &mut Ve
 /// applied BEFORE the single `check_game_over`, so the game-over check observes
 /// the true post-event living set. When every remaining player is in the set
 /// the result is a draw (`GameOver { winner: None }`) per CR 104.4a, rather than
-/// crowning whichever player happened to be processed first. With a single loser
-/// this is exactly the previous per-player behavior.
+/// crowning whichever player happened to be processed first.
 pub fn eliminate_players_simultaneously(
     state: &mut GameState,
     players_to_eliminate: &[PlayerId],
@@ -325,6 +320,20 @@ pub fn eliminate_players_simultaneously(
         return;
     }
 
+    // CR 104.1 + CR 104.3: a two-player loss ends the game immediately.
+    // CR 800.4's continuing multiplayer departure (zone/control/stack sweeps)
+    // must not rewrite the terminal board or create further game actions.
+    if state.players.len() == 2 {
+        check_game_over(state, events);
+        if staged_optional_sacrifice_decline.is_some() {
+            finish_abandoned_source_bound_resolution_carrier(state);
+        }
+        if let Some(GameEnd { winner }) = state.game_end {
+            clear_terminal_trigger_scaffolding(state, winner);
+        }
+        return;
+    }
+
     // CR 800.4a: after ALL owned-exiles, end control effects the leaving players
     // control and exile anything still under a leaver's control. Runs ONCE over
     // the full `leaving_set` — the retain+sweep scope is what makes a co-leaver's
@@ -432,39 +441,7 @@ pub fn eliminate_players_simultaneously(
         if staged_optional_sacrifice_decline.is_some() {
             finish_abandoned_source_bound_resolution_carrier(state);
         }
-        // Terminal: drop trigger scaffolding the client would otherwise show as
-        // a stuck stack / ordering prompt.
-        let mut terminal_firings = state
-            .pending_trigger_order
-            .take()
-            .into_iter()
-            .flat_map(|order| order.groups)
-            .flat_map(|group| group.triggers)
-            .map(|context| context.firing())
-            .collect::<Vec<_>>();
-        terminal_firings.extend(
-            std::mem::take(&mut state.deferred_triggers)
-                .into_iter()
-                .map(|context| context.firing()),
-        );
-        terminal_firings.extend(state.pending_trigger_firing.take());
-        state.pending_trigger = None;
-        state.pending_trigger_entry = None;
-        state.pending_trigger_event_batch.clear();
-        // CR 117.3c: The construction priority recipient is scheduling state for
-        // a batch that no longer exists. Leaving it installed would durably
-        // serialize a departed player into a terminal `GameOver` snapshot — the
-        // exact leak the surrounding comment already calls out for the reused
-        // singleton engine. The terminal arm needs no re-point, because there is
-        // no later construction to route.
-        state.pending_trigger_construction_priority_recipient = None;
-        for firing in terminal_firings {
-            crate::game::lifecycle::record_delayed_terminal(
-                firing,
-                crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
-            );
-        }
-        state.waiting_for = WaitingFor::GameOver { winner };
+        clear_terminal_trigger_scaffolding(state, winner);
     } else {
         // CR 800.4a + CR 608.2m + CR 800.4g/800.4h: once every departure,
         // control-effect end and stack removal above has settled, reconcile an
@@ -594,6 +571,36 @@ pub fn eliminate_players_simultaneously(
             }
         }
     }
+}
+
+fn clear_terminal_trigger_scaffolding(state: &mut GameState, winner: Option<PlayerId>) {
+    // The game ended: retire unconstructed trigger work without changing any
+    // card zones, existing stack objects, or their controllers.
+    let mut terminal_firings = state
+        .pending_trigger_order
+        .take()
+        .into_iter()
+        .flat_map(|order| order.groups)
+        .flat_map(|group| group.triggers)
+        .map(|context| context.firing())
+        .collect::<Vec<_>>();
+    terminal_firings.extend(
+        std::mem::take(&mut state.deferred_triggers)
+            .into_iter()
+            .map(|context| context.firing()),
+    );
+    terminal_firings.extend(state.pending_trigger_firing.take());
+    state.pending_trigger = None;
+    state.pending_trigger_entry = None;
+    state.pending_trigger_event_batch.clear();
+    state.pending_trigger_construction_priority_recipient = None;
+    for firing in terminal_firings {
+        crate::game::lifecycle::record_delayed_terminal(
+            firing,
+            crate::game::lifecycle::DelayedTerminalDisposition::Eliminated,
+        );
+    }
+    state.waiting_for = WaitingFor::GameOver { winner };
 }
 
 /// CR 103.5 + CR 800.4a: Prune eliminated players from the in-flight
@@ -1107,8 +1114,11 @@ fn do_eliminate(
     leaving_set: &HashSet<PlayerId>,
     events: &mut Vec<GameEvent>,
 ) -> RulesExecutionNodeRef {
-    let planar_handoff =
-        crate::game::planechase::prepare_player_left_game_handoff(state, player, leaving_set);
+    let planar_handoff = if state.players.len() > 2 {
+        crate::game::planechase::prepare_player_left_game_handoff(state, player, leaving_set)
+    } else {
+        None
+    };
 
     // CR 733 + CR 800.4: open the leave's own execution node BEFORE the sweep, so
     // every command it settles below — the owned-object exiles, the control
@@ -1127,6 +1137,22 @@ fn do_eliminate(
         .resolved_rules_journal
         .record_player_leave(command)
         .expect("resolved player leave must have a live journal cause");
+
+    if state.players.len() == 2 {
+        // Keep departure journaling and retire the losing controller's paused
+        // work, but do not execute CR 800.4 multiplayer gameplay teardown.
+        abandon_source_bound_resolution_prompt(state, player, events);
+        abandon_change_zone_family_for_controller(state, player);
+        abandon_pending_spell_casts(state, player, &[]);
+        if state.active_spell_resolution().is_some_and(|resolution| {
+            resolution.cast_controller.unwrap_or(resolution.controller) == player
+        }) {
+            let _ = state.take_active_spell_resolution();
+        }
+        events.push(GameEvent::PlayerEliminated { player_id: player });
+        state.active_rules_execution_node = enclosing_node;
+        return leave_node;
+    }
 
     // CR 800.4a + CR 616.1: Capture the parked replacement chooser before
     // cast-abandonment teardown can replace its prompt with priority.
@@ -2794,6 +2820,137 @@ mod tests {
         )));
     }
 
+    #[test]
+    fn two_player_terminal_loss_preserves_zones_control_and_stack() {
+        for losses in [vec![PlayerId(0)], vec![PlayerId(0), PlayerId(1)]] {
+            let mut state = setup_two_player();
+            let mut originals = Vec::new();
+            for (index, zone) in [
+                Zone::Library,
+                Zone::Hand,
+                Zone::Battlefield,
+                Zone::Graveyard,
+                Zone::Exile,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let id = create_object(
+                    &mut state,
+                    CardId(index as u64 + 70),
+                    PlayerId(0),
+                    format!("Terminal object {index}"),
+                    zone,
+                );
+                originals.push((id, zone));
+            }
+            let stolen = create_object(
+                &mut state,
+                CardId(80),
+                PlayerId(1),
+                "Survivor-owned permanent".to_string(),
+                Zone::Battlefield,
+            );
+            state.objects.get_mut(&stolen).unwrap().controller = PlayerId(0);
+            let spell = create_object(
+                &mut state,
+                CardId(81),
+                PlayerId(0),
+                "Unresolved spell".to_string(),
+                Zone::Stack,
+            );
+            state.stack.push_back(StackEntry {
+                id: spell,
+                source_id: spell,
+                controller: PlayerId(0),
+                kind: StackEntryKind::Spell {
+                    card_id: CardId(81),
+                    ability: None,
+                    casting_variant: CastingVariant::Normal,
+                    actual_mana_spent: 0,
+                },
+            });
+            let mut events = Vec::new();
+            eliminate_players_simultaneously(&mut state, &losses, &mut events);
+            let winner = (losses.len() == 1).then_some(PlayerId(1));
+            assert!(
+                matches!(state.waiting_for, WaitingFor::GameOver { winner: actual } if actual == winner)
+            );
+            for (id, zone) in originals {
+                assert_eq!(state.objects[&id].zone, zone);
+            }
+            assert_eq!(state.objects[&stolen].zone, Zone::Battlefield);
+            assert_eq!(state.objects[&stolen].controller, PlayerId(0));
+            assert_eq!(state.objects[&spell].zone, Zone::Stack);
+            assert_eq!(state.stack.len(), 1);
+            assert_eq!(state.stack[0].source_id, spell);
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, GameEvent::ZoneChanged { .. })));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, GameEvent::GameOver { .. }))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn worship_fetch_last_life_keeps_paid_sacrifice_in_graveyard_at_game_over() {
+        use crate::game::scenario::GameScenario;
+        use crate::types::phase::Phase;
+        let mut scenario = GameScenario::new();
+        scenario
+            .at_phase(Phase::PreCombatMain)
+            .with_life(PlayerId(0), 1);
+        let fetch = scenario.add_land_from_oracle(PlayerId(0), "Windswept Heath",
+            "{T}, Pay 1 life, Sacrifice this land: Search your library for a Forest or Plains card, put it onto the battlefield, then shuffle.").id();
+        let worship = scenario.add_enchantment_from_oracle(PlayerId(0), "Worship",
+            "If you control a creature, damage that would reduce your life total to less than 1 reduces it to 1 instead.").id();
+        let lions = scenario
+            .add_creature(PlayerId(0), "Savannah Lions", 2, 1)
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        let forest = create_object(
+            state,
+            CardId(91),
+            PlayerId(0),
+            "Forest".to_string(),
+            Zone::Library,
+        );
+        let result = crate::game::engine::apply(
+            state,
+            PlayerId(0),
+            GameAction::ActivateAbility {
+                source_id: fetch,
+                ability_index: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.players[0].life, 0);
+        assert!(matches!(
+            state.waiting_for,
+            WaitingFor::GameOver {
+                winner: Some(PlayerId(1))
+            }
+        ));
+        assert_eq!(state.objects[&fetch].zone, Zone::Graveyard);
+        assert!(state.players[0].graveyard.contains(&fetch));
+        assert_eq!(state.objects[&forest].zone, Zone::Library);
+        assert_eq!(state.objects[&worship].zone, Zone::Battlefield);
+        assert_eq!(state.objects[&lions].zone, Zone::Battlefield);
+        assert!(!result.events.iter().any(|event| matches!(
+            event,
+            GameEvent::ZoneChanged {
+                to: Zone::Exile,
+                ..
+            }
+        )));
+    }
+
     /// CR 104.1 + CR 104.4b: a result recorded by `end_game` survives a later
     /// overwrite of `waiting_for` in the same action. No player is eliminated,
     /// so `is_eliminated` cannot re-derive this draw; only the record can.
@@ -3217,7 +3374,7 @@ mod tests {
 
     #[test]
     fn elimination_removes_spells_from_stack() {
-        let mut state = setup_two_player();
+        let mut state = setup_three_player();
         let obj_id = create_object(
             &mut state,
             CardId(1),
@@ -4203,25 +4360,6 @@ mod tests {
                 player_id: PlayerId(1)
             }
         )));
-    }
-
-    #[test]
-    fn initiative_transfers_in_two_player_game() {
-        let mut state = setup_two_player();
-        state.active_player = PlayerId(0);
-        state.initiative = Some(PlayerId(0));
-        let mut events = Vec::new();
-
-        eliminate_player(&mut state, PlayerId(0), &mut events);
-
-        // CR 726.4: P1 is still alive, so they get initiative (game ends immediately after).
-        assert_eq!(state.initiative, Some(PlayerId(1)));
-        assert!(matches!(
-            state.waiting_for,
-            WaitingFor::GameOver {
-                winner: Some(PlayerId(1))
-            }
-        ));
     }
 
     #[test]
