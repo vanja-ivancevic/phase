@@ -852,7 +852,7 @@ fn build_mobilize_trigger(qty: &QuantityExpr) -> TriggerDefinition {
     use crate::types::triggers::TriggerMode;
 
     let token_effect = Effect::Token {
-        name: "Warrior".to_string(),
+        name: "Warrior Token".to_string(),
         power: PtValue::Fixed(1),
         toughness: PtValue::Fixed(1),
         types: vec!["Creature".to_string(), "Warrior".to_string()],
@@ -903,7 +903,7 @@ pub fn synthesize_mobilize(face: &mut CardFace) {
         matches!(t.mode, TriggerMode::Attacks)
             && matches!(
                 t.execute.as_deref().map(|a| &*a.effect),
-                Some(Effect::Token { name, .. }) if name == "Warrior"
+                Some(Effect::Token { name, .. }) if name == "Warrior Token"
             )
     });
     if already_has_trigger {
@@ -3702,7 +3702,7 @@ pub fn synthesize_fabricate(face: &mut CardFace) {
                 Some(Effect::ChooseOneOf { branches, .. })
                     if branches.iter().any(|b| matches!(
                         &*b.effect,
-                        Effect::Token { name, .. } if name == "Servo"
+                        Effect::Token { name, .. } if name == "Servo Token"
                     ))
             )
     });
@@ -3748,7 +3748,7 @@ fn build_fabricate_trigger(n: u32) -> TriggerDefinition {
     let servos_branch = AbilityDefinition::new(
         AbilityKind::Spell,
         Effect::Token {
-            name: "Servo".to_string(),
+            name: "Servo Token".to_string(),
             power: PtValue::Fixed(1),
             toughness: PtValue::Fixed(1),
             types: vec![
@@ -3822,7 +3822,7 @@ fn is_fabricate_trigger_for_count(t: &TriggerDefinition, n: u32) -> bool {
         matches!(
             &*b.effect,
             Effect::Token { name, count: c, .. }
-                if name == "Servo" && *c == count
+                if name == "Servo Token" && *c == count
         )
     });
     counters_ok && servos_ok
@@ -4362,7 +4362,7 @@ fn build_afterlife_trigger(count: u32) -> TriggerDefinition {
     // token with flying. Colors carry both White and Black (CR 105.2b
     // multicolored).
     let token_effect = Effect::Token {
-        name: "Spirit".to_string(),
+        name: "Spirit Token".to_string(),
         power: PtValue::Fixed(1),
         toughness: PtValue::Fixed(1),
         types: vec!["Creature".to_string(), "Spirit".to_string()],
@@ -4443,7 +4443,7 @@ fn afterlife_trigger_count(t: &TriggerDefinition) -> Option<i32> {
         return None;
     };
 
-    if name != "Spirit"
+    if name != "Spirit Token"
         || !matches!(power, PtValue::Fixed(1))
         || !matches!(toughness, PtValue::Fixed(1))
         || !types.iter().map(String::as_str).eq(["Creature", "Spirit"])
@@ -12270,7 +12270,6 @@ mod fabricate_synthesis_tests {
             .find(|b| matches!(&*b.effect, Effect::Token { .. }))
             .expect("one branch must create Servo tokens");
         let Effect::Token {
-            name,
             power,
             toughness,
             types,
@@ -12281,7 +12280,6 @@ mod fabricate_synthesis_tests {
         else {
             unreachable!();
         };
-        assert_eq!(name, "Servo");
         assert!(matches!(power, PtValue::Fixed(1)));
         assert!(matches!(toughness, PtValue::Fixed(1)));
         assert_eq!(
@@ -12559,7 +12557,14 @@ mod fabricate_runtime_tests {
         let servos: Vec<&crate::game::game_object::GameObject> = state
             .objects
             .values()
-            .filter(|obj| obj.name == "Servo" && obj.is_token)
+            .filter(|obj| {
+                obj.is_token
+                    && obj
+                        .card_types
+                        .subtypes
+                        .iter()
+                        .any(|subtype| subtype == "Servo")
+            })
             .collect();
         assert_eq!(
             servos.len(),
@@ -12616,7 +12621,14 @@ mod fabricate_runtime_tests {
         let servos = state
             .objects
             .values()
-            .filter(|obj| obj.name == "Servo" && obj.is_token)
+            .filter(|obj| {
+                obj.is_token
+                    && obj
+                        .card_types
+                        .subtypes
+                        .iter()
+                        .any(|subtype| subtype == "Servo")
+            })
             .count();
         assert_eq!(
             servos, 2,
@@ -13004,7 +13016,6 @@ mod undying_persist_synthesis_tests {
 
         let execute = trigger.execute.as_deref().expect("execute body required");
         let Effect::Token {
-            name,
             power,
             toughness,
             types,
@@ -13019,7 +13030,6 @@ mod undying_persist_synthesis_tests {
         else {
             panic!("afterlife execute should be Effect::Token");
         };
-        assert_eq!(name, "Spirit");
         assert!(matches!(power, PtValue::Fixed(1)));
         assert!(matches!(toughness, PtValue::Fixed(1)));
         assert!(types.contains(&"Creature".to_string()));
@@ -13651,7 +13661,11 @@ mod undying_persist_runtime_tests {
         let spirits: Vec<_> = state
             .objects
             .values()
-            .filter(|obj| obj.is_token && obj.name == "Spirit" && obj.zone == Zone::Battlefield)
+            .filter(|obj| {
+                obj.is_token
+                    && obj.card_types.subtypes.iter().any(|s| s == "Spirit")
+                    && obj.zone == Zone::Battlefield
+            })
             .collect();
         assert_eq!(
             spirits.len(),

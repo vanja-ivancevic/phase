@@ -1534,7 +1534,14 @@ When this creature enters or dies, create a 1/1 red Goblin creature token.";
         .battlefield
         .iter()
         .filter_map(|id| state.objects.get(id))
-        .filter(|obj| obj.is_token && obj.name == "Goblin")
+        .filter(|obj| {
+            obj.is_token
+                && obj
+                    .card_types
+                    .subtypes
+                    .iter()
+                    .any(|subtype| subtype == "Goblin")
+        })
         .count();
     assert_eq!(
         goblin_tokens, 1,

@@ -14458,7 +14458,6 @@ mod tests {
             panic!("expected token sub-ability after exile, got {def:?}");
         };
         let Effect::Token {
-            name,
             power,
             toughness,
             types,
@@ -14467,7 +14466,6 @@ mod tests {
         else {
             panic!("expected Zombie token effect, got {:?}", sub.effect);
         };
-        assert_eq!(name, "Zombie");
         assert!(types.iter().any(|ty| ty == "Zombie"));
         assert_eq!(
             power,

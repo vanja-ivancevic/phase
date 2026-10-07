@@ -612,3 +612,47 @@ no new export was run. Qualified deck hashes: none. Collection and labeling
 remain unreleased, with independent actual-evidence review and teacher
 presentation qualification still separate.
 
+### Ordinary token characteristics (2026-10-07)
+
+The shared ordinary-token materializer now installs `ManaCost::NoCost` in
+both live characteristics and the layer baseline. Entry LKI and recorded
+creation replay use that authority. Unnamed, type-bearing tokens receive
+their subtype-derived rules name, including `Token`; Call of the Herd
+creates `Elephant Token`, not `Elephant`. Explicit names, catalog-defined
+identities, and copied names/mana costs retain their separate authorities.
+Mobilize, fabricate, and afterlife synthesis and their duplicate guards use
+the same generic names. Source-linked art lookup tolerates the rules-name
+suffix without weakening its exact-body guard.
+
+The focused M4 batch passed 256 distinct tests (257 executions across 27
+filters, one overlapping filter), including real parsed token creation,
+entry LKI, layers, copy characteristics, synthesis, and affected card paths.
+No full-workspace gate or broad corpus run was performed. Verification used
+jobs1 / codegen1 / debug0 / incremental0 / unsafe0 with the user-authorized,
+invocation-only zero minimum free swap; normal pressure, load8, free RAM20%,
+and disk20GiB guards remained enforced.
+
+A fresh production `oracle-gen` build with `cli` and without `test-support`
+exported all 339 original inputs (663,765,907 bytes), verified before and
+after. Producer SHA256:
+`6dca43b33fe75f31caf5fe621485f287f19bb216c1db7a9b63ddd3d4031cb2fc`.
+Card export SHA256:
+`d7d3ef839c3fbd0424e12edf995fcb46cfbc6be66e770a90d52f6234e7e4603a`.
+An external native smoke linked the actual Cargo-emitted production engine
+and loaded that fresh export. Its seed42 run observed `Elephant Token`,
+`NoCost`, 3/3, no-cost entry LKI and creation replay, unchanged values after
+layers, explicit `Elephant`, and a copied creature retaining its `{2}{U}`
+cost and name. All 2,822 native source inputs matched before/after the batch.
+Exact commands, Cargo metadata, artifact hashes, source bindings, input
+proofs, and results are retained under
+`/Fast/Shared/artifacts/analyses/phase-provider-zen5-20261003/token-characteristics-native-20261007/final/`.
+
+The reported target cases did not establish a target-eligibility defect:
+cast announcement object IDs are not committed selections in the current
+dispatch path; actual target selection uses the pending choice handshake
+and validates selected targets. No targeting API or consumer adapter changed.
+Consumers must retain requested intent rather than treating an announcement
+hint as accepted selection. Qualification, replay/privacy, and labeling remain
+consumer-owned. Qualified deck hashes: none; no blanket subset admission or
+transfer of prior verdicts to this source/export binding.
+

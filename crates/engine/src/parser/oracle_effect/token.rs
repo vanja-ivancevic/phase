@@ -1773,11 +1773,16 @@ fn parse_token_identity(
         return known_named_token_identity(descriptor, source_name);
     }
 
-    let name = if subtypes.is_empty() {
-        "Token".to_string()
-    } else {
-        subtypes.join(" ")
-    };
+    // CR 111.4: Only this unnamed, type-bearing branch derives a default name.
+    // Explicit leading/trailing names override it at the description boundary;
+    // registry-defined named tokens and copies use their separate authority.
+    let capacity = subtypes.iter().map(String::len).sum::<usize>() + subtypes.len() + 5;
+    let mut name = String::with_capacity(capacity);
+    for subtype in &subtypes {
+        name.push_str(subtype);
+        name.push(' ');
+    }
+    name.push_str("Token");
 
     let mut types = core_types;
     for subtype in subtypes {
@@ -1989,6 +1994,41 @@ mod tests {
         ObjectScope, PlayerFilter, QuantityExpr, QuantityRef, RoundingMode, TypeFilter,
     };
     use crate::types::card_type::CoreType;
+
+    #[test]
+    fn default_token_names_preserve_explicit_and_copy_identity() {
+        for (text, expected) in [
+            (
+                "Create a 3/3 green Elephant creature token.",
+                "Elephant Token",
+            ),
+            (
+                "Create a 1/1 red Goblin Scout creature token.",
+                "Goblin Scout Token",
+            ),
+            ("Create a 1/1 colorless creature token.", "Token"),
+            (
+                "Create a 3/3 green Elephant creature token named Elephant.",
+                "Elephant",
+            ),
+            (
+                "Create Boo, a legendary 1/1 red Hamster creature token with trample and haste.",
+                "Boo",
+            ),
+        ] {
+            let effect = try_parse_token(&text.to_lowercase(), text, &mut ParseContext::default())
+                .expect("the complete token description must parse");
+            let Effect::Token { name, .. } = effect else {
+                panic!("expected ordinary token creation");
+            };
+            assert_eq!(name, expected, "{text}");
+        }
+        let text = "Create a token that's a copy of target creature.";
+        assert!(matches!(
+            try_parse_token(&text.to_lowercase(), text, &mut ParseContext::default()),
+            Some(Effect::CopyTokenOf { .. }),
+        ));
+    }
 
     #[test]
     fn terminal_oxford_comma_color_clause_is_extracted() {
@@ -2250,7 +2290,6 @@ mod tests {
         let effect = try_parse_token(&txt.to_lowercase(), txt, &mut ParseContext::default())
             .expect("expected Stitcher Geralf token effect");
         let Effect::Token {
-            name,
             power,
             toughness,
             types,
@@ -2273,7 +2312,6 @@ mod tests {
                 .expect("statically valid property aggregate"),
             ),
         });
-        assert_eq!(name, "Zombie");
         assert!(
             types.iter().any(|t| t == "Creature") && types.iter().any(|t| t == "Zombie"),
             "types must include Creature and Zombie, got {types:?}"
@@ -3185,7 +3223,7 @@ mod tests {
 
         assert_eq!(keywords, vec![Keyword::Flying]);
         assert_eq!(
-            name, "Bird",
+            name, "Bird Token",
             "a non-keyword clause must not rebind the name"
         );
     }
@@ -3195,7 +3233,7 @@ mod tests {
         for (text, expected_name) in [
             (
                 "Create a number of 1/1 red Goblin creature tokens equal to two plus the number of cards named Goblin Gathering in your graveyard.",
-                "Goblin",
+                "Goblin Token",
             ),
             (
                 "Create a Blood token and conjure a card named Blood Artist onto the battlefield.",
@@ -3245,7 +3283,10 @@ mod tests {
             panic!("expected Token effect, got {effect:?}");
         };
 
-        assert_eq!(name, "Bird", "quoted text must not supply a token name");
+        assert_eq!(
+            name, "Bird Token",
+            "quoted text must not supply a token name"
+        );
         assert_eq!(keywords, vec![Keyword::Flying]);
     }
 

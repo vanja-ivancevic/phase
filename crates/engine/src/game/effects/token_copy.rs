@@ -2091,6 +2091,11 @@ mod tests {
             source.card_types = source.base_card_types.clone();
             source.base_keywords = vec![Keyword::Ninjutsu(Default::default())];
             source.keywords = source.base_keywords.clone();
+            source.mana_cost = crate::types::mana::ManaCost::Cost {
+                generic: 2,
+                shards: vec![crate::types::mana::ManaCostShard::Blue],
+            };
+            source.base_mana_cost = source.mana_cost.clone();
         }
 
         let mut events = Vec::new();
@@ -2117,6 +2122,17 @@ mod tests {
         let token = state.objects.get(&token_id).unwrap();
 
         assert_eq!(token.name, "Mist-Syndicate Naga");
+        assert_eq!(
+            token.mana_cost,
+            crate::types::mana::ManaCost::Cost {
+                generic: 2,
+                shards: vec![crate::types::mana::ManaCostShard::Blue],
+            },
+        );
+        assert_eq!(
+            crate::game::printed_cards::intrinsic_copiable_values(token).mana_cost,
+            token.mana_cost,
+        );
         assert_eq!(token.power, Some(3));
         assert_eq!(token.toughness, Some(1));
         assert_eq!(token.color, vec![ManaColor::Blue]);

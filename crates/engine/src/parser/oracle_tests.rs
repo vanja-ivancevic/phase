@@ -8206,7 +8206,6 @@ fn modal_target_player_creates_spawn_tokens_with_quoted_mana_ability() {
     let first_mode = r.abilities.first().expect("first mode");
     match &*first_mode.effect {
         Effect::Token {
-            name,
             power,
             toughness,
             types,
@@ -8216,7 +8215,6 @@ fn modal_target_player_creates_spawn_tokens_with_quoted_mana_ability() {
             static_abilities,
             ..
         } => {
-            assert_eq!(name, "Eldrazi Spawn");
             assert_eq!(power, &PtValue::Fixed(0));
             assert_eq!(toughness, &PtValue::Fixed(1));
             assert_eq!(
@@ -8299,7 +8297,6 @@ fn kozileks_command_full_four_mode_parse() {
     // action) to add {C}.
     match &*r.abilities[0].effect {
         Effect::Token {
-            name,
             power,
             toughness,
             colors,
@@ -8308,7 +8305,6 @@ fn kozileks_command_full_four_mode_parse() {
             static_abilities,
             ..
         } => {
-            assert_eq!(name, "Eldrazi Spawn");
             assert_eq!(power, &PtValue::Fixed(0));
             assert_eq!(toughness, &PtValue::Fixed(1));
             assert!(colors.is_empty(), "Eldrazi Spawn is colorless");

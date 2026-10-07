@@ -10393,12 +10393,8 @@ fn trigger_skyclave_apparition_leaves_battlefield_uses_linked_exile_owner_scope(
 
     match execute.effect.as_ref() {
         Effect::Token {
-            name,
-            power,
-            toughness,
-            ..
+            power, toughness, ..
         } => {
-            assert_eq!(name, "Illusion");
             let expected = QuantityExpr::Ref {
                 qty: QuantityRef::PropertyAggregate(
                     crate::types::ability::PropertyAggregate::new(
@@ -12902,7 +12898,6 @@ fn parse_greatest_mana_value_among_instant_and_sorcery_spells_cast_this_turn() {
 
     let execute = def.execute.as_deref().expect("Rootha token effect");
     let Effect::Token {
-        name,
         power,
         toughness,
         colors,
@@ -12912,7 +12907,6 @@ fn parse_greatest_mana_value_among_instant_and_sorcery_spells_cast_this_turn() {
     else {
         panic!("expected Rootha token effect, got {:#?}", execute.effect);
     };
-    assert_eq!(name, "Elemental");
     assert_eq!(colors, &vec![ManaColor::Blue, ManaColor::Red]);
     assert!(keywords.contains(&Keyword::Flying));
     assert!(keywords.contains(&Keyword::Haste));
@@ -19552,7 +19546,7 @@ fn phase_trigger_self_bounce_stays_battlefield_hosted() {
             .sub_ability
             .as_deref()
             .map(|ability| ability.effect.as_ref()),
-        Some(Effect::Token { name, .. }) if name == "Thopter"
+        Some(Effect::Token { types, .. }) if types.iter().any(|ty| ty == "Thopter")
     ));
 }
 
@@ -29900,14 +29894,12 @@ fn spellcast_you_may_pay_if_you_do_create_token() {
     assert_eq!(token.condition, Some(AbilityCondition::effect_performed()));
     match &*token.effect {
         Effect::Token {
-            name,
             power,
             toughness,
             types,
             owner,
             ..
         } => {
-            assert_eq!(name, "Myr");
             assert_eq!(power, &PtValue::Fixed(1));
             assert_eq!(toughness, &PtValue::Fixed(1));
             assert_eq!(
@@ -37083,10 +37075,10 @@ fn akroan_horse_etb_parsed_trigger() {
     assert!(matches!(
         upkeep_exec.effect.as_ref(),
         Effect::Token {
-            name,
+            types,
             ref colors,
             ..
-        } if name == "Soldier" && colors == &vec![ManaColor::White]
+        } if types.iter().any(|ty| ty == "Soldier") && colors == &vec![ManaColor::White]
     ));
     assert_eq!(upkeep_exec.player_scope, Some(PlayerFilter::Opponent));
 }

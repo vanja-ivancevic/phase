@@ -27549,7 +27549,12 @@ fn kozileks_command_modes_tokens_and_exile_creature_end_to_end() {
         .battlefield
         .iter()
         .copied()
-        .filter(|id| state.objects[id].name == "Eldrazi Spawn")
+        .filter(|id| {
+            let object = &state.objects[id];
+            object.is_token
+                && object.card_types.subtypes.iter().any(|ty| ty == "Eldrazi")
+                && object.card_types.subtypes.iter().any(|ty| ty == "Spawn")
+        })
         .collect();
     assert_eq!(
         spawns.len(),

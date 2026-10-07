@@ -704,10 +704,14 @@ fn semantically_unique_ref(matches: &[&TokenPreset]) -> Option<TokenImageRef> {
 /// trailing " Role" so a "Monster Role" token body matches its "Monster" face
 /// preset. Without this a DFC Role token ("Monster // Sorcerer"), whose source
 /// card links to BOTH face presets and so skips the single-preset fast path,
-/// never resolves an image ref and renders with no art. Non-Role names have no
-/// " Role" suffix and are unaffected; the accompanying subtype/type comparison
-/// still prevents a Role body from matching a non-Role preset.
+/// never resolves an image ref and renders with no art. The accompanying
+/// subtype/type comparison still prevents a Role body from matching a
+/// non-Role preset.
+/// CR 111.4: Generic rules names now include " Token", while MTGJSON's art
+/// catalog retains subtype labels. Reconcile only at this art/body lookup;
+/// never rewrite the live object's name or its serialized characteristics.
 fn role_normalized_display_name(name: &str) -> &str {
+    let name = name.strip_suffix(" Token").unwrap_or(name);
     name.strip_suffix(" Role").unwrap_or(name)
 }
 
@@ -979,6 +983,31 @@ mod tests {
             );
         }
         assert!(checked > 0, "no Planeswalker presets in the catalog");
+    }
+
+    #[test]
+    fn generic_rules_name_keeps_source_linked_art_and_exact_body_guard() {
+        let preset = known_token_presets()
+            .iter()
+            .find(|preset| {
+                preset.body.display_name == "Elephant"
+                    && preset.body.power == Some(3)
+                    && preset.body.toughness == Some(3)
+                    && preset.body.colors == [ManaColor::Green]
+                    && preset
+                        .source_card_names
+                        .iter()
+                        .any(|name| name == "Call of the Herd")
+            })
+            .expect("the maintained catalog contains Call of the Herd's Elephant");
+        let (state, source) = state_with_source("Call of the Herd", None, &[preset.id.as_str()]);
+        let mut body = preset.body.clone();
+        body.display_name = "Elephant Token".to_string();
+        let image = find_exact_token_ref(&state, source, &body)
+            .expect("rules names must retain their exact source-linked catalog art");
+        assert_eq!(image.preset_id, preset.id);
+        body.power = Some(4);
+        assert!(find_exact_token_ref(&state, source, &body).is_none());
     }
 
     #[test]

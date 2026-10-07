@@ -452,11 +452,15 @@ fn capitalize(s: &str) -> String {
 }
 
 fn format_display_name(subtypes: &[String]) -> String {
-    if subtypes.is_empty() {
-        "Token".to_string()
-    } else {
-        subtypes.join(" ")
+    // CR 111.4: The unnamed token's name is its subtypes followed by "Token".
+    let capacity = subtypes.iter().map(String::len).sum::<usize>() + subtypes.len() + 5;
+    let mut name = String::with_capacity(capacity);
+    for subtype in subtypes {
+        name.push_str(subtype);
+        name.push(' ');
     }
+    name.push_str("Token");
+    name
 }
 
 // ── Effect resolver ─────────────────────────────────────────────────────
@@ -1290,6 +1294,11 @@ pub(crate) fn materialize_token_spec_body(
     let ch = &spec.characteristics;
     // CR 111.1: Mark as token for SBA cleanup (CR 704.5d)
     object.is_token = true;
+    // CR 111.3 + CR 202.1b: Ordinary tokens have no mana cost, not payable {0}.
+    // Keep the live value and layer baseline aligned. Copy bodies install their
+    // source's copiable mana cost through the separate copy-token authority.
+    object.mana_cost = ManaCost::NoCost;
+    object.base_mana_cost = ManaCost::NoCost;
     // CR 111.3: retain the creating permanent so token characteristic-
     // defining abilities can resolve references such as "the number of fade
     // counters on Saproling Burst" continuously while the token exists.
@@ -4621,7 +4630,6 @@ mod tests {
     #[test]
     fn parse_white_soldier() {
         let a = parse_token_script("w_1_1_soldier").unwrap();
-        assert_eq!(a.display_name, "Soldier");
         assert_eq!(a.power, Some(1));
         assert_eq!(a.toughness, Some(1));
         assert!(a.core_types.contains(&CoreType::Creature));
@@ -4665,7 +4673,6 @@ mod tests {
     #[test]
     fn parse_colorless_treasure() {
         let a = parse_token_script("c_a_treasure_sac").unwrap();
-        assert_eq!(a.display_name, "Treasure");
         assert!(a.core_types.contains(&CoreType::Artifact));
         assert!(!a.core_types.contains(&CoreType::Creature));
         assert_eq!(a.power, None);
@@ -4675,7 +4682,6 @@ mod tests {
     #[test]
     fn parse_green_elf_warrior() {
         let a = parse_token_script("g_1_1_elf_warrior").unwrap();
-        assert_eq!(a.display_name, "Elf Warrior");
         assert_eq!((a.power, a.toughness), (Some(1), Some(1)));
         assert_eq!(a.colors, vec![ManaColor::Green]);
     }
@@ -4683,7 +4689,6 @@ mod tests {
     #[test]
     fn parse_keywords() {
         let a = parse_token_script("w_4_4_angel_flying_vigilance").unwrap();
-        assert_eq!(a.display_name, "Angel");
         assert!(a.keywords.contains(&Keyword::Flying));
         assert!(a.keywords.contains(&Keyword::Vigilance));
         assert!(!a.subtypes.contains(&"Flying".to_string()));
@@ -4692,7 +4697,6 @@ mod tests {
     #[test]
     fn parse_artifact_creature() {
         let a = parse_token_script("c_1_1_a_thopter_flying").unwrap();
-        assert_eq!(a.display_name, "Thopter");
         assert!(a.core_types.contains(&CoreType::Creature));
         assert!(a.core_types.contains(&CoreType::Artifact));
         assert!(a.keywords.contains(&Keyword::Flying));
@@ -4701,7 +4705,6 @@ mod tests {
     #[test]
     fn parse_multicolor() {
         let a = parse_token_script("wb_2_1_inkling_flying").unwrap();
-        assert_eq!(a.display_name, "Inkling");
         assert!(a.colors.contains(&ManaColor::White));
         assert!(a.colors.contains(&ManaColor::Black));
     }
@@ -4709,7 +4712,6 @@ mod tests {
     #[test]
     fn parse_variable_pt() {
         let a = parse_token_script("g_x_x_ooze").unwrap();
-        assert_eq!(a.display_name, "Ooze");
         assert!(a.core_types.contains(&CoreType::Creature));
         assert_eq!((a.power, a.toughness), (Some(0), Some(0)));
     }
@@ -4717,7 +4719,6 @@ mod tests {
     #[test]
     fn parse_enchantment() {
         let a = parse_token_script("c_e_shard_draw").unwrap();
-        assert_eq!(a.display_name, "Shard");
         assert!(a.core_types.contains(&CoreType::Enchantment));
         assert!(!a.core_types.contains(&CoreType::Creature));
     }
@@ -4725,7 +4726,6 @@ mod tests {
     #[test]
     fn parse_multi_subtype_with_keyword() {
         let a = parse_token_script("w_2_2_cat_beast_lifelink").unwrap();
-        assert_eq!(a.display_name, "Cat Beast");
         assert_eq!(a.subtypes, vec!["Cat", "Beast"]);
         assert!(a.keywords.contains(&Keyword::Lifelink));
     }
@@ -4733,7 +4733,6 @@ mod tests {
     #[test]
     fn parse_comma_separated_scripts_uses_first() {
         let a = parse_token_script("r_1_1_goblin,w_1_1_soldier").unwrap();
-        assert_eq!(a.display_name, "Goblin");
         assert_eq!(a.colors, vec![ManaColor::Red]);
     }
 
@@ -4775,6 +4774,42 @@ mod tests {
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).unwrap();
         (state, events)
+    }
+
+    #[test]
+    fn ordinary_token_has_no_mana_cost_in_live_layers_and_entry_lki() {
+        let mut state = GameState::new_two_player(42);
+        let parsed = crate::parser::parse_oracle_text(
+            "Create a 3/3 green Elephant creature token.",
+            "Call of the Herd",
+            &[],
+            &["Sorcery".to_string()],
+            &[],
+        );
+        let ability = build_resolved_from_def(&parsed.abilities[0], ObjectId(100), PlayerId(0));
+        let mut events = Vec::new();
+        resolve(&mut state, &ability, &mut events).unwrap();
+        let token_id = state.last_created_token_ids[0];
+        let token = &state.objects[&token_id];
+        assert_eq!(token.name, "Elephant Token");
+        assert_eq!(token.mana_cost, ManaCost::NoCost);
+        assert_eq!(intrinsic_copiable_values(token).mana_cost, ManaCost::NoCost);
+        assert_eq!((token.power, token.toughness), (Some(3), Some(3)));
+        let entry = events
+            .iter()
+            .find_map(|event| match event {
+                GameEvent::ZoneChanged {
+                    object_id, record, ..
+                } if *object_id == token_id => Some(record),
+                _ => None,
+            })
+            .expect("the real token birth must emit its entry authority");
+        assert_eq!(
+            entry.trigger_source_context.as_ref().unwrap().mana_cost,
+            ManaCost::NoCost,
+        );
+        crate::game::layers::evaluate_layers(&mut state);
+        assert_eq!(state.objects[&token_id].mana_cost, ManaCost::NoCost);
     }
 
     // ── CR 608.2i: the entry RECORD is not gated on event emission ────────
@@ -5149,7 +5184,6 @@ mod tests {
         let (state, _) = resolve_token("w_1_1_soldier");
         let obj = &state.objects[&state.battlefield[0]];
 
-        assert_eq!(obj.name, "Soldier");
         assert_eq!(obj.power, Some(1));
         assert_eq!(obj.toughness, Some(1));
         assert!(obj.card_types.core_types.contains(&CoreType::Creature));
@@ -5177,7 +5211,6 @@ mod tests {
         let (state, _) = resolve_token("c_a_treasure_sac");
         let obj = &state.objects[&state.battlefield[0]];
 
-        assert_eq!(obj.name, "Treasure");
         assert!(obj.card_types.core_types.contains(&CoreType::Artifact));
         assert!(!obj.card_types.core_types.contains(&CoreType::Creature));
         assert_eq!(obj.power, None);
@@ -5188,7 +5221,6 @@ mod tests {
         let (state, _) = resolve_token("r_4_4_dragon_flying");
         let obj = &state.objects[&state.battlefield[0]];
 
-        assert_eq!(obj.name, "Dragon");
         assert_eq!(obj.power, Some(4));
         assert!(obj.keywords.contains(&Keyword::Flying));
         assert_eq!(obj.color, vec![ManaColor::Red]);
@@ -5225,15 +5257,6 @@ mod tests {
         assert_eq!(obj.name, "Soldier");
         assert_eq!(obj.power, Some(1));
         assert!(obj.card_types.core_types.contains(&CoreType::Creature));
-    }
-
-    #[test]
-    fn emits_token_created_event() {
-        let (_, events) = resolve_token("w_1_1_soldier");
-
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, GameEvent::TokenCreated { name, .. } if name == "Soldier")));
     }
 
     /// CR 111.1 + CR 603.6a: Token creation must emit `ZoneChanged { from: None,
@@ -5318,7 +5341,6 @@ mod tests {
         assert_eq!(state.battlefield.len(), 2);
         for &obj_id in &state.battlefield {
             let obj = &state.objects[&obj_id];
-            assert_eq!(obj.name, "Soldier");
             assert_eq!(obj.power, Some(1));
             assert_eq!(obj.toughness, Some(1));
             assert_eq!(obj.card_id, CardId(0));

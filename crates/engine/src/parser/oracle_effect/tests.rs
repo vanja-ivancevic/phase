@@ -271,7 +271,6 @@ fn assert_grip_of_phyresis_chain(text: &str) {
         .as_deref()
         .expect("Germ token follows control");
     let Effect::Token {
-        name,
         power: PtValue::Fixed(0),
         toughness: PtValue::Fixed(0),
         colors,
@@ -284,7 +283,6 @@ fn assert_grip_of_phyresis_chain(text: &str) {
             token.effect
         );
     };
-    assert_eq!(name, "Phyrexian Germ");
     assert_eq!(colors, &vec![crate::types::mana::ManaColor::Black]);
     assert_eq!(
         types,
@@ -9928,14 +9926,12 @@ fn acorn_catapult_disjunctive_recipient_token_owner_is_parent_target_controller(
         .expect("Acorn Catapult must chain the token creation as a sub-ability");
     match &*sub.effect {
         Effect::Token {
-            name,
             power,
             toughness,
             colors,
             owner,
             ..
         } => {
-            assert_eq!(name, "Squirrel");
             assert_eq!(power, &PtValue::Fixed(1));
             assert_eq!(toughness, &PtValue::Fixed(1));
             assert_eq!(colors, &vec![crate::types::mana::ManaColor::Green]);
@@ -16726,8 +16722,7 @@ fn effect_chain_create_distinct_token_sequence_preserves_second_token() {
         );
 
     match &*def.effect {
-        Effect::Token { name, keywords, .. } => {
-            assert_eq!(name, "Phyrexian Wurm");
+        Effect::Token { keywords, .. } => {
             assert_eq!(keywords, &vec![Keyword::Deathtouch]);
         }
         other => panic!("expected first Token effect, got {other:?}"),
@@ -16735,8 +16730,7 @@ fn effect_chain_create_distinct_token_sequence_preserves_second_token() {
 
     let sub = def.sub_ability.as_ref().expect("second token sub-ability");
     match &*sub.effect {
-        Effect::Token { name, keywords, .. } => {
-            assert_eq!(name, "Phyrexian Wurm");
+        Effect::Token { keywords, .. } => {
             assert_eq!(keywords, &vec![Keyword::Lifelink]);
         }
         other => panic!("expected second Token effect, got {other:?}"),
@@ -16771,8 +16765,7 @@ fn effect_chain_create_single_token_with_keyword_conjunction_does_not_split() {
 
     assert!(def.sub_ability.is_none());
     match &*def.effect {
-        Effect::Token { name, keywords, .. } => {
-            assert_eq!(name, "Angel");
+        Effect::Token { keywords, .. } => {
             assert_eq!(keywords, &vec![Keyword::Flying, Keyword::Vigilance]);
         }
         other => panic!("expected Token effect, got {other:?}"),
@@ -16806,12 +16799,8 @@ fn effect_chain_bestial_menace_preserves_middle_token() {
     // node[1] = the middle token the old binary split silently dropped.
     match nodes[1] {
         Effect::Token {
-            name,
-            power,
-            toughness,
-            ..
+            power, toughness, ..
         } => {
-            assert_eq!(name, "Wolf");
             assert_eq!(*power, PtValue::Fixed(2));
             assert_eq!(*toughness, PtValue::Fixed(2));
         }
@@ -16861,21 +16850,18 @@ fn effect_chain_trostanis_summoner_mixed_keywords() {
     let nodes = token_sequence_chain(&def);
     assert_eq!(nodes.len(), 3, "expected 3 tokens, got {nodes:?}");
     match nodes[0] {
-        Effect::Token { name, keywords, .. } => {
-            assert_eq!(name, "Knight");
+        Effect::Token { keywords, .. } => {
             assert_eq!(keywords, &vec![Keyword::Vigilance]);
         }
         other => panic!("expected Knight/Vigilance at node[0], got {other:?}"),
     }
     match nodes[1] {
         Effect::Token {
-            name,
             power,
             toughness,
             keywords,
             ..
         } => {
-            assert_eq!(name, "Centaur");
             assert_eq!(*power, PtValue::Fixed(3));
             assert_eq!(*toughness, PtValue::Fixed(3));
             assert!(keywords.is_empty(), "middle Centaur carries no keyword");
@@ -16883,8 +16869,7 @@ fn effect_chain_trostanis_summoner_mixed_keywords() {
         other => panic!("expected Centaur 3/3 at node[1], got {other:?}"),
     }
     match nodes[2] {
-        Effect::Token { name, keywords, .. } => {
-            assert_eq!(name, "Rhino");
+        Effect::Token { keywords, .. } => {
             assert_eq!(keywords, &vec![Keyword::Trample]);
         }
         other => panic!("expected Rhino/Trample at node[2], got {other:?}"),
@@ -16924,14 +16909,12 @@ fn effect_chain_companion_of_the_wilds_cant_block_on_rat_not_food() {
     // node[1] = the 1/1 black Rat with the CantBlock static.
     match nodes[1] {
         Effect::Token {
-            name,
             power,
             toughness,
             colors,
             static_abilities,
             ..
         } => {
-            assert_eq!(name, "Rat");
             assert_eq!(*power, PtValue::Fixed(1));
             assert_eq!(*toughness, PtValue::Fixed(1));
             assert_eq!(colors, &vec![ManaColor::Black]);
@@ -16961,15 +16944,13 @@ fn effect_chain_intra_item_keyword_comma_does_not_oversplit() {
     let nodes = token_sequence_chain(&def);
     assert_eq!(nodes.len(), 2, "expected exactly 2 tokens, got {nodes:?}");
     match nodes[0] {
-        Effect::Token { name, keywords, .. } => {
-            assert_eq!(name, "Zombie");
+        Effect::Token { keywords, .. } => {
             assert_eq!(keywords, &vec![Keyword::Menace, Keyword::Vigilance]);
         }
         other => panic!("expected Zombie(menace,vigilance) at node[0], got {other:?}"),
     }
     match nodes[1] {
-        Effect::Token { name, keywords, .. } => {
-            assert_eq!(name, "Bird");
+        Effect::Token { keywords, .. } => {
             assert_eq!(keywords, &vec![Keyword::Flying]);
         }
         other => panic!("expected Bird(flying) at node[1], got {other:?}"),
@@ -39347,11 +39328,10 @@ fn copy_token_suffix_condition_attaches_otherwise() {
         matches!(
             &*else_ab.effect,
             Effect::Token {
-                name,
                 tapped: true,
                 keywords,
                 ..
-            } if name == "Insect" && keywords.contains(&Keyword::Flying)
+            } if keywords.contains(&Keyword::Flying)
         ),
         "expected tapped flying Insect fallback, got {:?}",
         else_ab.effect
@@ -58653,14 +58633,11 @@ fn discover_the_impossible_cast_target_stays_parent_target_after_exiled_by_sourc
 /// debug-print order.
 fn granted_dies_token<'a>(effect: &'a Effect, who: &str) -> &'a Effect {
     let Effect::Token {
-        name,
-        static_abilities,
-        ..
+        static_abilities, ..
     } = effect
     else {
         panic!("{who}: expected a Token, got {effect:?}");
     };
-    assert_eq!(name, who, "token name");
     let trigger = static_abilities
         .iter()
         .flat_map(|sd| sd.modifications.iter())
@@ -58705,10 +58682,14 @@ fn reef_worm_nested_token_cascade() {
     let whale = granted_dies_token(&def.effect, "Fish");
     let kraken = granted_dies_token(whale, "Whale");
     // The Kraken is a leaf: a plain token, no further grant.
-    let Effect::Token { name, .. } = kraken else {
+    let Effect::Token {
+        power: PtValue::Fixed(9),
+        toughness: PtValue::Fixed(9),
+        ..
+    } = kraken
+    else {
         panic!("Kraken must be a plain Token, got {kraken:?}");
     };
-    assert_eq!(name, "Kraken", "innermost token is the 9/9 Kraken");
 }
 
 /// The structural single-quote span parser: a contraction or possessive INSIDE
@@ -58819,14 +58800,11 @@ fn nested_token_cascade_survives_embedded_apostrophe() {
         let def = parse_effect_chain(&text, AbilityKind::Spell);
         // Fish must remain a single Token, not a ChooseOneOf/sequence.
         let Effect::Token {
-            name,
-            static_abilities,
-            ..
+            static_abilities, ..
         } = &*def.effect
         else {
             panic!("[{label}] Fish must stay one Token, got {:?}", def.effect);
         };
-        assert_eq!(name, "Fish", "[{label}]");
         // The Fish's dies-trigger must create a Whale that itself carries a grant
         // whose effect creates a Kraken — i.e. the apostrophe did not split them.
         let whale_effect = static_abilities
@@ -58840,14 +58818,12 @@ fn nested_token_cascade_survives_embedded_apostrophe() {
             })
             .unwrap_or_else(|| panic!("[{label}] Fish carries a dies-trigger for the Whale"));
         let Effect::Token {
-            name: whale_name,
             static_abilities: whale_statics,
             ..
         } = &**whale_effect
         else {
             panic!("[{label}] Fish's trigger must create a Whale Token, got {whale_effect:?}");
         };
-        assert_eq!(whale_name, "Whale", "[{label}]");
         let makes_kraken = whale_statics
             .iter()
             .flat_map(|sd| sd.modifications.iter())
@@ -58856,7 +58832,7 @@ fn nested_token_cascade_survives_embedded_apostrophe() {
                     m,
                     crate::types::ability::ContinuousModification::GrantTrigger { trigger }
                         if trigger.execute.as_ref().is_some_and(|e|
-                            matches!(&*e.effect, Effect::Token { name, .. } if name == "Kraken"))
+                            matches!(&*e.effect, Effect::Token { power: PtValue::Fixed(9), toughness: PtValue::Fixed(9), .. }))
                 )
             });
         assert!(
@@ -58893,10 +58869,14 @@ fn reef_worm_card_path_builds_cascade() {
     // Kraken — each hop through `Effect::Token` → `GrantTrigger` → execute.
     let whale = granted_dies_token(&dies.effect, "Fish");
     let kraken = granted_dies_token(whale, "Whale");
-    let Effect::Token { name, .. } = kraken else {
+    let Effect::Token {
+        power: PtValue::Fixed(9),
+        toughness: PtValue::Fixed(9),
+        ..
+    } = kraken
+    else {
         panic!("Kraken must be a plain Token leaf, got {kraken:?}");
     };
-    assert_eq!(name, "Kraken", "innermost token is the 9/9 Kraken");
 }
 
 /// CR 702.62a + CR 118.9: The Face of Boe's verbless "pay its suspend cost

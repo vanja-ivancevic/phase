@@ -732,10 +732,12 @@ fn exile_return_occurs_before_a_pending_resolution_choice() {
         .any(|entry| entry.source_id == returned_id));
     let mut trigger_events = Vec::new();
     crate::game::stack::resolve_top(state, &mut trigger_events);
-    assert!(state
-        .battlefield
-        .iter()
-        .any(|id| state.objects[id].name == "Soldier"));
+    assert!(state.battlefield.iter().any(|id| state.objects[id].is_token
+        && state.objects[id]
+            .card_types
+            .subtypes
+            .iter()
+            .any(|ty| ty == "Soldier")));
 }
 
 /// CR 400.7 + CR 610.3a + CR 611.2: Full integration test using the real
