@@ -210,6 +210,14 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 104 — GameEvent.CoinFlipped replaces `won: boolean` with a typed
+ *      `result` ("Won" | "Lost" | "Heads" | "Tails"; CR 705.2 face-only flips
+ *      have no winner); serialized state gains Effect.FlipCoin.result_is_face,
+ *      the per-player coin-face ledger, the parked coin instruction, and the
+ *      LinkedBattlefieldReturn target filter with its exact-incarnation links
+ *      (CR 607.2c), plus the cost-owned Exile.same_zone_owner constraint.
+ *      A v103 peer cannot parse the event or retain the new payment rule;
+ *      there is no `won` fallback. P2P moves in lockstep (wire 86); lobby stays 15.
  * 103 — FormatConfig loses `allow_experimental_dungeons`: the per-session
  *      flag is gone and the Baldur's Gate Wilderness pool is format-derived
  *      (Freeform and Freeform Commander only). A v102 peer would parse the
@@ -682,7 +690,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 103;
+export const PROTOCOL_VERSION = 104;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

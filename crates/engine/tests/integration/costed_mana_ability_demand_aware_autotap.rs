@@ -92,6 +92,7 @@ fn wubrg_spell_funded_by_two_signets_and_two_plains_resolves() {
     // legal line (Plains -> Dimir, Plains -> Gruul, pool {U}{B}{R}{G}) resolves.
     let mut scenario = GameScenario::new_n_player(2, 7);
     scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_land_to_library_top(P0, "Drawable land");
 
     // Exactly two Plains: one per Signet `{1}` sub-cost. No spare colorless or
     // extra colored source — if a Signet's `{1}` consumes a reserved floated
@@ -231,6 +232,7 @@ fn reserved_sibling_rock_not_cross_tapped_for_nested_sub_cost() {
     // exclusion does not strand the payment.
     let mut scenario = GameScenario::new_n_player(2, 7);
     scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_land_to_library_top(P0, "Drawable land");
 
     let plains: Vec<ObjectId> = (0..3)
         .map(|_| scenario.add_basic_land(P0, ManaColor::White))
@@ -317,6 +319,7 @@ fn wurg_spell_funded_by_two_disjoint_signets_with_surplus_white_resolves() {
     // (Plains -> Azorius, Plains -> Gruul, pool {W}{U}{R}{G}) resolves.
     let mut scenario = GameScenario::new_n_player(2, 7);
     scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_land_to_library_top(P0, "Drawable land");
 
     let plains1 = scenario.add_basic_land(P0, ManaColor::White);
     let plains2 = scenario.add_basic_land(P0, ManaColor::White);
@@ -392,6 +395,7 @@ fn wubrg_three_signets_resolves() {
     // surplus white Plains units for the generic `{1}` pips. Resolves.
     let mut scenario = GameScenario::new_n_player(2, 7);
     scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_land_to_library_top(P0, "Drawable land");
 
     let plains: Vec<ObjectId> = (0..3)
         .map(|_| scenario.add_basic_land(P0, ManaColor::White))
@@ -466,6 +470,7 @@ fn ww_u_cost_does_not_touch_demanded_white_at_count_equal_demand_resolves() {
     // Stone — never the reserved white or singleton blue. Resolves.
     let mut scenario = GameScenario::new_n_player(2, 7);
     scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_land_to_library_top(P0, "Drawable land");
 
     let plains = scenario.add_basic_land(P0, ManaColor::White);
 
@@ -534,6 +539,7 @@ fn signet_one_cost_paid_from_only_demanded_float_no_surplus_no_hard_block() {
     // produced {W}{U}. Resolves.
     let mut scenario = GameScenario::new_n_player(2, 7);
     scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_land_to_library_top(P0, "Drawable land");
 
     let azorius = scenario
         .add_creature_from_oracle(P0, "Azorius Signet", 0, 0, AZORIUS_SIGNET_ORACLE)

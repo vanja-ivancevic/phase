@@ -2921,6 +2921,7 @@ fn usable_disjunctive_permission_filter(filter: &TargetFilter) -> bool {
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource

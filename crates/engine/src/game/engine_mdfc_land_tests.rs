@@ -1040,10 +1040,10 @@ fn start_game_contest_is_bounded_no_hang() {
             let result = start_game(&mut state);
             let (rounds, winner) = contest_event(&result);
             assert!(
-                    rounds.len() <= FIRST_PLAYER_CONTEST_MAX_ROUNDS,
-                    "contest must terminate within the bounded reroll cap (got {} rounds, cap {FIRST_PLAYER_CONTEST_MAX_ROUNDS})",
-                    rounds.len()
-                );
+                rounds.len() <= FIRST_PLAYER_CONTEST_MAX_ROUNDS,
+                "contest must terminate within the bounded reroll cap (got {} rounds, cap {FIRST_PLAYER_CONTEST_MAX_ROUNDS})",
+                rounds.len()
+            );
             assert!(state.seat_order.contains(&winner));
             assert_eq!(state.current_starting_player, winner);
         }

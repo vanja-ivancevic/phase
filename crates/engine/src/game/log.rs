@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::game::combat::AttackTarget;
 use crate::game::planechase::PlanarDieFace;
-use crate::types::ability::{AbilityTag, TargetRef};
+use crate::types::ability::{AbilityTag, CoinFlipResult, TargetRef};
 use crate::types::events::{GameEvent, PlayerActionKind};
 use crate::types::game_state::{GameState, StackObjectClass, ZoneChangeRecord};
 use crate::types::identifiers::ObjectId;
@@ -1955,10 +1955,15 @@ fn format_segments(event: &GameEvent, state: &GameState) -> Vec<LogSegment> {
             num(*result as i32),
         ],
 
-        GameEvent::CoinFlipped { player_id, won } => vec![
+        GameEvent::CoinFlipped { player_id, result } => vec![
             player_seg(state, *player_id),
             text(" flips a coin: "),
-            text(if *won { "wins" } else { "loses" }),
+            text(match result {
+                CoinFlipResult::Won => "wins",
+                CoinFlipResult::Lost => "loses",
+                CoinFlipResult::Heads => "heads",
+                CoinFlipResult::Tails => "tails",
+            }),
         ],
 
         GameEvent::RingTemptsYou { player_id, .. } => {
@@ -3209,7 +3214,7 @@ mod tests {
             },
             GameEvent::CoinFlipped {
                 player_id: PlayerId(0),
-                won: true,
+                result: CoinFlipResult::Won,
             },
             GameEvent::RingTemptsYou {
                 player_id: PlayerId(0),

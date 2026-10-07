@@ -3366,6 +3366,7 @@ fn classify_attach_host_authority(filter: &TargetFilter) -> AttachHostAuthority 
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::ChosenDamageSource { .. }
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }

@@ -82,6 +82,7 @@ pub(crate) fn translate_cost(cost_str: &str) -> Result<AbilityCost, ForgeTransla
                 let parts: Vec<&str> = inner.splitn(3, '/').collect();
                 let count: u32 = parts.first().and_then(|s| s.parse().ok()).unwrap_or(1);
                 costs.push(AbilityCost::Exile {
+                    same_zone_owner: false,
                     count,
                     zone: None,
                     filter: None,

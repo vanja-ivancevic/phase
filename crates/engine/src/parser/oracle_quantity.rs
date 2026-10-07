@@ -620,6 +620,13 @@ pub(crate) fn parse_quantity_ref_with_context(
                 });
             }
         }
+        // CR 608.2c + CR 701.20b: a revealed population is the preceding
+        // instruction's tracked set, not a battlefield census. Share the
+        // fully consumed filter lowering with the "for each" entry.
+        let lower_rest = rest.to_ascii_lowercase();
+        if let Some(qty) = parse_filtered_revealed_this_way(&lower_rest) {
+            return Some(qty);
+        }
         // CR 608.2c + CR 400.7: "the number of [filter] destroyed/sacrificed
         // this way" — count from the tracked set populated by the preceding
         // destroy/sacrifice in the sub_ability chain. Must run BEFORE
@@ -627,9 +634,7 @@ pub(crate) fn parse_quantity_ref_with_context(
         // and leave an unresolved "that were destroyed this way" tail.
         // Class: Kaya's Wrath (issue #2943), Ceaseless Conflict, and any
         // "equal to the number of … destroyed this way" lifegain phrasing.
-        if let Some(qty) =
-            parse_destroyed_or_sacrificed_this_way_quantity(&rest.to_ascii_lowercase())
-        {
+        if let Some(qty) = parse_destroyed_or_sacrificed_this_way_quantity(&lower_rest) {
             return Some(qty);
         }
         // CR 608.2c + CR 400.7j + CR 701.8a: "the number of <type> {returned | put
@@ -2596,9 +2601,26 @@ fn parse_filtered_revealed_this_way(lower: &str) -> Option<QuantityRef> {
         if let Ok(("", filter_phrase)) = result {
             let (filter, remainder) =
                 crate::parser::oracle_target::parse_type_phrase_folding(filter_phrase.trim());
-            if !remainder.trim().is_empty() {
-                continue;
-            }
+            let filter = if remainder.trim().is_empty() {
+                filter
+            } else {
+                // Reuse the existing nom chosen-color population grammar;
+                // only its fully consumed typed filter is transferred from
+                // ObjectCount to the revealed tracked-set domain.
+                let Ok((
+                    "",
+                    QuantityRef::ObjectCount {
+                        filter: TargetFilter::Typed(typed),
+                    },
+                )) = nom_quantity::parse_for_each_clause_ref(filter_phrase.trim())
+                else {
+                    continue;
+                };
+                if !typed.properties.contains(&FilterProp::IsChosenColor) {
+                    continue;
+                }
+                TargetFilter::Typed(typed)
+            };
             if filter_is_nontrivial_for_tracked_set(&filter) {
                 return Some(QuantityRef::FilteredTrackedSetSize {
                     filter: Box::new(filter),
@@ -3511,8 +3533,10 @@ fn parse_for_each_clause_with_they_controller(
         // Only emit `FilteredTrackedSetSize` when the filter restricts the
         // tracked set. Bare "destroyed this way" still falls through to the
         // unfiltered `TrackedSetSize`.
-        if let Some(qty) = parse_filtered_revealed_this_way(&lower) {
-            return Some(qty);
+        if lower.contains("revealed this way") {
+            // An unsupported revealed filter or trailing clause must not
+            // become the unfiltered "this way" fallback below.
+            return parse_filtered_revealed_this_way(&lower);
         }
         if let Some(qty) = parse_filtered_destroyed_this_way(&lower) {
             return Some(qty);
@@ -8204,6 +8228,21 @@ mod tests {
                 }
             }
             other => panic!("expected FilteredTrackedSetSize, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn revealed_chosen_color_count_rejects_unknown_qualifiers_and_tails() {
+        for phrase in [
+            "cards of that colorless revealed this way",
+            "cards of that color with blorgon revealed this way",
+            "cards of that color revealed this way with blorgon",
+        ] {
+            assert_eq!(parse_filtered_revealed_this_way(phrase), None, "{phrase}");
+            assert_eq!(parse_for_each_clause(phrase), None, "{phrase}");
+            let count = format!("the number of {phrase}");
+            assert_eq!(parse_quantity_ref(&count), None, "{count}");
+            assert_eq!(parse_event_context_quantity(&count), None, "{count}");
         }
     }
 

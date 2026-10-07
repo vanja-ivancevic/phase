@@ -916,11 +916,11 @@ fn chalice_of_the_void_enters_with_x_and_counters_matching_spell() {
         };
     }
     apply_oracle_to_object(
-            &mut state,
-            chalice,
-            "Chalice of the Void",
-            "This artifact enters with X charge counters on it.\nWhenever a player casts a spell with mana value equal to the number of charge counters on this artifact, counter that spell.",
-        );
+        &mut state,
+        chalice,
+        "Chalice of the Void",
+        "This artifact enters with X charge counters on it.\nWhenever a player casts a spell with mana value equal to the number of charge counters on this artifact, counter that spell.",
+    );
     let player = state
         .players
         .iter_mut()
@@ -1049,11 +1049,11 @@ fn walking_ballista_enters_with_x_counters_and_survives_zero_zero_sba() {
         };
     }
     apply_oracle_to_object(
-            &mut state,
-            ballista,
-            "Walking Ballista",
-            "Walking Ballista enters with X +1/+1 counters on it.\n{4}: Put a +1/+1 counter on this creature.\nRemove a +1/+1 counter from this creature: It deals 1 damage to any target.",
-        );
+        &mut state,
+        ballista,
+        "Walking Ballista",
+        "Walking Ballista enters with X +1/+1 counters on it.\n{4}: Put a +1/+1 counter on this creature.\nRemove a +1/+1 counter from this creature: It deals 1 damage to any target.",
+    );
     // Pay 2X = 8 colorless mana for X = 4.
     let player = state
         .players
@@ -1087,14 +1087,14 @@ fn walking_ballista_enters_with_x_counters_and_survives_zero_zero_sba() {
     // CR 614.1c: counters land before CR 704.5f checks 0 toughness, so
     // the Ballista must be alive on the battlefield, not in the graveyard.
     assert_eq!(
-            state.objects[&ballista].zone,
-            Zone::Battlefield,
-            "Walking Ballista must enter and survive — counters land before 0/0 SBA (CR 614.1c + CR 704.5f). \
+        state.objects[&ballista].zone,
+        Zone::Battlefield,
+        "Walking Ballista must enter and survive — counters land before 0/0 SBA (CR 614.1c + CR 704.5f). \
              Got zone {:?}, cost_x_paid={:?}, counters={:?}",
-            state.objects[&ballista].zone,
-            state.objects[&ballista].cost_x_paid,
-            state.objects[&ballista].counters,
-        );
+        state.objects[&ballista].zone,
+        state.objects[&ballista].cost_x_paid,
+        state.objects[&ballista].counters,
+    );
     assert_eq!(
         state.objects[&ballista]
             .counters
@@ -1705,11 +1705,11 @@ fn broadside_bombardiers_boast_activates_after_attacking_and_requires_sacrifice(
         obj.summoning_sick = false;
     }
     apply_oracle_to_object(
-            &mut state,
-            bombardiers,
-            "Broadside Bombardiers",
-            "Menace\nHaste\nBoast — Sacrifice another creature or artifact: This creature deals damage equal to 2 plus the sacrificed permanent's mana value to any target. (Activate only if this creature attacked this turn and only once each turn.)",
-        );
+        &mut state,
+        bombardiers,
+        "Broadside Bombardiers",
+        "Menace\nHaste\nBoast — Sacrifice another creature or artifact: This creature deals damage equal to 2 plus the sacrificed permanent's mana value to any target. (Activate only if this creature attacked this turn and only once each turn.)",
+    );
     let sacrifice = create_object(
         &mut state,
         CardId(9141),
@@ -5002,11 +5002,11 @@ fn black_dragon_gate_tap_offers_fixed_black_or_chosen_color() {
         obj.card_types.subtypes.push("Gate".to_string());
     }
     apply_oracle_to_object(
-            &mut state,
-            gate,
-            "Black Dragon Gate",
-            "This land enters tapped.\nAs this land enters, choose a color other than black.\n{T}: Add {B} or one mana of the chosen color.",
-        );
+        &mut state,
+        gate,
+        "Black Dragon Gate",
+        "This land enters tapped.\nAs this land enters, choose a color other than black.\n{T}: Add {B} or one mana of the chosen color.",
+    );
     state
         .objects
         .get_mut(&gate)
@@ -5068,11 +5068,11 @@ fn thriving_grove_play_land_stays_tapped_after_color_choice() {
         obj.card_types.core_types.push(CoreType::Land);
     }
     apply_oracle_to_object(
-            &mut state,
-            grove,
-            "Thriving Grove",
-            "This land enters tapped. As it enters, choose a color other than green.\n{T}: Add {G} or one mana of the chosen color.",
-        );
+        &mut state,
+        grove,
+        "Thriving Grove",
+        "This land enters tapped. As it enters, choose a color other than green.\n{T}: Add {G} or one mana of the chosen color.",
+    );
 
     let result = apply_as_current(
         &mut state,
@@ -5982,10 +5982,10 @@ fn two_hg_controlled_team_turn_routes_teammate_priority_to_controller() {
         }
     );
     assert_eq!(
-            turn_control::authorized_submitter(&state),
-            Some(PlayerId(2)),
-            "CR 117.6 + CR 805.5b move priority from the active team to the opposing team representative"
-        );
+        turn_control::authorized_submitter(&state),
+        Some(PlayerId(2)),
+        "CR 117.6 + CR 805.5b move priority from the active team to the opposing team representative"
+    );
     assert_eq!(
         state.priority_player,
         PlayerId(2),
@@ -5994,9 +5994,9 @@ fn two_hg_controlled_team_turn_routes_teammate_priority_to_controller() {
 
     let teammate_result = apply(&mut state, PlayerId(1), GameAction::PassPriority);
     assert!(
-            matches!(teammate_result, Err(EngineError::WrongPlayer)),
-            "active-team teammate must not submit after team-level priority has moved to P2: {teammate_result:?}"
-        );
+        matches!(teammate_result, Err(EngineError::WrongPlayer)),
+        "active-team teammate must not submit after team-level priority has moved to P2: {teammate_result:?}"
+    );
 
     let controller_result = apply(&mut state, PlayerId(2), GameAction::PassPriority);
     assert!(
@@ -7874,11 +7874,11 @@ fn gamble_searches_to_hand_then_discards_random_card() {
         obj.base_card_types = obj.card_types.clone();
     }
     apply_spell_oracle_to_object(
-            &mut state,
-            gamble,
-            "Gamble",
-            "Search your library for a card, put that card into your hand, discard a card at random, then shuffle.",
-        );
+        &mut state,
+        gamble,
+        "Gamble",
+        "Search your library for a card, put that card into your hand, discard a card at random, then shuffle.",
+    );
     let hand_a = create_object(
         &mut state,
         CardId(20),
@@ -7971,11 +7971,11 @@ fn disciple_of_bolas_uses_sacrificed_creature_power_for_life_and_draw() {
         };
     }
     apply_oracle_to_object(
-            &mut state,
-            disciple,
-            "Disciple of Bolas",
-            "When this creature enters, sacrifice another creature. You gain X life and draw X cards, where X is that creature's power.",
-        );
+        &mut state,
+        disciple,
+        "Disciple of Bolas",
+        "When this creature enters, sacrifice another creature. You gain X life and draw X cards, where X is that creature's power.",
+    );
 
     let hill_giant = create_object(
         &mut state,
@@ -12750,7 +12750,7 @@ fn academy_loremaster_may_slot_is_withheld_when_the_announcer_is_not_the_propose
                 WaitingFor::Priority { .. }
                     if !runner.state().stack.is_empty() && runner.state().phase == Phase::Draw =>
                 {
-                    return
+                    return;
                 }
                 WaitingFor::Priority { .. } => {
                     runner.act(GameAction::PassPriority).ok();

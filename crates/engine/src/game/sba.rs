@@ -57,36 +57,22 @@ fn has_siege_type(obj: &crate::game::game_object::GameObject) -> bool {
 }
 
 /// CR 704.4: state-based actions pay no attention to what happens during the
-/// resolution of a spell or ability. An entry that is mid-resolution — parked on
-/// a CR 616.1 replacement-ordering choice, or on a CR 303.4f Aura-host choice —
-/// is not yet the thing that entered, so the object-destroying SBAs (notably the
-/// CR 704.5m unattached-Aura sweep) must not see it.
+/// resolution of a spell or ability. This includes player loss: a player at
+/// nonpositive life still answers that resolution's choices until it completes.
+/// Object and prompt-owning SBAs likewise wait, so they cannot destroy an
+/// unsettled entering object or overwrite the resolution's prompt and orphan
+/// its carrier and parked frames.
 ///
-/// NOT `effects::waits_for_resolution_choice`, though the two overlap on
-/// `ReturnAsAuraTarget`. That predicate answers a different question — "must a
-/// chained sub-ability be stashed as a CR 608.2c continuation across this
-/// window?" — and answers it for some sixty prompt variants (Scry, Discard,
-/// Search, …). Reusing it here would suppress the CR 704.5 SBAs across every one
-/// of them, a behavior change with nothing to do with an in-flight ENTRY. It
-/// also cannot express the other half of this gate: `pending_replacement`, which
-/// is a parked event rather than a `WaitingFor` variant at all.
-fn mid_resolution_entry_pauses_sba(state: &GameState) -> bool {
-    // CR 704.4: a resolution carrier that is paused on a player prompt (an
-    // "each opponent may sacrifice" fan-out waiting on the next opponent, for
-    // instance) is reached only by the player-loss safety net in
-    // `reconcile_terminal_result`. The prompt-owning SBAs below (CR 903.9a
-    // commander zone return, CR 704.5j legend rule) would overwrite that
-    // paused prompt with their own, orphaning the carrier and its parked frames
-    // until `start_next_turn` rejects the turn. Every deferred SBA (CR 704.3)
-    // reruns on the ordinary priority-gated pass once the resolution completes;
-    // commander eligibility is state-derived, so the owner is still offered the
-    // choice then. A carrier inside a Priority window is NOT paused: the
-    // CR 724.1c / CR 724.2c checks run by `end_the_turn` and
-    // `end_combat_phase` keep their full SBA pass when the effect resolves
-    // from the stack. The same effects resolved from an accepted optional
-    // prompt (`resolve_optional_effect_decision` runs before the handler
-    // restores Priority) are a documented deferral: their object SBAs run on
-    // the next priority-gated pass instead.
+/// `pending_replacement` also covers a parked event before its `WaitingFor`
+/// variant is installed. `ReturnAsAuraTarget` covers the Aura-host choice even
+/// without a stack carrier. Later calls within the SBA loop use the same guard
+/// to stop when an SBA zone move parks a replacement or Aura-host choice.
+///
+/// A carrier inside a Priority window is NOT paused: the CR 724.1c / CR 724.2c
+/// checks run by `end_the_turn` and `end_combat_phase` keep their full SBA pass
+/// when the effect resolves from the stack. The same effects resolved from an
+/// accepted optional prompt defer their SBAs to the next priority-gated pass.
+pub(crate) fn mid_resolution_entry_pauses_sba(state: &GameState) -> bool {
     let paused_on_prompt = state.resolving_stack_entry.is_some()
         && !matches!(state.waiting_for, WaitingFor::Priority { .. });
     paused_on_prompt
@@ -111,6 +97,13 @@ pub(crate) fn check_state_based_actions_with_waiting_triggers(
     events: &mut Vec<GameEvent>,
     waiting: &[crate::game::triggers::PendingTriggerContext],
 ) {
+    // CR 704.3-704.4: defer ALL SBAs, including player loss, while a
+    // resolution owns the open choice. They rerun once resolution completes;
+    // negative life during resolution is not an already-eliminated player.
+    if mid_resolution_entry_pauses_sba(state) {
+        return;
+    }
+
     // CR 604.2: Re-evaluate layers so computed P/T reflects current static abilities.
     if state.layers_dirty.is_dirty() {
         // Snapshot P/T before layer re-evaluation for delta logging.
@@ -176,28 +169,6 @@ pub(crate) fn check_state_based_actions_with_waiting_triggers(
             if matches!(state.waiting_for, WaitingFor::GameOver { .. }) {
                 return;
             }
-        }
-
-        // CR 704.4: state-based actions pay no attention to what happens during
-        // the resolution of a spell or ability. If a replacement choice is
-        // ALREADY pending when this check runs, resolution is paused mid-event and
-        // the object-destroying SBAs below must not fire against a not-yet-settled
-        // object. The only way to reach here with `pending_replacement` set is
-        // `reconcile_terminal_result`'s player-loss safety net (engine.rs) running
-        // the loop while paused on a CR 616.1 replacement-order choice — e.g. a
-        // permanent entering as a 0/0 with two order-material "+1/+1 counters" ETB
-        // replacements whose application order the controller must choose. Its
-        // counters have not landed yet, so running `check_zero_toughness`
-        // (CR 704.5f) now would wrongly send the still-entering 0/0 to the
-        // graveyard. The normal priority-gated loop always enters with no pending
-        // replacement, and the player-loss block above cannot create one, so this
-        // guard is inert outside the reconcile path. The player-loss SBAs above
-        // have already run (the safety net's sole purpose); the remaining SBAs run
-        // on the next pass once the choice is answered. The later
-        // `pending_replacement` guard (after lethal-damage) still handles
-        // regeneration replacements created *within* this loop.
-        if mid_resolution_entry_pauses_sba(state) {
-            return;
         }
 
         // CR 903.9a: A commander in graveyard or exile (since last SBA check) may
@@ -2756,14 +2727,12 @@ mod tests {
         );
     }
 
-    /// CR 704.4 + CR 903.9a: the player-loss safety net runs SBAs while a
-    /// resolution is paused on an opponent's prompt (Fandaniel, Telophoroi
-    /// Ascian's "each opponent may sacrifice a nontoken creature" fan-out with
-    /// P2 still to answer). The dying player loses, but the commander-zone
-    /// choice for the sacrificed commander must wait for the priority-gated
-    /// pass after the resolution completes — issuing it now overwrites the
-    /// paused prompt and orphans the resolution carrier (ai-duel commander
-    /// suite seed 30777 aborted in `start_next_turn`).
+    /// CR 704.4 + CR 903.9a: while a resolution is paused on an opponent's
+    /// prompt (Fandaniel, Telophoroi Ascian's sacrifice fan-out with P2 still
+    /// to answer), both player loss and the sacrificed commander's zone choice
+    /// wait. Neither may overwrite the prompt or orphan the resolution carrier.
+    /// Once resolution completes, the ordinary SBA pass eliminates the dying
+    /// player and offers the commander's surviving owner the deferred choice.
     #[test]
     fn paused_resolution_defers_commander_zone_choice_until_resolution_completes() {
         use crate::types::resolution::OptionalEffectFrame;
@@ -2823,7 +2792,16 @@ mod tests {
         assert!(has_pending_player_loss_sba(&state));
         check_state_based_actions(&mut state, &mut events);
 
-        assert!(state.players[1].is_eliminated, "CR 704.5a still fires");
+        assert!(
+            !state.players[1].is_eliminated,
+            "CR 704.4 defers player loss until the resolution completes"
+        );
+        assert!(
+            events.is_empty(),
+            "no SBA fires during the paused resolution"
+        );
+        assert!(state.game_end.is_none());
+        assert_eq!(state.objects[&commander].zone, Zone::Graveyard);
         assert_eq!(
             state.waiting_for, paused_prompt,
             "the paused resolution prompt must survive the safety-net pass"
@@ -2831,8 +2809,8 @@ mod tests {
         assert!(state.resolving_stack_entry.is_some());
         assert_eq!(state.resolution_stack.len(), 1);
 
-        // The resolution completes; the ordinary priority-gated pass now offers
-        // the deferred CR 903.9a choice to the commander's owner.
+        // The resolution completes; the ordinary priority-gated pass now
+        // performs player loss and offers the deferred CR 903.9a choice.
         let _ = state
             .take_active_optional_effect_frame()
             .expect("frame is not buried")
@@ -2845,6 +2823,27 @@ mod tests {
             player: PlayerId(0),
         };
         check_state_based_actions(&mut state, &mut events);
+        assert!(state.players[1].is_eliminated, "CR 704.5a now fires");
+        assert!(state.resolving_stack_entry.is_none());
+        assert!(state.resolution_stack.is_empty());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        GameEvent::PlayerLost { player_id } if *player_id == PlayerId(1)
+                    )
+                })
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, GameEvent::GameOver { .. })),
+            "three surviving players keep the game going"
+        );
         assert!(matches!(
             state.waiting_for,
             WaitingFor::CommanderZoneChoice {
@@ -4559,12 +4558,10 @@ mod tests {
 
     #[test]
     fn sba_object_destroying_suppressed_while_replacement_choice_pending() {
-        // CR 704.4 + CR 616.1: reproduces the reconcile_terminal_result path —
-        // the player-loss safety net runs the SBA loop while resolution is paused
-        // mid-entry on a replacement-order choice. The concurrent player-loss SBA
-        // must still fire, but the object-destroying zero-toughness SBA must NOT
-        // run against a permanent still entering as a 0/0 (its counters have not
-        // landed). Three players so eliminating one does not end the game.
+        // CR 704.4 + CR 616.1: a replacement-order choice pauses resolution,
+        // including both player-loss and object-destroying SBAs. A permanent
+        // still entering as a 0/0 must survive until its entry work completes.
+        // Three players keep the resumed loss from ending the game.
         let mut state = GameState::new(FormatConfig::free_for_all(), 3, 42);
 
         // A permanent mid-entry as a 0/0 (ETB counters not yet placed), P0's.
@@ -4595,19 +4592,19 @@ mod tests {
             may_cost_remaining: None,
         });
 
-        // A concurrent player-loss SBA (P2 at 0 life) — the reason reconcile runs
-        // the SBA loop mid-choice in the first place.
+        // A concurrent loss condition must wait for the replacement choice.
         state.players[2].life = 0;
 
         let mut events = Vec::new();
         check_state_based_actions(&mut state, &mut events);
 
-        // Player-loss SBA still processed (guard sits AFTER the player-loss block)...
         assert!(
-            state.players[2].is_eliminated,
-            "player-loss SBA must still run while a replacement choice is pending"
+            !state.players[2].is_eliminated,
+            "player-loss SBAs must wait for the paused resolution"
         );
-        // ...but the still-entering 0/0 is spared (CR 704.4): zero-toughness skipped.
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, GameEvent::PlayerLost { .. })));
         assert_eq!(
             state.objects[&entering].zone,
             Zone::Battlefield,
@@ -4621,6 +4618,19 @@ mod tests {
         // exemption, is what spared it above.
         state.pending_replacement = None;
         check_state_based_actions(&mut state, &mut events);
+        assert!(state.players[2].is_eliminated);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::PlayerLost {
+                        player_id: PlayerId(2)
+                    }
+                ))
+                .count(),
+            1
+        );
         assert_eq!(
             state.objects[&entering].zone,
             Zone::Graveyard,
@@ -4728,17 +4738,15 @@ mod tests {
 
     #[test]
     fn sba_object_destroying_unfrozen_after_parked_chooser_eliminated() {
-        // CR 800.4a + CR 704.4: complements the sibling suppression test — here the
-        // eliminated player IS the parked chooser, so do_eliminate clears
-        // pending_replacement, the sba.rs guard no longer bails, and the
-        // object-destroying SBAs resume WITHIN the same check. 3 players so the game
-        // continues after one elimination.
+        // CR 800.4a + CR 704.4: a life-total loss waits for a parked replacement
+        // choice, but explicit departure still retires that player's choice.
+        // Object SBAs may resume once the departed chooser's pause is cleared.
         let mut state = GameState::new(FormatConfig::free_for_all(), 3, 42);
 
         // P0's 0/0 — spared by the guard while a replacement is pending.
         let entering = create_creature(&mut state, CardId(9130), PlayerId(0), "Entering 0/0", 0, 0);
 
-        // Chooser C = P2 is ALSO the loser (0 life). Latched key = ReplacementChoice{P2}.
+        // P2 has a loss condition while owning the replacement choice.
         state.players[2].life = 0;
         state.waiting_for = WaitingFor::ReplacementChoice {
             player: PlayerId(2),
@@ -4771,6 +4779,10 @@ mod tests {
         });
 
         let mut events = Vec::new();
+        check_state_based_actions(&mut state, &mut events);
+        assert!(!state.players[2].is_eliminated);
+        assert_eq!(state.objects[&entering].zone, Zone::Battlefield);
+        super::super::elimination::eliminate_player(&mut state, PlayerId(2), &mut events);
         check_state_based_actions(&mut state, &mut events);
 
         assert!(state.players[2].is_eliminated);

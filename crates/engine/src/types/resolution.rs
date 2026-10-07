@@ -110,6 +110,9 @@ pub struct OptionalEffectFrame {
 pub enum PendingCoinFlipKind {
     /// `Effect::FlipCoin` — a single logical flip.
     Single,
+    /// CR 705.2: A single heads/tails instruction (`Effect::FlipCoin` with
+    /// `result_is_face`); neither face wins or loses the flip.
+    SingleFace,
     /// `Effect::FlipCoins { count }` — `remaining` flips still to perform after
     /// the one currently paused for a keep choice.
     FlipN { remaining: u32 },
@@ -124,7 +127,8 @@ pub enum PendingCoinFlipKind {
 pub struct PendingCoinFlip {
     pub source_id: ObjectId,
     pub controller: PlayerId,
-    /// CR 705.2: The player who flips (and therefore wins or loses) the coin.
+    /// CR 705.2: The player who flips the coin. For a called flip this player
+    /// wins or loses it; for a `SingleFace` flip no player wins or loses.
     /// Defaults to the controller for in-flight states serialized before this
     /// field existed.
     #[serde(default)]

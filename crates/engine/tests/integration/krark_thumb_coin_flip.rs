@@ -18,7 +18,7 @@
 use engine::game::replacement::{replace_event, ReplacementResult};
 use engine::game::scenario::{GameScenario, P0, P1};
 use engine::parser::parse_oracle_text;
-use engine::types::ability::{Effect, QuantityExpr, ReplacementPlayerScope};
+use engine::types::ability::{CoinFlipResult, Effect, QuantityExpr, ReplacementPlayerScope};
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
 use engine::types::game_state::CastPaymentMode;
@@ -203,6 +203,7 @@ fn setup_single_flip(seed: u64) -> (engine::game::scenario::GameRunner, ObjectId
             win_effect: None,
             lose_effect: None,
             flipper: engine::types::ability::TargetFilter::Controller,
+            result_is_face: false,
         },
     );
     let mut runner = scenario.build();
@@ -244,7 +245,7 @@ fn single_flip_suspends_for_keep_choice_with_no_coin_flipped() {
 }
 
 /// G-NEW-1 + keep round-trip: after `SelectCoinFlips { [i] }`, EXACTLY ONE
-/// `CoinFlipped` fires with `won == results[i]`, and the engine returns to a
+/// `CoinFlipped` fires with the called result of `results[i]`, and the engine returns to a
 /// normal Priority state with the flip spell resolved.
 #[test]
 fn keeping_a_flip_emits_exactly_one_coin_flipped_and_returns_to_priority() {
@@ -288,18 +289,18 @@ fn keeping_a_flip_emits_exactly_one_coin_flipped_and_returns_to_priority() {
         })
         .expect("SelectCoinFlips must succeed");
 
-    let coin_flips: Vec<bool> = keep_result
+    let coin_flips: Vec<CoinFlipResult> = keep_result
         .events
         .iter()
         .filter_map(|e| match e {
-            GameEvent::CoinFlipped { won, .. } => Some(*won),
+            GameEvent::CoinFlipped { result, .. } => Some(*result),
             _ => None,
         })
         .collect();
     assert_eq!(
         coin_flips,
-        vec![expected_won],
-        "exactly one CoinFlipped with won == kept result"
+        vec![CoinFlipResult::from_won(expected_won)],
+        "exactly one CoinFlipped whose called result is the kept coin"
     );
 
     // The flip effect completed and we are back at Priority.

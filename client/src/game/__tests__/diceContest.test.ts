@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { GameAction, GameEvent, SubmitResult } from "../../adapter/types";
+import type { CoinFlipResult, GameAction, GameEvent, SubmitResult } from "../../adapter/types";
 import { useGameStore } from "../../stores/gameStore";
 import { usePreferencesStore } from "../../stores/preferencesStore";
 import { useUiStore } from "../../stores/uiStore";
@@ -13,9 +13,9 @@ const die = (player_id: number, sides: number, result: number): GameEvent => ({
   type: "DieRolled",
   data: { player_id, sides, result },
 });
-const coin = (player_id: number, won: boolean): GameEvent => ({
+const coin = (player_id: number, result: CoinFlipResult): GameEvent => ({
   type: "CoinFlipped",
-  data: { player_id, won },
+  data: { player_id, result },
 });
 // CR 706.6: a die ignored by a replacement (e.g. Wyll's drop-lowest).
 const ignoredDie = (player_id: number, sides: number, result: number): GameEvent => ({
@@ -221,21 +221,12 @@ describe("flashInGameRolls", () => {
     expect(d?.kind === "die" && d.rolls.length).toBe(2);
   });
 
-  it("shows a coin flip when the batch has no dice", () => {
-    flashInGameRolls([coin(1, true)]);
-    expect(useUiStore.getState().diceRoll).toMatchObject({
-      kind: "coin",
-      playerId: 1,
-      won: true,
-      context: "ability",
-    });
-  });
 
   it("queues every coin flip in an event batch", () => {
-    flashInGameRolls([coin(1, true), coin(1, false)]);
+    flashInGameRolls([coin(1, "Won"), coin(1, "Lost")]);
     const state = useUiStore.getState();
-    expect(state.diceRoll).toMatchObject({ kind: "coin", playerId: 1, won: true });
-    expect(state.diceRollQueue).toMatchObject([{ kind: "coin", playerId: 1, won: false }]);
+    expect(state.diceRoll).toMatchObject({ kind: "coin", playerId: 1, result: "Won" });
+    expect(state.diceRollQueue).toMatchObject([{ kind: "coin", playerId: 1, result: "Lost" }]);
   });
 
   it("no-ops on a batch containing neither dice nor coins", () => {
@@ -244,16 +235,16 @@ describe("flashInGameRolls", () => {
   });
 
   it("queues a co-occurring coin behind the dice instead of dropping it", () => {
-    flashInGameRolls([die(0, 20, 12), coin(0, true)]);
+    flashInGameRolls([die(0, 20, 12), coin(0, "Won")]);
     const s = useUiStore.getState();
     expect(s.diceRoll).toMatchObject({ kind: "die" });
     expect(s.diceRollQueue).toEqual([
-      { kind: "coin", playerId: 0, won: true, context: "ability" },
+      { kind: "coin", playerId: 0, result: "Won", context: "ability" },
     ]);
   });
 
   it("plays queued rolls serially: dice → coin → idle", () => {
-    flashInGameRolls([die(0, 20, 12), coin(0, true)]);
+    flashInGameRolls([die(0, 20, 12), coin(0, "Won")]);
     expect(useUiStore.getState().diceRoll?.kind).toBe("die");
     vi.advanceTimersByTime(2400); // one DICE_ROLL_DURATION_MS at speed 1
     expect(useUiStore.getState().diceRoll).toMatchObject({ kind: "coin" });

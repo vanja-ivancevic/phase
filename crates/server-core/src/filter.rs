@@ -420,6 +420,7 @@ mod tests {
             mass_library_order: None,
             enters_modified_if: None,
             duration: None,
+            same_zone_owner: false,
         };
 
         let filtered = filter_state_for_player(&state, PlayerId(1));
@@ -503,6 +504,7 @@ mod tests {
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
+            same_zone_owner: false,
         };
         state.pending_mass_library_order_choice = Some(Box::new(PendingMassLibraryOrderChoice {
             source_id: ObjectId(100),

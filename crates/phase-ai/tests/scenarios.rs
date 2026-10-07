@@ -1410,6 +1410,7 @@ fn curie_def() -> engine::types::ability::AbilityDefinition {
                         .controller(ControllerRef::You)
                         .properties(vec![FilterProp::Another, FilterProp::NonToken]),
                 )),
+                same_zone_owner: false,
             },
         ],
     })

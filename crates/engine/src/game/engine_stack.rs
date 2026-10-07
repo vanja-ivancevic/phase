@@ -52,7 +52,9 @@ pub(super) fn finalize_trigger_target_selection(
     // CR 601.2d + CR 603.3d: When a triggered ability divides damage or
     // counters among its targets, the controller announces that division while
     // putting the ability on the stack, after targets have been chosen.
-    if let Some(unit) = distribute {
+    if let Some(unit) = distribute
+        .filter(|unit| *unit != crate::types::game_state::DistributionUnit::EvenSplitDamage)
+    {
         if let Some(total) =
             extract_distribution_total(state, &trigger.ability, &trigger.ability.effect)
         {

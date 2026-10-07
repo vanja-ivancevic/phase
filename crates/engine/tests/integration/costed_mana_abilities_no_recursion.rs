@@ -215,6 +215,7 @@ fn both_signets_and_lands_fund_a_spell_no_over_exclusion() {
     // the permanent guard against the exclusion chain becoming too broad.
     let mut scenario = GameScenario::new_n_player(2, 7);
     scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_land_to_library_top(P0, "Drawable land");
 
     // Four untapped basic Plains: comfortably fund the activated Dimir Signet's
     // {1} sub-cost without any Signet-funds-Signet cross-payment.

@@ -445,6 +445,7 @@ fn fixup_bare_noun_continuations(costs: &mut [AbilityCost]) {
                                 AbilityCost::Sacrifice(SacrificeCost::count(filter, count))
                             }
                             PrecedingVerb::Exile { zone } => AbilityCost::Exile {
+                                same_zone_owner: false,
                                 count,
                                 zone: extract_filter_zone(&filter).or(zone),
                                 filter: Some(filter),
@@ -483,6 +484,7 @@ fn fixup_bare_noun_continuations(costs: &mut [AbilityCost]) {
                         AbilityCost::Sacrifice(SacrificeCost::count(filter, 1))
                     }
                     PrecedingVerb::Exile { zone } => AbilityCost::Exile {
+                        same_zone_owner: false,
                         count: 1,
                         zone,
                         filter: Some(filter),
@@ -1147,6 +1149,7 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
         // → GrantingObject).
         if let Some((filter, zone)) = try_parse_self_exile_cost(&rest_lower) {
             return AbilityCost::Exile {
+                same_zone_owner: false,
                 count: 1,
                 zone,
                 filter: Some(filter),
@@ -1155,6 +1158,7 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
         // "Exile the top card of your library" / "Exile the top N cards of your library"
         if let Some(count) = try_parse_exile_top_library(&rest_lower) {
             return AbilityCost::Exile {
+                same_zone_owner: false,
                 count,
                 zone: Some(Zone::Library),
                 filter: None,
@@ -1180,6 +1184,7 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
             .is_some()
             {
                 return AbilityCost::Exile {
+                    same_zone_owner: false,
                     count: EXILE_COST_X,
                     zone: Some(Zone::Graveyard),
                     filter: None,
@@ -1202,6 +1207,7 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
             .is_some()
             {
                 return AbilityCost::Exile {
+                    same_zone_owner: false,
                     count,
                     zone: Some(Zone::Graveyard),
                     filter: None,
@@ -1216,10 +1222,18 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
         let (filter, remainder) = parse_type_phrase_folding(filter_text);
         if remainder.trim().is_empty() {
             let zone = extract_filter_zone(&filter);
+            // Preserve the collective source qualifier before the shared
+            // object-filter parser normalizes singular and plural zone words.
+            let same_zone_owner = zone == Some(Zone::Graveyard)
+                && rest_lower
+                    .trim_end()
+                    .trim_end_matches('.')
+                    .ends_with(" from a single graveyard");
             return AbilityCost::Exile {
                 count,
                 zone,
                 filter: Some(filter),
+                same_zone_owner,
             };
         }
     }
@@ -1354,6 +1368,7 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
                     count: 3,
                     zone: Some(Zone::Graveyard),
                     filter: None,
+                    same_zone_owner: false,
                 },
                 AbilityCost::Sacrifice(SacrificeCost::count(
                     TargetFilter::Typed(TypedFilter::permanent().subtype("Food".to_string())),
@@ -3103,6 +3118,7 @@ mod tests {
                     count: 4,
                     zone: Some(Zone::Graveyard),
                     filter: Some(_),
+                    ..
                 }
             ),
             "Demilich's exile-four rider must lower to an Exile-from-graveyard cost, got {:?}",
@@ -3115,6 +3131,7 @@ mod tests {
                     count: 1,
                     zone: Some(Zone::Graveyard),
                     filter: Some(_),
+                    ..
                 }
             ),
             "Helbrute's exile-another-creature rider must lower to an Exile-from-graveyard cost, got {:?}",
@@ -3862,6 +3879,7 @@ mod tests {
                 count: EXILE_COST_X,
                 zone: Some(Zone::Graveyard),
                 filter: None,
+                same_zone_owner: false,
             }
         );
     }
@@ -3874,6 +3892,7 @@ mod tests {
                 count: 2,
                 zone: Some(Zone::Graveyard),
                 filter: None,
+                same_zone_owner: false,
             }
         );
     }
@@ -4354,6 +4373,7 @@ mod tests {
                 count,
                 zone,
                 filter,
+                ..
             } => {
                 assert_eq!(count, 1);
                 assert_eq!(zone, Some(crate::types::zones::Zone::Hand));
@@ -4527,6 +4547,7 @@ mod tests {
                 count: 1,
                 zone: Some(Zone::Graveyard),
                 filter: Some(TargetFilter::SelfRef),
+                same_zone_owner: false,
             }
         );
     }
@@ -4539,6 +4560,7 @@ mod tests {
                 count: 1,
                 zone: None,
                 filter: Some(TargetFilter::SelfRef),
+                same_zone_owner: false,
             }
         );
     }
@@ -4551,6 +4573,7 @@ mod tests {
                 count: 1,
                 zone: None,
                 filter: Some(TargetFilter::SelfRef),
+                same_zone_owner: false,
             }
         );
     }
@@ -4563,6 +4586,7 @@ mod tests {
                 count: 1,
                 zone: Some(Zone::Hand),
                 filter: Some(TargetFilter::SelfRef),
+                same_zone_owner: false,
             }
         );
     }
@@ -4575,6 +4599,7 @@ mod tests {
                 count: 1,
                 zone: Some(Zone::Library),
                 filter: None,
+                same_zone_owner: false,
             }
         );
     }

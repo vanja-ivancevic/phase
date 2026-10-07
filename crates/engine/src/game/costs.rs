@@ -77,6 +77,7 @@ fn find_eligible_exile_targets(
     source_id: ObjectId,
     zone: Zone,
     filter: Option<&TargetFilter>,
+    minimum_group_size: usize,
 ) -> Vec<ObjectId> {
     let ctx = FilterContext::from_source(state, source_id);
     let player_state = state.players.get(player.0 as usize);
@@ -97,36 +98,23 @@ fn find_eligible_exile_targets(
                 )
             });
 
-            if is_unrestricted {
-                // Scan all players' graveyards
-                state
-                    .players
-                    .iter()
-                    .flat_map(|p| p.graveyard.iter().copied())
-                    .filter(|&id| {
-                        id != source_id
-                            && filter.is_none_or(|f| {
-                                super::filter::matches_target_filter(state, id, f, &ctx)
-                            })
-                    })
-                    .collect()
-            } else {
-                // Scan only the payer's graveyard (controller-scoped)
-                player_state
-                    .map(|p| {
-                        p.graveyard
-                            .iter()
-                            .copied()
-                            .filter(|&id| {
-                                id != source_id
-                                    && filter.is_none_or(|f| {
-                                        super::filter::matches_target_filter(state, id, f, &ctx)
-                                    })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
+            let mut eligible = Vec::new();
+            for owner in &state.players {
+                if !is_unrestricted && owner.id != player {
+                    continue;
+                }
+                let start = eligible.len();
+                eligible.extend(owner.graveyard.iter().copied().filter(|&id| {
+                    id != source_id
+                        && filter.is_none_or(|f| {
+                            super::filter::matches_target_filter(state, id, f, &ctx)
+                        })
+                }));
+                if eligible.len() - start < minimum_group_size {
+                    eligible.truncate(start);
+                }
             }
+            eligible
         }
         Zone::Hand => player_state
             .map(|p| {
@@ -1216,6 +1204,7 @@ fn pay_ability_cost_inner(
             filter: Some(TargetFilter::SelfRef),
             zone,
             count: 1,
+            ..
         } => {
             let obj = state.objects.get(&source_id).ok_or_else(|| {
                 EngineError::InvalidAction("Source object not found for exile cost".to_string())
@@ -1248,6 +1237,7 @@ fn pay_ability_cost_inner(
             count,
             zone,
             filter,
+            same_zone_owner,
         } if !matches!(filter, Some(TargetFilter::SelfRef))
             && matches!(scope, PaymentScope::Resolution { .. }) =>
         {
@@ -1260,6 +1250,7 @@ fn pay_ability_cost_inner(
                 source_id,
                 effective_zone,
                 filter.as_ref(),
+                if *same_zone_owner { count } else { 0 },
             );
             let count = if any_number { eligible.len() } else { count };
             if eligible.len() < count {
@@ -1313,33 +1304,31 @@ fn pay_ability_cost_inner(
                 }
                 state.last_effect_count = Some(count as i32);
             } else {
-                state.waiting_for = WaitingFor::EffectZoneChoice {
-                    player,
-                    cards: eligible,
-                    count,
-                    min_count: 0,
-                    up_to: any_number,
-                    source_id,
-                    effect_kind: crate::types::ability::EffectKind::PayCost,
-                    zone: effective_zone,
-                    destination: Some(Zone::Exile),
-                    enter_tapped: crate::types::zones::EtbTapState::Unspecified,
-                    enter_transformed: false,
-                    enters_under_player: None,
-                    enters_attacking: false,
-                    owner_library: false,
-                    track_exiled_by_source: true,
-                    face_down_in_exile: crate::types::ability::ExileConcealment::Public,
-                    face_down_profile: None,
-                    enter_with_counters: vec![],
-                    conditional_enter_with_counters: vec![],
-                    count_param: 0,
-                    library_position: None,
-                    mass_library_order: None,
-                    is_cost_payment: true,
-                    enters_modified_if: None,
-                    duration: None,
-                };
+                state.waiting_for = WaitingFor::EffectZoneChoice { player,
+                cards: eligible,
+                count,
+                min_count: if any_number { 0 } else { count },
+                up_to: any_number,
+                source_id,
+                effect_kind: crate::types::ability::EffectKind::PayCost,
+                zone: effective_zone,
+                destination: Some(Zone::Exile),
+                enter_tapped: crate::types::zones::EtbTapState::Unspecified,
+                enter_transformed: false,
+                enters_under_player: None,
+                enters_attacking: false,
+                owner_library: false,
+                track_exiled_by_source: true,
+                face_down_in_exile: crate::types::ability::ExileConcealment::Public,
+                face_down_profile: None,
+                enter_with_counters: vec![],
+                conditional_enter_with_counters: vec![],
+                count_param: 0,
+                library_position: None,
+                mass_library_order: None,
+                is_cost_payment: true,
+                enters_modified_if: None,
+                duration: None, same_zone_owner: *same_zone_owner };
                 return Ok(PaymentOutcome::Paused {
                     remaining_cost: None,
                 });
@@ -2022,6 +2011,7 @@ pub(crate) fn is_direct_resolution_optional_payment_branch(cost: &AbilityCost) -
             count,
             zone: Some(_),
             filter,
+            ..
         } => *count > 0 && matches!(filter, None | Some(TargetFilter::Typed(_))),
         AbilityCost::Discard { .. }
         | AbilityCost::Exile { .. }
@@ -2424,7 +2414,7 @@ fn can_pay_resolution(
             count,
             zone,
             filter,
-            ..
+            same_zone_owner,
         } if !matches!(filter, Some(TargetFilter::SelfRef)) => {
             // CR 107.1c: zero is a legal choice for "any number", so this
             // cost never fails the resolution-time resource pre-gate.
@@ -2439,6 +2429,7 @@ fn can_pay_resolution(
                 ability.source_id,
                 effective_zone,
                 filter.as_ref(),
+                if *same_zone_owner { count } else { 0 },
             );
             eligible.len() >= count
         }
@@ -2730,6 +2721,7 @@ mod tests {
                 self_scope: DiscardSelfScope::FromHand,
             },
             AbilityCost::Exile { .. } => AbilityCost::Exile {
+                same_zone_owner: false,
                 count: 1,
                 zone: None,
                 filter: Some(TargetFilter::SelfRef),
@@ -2854,6 +2846,7 @@ mod tests {
                 self_scope: DiscardSelfScope::FromHand,
             },
             AbilityCost::Exile {
+                same_zone_owner: false,
                 count: 1,
                 zone: None,
                 filter: None,
@@ -2976,6 +2969,7 @@ mod tests {
                 self_scope: DiscardSelfScope::FromHand,
             },
             AbilityCost::Exile {
+                same_zone_owner: false,
                 count: 1,
                 zone: Some(Zone::Graveyard),
                 filter: None,
@@ -2999,6 +2993,7 @@ mod tests {
                 self_scope: DiscardSelfScope::FromHand,
             },
             AbilityCost::Exile {
+                same_zone_owner: false,
                 count: 1,
                 zone: None,
                 filter: None,
@@ -3614,6 +3609,7 @@ mod tests {
                     count: 1,
                     zone: None,
                     filter: Some(card_filter),
+                    same_zone_owner: false,
                 },
             ],
         };
@@ -3654,6 +3650,7 @@ mod tests {
                     count: 2,
                     zone: Some(Zone::Battlefield),
                     filter: Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact))),
+                    same_zone_owner: false,
                 },
             ],
         };
@@ -3697,6 +3694,7 @@ mod tests {
     #[test]
     fn self_ref_removal_legs_are_out_of_scope() {
         let self_exile = AbilityCost::Exile {
+            same_zone_owner: false,
             count: 1,
             zone: None,
             filter: Some(TargetFilter::SelfRef),

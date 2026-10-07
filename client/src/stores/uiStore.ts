@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type {
+  CoinFlipResult,
   ObjectAction,
   ObjectId,
   PlayerId,
@@ -66,9 +67,10 @@ export type DiceRollPayload =
   | {
       kind: "coin";
       playerId: PlayerId;
-      /** The engine `won` flag (relative to the flipping player); the overlay
-       *  maps it to a heads/tails face (presentation choice, not engine data). */
-      won: boolean;
+      /** The engine-authored result. `Won`/`Lost` (relative to the flipping
+       *  player) for a called flip; `Heads`/`Tails` for a face-only flip, which
+       *  has no winner (CR 705.2). */
+      result: CoinFlipResult;
       context: "startingPlayer" | "ability";
     };
 

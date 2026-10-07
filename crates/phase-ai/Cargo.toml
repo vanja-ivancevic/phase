@@ -67,6 +67,10 @@ name = "ai-gate"
 path = "src/bin/ai_gate.rs"
 
 [[bin]]
+name = "deck-corpus"
+path = "src/bin/deck_corpus.rs"
+
+[[bin]]
 name = "ai-perf-gate"
 path = "src/bin/ai_perf_gate.rs"
 test = false

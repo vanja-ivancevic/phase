@@ -192,23 +192,23 @@ pub(crate) fn target_selection_requires_reducer_validation(state: &GameState) ->
     matches!(&state.waiting_for, WaitingFor::TargetSelection { .. })
 }
 
-/// Whether a decision needs the reducer to validate an in-progress cast.
+/// Whether an announcement decision needs the reducer to validate its next step.
 ///
-/// CR 601.2b-c: a kicker declaration precedes target selection and may replace
-/// the spell's target requirements. The capability contract must therefore
-/// simulate each such payment decision before issuing it; otherwise an AI can
-/// decline the only target-enabling kicker and receive a targetless cast.
+/// CR 601.2b-c: optional and alternative costs can change target requirements,
+/// replace the printed cost, or finish payment even when targets were already
+/// selected. Validate both acceptance and decline, not only deferred targets.
+/// CR 107.3a + CR 601.2b/f + CR 602.2b: the affordable X range is only a numeric
+/// bound; a value can still lack a legal target or a payable activation cost.
+/// Keep the range protocol intact and issue its reducer-executable subset.
 /// CR 601.2h: an unfinished mana payment cannot be finalized, so its pass
 /// candidate must likewise be simulated before it enters the contract.
 fn decision_contract_requires_reducer_validation(state: &GameState) -> bool {
     target_selection_requires_reducer_validation(state)
-        || matches!(&state.waiting_for, WaitingFor::ManaPayment { .. })
         || matches!(
             &state.waiting_for,
-            WaitingFor::OptionalCostChoice {
-                pending_cast,
-                ..
-            } if pending_cast.deferred_target_selection
+            WaitingFor::ManaPayment { .. }
+                | WaitingFor::OptionalCostChoice { .. }
+                | WaitingFor::ChooseXValue { .. }
         )
 }
 

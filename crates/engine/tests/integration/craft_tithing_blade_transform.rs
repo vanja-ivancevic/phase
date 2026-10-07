@@ -99,6 +99,7 @@ fn craft_ability(cost: ManaCost) -> AbilityDefinition {
                 count: 1,
                 zone: Some(Zone::Battlefield),
                 filter: Some(TargetFilter::SelfRef),
+                same_zone_owner: false,
             },
             AbilityCost::ExileMaterials {
                 materials: craft_with_creature_materials(),

@@ -8,6 +8,7 @@ use engine::types::ability::{
     TypeFilter, TypedFilter,
 };
 use engine::types::actions::GameAction;
+use engine::types::events::GameEvent;
 use engine::types::game_state::{CastPaymentMode, PayCostKind, StackEntryKind, WaitingFor};
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
 use engine::types::phase::Phase;
@@ -94,17 +95,34 @@ fn tapped_artifact_mana_source_can_pay_spell_and_be_sacrificed_as_additional_cos
         other => panic!("expected sacrifice choice, got {other:?}"),
     }
 
-    runner
+    let payment = runner
         .act(GameAction::SelectCards { cards: vec![lens] })
         .expect("selected artifact should pay sacrifice cost after auto-tap mana");
+    let mut tapped = false;
+    let mut tapped_before_sacrifice = false;
+    for event in &payment.events {
+        match event {
+            GameEvent::PermanentTapped { object_id, .. } if *object_id == lens => {
+                tapped = true;
+            }
+            GameEvent::ZoneChanged {
+                object_id,
+                to: Zone::Graveyard,
+                ..
+            } if *object_id == lens => {
+                tapped_before_sacrifice = tapped;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        tapped_before_sacrifice,
+        "the mana source must tap before its sacrifice, not on the new graveyard object"
+    );
 
     assert!(
         matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
         "spell should be fully cast after using the artifact for mana and sacrifice"
-    );
-    assert!(
-        runner.state().objects[&lens].tapped,
-        "artifact should have tapped for mana before being sacrificed"
     );
     assert_eq!(
         runner.state().objects[&lens].zone,
@@ -192,13 +210,13 @@ fn manual_payment_defers_selected_artifact_sacrifice_until_mana_payment_commit()
         matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
         "spell should finish casting after manual mana payment"
     );
-    assert!(runner.state().objects[&lens].tapped);
     assert_eq!(runner.state().objects[&lens].zone, Zone::Graveyard);
 
     // ── PR #9157 blocker 2: the deferred sacrifice's cost-paid provenance ──
     //
-    // The assertions above pin the BOARD (tapped, in the graveyard). They say
-    // nothing about the provenance the payment published, and that is exactly
+    // The assertions above establish the completed cast and sacrifice. The
+    // former permanent's tap status belongs to its captured at-exit facts, not
+    // the new graveyard object. Payment provenance is checked below:
     // where the deferral bites: `handle_sacrifice_for_cost` captures the
     // selection and publishes it BEFORE returning through the deferral branch —
     // i.e. before the mana window — and the very permanent selected here is
@@ -604,7 +622,6 @@ fn x_cost_spell_defers_artifact_sacrifice_through_x_choice_and_mana_payment() {
         matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
         "X spell should finish casting after deferred sacrifice commit"
     );
-    assert!(runner.state().objects[&lens].tapped);
     assert_eq!(runner.state().objects[&lens].zone, Zone::Graveyard);
 }
 
@@ -892,7 +909,6 @@ fn deferred_sacrifice_artifact_granting_spend_permission_is_paid_before_it_leave
         matches!(runner.state().waiting_for, WaitingFor::Priority { .. }),
         "spell should finish casting after spending mana before the permission source leaves"
     );
-    assert!(runner.state().objects[&artifact].tapped);
     assert_eq!(runner.state().objects[&artifact].zone, Zone::Graveyard);
 }
 
@@ -942,6 +958,7 @@ fn deferred_sacrifice_permanent_is_not_exile_cost_choice_for_mana_ability() {
                 },
             )
             .cost(AbilityCost::Exile {
+                same_zone_owner: false,
                 count: 1,
                 zone: None,
                 filter: Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Creature))),

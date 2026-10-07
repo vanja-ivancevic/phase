@@ -7779,6 +7779,11 @@ pub enum TargetFilter {
     /// source (not the resolving ability), so a static grant resolves it against
     /// the permanent that HAS the static.
     ChosenCard,
+    /// CR 607.2c + CR 400.7: The exact battlefield incarnation put there by
+    /// this source's linked ability. Trigger placement freezes this relation
+    /// into ordinary incarnation-pinned ParentTarget referents. A death
+    /// instruction follows only the recorded immediate graveyard successor.
+    LinkedBattlefieldReturn,
     /// Matches exactly the objects in a tracked set.
     /// CR 603.7: Delayed triggers act on specific objects from the originating effect.
     TrackedSet {
@@ -13935,6 +13940,11 @@ pub enum AbilityCost {
         zone: Option<Zone>,
         #[serde(default)]
         filter: Option<TargetFilter>,
+        /// CR 400.1 + CR 601.2h: All selected objects must come from one
+        /// player's pile in `zone`, e.g. "from a single graveyard".
+        /// This constrains the complete cost payment, not individual objects.
+        #[serde(default)]
+        same_zone_owner: bool,
     },
     /// CR 702.167a/b: Craft's "Exile [materials] from among permanents you
     /// control and/or cards in your graveyard" component. Distinct from
@@ -19361,6 +19371,12 @@ pub enum Effect {
             skip_serializing_if = "is_target_filter_controller"
         )]
         flipper: TargetFilter,
+        /// CR 705.2: the instruction refers to heads/tails, not winning/losing.
+        /// A face-only flip records `Heads`/`Tails` for the flipper in the
+        /// per-player `GameState::resolution_coin_flips` ledger and never runs
+        /// a win/lose branch.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        result_is_face: bool,
     },
     /// CR 705: Flip N coins. `win_effect` runs once per heads (win),
     /// `lose_effect` runs once per tails (loss). Generalization of `FlipCoin`
@@ -21748,6 +21764,10 @@ impl TargetFilter {
                 // the whole ability (Amass head included) is removed from the
                 // stack for lack of a legal target before it ever resolves.
                 | TargetFilter::AmassedArmy
+                // CR 607.2c + CR 115.1: "the creature put onto the battlefield
+                // with this permanent" is a source-linked anaphor, not a chosen
+                // target. Its exact recipient is frozen at trigger stack-push.
+                | TargetFilter::LinkedBattlefieldReturn
                 | TargetFilter::ParentTarget
                 | TargetFilter::ParentTargetSlot { .. }
                 | TargetFilter::ParentTargetController
@@ -26372,8 +26392,8 @@ pub struct AbilityDefinition {
     /// timing is used for non-target instructions such as "return a land card
     /// from your graveyard" after another instruction has changed zone state.
     pub target_choice_timing: TargetChoiceTiming,
-    /// CR 601.2d: When set, the controller distributes this effect among chosen targets.
-    /// Triggers WaitingFor::DistributeAmong during casting target selection.
+    /// Division rule for this effect. Controller-chosen division is announced
+    /// after targets; even division is determined over legal targets at resolution.
     pub distribute: Option<DistributionUnit>,
     /// CR 118.12: "Effect unless [player] pays {cost}" — resolution-time payment modifier.
     /// Triggered abilities and normal spell/activated definitions use the same runtime
@@ -27559,6 +27579,12 @@ pub enum AbilityCondition {
     /// mid-resolution flip is not the trigger event, so the two read different
     /// state sources. Feeds `RepeatContinuation::WhileCondition` ("repeat this
     /// process") and any cross-sentence flip-result gate.
+    ///
+    /// CR 705.2 + CR 608.2c: a `Heads`/`Tails` result is a face qualification
+    /// ("each player whose coin comes up tails"). It binds to the scoped player
+    /// of the gated instruction (falling back to the controller) and reads that
+    /// player's own entry in `state.resolution_coin_flips`, never the scalar
+    /// last-flip record of whichever player flipped last.
     CoinFlipOutcome { result: CoinFlipResult },
     /// CR 603.12: "When you do" — a reflexive trigger based on whether the
     /// parent event actually occurred. An optional non-cost parent must be
@@ -29998,11 +30024,17 @@ pub struct CounterTriggerFilter {
     pub threshold: Option<u32>,
 }
 
-/// CR 705.2: Typed result filter for coin-flip triggers.
+/// CR 705.2: Typed result of one completed coin flip, and the result filter
+/// for coin-flip triggers and conditions. `Won`/`Lost` belong to instructions
+/// where the flipper calls the flip; `Heads`/`Tails` belong to face-only
+/// instructions, for which no player wins or loses the flip. The two pairs are
+/// never interchangeable: a `Heads` result does not satisfy a `Won` filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CoinFlipResult {
     Won,
     Lost,
+    Heads,
+    Tails,
 }
 
 impl CoinFlipResult {
@@ -30017,6 +30049,15 @@ impl CoinFlipResult {
             CoinFlipResult::Won
         } else {
             CoinFlipResult::Lost
+        }
+    }
+
+    /// CR 705.2: face-only instructions do not create a winning/losing player.
+    pub fn from_face(heads: bool) -> Self {
+        if heads {
+            CoinFlipResult::Heads
+        } else {
+            CoinFlipResult::Tails
         }
     }
 }
@@ -33778,9 +33819,8 @@ pub struct ResolvedAbility {
     /// Each entry maps a target to its assigned portion. Read at resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distribution: Option<Vec<(TargetRef, u32)>>,
-    /// CR 601.2d + CR 603.3d: Unassigned division metadata carried from the
-    /// definition until this stack object's targets and portions are announced.
-    /// Distinct from `distribution`, which stores the completed assignment.
+    /// Division rule carried from the definition. Controller-chosen portions
+    /// are stored in `distribution`; even division remains here for resolution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub distribute: Option<DistributionUnit>,
     /// Player scope for "each player/opponent [effect]" patterns.
@@ -38217,12 +38257,14 @@ mod tests {
             count: 1,
             zone: Some(Zone::Library),
             filter: None,
+            same_zone_owner: false,
         }
         .supports_cumulative_upkeep_payment());
         assert!(!AbilityCost::Exile {
             count: 1,
             zone: Some(Zone::Graveyard),
             filter: None,
+            same_zone_owner: false,
         }
         .supports_cumulative_upkeep_payment());
 
@@ -39192,6 +39234,7 @@ mod tests {
                 count: 1,
                 zone: None,
                 filter: Some(TypedFilter::creature().into()),
+                same_zone_owner: false,
             },
             AbilityCost::TapCreatures {
                 requirement: TapCreaturesRequirement::count(2),
@@ -40521,6 +40564,7 @@ mod tests {
                         count: 1,
                         zone: None,
                         filter: None,
+                        same_zone_owner: false,
                     },
                     vec![CostCategory::ExilesCards],
                 ),

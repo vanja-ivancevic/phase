@@ -138,7 +138,11 @@ pub(crate) fn parse_it_copula(input: &str) -> OracleResult<'_, bool> {
     alt((
         value(
             true,
-            alt((recognize((tag(" "), parse_isnt, tag(" "))), tag(" is not "))),
+            alt((
+                recognize((tag(" "), parse_isnt, tag(" "))),
+                tag(" is not "),
+                recognize((parse_apostrophe_s, tag(" not "))),
+            )),
         ),
         value(
             false,

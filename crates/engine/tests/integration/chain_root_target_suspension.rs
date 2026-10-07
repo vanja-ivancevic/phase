@@ -209,6 +209,7 @@ fn chain_root_targets_survive_a_real_coin_flip_keep_choice_suspension() {
                 win_effect: Some(Box::new(counter_gated_branch())),
                 lose_effect: Some(Box::new(counter_gated_branch())),
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             },
             vec![],
             source,

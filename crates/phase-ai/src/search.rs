@@ -13656,6 +13656,7 @@ mod tests {
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
+            same_zone_owner: false,
         };
     }
 
@@ -14414,6 +14415,7 @@ mod tests {
                 is_cost_payment: false,
                 enters_modified_if: None,
                 duration: None,
+                same_zone_owner: false,
             }
         });
         push("ConniveDiscard", &|state| {

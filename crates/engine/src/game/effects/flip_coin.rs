@@ -32,6 +32,52 @@ enum CoinFlipOutcome {
     Prevented,
 }
 
+/// Invalidate this player's previous result before proposing another flip. A
+/// prevented or still-unkept flip cannot satisfy a later result qualification.
+fn forget_player_flip(state: &mut GameState, player: PlayerId, result_is_face: bool) {
+    if state
+        .resolution_coin_flip
+        .is_some_and(|flip| flip.flipper == player)
+    {
+        state.resolution_coin_flip = None;
+    }
+    if result_is_face {
+        state
+            .resolution_coin_flips
+            .retain(|flip| flip.flipper != player);
+    }
+}
+
+/// Publish only a completed logical flip, never a coin ignored by replacement.
+/// CR 705: a heads/tails instruction has no winning or losing player.
+fn record_flip(
+    state: &mut GameState,
+    player: PlayerId,
+    heads: bool,
+    result_is_face: bool,
+    events: &mut Vec<GameEvent>,
+) {
+    let result = if result_is_face {
+        CoinFlipResult::from_face(heads)
+    } else {
+        CoinFlipResult::from_won(heads)
+    };
+    events.push(GameEvent::CoinFlipped {
+        player_id: player,
+        result,
+    });
+    let flip = ResolutionCoinFlip {
+        flipper: player,
+        result,
+    };
+    state.resolution_coin_flip = Some(flip);
+    if result_is_face {
+        // Proposal invalidation removed this player's preceding result; the
+        // completed logical flip is published exactly once, including resumes.
+        state.resolution_coin_flips.push(flip);
+    }
+}
+
 /// CR 705.1 + CR 614.1a: Route one logical coin flip through the CR 614
 /// replacement pipeline before touching the RNG, mirroring `draw`/`scry`/`mill`.
 ///
@@ -44,8 +90,10 @@ enum CoinFlipOutcome {
 fn flip_through_replacement(
     state: &mut GameState,
     player: PlayerId,
+    result_is_face: bool,
     events: &mut Vec<GameEvent>,
 ) -> CoinFlipOutcome {
+    forget_player_flip(state, player, result_is_face);
     let proposed = ProposedEvent::CoinFlip {
         player_id: player,
         count: 1,
@@ -54,50 +102,57 @@ fn flip_through_replacement(
 
     let count = match replacement::replace_event(state, proposed, events) {
         ReplacementResult::Execute(ProposedEvent::CoinFlip { count, .. }) => count,
-        // A different event was substituted, or nothing matched cleanly — treat
-        // as a normal single flip rather than guessing at a foreign event.
-        ReplacementResult::Execute(_) => 1,
+        // CR 614.6: replacing the flip with a different event does not also
+        // perform the original flip.
+        ReplacementResult::Execute(_) => return CoinFlipOutcome::Prevented,
         ReplacementResult::Prevented => return CoinFlipOutcome::Prevented,
         ReplacementResult::NeedsChoice(choice_player) => {
-            // CR 614 interactive replacement (none ship for CoinFlip today, but
-            // stay correct if one is added): defer to the replacement-choice UI.
+            // CR 616.1: competing mandatory replacements also require ordering.
             state.waiting_for =
                 crate::game::replacement::replacement_choice_waiting_for(choice_player, state);
             return CoinFlipOutcome::Suspended;
         }
     };
+    execute_replaced_flip(state, player, count, result_is_face, events)
+}
 
+/// Consume the replacement pipeline's count without proposing the flip again.
+fn execute_replaced_flip(
+    state: &mut GameState,
+    player: PlayerId,
+    count: u32,
+    result_is_face: bool,
+    events: &mut Vec<GameEvent>,
+) -> CoinFlipOutcome {
     if count == 0 {
         return CoinFlipOutcome::Prevented;
     }
 
-    // CR 705.1: flip each coin with the game's seeded RNG.
-    let results: Vec<bool> = (0..count).map(|_| state.rng.random_bool(0.5)).collect();
-
     if count == 1 {
-        let won = results[0];
-        events.push(GameEvent::CoinFlipped {
-            player_id: player,
-            won,
-        });
-        // CR 705.2: record the flipper's result so a `WhileCondition` loop gate
-        // ("if you lose the flip, repeat this process") can read it after the
-        // resolution's tail runs. Overwrite-on-produce, mirroring reveal tracking.
-        state.resolution_coin_flip = Some(ResolutionCoinFlip {
-            flipper: player,
-            result: CoinFlipResult::from_won(won),
-        });
+        let won = state.rng.random_bool(0.5);
+        record_flip(state, player, won, result_is_face, events);
         CoinFlipOutcome::Resolved(won)
     } else {
         // CR 614.1a + CR 705.1: Krark's Thumb — keep one, ignore the rest. The
         // kept flip's `CoinFlipped` is emitted in `resume_after_keep` so the
         // ignored flips never "happen".
+        let results: Vec<bool> = (0..count).map(|_| state.rng.random_bool(0.5)).collect();
         state.waiting_for = WaitingFor::CoinFlipKeepChoice {
             player,
             results,
             keep_count: 1,
         };
         CoinFlipOutcome::Suspended
+    }
+}
+
+/// Mirror die-roll instruction ownership: before replacement ordering there
+/// are no coins to keep, so do not park a keep-choice frame over that prompt.
+fn park_pending_flip(state: &mut GameState, pending: PendingCoinFlip) {
+    if matches!(state.waiting_for, WaitingFor::ReplacementChoice { .. }) {
+        state.pending_coin_flip_instruction = Some(Box::new(pending));
+    } else {
+        state.push_coin_flip_frame(pending);
     }
 }
 
@@ -134,12 +189,18 @@ pub fn resolve(
     ability: &ResolvedAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<(), EffectError> {
-    let (win_effect, lose_effect, flipper) = match &ability.effect {
+    let (win_effect, lose_effect, flipper, result_is_face) = match &ability.effect {
         Effect::FlipCoin {
             win_effect,
             lose_effect,
             flipper,
-        } => (win_effect.as_deref(), lose_effect.as_deref(), flipper),
+            result_is_face,
+        } => (
+            win_effect.as_deref(),
+            lose_effect.as_deref(),
+            flipper,
+            *result_is_face,
+        ),
         _ => return Err(EffectError::MissingParam("FlipCoin".to_string())),
     };
 
@@ -156,7 +217,7 @@ pub fn resolve(
     // CR 705.1 + CR 614.1a: route the flip through the replacement pipeline so
     // Krark's Thumb can double it.
     let prior_waiting_for = state.waiting_for.clone();
-    let won = match flip_through_replacement(state, flipper, events) {
+    let won = match flip_through_replacement(state, flipper, result_is_face, events) {
         CoinFlipOutcome::Resolved(won) => won,
         CoinFlipOutcome::Prevented => {
             // CR 614.6: the flip never happened — no branch, report resolved.
@@ -172,16 +233,23 @@ pub fn resolve(
             // `resume_after_keep` can run the kept flip's branch. `EffectResolved`
             // is deferred until the keep choice resolves. CR 705.2: the kept flip's
             // `CoinFlipped` is recorded for the `flipper`, not the controller.
-            state.push_coin_flip_frame(PendingCoinFlip {
-                source_id: ability.source_id,
-                controller: ability.controller,
-                flipper,
-                targets: ability.targets.clone(),
-                win_effect: win_effect.map(|d| Box::new(d.clone())),
-                lose_effect: lose_effect.map(|d| Box::new(d.clone())),
-                kind: PendingCoinFlipKind::Single,
-                chain_root_targets: ability.context.chain_root_targets.clone(),
-            });
+            park_pending_flip(
+                state,
+                PendingCoinFlip {
+                    source_id: ability.source_id,
+                    controller: ability.controller,
+                    flipper,
+                    targets: ability.targets.clone(),
+                    win_effect: win_effect.map(|d| Box::new(d.clone())),
+                    lose_effect: lose_effect.map(|d| Box::new(d.clone())),
+                    kind: if result_is_face {
+                        PendingCoinFlipKind::SingleFace
+                    } else {
+                        PendingCoinFlipKind::Single
+                    },
+                    chain_root_targets: ability.context.chain_root_targets.clone(),
+                },
+            );
             return Ok(());
         }
     };
@@ -192,7 +260,13 @@ pub fn resolve(
     // Mage's "you may exile Ral" prompt and his return-transformed sub-ability
     // (CR 712.8e: a nonmodal double-faced permanent put onto the battlefield
     // transformed has its back face up).
-    let branch = if won { win_effect } else { lose_effect };
+    let branch = if result_is_face {
+        None
+    } else if won {
+        win_effect
+    } else {
+        lose_effect
+    };
     run_flip_branch(
         state,
         branch,
@@ -256,25 +330,28 @@ pub fn resolve_flip_coins(
     // Krark's Thumb can double it), routing each outcome through the appropriate
     // branch exactly as the single-flip resolver does.
     for i in 0..n {
-        let won = match flip_through_replacement(state, flipper, events) {
+        let won = match flip_through_replacement(state, flipper, false, events) {
             CoinFlipOutcome::Resolved(won) => won,
             // CR 614.6: this flip was prevented entirely — skip its branch.
             CoinFlipOutcome::Prevented => continue,
             CoinFlipOutcome::Suspended => {
                 // CR 614.1a: doubled flip — stash loop position and resume after
                 // the keep choice. `remaining` excludes the paused flip itself.
-                state.push_coin_flip_frame(PendingCoinFlip {
-                    source_id: ability.source_id,
-                    controller: ability.controller,
-                    flipper,
-                    targets: ability.targets.clone(),
-                    win_effect: win_effect.map(|d| Box::new(d.clone())),
-                    lose_effect: lose_effect.map(|d| Box::new(d.clone())),
-                    kind: PendingCoinFlipKind::FlipN {
-                        remaining: n - i - 1,
+                park_pending_flip(
+                    state,
+                    PendingCoinFlip {
+                        source_id: ability.source_id,
+                        controller: ability.controller,
+                        flipper,
+                        targets: ability.targets.clone(),
+                        win_effect: win_effect.map(|d| Box::new(d.clone())),
+                        lose_effect: lose_effect.map(|d| Box::new(d.clone())),
+                        kind: PendingCoinFlipKind::FlipN {
+                            remaining: n - i - 1,
+                        },
+                        chain_root_targets: ability.context.chain_root_targets.clone(),
                     },
-                    chain_root_targets: ability.context.chain_root_targets.clone(),
-                });
+                );
                 return Ok(());
             }
         };
@@ -365,34 +442,43 @@ fn flip_until_lose_loop(
     chain_root_targets: &[TargetRef],
     events: &mut Vec<GameEvent>,
 ) -> Result<Option<u32>, EffectError> {
-    // Safety cap prevents infinite loops with pathological RNG seeds.
+    // Safety cap prevents infinite loops with pathological RNG seeds. The cap
+    // bounds TOTAL attempts, not just wins: CR 614.6 makes a prevented flip
+    // neither a win nor the losing flip, so an effect that prevents every flip
+    // would otherwise spin forever without advancing `win_count`.
     const MAX_FLIPS: u32 = 1000;
     let mut win_count = wins_so_far;
-    while win_count < MAX_FLIPS {
-        match flip_through_replacement(state, controller, events) {
+    for _ in 0..MAX_FLIPS {
+        match flip_through_replacement(state, controller, false, events) {
             CoinFlipOutcome::Resolved(true) => win_count += 1,
             CoinFlipOutcome::Resolved(false) => return Ok(Some(win_count)),
             // CR 614.6: a prevented flip is neither a win nor the losing flip.
             CoinFlipOutcome::Prevented => continue,
             CoinFlipOutcome::Suspended => {
-                state.push_coin_flip_frame(PendingCoinFlip {
-                    source_id,
-                    controller,
-                    // CR 705: "flip a coin until you lose" is always the controller.
-                    flipper: controller,
-                    targets: targets.to_vec(),
-                    win_effect: Some(Box::new(win_effect.clone())),
-                    lose_effect: None,
-                    kind: PendingCoinFlipKind::UntilLose {
-                        wins_so_far: win_count,
+                park_pending_flip(
+                    state,
+                    PendingCoinFlip {
+                        source_id,
+                        controller,
+                        // CR 705: "flip a coin until you lose" is always the controller.
+                        flipper: controller,
+                        targets: targets.to_vec(),
+                        win_effect: Some(Box::new(win_effect.clone())),
+                        lose_effect: None,
+                        kind: PendingCoinFlipKind::UntilLose {
+                            wins_so_far: win_count,
+                        },
+                        chain_root_targets: chain_root_targets.to_vec(),
                     },
-                    chain_root_targets: chain_root_targets.to_vec(),
-                });
+                );
                 return Ok(None);
             }
         }
     }
-    Ok(Some(win_count))
+    Err(EffectError::InvalidParam(
+        "flip-until-lose exhausted 1000 attempts without a losing flip; unresolved loop"
+            .to_string(),
+    ))
 }
 
 /// CR 705.2: Run the win effect once per win, then emit `EffectResolved` unless a
@@ -443,6 +529,40 @@ fn finish_until_lose(
     Ok(())
 }
 
+/// CR 616.1: finish the pipeline's modified flip after replacement ordering.
+pub(crate) fn resume_after_replacement(
+    state: &mut GameState,
+    event: Option<ProposedEvent>,
+    events: &mut Vec<GameEvent>,
+) -> Result<Option<WaitingFor>, EffectError> {
+    let pending = state
+        .pending_coin_flip_instruction
+        .take()
+        .ok_or_else(|| EffectError::MissingParam("coin flip instruction".to_string()))?;
+    state.waiting_for = WaitingFor::Priority {
+        player: pending.controller,
+    };
+    let outcome = match event {
+        Some(ProposedEvent::CoinFlip { count, .. }) => execute_replaced_flip(
+            state,
+            pending.flipper,
+            count,
+            matches!(pending.kind, PendingCoinFlipKind::SingleFace),
+            events,
+        ),
+        // CR 614.6: a prevented or substituted flip contributes no result.
+        _ => CoinFlipOutcome::Prevented,
+    };
+    match outcome {
+        CoinFlipOutcome::Resolved(won) => finish_pending_flip(state, *pending, Some(won), events),
+        CoinFlipOutcome::Prevented => finish_pending_flip(state, *pending, None, events),
+        CoinFlipOutcome::Suspended => {
+            park_pending_flip(state, *pending);
+            Ok(Some(state.waiting_for.clone()))
+        }
+    }
+}
+
 /// CR 705.1 + CR 614.1a: Resume a multi-flip resolver after the controller keeps
 /// one of the doubled (Krark's Thumb) coins.
 ///
@@ -466,6 +586,23 @@ pub fn resume_after_keep(
     kept: Vec<bool>,
     events: &mut Vec<GameEvent>,
 ) -> Result<Option<WaitingFor>, EffectError> {
+    record_flip(
+        state,
+        pending.flipper,
+        kept[0],
+        matches!(pending.kind, PendingCoinFlipKind::SingleFace),
+        events,
+    );
+    finish_pending_flip(state, pending, Some(kept[0]), events)
+}
+
+/// Finish one logical flip (or its prevention), then resume its caller's loop.
+fn finish_pending_flip(
+    state: &mut GameState,
+    pending: PendingCoinFlip,
+    won: Option<bool>,
+    events: &mut Vec<GameEvent>,
+) -> Result<Option<WaitingFor>, EffectError> {
     let PendingCoinFlip {
         source_id,
         controller,
@@ -477,23 +614,8 @@ pub fn resume_after_keep(
         chain_root_targets,
     } = pending;
 
-    // CR 705.1 + CR 614.1a + CR 705.2: the single surviving flip is recorded for
-    // the flipper (the player who flipped), not necessarily the source's
-    // controller (Mirrored Depths / Planar Chaos, "that player flips a coin").
-    let won = kept[0];
-    events.push(GameEvent::CoinFlipped {
-        player_id: flipper,
-        won,
-    });
-    // CR 705.2: record the kept flip's result for the flipper (not the source's
-    // controller) so a `WhileCondition` loop gate reads the surviving flip.
-    state.resolution_coin_flip = Some(ResolutionCoinFlip {
-        flipper,
-        result: CoinFlipResult::from_won(won),
-    });
-
     let effect_kind = match kind {
-        PendingCoinFlipKind::Single => EffectKind::FlipCoin,
+        PendingCoinFlipKind::Single | PendingCoinFlipKind::SingleFace => EffectKind::FlipCoin,
         PendingCoinFlipKind::FlipN { .. } => EffectKind::FlipCoins,
         PendingCoinFlipKind::UntilLose { .. } => EffectKind::FlipCoinUntilLose,
     };
@@ -503,12 +625,20 @@ pub fn resume_after_keep(
     let suspended = |state: &GameState| super::waits_for_resolution_choice(&state.waiting_for);
 
     match kind {
+        PendingCoinFlipKind::SingleFace => {
+            events.push(GameEvent::EffectResolved {
+                kind: effect_kind,
+                source_id,
+                subject: None,
+            });
+            Ok(None)
+        }
         PendingCoinFlipKind::Single => {
             // CR 705.2: run the kept flip's won/lost branch.
-            let branch = if won {
-                win_effect.as_deref()
-            } else {
-                lose_effect.as_deref()
+            let branch = match won {
+                Some(true) => win_effect.as_deref(),
+                Some(false) => lose_effect.as_deref(),
+                None => None,
             };
             run_flip_branch(
                 state,
@@ -531,10 +661,10 @@ pub fn resume_after_keep(
         }
         PendingCoinFlipKind::FlipN { remaining } => {
             // CR 705.2: run the kept flip's branch, then continue the loop.
-            let branch = if won {
-                win_effect.as_deref()
-            } else {
-                lose_effect.as_deref()
+            let branch = match won {
+                Some(true) => win_effect.as_deref(),
+                Some(false) => lose_effect.as_deref(),
+                None => None,
             };
             run_flip_branch(
                 state,
@@ -551,7 +681,7 @@ pub fn resume_after_keep(
 
             for i in 0..remaining {
                 // CR 705.2: the remaining `FlipCoins` flips belong to the flipper.
-                match flip_through_replacement(state, flipper, events) {
+                match flip_through_replacement(state, flipper, false, events) {
                     CoinFlipOutcome::Resolved(flip_won) => {
                         let branch = if flip_won {
                             win_effect.as_deref()
@@ -573,18 +703,21 @@ pub fn resume_after_keep(
                     }
                     CoinFlipOutcome::Prevented => continue,
                     CoinFlipOutcome::Suspended => {
-                        state.push_coin_flip_frame(PendingCoinFlip {
-                            source_id,
-                            controller,
-                            flipper,
-                            targets: targets.clone(),
-                            win_effect: win_effect.clone(),
-                            lose_effect: lose_effect.clone(),
-                            kind: PendingCoinFlipKind::FlipN {
-                                remaining: remaining - i - 1,
+                        park_pending_flip(
+                            state,
+                            PendingCoinFlip {
+                                source_id,
+                                controller,
+                                flipper,
+                                targets: targets.clone(),
+                                win_effect: win_effect.clone(),
+                                lose_effect: lose_effect.clone(),
+                                kind: PendingCoinFlipKind::FlipN {
+                                    remaining: remaining - i - 1,
+                                },
+                                chain_root_targets: chain_root_targets.clone(),
                             },
-                            chain_root_targets: chain_root_targets.clone(),
-                        });
+                        );
                         return Ok(Some(state.waiting_for.clone()));
                     }
                 }
@@ -600,9 +733,9 @@ pub fn resume_after_keep(
             let win_effect_def = win_effect
                 .as_deref()
                 .ok_or_else(|| EffectError::MissingParam("FlipCoinUntilLose".to_string()))?;
-            // CR 705: the kept flip counts toward the win streak (won) or ends it.
-            if won {
-                let seed = wins_so_far + 1;
+            // A prevented flip neither adds a win nor ends the losing loop.
+            if won != Some(false) {
+                let seed = wins_so_far + u32::from(won == Some(true));
                 match flip_until_lose_loop(
                     state,
                     controller,
@@ -670,6 +803,7 @@ mod tests {
                 win_effect: None,
                 lose_effect: None,
                 flipper: crate::types::ability::TargetFilter::Controller,
+                result_is_face: false,
             },
             vec![],
             ObjectId(1),
@@ -707,6 +841,7 @@ mod tests {
                 win_effect: Some(win_effect),
                 lose_effect: Some(lose_effect),
                 flipper: crate::types::ability::TargetFilter::Controller,
+                result_is_face: false,
             },
             vec![],
             ObjectId(1),
@@ -773,8 +908,79 @@ mod tests {
             .find(|e| matches!(e, GameEvent::CoinFlipped { .. }));
         assert!(matches!(
             last_flip,
-            Some(GameEvent::CoinFlipped { won: false, .. })
+            Some(GameEvent::CoinFlipped {
+                result: CoinFlipResult::Lost,
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn flip_until_lose_prevention_reports_unresolved_loop_without_payoff() {
+        use crate::game::scenario::{GameScenario, P0};
+        use crate::types::ability::{ReplacementDefinition, ReplacementPlayerScope, TargetFilter};
+        use crate::types::replacements::ReplacementEvent;
+        use std::sync::Arc;
+
+        let mut scenario = GameScenario::new();
+        let source = scenario
+            .add_artifact_from_oracle(
+                P0,
+                "Krark's Thumb",
+                "If you would flip a coin, instead flip two coins and ignore one.",
+            )
+            .id();
+        let mut runner = scenario.build();
+        let mut prevent =
+            ReplacementDefinition::new(ReplacementEvent::CoinFlip).execute(AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::FlipCoins {
+                    count: QuantityExpr::Fixed { value: 0 },
+                    win_effect: None,
+                    lose_effect: None,
+                    flipper: TargetFilter::Controller,
+                },
+            ));
+        prevent.valid_player = Some(ReplacementPlayerScope::AnyPlayer);
+        let state = runner.state_mut();
+        let object = state.objects.get_mut(&source).unwrap();
+        object.base_replacement_definitions = Arc::new(vec![prevent]);
+        object.replacement_definitions = Arc::clone(&object.base_replacement_definitions).into();
+        state.layers_dirty.mark_full();
+        let ability = ResolvedAbility::new(
+            Effect::FlipCoinUntilLose {
+                win_effect: Box::new(AbilityDefinition::new(
+                    AbilityKind::Spell,
+                    Effect::GainLife {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                        player: TargetFilter::Controller,
+                    },
+                )),
+            },
+            vec![],
+            source,
+            P0,
+        );
+        let mut events = Vec::new();
+        assert!(matches!(
+            resolve_until_lose(state, &ability, &mut events),
+            Err(EffectError::InvalidParam(_))
+        ));
+        let Effect::FlipCoinUntilLose { win_effect } = &ability.effect else {
+            unreachable!()
+        };
+        // Resuming after 1,000 wins must still wait for an actual losing flip.
+        // The old win-count bound declared completion without attempting one.
+        assert!(matches!(
+            flip_until_lose_loop(state, P0, win_effect, &[], source, 1000, &[], &mut events,),
+            Err(EffectError::InvalidParam(_))
+        ));
+        assert_eq!(state.players[0].life, 20);
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            GameEvent::CoinFlipped { .. } | GameEvent::EffectResolved { .. }
+        )));
+        assert!(state.pending_coin_flip_instruction.is_none());
     }
 
     #[test]
@@ -857,7 +1063,15 @@ mod tests {
 
         let heads = events
             .iter()
-            .filter(|e| matches!(e, GameEvent::CoinFlipped { won: true, .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    GameEvent::CoinFlipped {
+                        result: CoinFlipResult::Won,
+                        ..
+                    }
+                )
+            })
             .count() as i32;
         assert_eq!(state.players[0].life - initial_life, heads);
     }
@@ -1050,6 +1264,7 @@ mod tests {
                 win_effect: Some(win_effect),
                 lose_effect: Some(lose_effect),
                 flipper: crate::types::ability::TargetFilter::Controller,
+                result_is_face: false,
             },
         );
         def.sub_ability = Some(Box::new(return_transformed));
@@ -1294,7 +1509,7 @@ mod tests {
         let won = events
             .iter()
             .find_map(|e| match e {
-                GameEvent::CoinFlipped { won, .. } => Some(*won),
+                GameEvent::CoinFlipped { result, .. } => Some(*result == CoinFlipResult::Won),
                 _ => None,
             })
             .expect("CoinFlipped event");
@@ -1378,7 +1593,7 @@ mod tests {
         let won = events
             .iter()
             .find_map(|e| match e {
-                GameEvent::CoinFlipped { won, .. } => Some(*won),
+                GameEvent::CoinFlipped { result, .. } => Some(*result == CoinFlipResult::Won),
                 _ => None,
             })
             .expect("CoinFlipped event");
@@ -1473,6 +1688,7 @@ mod tests {
             win_effect: None,
             lose_effect,
             flipper: TargetFilter::TriggeringPlayer,
+            result_is_face: false,
         }
     }
 
@@ -1505,7 +1721,7 @@ mod tests {
         let flip = events
             .iter()
             .find_map(|e| match e {
-                GameEvent::CoinFlipped { player_id, won } => Some((*player_id, *won)),
+                GameEvent::CoinFlipped { player_id, result } => Some((*player_id, *result)),
                 _ => None,
             })
             .expect("a coin was flipped");
@@ -1564,7 +1780,7 @@ mod tests {
                 e,
                 GameEvent::CoinFlipped {
                     player_id: PlayerId(1),
-                    won: false
+                    result: CoinFlipResult::Lost
                 }
             )),
             "expected P1 to lose the flip, events: {events:?}"
@@ -1602,6 +1818,7 @@ mod tests {
                 win_effect: None,
                 lose_effect: None,
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             },
         );
         def.player_scope = Some(crate::types::ability::PlayerFilter::All);
@@ -1653,6 +1870,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             flipper: TargetFilter::Controller,
+            result_is_face: false,
         };
         let json = serde_json::to_string(&controller_flip).unwrap();
         assert!(
@@ -1665,6 +1883,7 @@ mod tests {
             win_effect: None,
             lose_effect: None,
             flipper: TargetFilter::TriggeringPlayer,
+            result_is_face: false,
         };
         let json = serde_json::to_string(&subject_flip).unwrap();
         assert!(
@@ -1703,6 +1922,7 @@ mod tests {
                 win_effect: None,
                 lose_effect: None,
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             },
             vec![],
             ObjectId(1),
@@ -1715,13 +1935,13 @@ mod tests {
             .resolution_coin_flip
             .expect("flip must record resolution_coin_flip");
         assert_eq!(recorded.flipper, PlayerId(0), "flipper is the controller");
-        let event_won = events.iter().find_map(|e| match e {
-            GameEvent::CoinFlipped { won, .. } => Some(*won),
+        let event_result = events.iter().find_map(|e| match e {
+            GameEvent::CoinFlipped { result, .. } => Some(*result),
             _ => None,
         });
         assert_eq!(
             Some(recorded.result),
-            event_won.map(CoinFlipResult::from_won),
+            event_result,
             "recorded result must match the CoinFlipped event"
         );
     }
@@ -1744,6 +1964,7 @@ mod tests {
                 win_effect: None,
                 lose_effect: None,
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             },
             vec![],
             ObjectId(1),
@@ -1762,7 +1983,7 @@ mod tests {
         let flips: Vec<bool> = events
             .iter()
             .filter_map(|e| match e {
-                GameEvent::CoinFlipped { won, .. } => Some(*won),
+                GameEvent::CoinFlipped { result, .. } => Some(*result == CoinFlipResult::Won),
                 _ => None,
             })
             .collect();
@@ -1922,7 +2143,7 @@ mod tests {
                 .events
                 .iter()
                 .filter_map(|e| match e {
-                    GameEvent::CoinFlipped { won, .. } => Some(*won),
+                    GameEvent::CoinFlipped { result, .. } => Some(*result == CoinFlipResult::Won),
                     _ => None,
                 })
                 .collect()

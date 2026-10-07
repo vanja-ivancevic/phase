@@ -763,6 +763,9 @@ fn fmt_target(filter: &TargetFilter) -> String {
         // CR 701.47c: matches `ObjectScope::AmassedArmy`'s description string.
         TargetFilter::AmassedArmy => "amassed Army".into(),
         TargetFilter::ChosenCard => "the chosen object".into(),
+        TargetFilter::LinkedBattlefieldReturn => {
+            "object put onto the battlefield with this source".into()
+        }
         TargetFilter::TriggeringSpellController => "triggering spell's controller".into(),
         TargetFilter::TriggeringSpellOwner => "triggering spell's owner".into(),
         TargetFilter::TriggeringSourceController => "triggering source's controller".into(),
@@ -3709,10 +3712,15 @@ fn effect_details(effect: &Effect) -> Vec<(String, String)> {
             win_effect,
             lose_effect,
             flipper,
+            result_is_face,
         } => {
             // CR 705.2: surface a non-default flipper ("that player flips a coin").
             if !matches!(flipper, TargetFilter::Controller) {
                 d.push(("flipper".into(), format!("{flipper:?}")));
+            }
+            // CR 705.2: a face-only flip has no winner or loser.
+            if *result_is_face {
+                d.push(("result".into(), "heads/tails".into()));
             }
             if win_effect.is_some() {
                 d.push(("win".into(), "yes".into()));
@@ -4604,6 +4612,8 @@ fn fmt_ability_condition(cond: &AbilityCondition) -> String {
         AbilityCondition::CoinFlipOutcome { result } => match result {
             CoinFlipResult::Won => "you won the flip".into(),
             CoinFlipResult::Lost => "you lost the flip".into(),
+            CoinFlipResult::Heads => "that player's coin came up heads".into(),
+            CoinFlipResult::Tails => "that player's coin came up tails".into(),
         },
         AbilityCondition::WhenYouDo => "when you do".into(),
         AbilityCondition::WasCast { zone } => match zone {
@@ -15013,6 +15023,7 @@ mod tests {
                 win_effect: None,
                 lose_effect: Some(lose),
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             },
         );
         let item = build_test_ability_item(&def);
@@ -17714,6 +17725,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                     win_effect: Some(payload("flip_coin_win")),
                     lose_effect: None,
                     flipper: TargetFilter::Controller,
+                    result_is_face: false,
                 },
             ),
             AbilityDefinition::new(
@@ -17722,6 +17734,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                     win_effect: None,
                     lose_effect: Some(payload("flip_coin_lose")),
                     flipper: TargetFilter::Controller,
+                    result_is_face: false,
                 },
             ),
             AbilityDefinition::new(
@@ -17847,6 +17860,7 @@ Drain Life deals X damage to any target. You gain life equal to the damage dealt
                 win_effect: None,
                 lose_effect: None,
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             },
         );
         let mut visited = Vec::new();
@@ -20538,6 +20552,7 @@ At the beginning of the next end step, destroy all non-Wall creatures that playe
         let mut face = make_face();
         face.keywords
             .push(Keyword::CumulativeUpkeep(AbilityCost::Exile {
+                same_zone_owner: false,
                 count: 1,
                 zone: Some(Zone::Graveyard),
                 filter: None,
@@ -20561,6 +20576,7 @@ At the beginning of the next end step, destroy all non-Wall creatures that playe
         let mut face = make_face();
         face.keywords
             .push(Keyword::CumulativeUpkeep(AbilityCost::Exile {
+                same_zone_owner: false,
                 count: 1,
                 zone: Some(Zone::Library),
                 filter: None,

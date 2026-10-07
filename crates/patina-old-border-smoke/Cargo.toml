@@ -11,3 +11,6 @@ description = "Compact Patina old-border rules smoke suite."
 # enable Phase's own #[cfg(test)] integration corpus, so Patina's compact suite
 # still compiles the engine as one normal dependency.
 engine = { package = "phase-engine", path = "../engine", features = ["test-support"] }
+
+[dev-dependencies]
+serde_json = "1"

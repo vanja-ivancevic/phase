@@ -934,6 +934,19 @@ fn an_open_host_prompt_does_not_expose_the_token_to_sbas() {
         "the token was still on the battlefield to be attached when the prompt closed"
     );
     assert!(
+        !runner.state().players[1].is_eliminated,
+        "the attached copy still owes Yenna's scry choice before resolution completes"
+    );
+    let WaitingFor::ScryChoice { cards, .. } = runner.state().waiting_for.clone() else {
+        panic!(
+            "expected Yenna's remaining scry, got {:?}",
+            runner.state().waiting_for
+        );
+    };
+    runner
+        .act(GameAction::SelectCards { cards })
+        .expect("complete Yenna's scry before the player-loss SBA");
+    assert!(
         runner.state().players[1].is_eliminated,
         "CR 704.5a: the 0-life loss still processes once resolution finishes"
     );

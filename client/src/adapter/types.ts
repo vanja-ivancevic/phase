@@ -2663,6 +2663,8 @@ export type WaitingFor =
       count: number;
       min_count?: number;
       up_to?: boolean;
+      // Complete selection must stay within one source-zone owner.
+      same_zone_owner?: boolean;
       source_id: ObjectId;
       effect_kind: string;
       zone: Zone;
@@ -3306,6 +3308,10 @@ export type PlayerActionKind =
 /** CR 602.2 + CR 605.1a + CR 606.1: which kind of activated ability was activated. */
 export type ActivatedAbilityKind = "Normal" | "Loyalty" | "Mana";
 
+/** CR 705.2: one completed coin flip's result. `Won`/`Lost` belong to a called
+ *  flip; `Heads`/`Tails` to a face-only flip, which no player wins or loses. */
+export type CoinFlipResult = "Won" | "Lost" | "Heads" | "Tails";
+
 export type GameEvent =
   | { type: "GameStarted" }
   | {
@@ -3441,10 +3447,10 @@ export type GameEvent =
       type: "StartingPlayerContest";
       data: { rounds: { rolls: [PlayerId, number][] }[]; winner: PlayerId };
     }
-  // CR 705: a coin was flipped. `won` is whether the flipping player won the flip
-  // (relative to that player) — there is no engine-named face; the heads/tails
-  // depiction is a presentation choice.
-  | { type: "CoinFlipped"; data: { player_id: PlayerId; won: boolean } }
+  // CR 705: one completed logical coin flip. CR 705.2: `Won`/`Lost` (relative
+  // to the flipping player) for a called flip; `Heads`/`Tails` for a face-only
+  // flip, which no player wins or loses.
+  | { type: "CoinFlipped"; data: { player_id: PlayerId; result: CoinFlipResult } }
   // CR 116.2c: a player took the special action of paying a continuous effect's
   // printed termination cost. `group` is the engine-minted group key;
   // `source_id` is the permanent whose resolution installed the effect.

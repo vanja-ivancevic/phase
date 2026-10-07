@@ -865,6 +865,7 @@ mod tests {
             mass_library_order: None,
             is_cost_payment: false,
             duration: None,
+            same_zone_owner: false,
         };
 
         finalize_rules_state(&mut state);

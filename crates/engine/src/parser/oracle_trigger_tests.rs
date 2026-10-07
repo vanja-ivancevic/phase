@@ -16396,6 +16396,7 @@ fn trigger_unless_you_exile_card_from_graveyard() {
             count,
             zone,
             filter,
+            ..
         } => {
             assert_eq!(*count, 1);
             assert_eq!(*zone, Some(crate::types::zones::Zone::Graveyard));

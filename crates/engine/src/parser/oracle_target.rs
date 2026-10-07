@@ -9818,6 +9818,7 @@ fn narrow_population_for_exclusion(
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::TrackedSetFiltered { .. }
         | TargetFilter::ExiledBySource

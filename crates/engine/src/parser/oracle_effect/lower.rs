@@ -3805,6 +3805,7 @@ fn ability_reads_last_created(def: &AbilityDefinition) -> bool {
             | TargetFilter::CostPaidObject
             | TargetFilter::AmassedArmy
             | TargetFilter::ChosenCard
+            | TargetFilter::LinkedBattlefieldReturn
             | TargetFilter::TrackedSet { .. }
             | TargetFilter::ExiledBySource
             | TargetFilter::ExiledCardByIndex { .. }
@@ -3901,6 +3902,7 @@ pub(super) fn filter_tree_has_chosen_card(filter: &TargetFilter) -> bool {
         | TargetFilter::LastZoneChanged
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::ExiledCardByIndex { .. }
@@ -4850,11 +4852,13 @@ pub(super) fn consolidate_die_and_coin_defs(defs: &mut Vec<AbilityDefinition>, _
         // CR 705: Consolidate coin flip branches. CR 705.2: the bare flip carries
         // the `flipper` (which player flips); the following branch-only flips are
         // stubs with the default `Controller` flipper, so preserve the bare flip's
-        // flipper rather than the stubs'.
+        // flipper rather than the stubs'. A face-only flip has no win/lose
+        // branches to absorb (CR 705.2), so it never consolidates.
         if let Effect::FlipCoin {
             win_effect: None,
             lose_effect: None,
             flipper,
+            result_is_face: false,
         } = &*defs[i].effect
         {
             let flipper = flipper.clone();
@@ -4887,6 +4891,7 @@ pub(super) fn consolidate_die_and_coin_defs(defs: &mut Vec<AbilityDefinition>, _
                     win_effect: win,
                     lose_effect: lose,
                     flipper,
+                    result_is_face: false,
                 };
                 defs.drain(i + 1..j);
             }
@@ -9121,8 +9126,19 @@ pub(super) fn try_parse_distribute_damage(lower: &str, text: &str) -> Option<Par
     let target_text = target_tp.original.trim();
 
     // CR 115.1d: Detect the target-count quantifier before the target phrase.
-    let (stripped_target_text, multi_target) =
-        strip_distribute_among_target_quantifier(target_text, &amount);
+    let (stripped_target_text, multi_target) = if distribute_kind
+        == DistributionUnit::EvenSplitDamage
+        && target_text
+            .to_ascii_lowercase()
+            .starts_with("any number of ")
+    {
+        (
+            &target_text["any number of ".len()..],
+            Some(MultiTargetSpec::unlimited(0)),
+        )
+    } else {
+        strip_distribute_among_target_quantifier(target_text, &amount)
+    };
     let (target, _) = parse_target(stripped_target_text);
 
     Some(ParsedEffectClause {

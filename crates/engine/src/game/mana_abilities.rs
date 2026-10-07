@@ -663,7 +663,9 @@ pub(super) fn resolve_mana_ability_excluding(
         events,
         cost_event_start,
     )?;
-    if !matches!(state.waiting_for, WaitingFor::Priority { .. }) {
+    // A synchronous completion returns Priority; the ambient prompt still
+    // belongs to the caller. Only a returned pause transfers that ownership.
+    if !matches!(waiting_for, WaitingFor::Priority { .. }) {
         state.waiting_for = waiting_for;
     } else {
         state.waiting_for = waiting_before;
@@ -1327,7 +1329,7 @@ pub fn handle_choose_mana_color(
 
     // CR 602.2a: the same announcement-bound definition production and the
     // activation event used before the prompt.
-    let ability_def = mana_ability_definition(state, pending)?;
+    let ability_def = mana_ability_definition(state, pending)?.clone();
 
     let node = pending
         .rules_execution_node
@@ -1414,7 +1416,7 @@ pub(crate) fn batch_activate_mana_siblings(
     // The originally-activated source's mana ability is the shape every sibling
     // was selected to match. Re-resolve each sibling's matching ability index
     // (a sibling may carry unrelated abilities too).
-    let reference_def = mana_ability_definition(state, pending)?;
+    let reference_def = mana_ability_definition(state, pending)?.clone();
 
     for &sibling_id in pending.batch_siblings.iter().take(extra) {
         let Some((index, def)) = state.objects.get(&sibling_id).and_then(|obj| {
@@ -2063,7 +2065,7 @@ pub(super) fn advance_mana_ability_activation(
     pending: PendingManaAbility,
     events: &mut Vec<GameEvent>,
 ) -> Result<WaitingFor, EngineError> {
-    let ability_def = mana_ability_definition(state, &pending)?;
+    let ability_def = mana_ability_definition(state, &pending)?.clone();
 
     // CR 107.3a + CR 601.2b + CR 702.179f: A `Pay X speed` mana-ability cost
     // (Chicago Loop's `Pay X speed: Add X mana in any combination of colors`)
@@ -2170,7 +2172,7 @@ pub(super) fn advance_mana_ability_activation(
                 kind: PayCostKind::ExileFromManaZone { zone },
                 choices: cards,
                 count,
-                min_count: 0,
+                min_count: count,
                 resume: CostResume::ManaAbility {
                     mana_ability: Box::new(pending),
                 },
@@ -2390,12 +2392,12 @@ enum ManaAbilityPaymentProgress {
 /// activation's kind must all read the one definition the player activated.
 /// Only a pending restored from before the snapshot existed (`None`) falls back
 /// to the live index.
-fn mana_ability_definition(
-    state: &GameState,
-    pending: &PendingManaAbility,
-) -> Result<AbilityDefinition, EngineError> {
+fn mana_ability_definition<'a>(
+    state: &'a GameState,
+    pending: &'a PendingManaAbility,
+) -> Result<&'a AbilityDefinition, EngineError> {
     if let Some(snapshot) = pending.ability_snapshot.as_ref() {
-        return Ok(snapshot.clone());
+        return Ok(snapshot);
     }
     state
         .objects
@@ -2405,7 +2407,6 @@ fn mana_ability_definition(
                 .ability_index
                 .and_then(|index| obj.abilities.get(index))
         })
-        .cloned()
         .ok_or_else(|| EngineError::InvalidAction("Mana ability no longer exists".to_string()))
 }
 
@@ -2707,6 +2708,7 @@ fn pay_selected_mana_ability_exile_cost(
     count: u32,
     zone: Option<Zone>,
     filter: Option<&TargetFilter>,
+    same_zone_owner: bool,
     events: &mut Vec<GameEvent>,
     cost_event_start: usize,
 ) -> Result<ManaAbilityPaymentProgress, EngineError> {
@@ -2738,6 +2740,7 @@ fn pay_selected_mana_ability_exile_cost(
             effective_zone,
             filter,
             count,
+            same_zone_owner,
         );
         if effective_zone == Zone::Library {
             if selected != legal {
@@ -2750,6 +2753,17 @@ fn pay_selected_mana_ability_exile_cost(
         }) {
             return Err(EngineError::ActionNotAllowed(
                 "Selected card does not match the exile cost".to_string(),
+            ));
+        }
+        if same_zone_owner
+            && !super::cost_payability::exile_selection_has_same_zone_owner(
+                state,
+                effective_zone,
+                selected,
+            )
+        {
+            return Err(EngineError::ActionNotAllowed(
+                "Exile cost must be paid from a single player's zone".to_string(),
             ));
         }
         cursor.next_exiled = end;
@@ -2882,6 +2896,7 @@ fn pay_mana_ability_cost_component(
             filter: Some(TargetFilter::SelfRef),
             zone,
             count: 1,
+            ..
         } => {
             let required_zone = zone.unwrap_or(Zone::Battlefield);
             let source = state.objects.get(&pending.source_id).ok_or_else(|| {
@@ -2919,6 +2934,7 @@ fn pay_mana_ability_cost_component(
             count,
             zone,
             filter,
+            same_zone_owner,
         } if !matches!(filter, Some(TargetFilter::SelfRef)) => {
             pay_selected_mana_ability_exile_cost(
                 state,
@@ -2927,6 +2943,7 @@ fn pay_mana_ability_cost_component(
                 *count,
                 *zone,
                 filter.as_ref(),
+                *same_zone_owner,
                 events,
                 cost_event_start,
             )
@@ -3201,7 +3218,7 @@ fn finish_mana_ability_cost_payment(
         .parent
         .take()
         .filter(|parent| matches!(parent.lifecycle, ManaAbilityCostParentLifecycle::Suspended));
-    let ability_def = mana_ability_definition(state, &pending)?;
+    let ability_def = mana_ability_definition(state, &pending)?.clone();
     // CR 602.2b + CR 601.2i + CR 605.3: every cost is paid, so the mana ability
     // has become activated. Publish it here — before the colour prompt and
     // before production — for every resolution mode (manual, auto-tap, nested
@@ -3799,7 +3816,7 @@ fn continue_mana_ability_cost_payment_in_node(
     events: &mut Vec<GameEvent>,
     cost_event_start: usize,
 ) -> Result<WaitingFor, EngineError> {
-    let ability_def = mana_ability_definition(state, &pending)?;
+    let ability_def = mana_ability_definition(state, &pending)?.clone();
     if cost_sacrifices_reserved_source(state, pending.source_id, &ability_def.cost) {
         return Err(EngineError::ActionNotAllowed(
             "This permanent is already committed to a spell sacrifice cost".to_string(),
@@ -5105,17 +5122,19 @@ fn discard_cost_choice(
 }
 
 /// CR 117.1 + CR 118.3: Match non-self `AbilityCost::Exile` shapes. Returns
-/// `(count, effective_zone, filter)` if found, else `None`.
-fn find_exile_cost(cost: &AbilityCost) -> Option<(u32, Zone, Option<&TargetFilter>)> {
+/// `(count, effective_zone, filter, same_zone_owner)` if found, else `None`.
+fn find_exile_cost(cost: &AbilityCost) -> Option<(u32, Zone, Option<&TargetFilter>, bool)> {
     match cost {
         AbilityCost::Exile {
             count,
             zone,
             filter,
+            same_zone_owner,
         } if !matches!(filter, Some(TargetFilter::SelfRef)) => Some((
             *count,
             exile_cost_effective_zone(*zone, filter.as_ref()),
             filter.as_ref(),
+            *same_zone_owner,
         )),
         AbilityCost::Composite { costs } => costs.iter().find_map(find_exile_cost),
         _ => None,
@@ -5131,14 +5150,22 @@ fn exile_cost_choice(
     source_id: ObjectId,
     cost: &Option<AbilityCost>,
 ) -> Option<(usize, Zone, Vec<ObjectId>)> {
-    let (count, zone, filter) = find_exile_cost(cost.as_ref()?)?;
+    let (count, zone, filter, same_zone_owner) = find_exile_cost(cost.as_ref()?)?;
     if zone == Zone::Library {
         return None;
     }
-    let cards = eligible_exile_cost_objects(state, player, source_id, zone, filter, count)
-        .into_iter()
-        .filter(|id| !deferred_spell_sacrifice_reserved(state, *id))
-        .collect();
+    let cards = eligible_exile_cost_objects(
+        state,
+        player,
+        source_id,
+        zone,
+        filter,
+        count,
+        same_zone_owner,
+    )
+    .into_iter()
+    .filter(|id| !deferred_spell_sacrifice_reserved(state, *id))
+    .collect();
     Some((count as usize, zone, cards))
 }
 
@@ -5147,7 +5174,9 @@ fn prepare_deterministic_exile_cost_selection(
     pending: &PendingManaAbility,
     cost: &Option<AbilityCost>,
 ) -> Result<Option<PendingManaAbility>, EngineError> {
-    let Some((count, Zone::Library, filter)) = cost.as_ref().and_then(find_exile_cost) else {
+    let Some((count, Zone::Library, filter, same_zone_owner)) =
+        cost.as_ref().and_then(find_exile_cost)
+    else {
         return Ok(None);
     };
     if count == 0 {
@@ -5165,6 +5194,7 @@ fn prepare_deterministic_exile_cost_selection(
         Zone::Library,
         None,
         count,
+        same_zone_owner,
     );
     if chosen.len() < count as usize {
         return Err(EngineError::ActionNotAllowed(
@@ -5181,6 +5211,15 @@ fn prepare_deterministic_exile_cost_selection(
     updated.chosen_exiled = chosen;
     updated.cost_paid_object = captured;
     Ok(Some(updated))
+}
+
+pub(super) fn exile_cost_prompt_same_zone_owner(
+    state: &GameState,
+    pending: &PendingManaAbility,
+) -> Option<Zone> {
+    let definition = mana_ability_definition(state, pending).ok()?;
+    let (_, zone, _, same_zone_owner) = find_exile_cost(definition.cost.as_ref()?)?;
+    same_zone_owner.then_some(zone)
 }
 
 /// CR 117.1 + CR 118.3 + CR 605.3b: Surface eligible battlefield permanents
@@ -5929,6 +5968,7 @@ mod tests {
 
     fn exile_cost(zone: Option<Zone>) -> AbilityCost {
         AbilityCost::Exile {
+            same_zone_owner: false,
             count: 1,
             zone,
             filter: None,
@@ -6292,6 +6332,7 @@ mod tests {
                 contribution: ManaContribution::Base,
             })
             .cost(AbilityCost::Exile {
+                same_zone_owner: false,
                 count: 1,
                 zone,
                 filter: Some(TargetFilter::SelfRef),
@@ -6424,6 +6465,7 @@ mod tests {
                     win_effect: Some(Box::new(link(wrapped.clone()))),
                     lose_effect: None,
                     flipper: TargetFilter::Controller,
+                    result_is_face: false,
                 },
             ),
             (
@@ -6480,6 +6522,7 @@ mod tests {
                     win_effect: Some(Box::new(link(draw_one()))),
                     lose_effect: None,
                     flipper: TargetFilter::Controller,
+                    result_is_face: false,
                 },
             ),
             (
@@ -6619,6 +6662,7 @@ mod tests {
                     win_effect: None,
                     lose_effect: Some(Box::new(link(draw_one()))),
                     flipper: TargetFilter::Controller,
+                    result_is_face: false,
                 },
             ),
             (
@@ -6665,6 +6709,7 @@ mod tests {
                 win_effect: None,
                 lose_effect: Some(Box::new(link(Effect::NoOp))),
                 flipper: TargetFilter::Controller,
+                result_is_face: false,
             },
             Effect::SeparateIntoPiles {
                 partition_subject: crate::types::ability::VoterScope::AllPlayers,
@@ -8215,6 +8260,7 @@ mod tests {
             },
         )
         .cost(AbilityCost::Exile {
+            same_zone_owner: false,
             filter: Some(TargetFilter::SelfRef),
             zone: Some(Zone::Hand),
             count: 1,
@@ -12216,6 +12262,181 @@ mod tests {
         );
     }
 
+    fn mana_prompt_forest(state: &mut GameState, card_id: u64) -> ObjectId {
+        let forest = create_object(
+            state,
+            CardId(card_id),
+            PlayerId(0),
+            "Forest".to_string(),
+            Zone::Battlefield,
+        );
+        let object = state.objects.get_mut(&forest).unwrap();
+        object.card_types.core_types.push(CoreType::Land);
+        object.card_types.subtypes.push("Forest".to_string());
+        forest
+    }
+
+    #[test]
+    fn mana_prompt_auto_resolved_source_preserves_live_payment() {
+        let mut state = GameState::new_two_player(42);
+        let forest = mana_prompt_forest(&mut state, 990_001);
+        let payment = WaitingFor::ManaPayment {
+            player: PlayerId(0),
+            convoke_mode: None,
+        };
+        state.waiting_for = payment.clone();
+        let ability = make_mana_ability(ManaProduction::Fixed {
+            colors: vec![ManaColor::Green],
+            contribution: ManaContribution::Base,
+        });
+        let mut events = Vec::new();
+
+        resolve_mana_ability(&mut state, forest, PlayerId(0), &ability, &mut events, None)
+            .expect("a completed automatic source must return to its live cost owner");
+
+        assert_eq!(state.waiting_for, payment);
+        assert!(state.pending_cost_move_resume.is_none());
+        assert!(state.objects[&forest].tapped);
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::Green), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    GameEvent::TappedForMana { source_id, .. } if *source_id == forest
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mana_prompt_skyshroud_elf_filters_for_master_decoy_without_false_pause() {
+        use crate::game::engine::apply_as_current;
+        use crate::types::actions::GameAction;
+
+        let mut state = GameState::new_two_player(42);
+        state.turn_number = 12;
+        state.phase = Phase::PreCombatMain;
+        state.active_player = PlayerId(0);
+        state.priority_player = PlayerId(0);
+        state.waiting_for = WaitingFor::Priority {
+            player: PlayerId(0),
+        };
+        let forests: Vec<_> = (990_002..990_005)
+            .map(|card_id| mana_prompt_forest(&mut state, card_id))
+            .collect();
+        let elf = create_object(
+            &mut state,
+            CardId(990_005),
+            PlayerId(0),
+            "Skyshroud Elf".to_string(),
+            Zone::Battlefield,
+        );
+        let filter = make_mana_ability(ManaProduction::AnyOneColor {
+            count: QuantityExpr::Fixed { value: 1 },
+            color_options: vec![ManaColor::White, ManaColor::Red],
+            contribution: ManaContribution::Base,
+        })
+        .cost(AbilityCost::Mana {
+            cost: ManaCost::generic(1),
+        });
+        {
+            let object = state.objects.get_mut(&elf).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.power = Some(1);
+            object.toughness = Some(1);
+            Arc::make_mut(&mut object.abilities).extend([
+                make_mana_ability(ManaProduction::Fixed {
+                    colors: vec![ManaColor::Green],
+                    contribution: ManaContribution::Base,
+                }),
+                filter,
+            ]);
+        }
+        let decoy = create_object(
+            &mut state,
+            CardId(990_006),
+            PlayerId(0),
+            "Master Decoy".to_string(),
+            Zone::Hand,
+        );
+        {
+            let object = state.objects.get_mut(&decoy).unwrap();
+            object.card_types.core_types.push(CoreType::Creature);
+            object.power = Some(1);
+            object.toughness = Some(2);
+            object.mana_cost = ManaCost::Cost {
+                shards: vec![ManaCostShard::White],
+                generic: 1,
+            };
+        }
+        // Bind printed fixture characteristics before the layer-based cast probe.
+        for (_, object) in state.objects.iter_mut() {
+            object.sync_missing_base_characteristics();
+        }
+        crate::game::layers::mark_layers_full(&mut state);
+        crate::game::layers::flush_layers(&mut state);
+        let cast = crate::ai_support::legal_actions(&state)
+            .into_iter()
+            .find(|action| {
+                matches!(
+                    action,
+                    GameAction::CastSpell { object_id, .. } if *object_id == decoy
+                )
+            })
+            .expect("the real menu must offer the filter-payable creature");
+        let cast_result = apply_as_current(&mut state, cast).expect("begin the offered cast");
+        assert!(matches!(
+            cast_result.waiting_for,
+            WaitingFor::ManaPayment { .. }
+        ));
+        assert_eq!(state.players[0].mana_pool.total(), 0);
+        assert!(state.pending_cost_move_resume.is_none());
+
+        let activation = crate::ai_support::legal_actions(&state)
+            .into_iter()
+            .find(|action| {
+                matches!(
+                    action,
+                    GameAction::ActivateAbility { source_id, ability_index: 1 } if *source_id == elf
+                )
+            })
+            .expect("the real payment menu must offer Skyshroud Elf's filter");
+        let result = apply_as_current(&mut state, activation).expect("pay the filter's sub-cost");
+        assert!(matches!(
+            result.waiting_for,
+            WaitingFor::ChooseManaColor { .. }
+        ));
+        assert!(
+            state.pending_cost_move_resume.is_none(),
+            "synchronous funding must not fabricate a replacement-paused cursor: {:?}",
+            state.pending_cost_move_resume
+        );
+        assert_eq!(
+            forests.iter().filter(|id| state.objects[id].tapped).count(),
+            1
+        );
+        assert_eq!(state.players[0].mana_pool.total(), 0);
+
+        let chosen = apply_as_current(
+            &mut state,
+            GameAction::ChooseManaColor {
+                choice: ManaChoice::SingleColor(ManaType::White),
+                count: 1,
+            },
+        )
+        .expect("finish the filter's single white output");
+        assert!(matches!(chosen.waiting_for, WaitingFor::ManaPayment { .. }));
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::White), 1);
+        apply_as_current(&mut state, GameAction::PassPriority)
+            .expect("the outer cast must spend its filtered mana and finish");
+        assert_eq!(state.objects[&decoy].zone, Zone::Stack);
+        assert!(state.pending_cast.is_none());
+        assert!(state.pending_cost_move_resume.is_none());
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::White), 0);
+    }
+
     #[test]
     fn fixed_filter_land_activates_by_tapping_other_mana_source_for_sub_cost() {
         // CR 117.1d + CR 118.2 + CR 602.2b + CR 605.3a: A mana ability with a
@@ -14776,6 +14997,7 @@ mod tests {
             },
         )
         .cost(AbilityCost::Exile {
+            same_zone_owner: false,
             count: 1,
             zone: None,
             filter: Some(TF::Typed(
@@ -14825,6 +15047,7 @@ mod tests {
             },
         )
         .cost(AbilityCost::Exile {
+            same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Graveyard),
             filter: Some(TargetFilter::Typed(

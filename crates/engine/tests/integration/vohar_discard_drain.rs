@@ -1,60 +1,12 @@
 //! Vohar drains only when its loot ability discards an instant or sorcery.
 
 use engine::game::scenario::{GameScenario, P0, P1};
-use engine::parser::oracle::parse_oracle_text;
-use engine::parser::oracle_ir::diagnostic::OracleDiagnostic;
-use engine::types::ability::{AbilityCondition, TargetFilter, TypeFilter};
 
 const VOHAR: &str = "{T}: Draw a card, then discard a card. If you discarded an instant or \
 sorcery card this way, each opponent loses 1 life and you gain 1 life.\n\
 {2}, Sacrifice Vohar: You may cast target instant or sorcery card from your graveyard this \
 turn. If that spell would be put into your graveyard, exile it instead. Activate only as a \
 sorcery.";
-
-#[test]
-fn vohar_parses_effect_discard_condition() {
-    let parsed = parse_oracle_text(
-        VOHAR,
-        "Vohar, Vodalian Desecrator",
-        &["Legendary".into()],
-        &["Creature".into()],
-        &["Phyrexian".into(), "Merfolk".into(), "Wizard".into()],
-    );
-    let drain = parsed.abilities[0]
-        .sub_ability
-        .as_ref()
-        .and_then(|discard| discard.sub_ability.as_ref())
-        .expect("Vohar's loot ability must contain its drain rider");
-    let Some(AbilityCondition::ZoneChangedThisWay {
-        filter,
-        destination: None,
-    }) = &drain.condition
-    else {
-        panic!(
-            "Vohar must check the card discarded by the effect: {:?}",
-            drain.condition
-        );
-    };
-    let TargetFilter::Typed(filter) = filter else {
-        panic!("Vohar's discard condition must use a typed filter: {filter:?}");
-    };
-    assert_eq!(
-        filter.type_filters,
-        vec![TypeFilter::AnyOf(vec![
-            TypeFilter::Instant,
-            TypeFilter::Sorcery
-        ])],
-        "Vohar must accept either an instant or a sorcery"
-    );
-    assert!(
-        !parsed.parse_warnings.iter().any(|warning| matches!(
-            warning,
-            OracleDiagnostic::SwallowedClause { detector, .. } if detector == "Condition_If"
-        )),
-        "Vohar's represented discard condition must not be reported as swallowed: {:?}",
-        parsed.parse_warnings
-    );
-}
 
 fn activate_vohar(discard_instant: bool) -> (i32, i32) {
     let mut scenario = GameScenario::new();
@@ -90,4 +42,36 @@ fn vohar_does_not_drain_after_discarding_a_land() {
         (20, 20),
         "discarding a land must not trigger Vohar's drain rider"
     );
+}
+
+#[test]
+fn vohar_gains_once_after_draining_multiple_opponents() {
+    let mut scenario = GameScenario::new_n_player(4, 42);
+    scenario.add_spell_to_library_top(P0, "Drawn Instant", true);
+    let vohar = scenario
+        .add_creature_from_oracle(P0, "Vohar, Vodalian Desecrator", 1, 2, VOHAR)
+        .id();
+    let mut runner = scenario.build();
+    runner.activate(vohar, 0).resolve();
+    let life: Vec<_> = runner
+        .state()
+        .players
+        .iter()
+        .map(|player| player.life)
+        .collect();
+    assert_eq!(life, [21, 19, 19, 19]);
+}
+
+#[test]
+fn a_false_scoped_guard_does_not_skip_the_next_independent_instruction() {
+    let mut scenario = GameScenario::new();
+    scenario.add_card_to_library_top(P0, "Drawn Land");
+    let oracle = format!("{} You gain 2 life.", VOHAR.split_once('\n').unwrap().0);
+    let source = scenario
+        .add_creature_from_oracle(P0, "Conditional Loot", 1, 2, &oracle)
+        .id();
+    let mut runner = scenario.build();
+    runner.activate(source, 0).resolve();
+    assert_eq!(runner.state().players[0].life, 22);
+    assert_eq!(runner.state().players[1].life, 20);
 }

@@ -391,6 +391,7 @@ fn prompt_resolution_tap_untap_choice(
         // Tap/untap selection performs no zone move, so no bounded-move
         // duration rides the round-trip.
         duration: None,
+        same_zone_owner: false,
     };
     true
 }

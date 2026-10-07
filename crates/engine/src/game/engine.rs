@@ -2106,24 +2106,21 @@ impl Drop for SimulationProbeGuard {
 }
 
 fn reconcile_terminal_result(state: &mut GameState, result: &mut ActionResult) {
-    // Safety net (fixes #962): If a player-loss SBA would eliminate a player,
-    // run SBAs now. CR 704.3 normally checks SBAs when a player would receive
-    // priority, but skipping them here can leave the engine waiting on a dead
-    // player for a non-priority choice.
+    // Safety net (fixes #962): run a pending player-loss SBA at an eligible
+    // action boundary so a non-resolution continuation cannot wait on a player
+    // who should already have lost. CR 101.2 "can't lose" exceptions share the
+    // predicate used by the real SBA checks.
     //
-    // The predicate lives in `sba` so it shares the same CR 101.2 "can't lose"
-    // exception as the real player-loss SBA checks, and stays narrower than the
-    // full SBA loop to avoid unrelated mid-resolution SBA prompts.
-    //
-    // CR 704.3 + CR 104.3b: not while the game is inside a process no player
-    // receives priority during: a cast or activation (CR 601.2h; CR 602.2b), a
-    // special action (CR 116.2), a mana ability (CR 605.3b) or a triggered
-    // mana ability (CR 605.4a). Paying life down to 0 is a legal payment
-    // (CR 119.4), so the 0-life check waits until that process ends and a
-    // player would next receive priority. Until then that player is still in
-    // the game, so waiting on their choices is not the #962 softlock; prompts
-    // owned by a resolution keep the net.
-    if sba::has_pending_player_loss_sba(state) && !state.withholds_priority() {
+    // CR 704.3-704.4: not during a cast or activation (CR 601.2h; CR 602.2b),
+    // special action (CR 116.2), mana ability (CR 605.3b / CR 605.4a), or a
+    // spell/ability resolution paused on its own choice. A player whose life
+    // reaches 0 during one of those processes is still in the game and must
+    // finish its choices. The shared SBA pause guard protects both player-loss
+    // and object SBAs; the ordinary priority-gated pass runs them on completion.
+    if !state.withholds_priority()
+        && !sba::mid_resolution_entry_pauses_sba(state)
+        && sba::has_pending_player_loss_sba(state)
+    {
         sba::check_state_based_actions(state, &mut result.events);
         // SBA may have advanced waiting_for (e.g., GameOver, or Priority for
         // the next living player). Sync the result.
@@ -15486,33 +15483,19 @@ fn apply_non_priority_pass_action(
                 player,
                 total,
                 targets,
-                ..
+                unit,
             },
             GameAction::DistributeAmong { distribution },
         ) => {
             let p = *player;
             let expected_total = *total;
 
-            // Validate: each target gets ≥ 1, and total matches.
-            let actual_total: u32 = distribution.iter().map(|(_, a)| *a).sum();
-            if actual_total != expected_total {
-                return Err(EngineError::InvalidAction(format!(
-                    "Distribution total {} != required {}",
-                    actual_total, expected_total
-                )));
-            }
-            for (t, amount) in &distribution {
-                if *amount == 0 {
-                    return Err(EngineError::InvalidAction(
-                        "Each target must receive at least 1".to_string(),
-                    ));
-                }
-                if !targets.contains(t) {
-                    return Err(EngineError::InvalidAction(
-                        "Distribution target not in legal set".to_string(),
-                    ));
-                }
-            }
+            super::ability_utils::validate_distribution(
+                unit,
+                expected_total,
+                targets,
+                &distribution,
+            )?;
 
             // Store on the pending cast's resolved ability if we're mid-casting.
             // The distribution will be read during effect resolution.

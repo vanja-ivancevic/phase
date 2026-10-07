@@ -85,6 +85,7 @@ pub(crate) fn target_filter_has_x_mana_value_constraint(filter: &TargetFilter) -
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::TriggeringSpellController
@@ -267,6 +268,7 @@ pub(crate) fn relax_x_mana_value_constraint(filter: &TargetFilter) -> TargetFilt
         | TargetFilter::CostPaidObject
         | TargetFilter::AmassedArmy
         | TargetFilter::ChosenCard
+        | TargetFilter::LinkedBattlefieldReturn
         | TargetFilter::TrackedSet { .. }
         | TargetFilter::ExiledBySource
         | TargetFilter::TriggeringSpellController
@@ -694,6 +696,7 @@ impl AbilityCost {
                 count,
                 zone,
                 filter,
+                same_zone_owner,
             } => {
                 // CR 107.1c: an "any number" choice includes zero, so the
                 // resource pre-gate is always satisfiable. The concrete
@@ -722,14 +725,14 @@ impl AbilityCost {
                     };
                 }
                 let zone = exile_cost_effective_zone(*zone, filter.as_ref());
-                let effective_filter = cost_filter_before_x_announcement(filter.as_ref());
                 eligible_exile_cost_objects(
                     state,
                     player,
                     source,
                     zone,
-                    effective_filter.as_ref(),
+                    filter.as_ref(),
                     *count,
+                    *same_zone_owner,
                 )
                 .len()
                     >= *count as usize
@@ -1096,8 +1099,10 @@ pub(super) fn exile_cost_effective_zone(zone: Option<Zone>, filter: Option<&Targ
     })
 }
 
-/// CR 117.1 + CR 118.3: Objects in `zone` controlled/owned by `player` that
-/// can be exiled to pay a non-self `AbilityCost::Exile`, excluding `source`.
+/// CR 117.1 + CR 118.3: Eligible objects for a non-self exile cost. Explicit
+/// graveyard filters retain their owner scope; an unfiltered legacy cost uses
+/// the payer's graveyard. A collective source constraint excludes piles that
+/// cannot independently pay the complete fixed count.
 ///
 /// `Zone::Library` is deterministic top-of-library payment, not a choice. Only
 /// the top `count` cards are eligible, and filtered library exile costs are not
@@ -1109,10 +1114,39 @@ pub(super) fn eligible_exile_cost_objects(
     zone: Zone,
     filter: Option<&TargetFilter>,
     count: u32,
+    same_zone_owner: bool,
 ) -> Vec<ObjectId> {
     let Some(p) = state.players.get(player.0 as usize) else {
         return Vec::new();
     };
+    if zone == Zone::Graveyard {
+        let effective_filter = cost_filter_before_x_announcement(filter);
+        let filter_ref = effective_filter.as_ref();
+        let any_owner =
+            filter_ref.is_some_and(|filter| filter.extract_in_zone() == Some(Zone::Graveyard));
+        let ctx = FilterContext::from_source_with_controller(source, player);
+        let mut eligible = Vec::new();
+        for owner in &state.players {
+            if !any_owner && owner.id != player {
+                continue;
+            }
+            let start = eligible.len();
+            eligible.extend(owner.graveyard.iter().copied().filter(|&id| {
+                id != source
+                    && state
+                        .objects
+                        .get(&id)
+                        .is_some_and(|object| object.zone == zone && object.owner == owner.id)
+                    && filter_ref.is_none_or(|filter| {
+                        matches_target_filter_in_owner_zone(state, id, filter, &ctx)
+                    })
+            }));
+            if same_zone_owner && eligible.len() - start < count as usize {
+                eligible.truncate(start);
+            }
+        }
+        return eligible;
+    }
     let ids: Box<dyn Iterator<Item = ObjectId> + '_> = match zone {
         Zone::Hand => Box::new(p.hand.iter().copied()),
         Zone::Graveyard => Box::new(p.graveyard.iter().copied()),
@@ -1152,6 +1186,41 @@ pub(super) fn eligible_exile_cost_objects(
             && filter_ref.is_none_or(|f| matches_target_filter_in_owner_zone(state, id, f, &ctx))
     })
     .collect()
+}
+
+/// CR 400.1 + CR 400.3: Recover the actual player-owned pile containing a live
+/// cost object, rather than inferring zone membership from its controller.
+pub fn exile_cost_zone_owner(state: &GameState, zone: Zone, id: ObjectId) -> Option<PlayerId> {
+    let object = state.objects.get(&id)?;
+    if object.zone != zone {
+        return None;
+    }
+    state.players.iter().find_map(|player| {
+        let present = match zone {
+            Zone::Hand => player.hand.contains(&id),
+            Zone::Graveyard => player.graveyard.contains(&id),
+            Zone::Library => player.library.contains(&id),
+            _ => false,
+        };
+        (present && object.owner == player.id).then_some(player.id)
+    })
+}
+
+/// Shared complete-selection predicate for admission and cost execution.
+pub fn exile_selection_has_same_zone_owner(
+    state: &GameState,
+    zone: Zone,
+    chosen: &[ObjectId],
+) -> bool {
+    let Some(&first) = chosen.first() else {
+        return true;
+    };
+    let Some(owner) = exile_cost_zone_owner(state, zone, first) else {
+        return false;
+    };
+    chosen
+        .iter()
+        .all(|&id| exile_cost_zone_owner(state, zone, id) == Some(owner))
 }
 
 /// CR 117.1 + CR 601.2b: Objects eligible to be exiled for an
@@ -1530,6 +1599,7 @@ mod tests {
         let mut scenario = GameScenario::new();
         let src = scenario.add_creature(P0, "Ominous Cemetery", 0, 0).id();
         let self_exile = AbilityCost::Exile {
+            same_zone_owner: false,
             count: 1,
             zone: None,
             filter: Some(TargetFilter::SelfRef),
@@ -1550,6 +1620,7 @@ mod tests {
             count: 1,
             zone: Some(Zone::Graveyard),
             filter: Some(TargetFilter::SelfRef),
+            same_zone_owner: false,
         }
         .is_payable(&scenario.state, P0, src));
     }
@@ -1833,6 +1904,7 @@ mod tests {
         let mut scenario = GameScenario::new();
         let source = scenario.add_creature(P0, "Harvest Pyre", 0, 1).id();
         let cost = AbilityCost::Exile {
+            same_zone_owner: false,
             count: EXILE_COST_X,
             zone: Some(Zone::Graveyard),
             filter: Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Instant))),
@@ -2099,6 +2171,7 @@ mod tests {
             Zone::Hand,
             filter.as_ref(),
             1,
+            false,
         );
         assert!(
             eligible.contains(&green_two_drop),
@@ -2123,6 +2196,7 @@ mod tests {
             .add_creature_to_graveyard(P0, "Uro, Titan of Nature's Wrath", 6, 6)
             .id();
         let cost = AbilityCost::Exile {
+            same_zone_owner: false,
             count: 5,
             zone: Some(Zone::Graveyard),
             filter: Some(TargetFilter::Typed(
@@ -2167,6 +2241,7 @@ mod tests {
                     ]),
             )),
             5,
+            false,
         );
         assert!(
             !eligible.contains(&uro),

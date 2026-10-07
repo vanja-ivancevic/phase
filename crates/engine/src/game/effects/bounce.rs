@@ -263,6 +263,7 @@ pub fn resolve(
                     is_cost_payment: false,
                     enters_modified_if: None,
                     duration: None,
+                    same_zone_owner: false,
                 };
                 return Ok(());
             }
@@ -360,6 +361,7 @@ pub fn resolve(
                     is_cost_payment: false,
                     enters_modified_if: None,
                     duration: None,
+                    same_zone_owner: false,
                 };
                 return Ok(());
             }
@@ -569,6 +571,7 @@ pub fn resolve_all(
                 library_position: None,
                 mass_library_order: None,
                 is_cost_payment: false,
+                same_zone_owner: false,
                 enters_modified_if: None,
                 duration: None,
             };

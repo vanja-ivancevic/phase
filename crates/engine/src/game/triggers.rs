@@ -1780,6 +1780,11 @@ pub fn trigger_source_context_for_latch(
         .get(&source.id)
         .cloned()
         .unwrap_or_default();
+    source_context.linked_battlefield_returns =
+        super::effects::change_zone::linked_battlefield_return_snapshot(
+            state,
+            source_context.identity.reference,
+        );
     source_context
 }
 
@@ -8414,6 +8419,60 @@ pub(crate) enum EventContextSeedTiming {
     ResolutionFallback,
 }
 
+/// Freeze a linked battlefield recipient before priority or deferred resolution.
+/// A death trigger follows only the event's immediate graveyard successor;
+/// source-departure triggers retain the exact battlefield recipient instead.
+fn bind_linked_battlefield_return_targets(
+    ability: &mut ResolvedAbility,
+    trigger_event: Option<&GameEvent>,
+) {
+    let recipients = ability
+        .trigger_source
+        .as_ref()
+        .map(|source| source.linked_battlefield_returns.as_slice())
+        .unwrap_or_default();
+    if matches!(
+        ability.effect,
+        Effect::ChangeZone {
+            target: TargetFilter::LinkedBattlefieldReturn,
+            ..
+        }
+    ) {
+        let pins = match trigger_event {
+            Some(
+                event @ GameEvent::ZoneChanged {
+                    from: Some(Zone::Battlefield),
+                    to: Zone::Graveyard,
+                    record,
+                    ..
+                },
+            ) if record
+                .trigger_source_context()
+                .is_some_and(|departed| recipients.contains(&departed.identity.reference)) =>
+            {
+                zone_change_parent_target_pin(event).into_iter().collect()
+            }
+            _ => recipients.to_vec(),
+        };
+        if !pins.is_empty() {
+            if let Effect::ChangeZone { target, .. } = &mut ability.effect {
+                *target = TargetFilter::ParentTarget;
+            }
+            ability.targets = pins
+                .iter()
+                .map(|pin| TargetRef::Object(pin.object_id))
+                .collect();
+            ability.target_incarnations = pins;
+        }
+    }
+    if let Some(sub) = ability.sub_ability.as_deref_mut() {
+        bind_linked_battlefield_return_targets(sub, trigger_event);
+    }
+    if let Some(otherwise) = ability.else_ability.as_deref_mut() {
+        bind_linked_battlefield_return_targets(otherwise, trigger_event);
+    }
+}
+
 pub(crate) fn seed_event_context_parent_targets(
     ability: &mut ResolvedAbility,
     trigger_event: Option<&GameEvent>,
@@ -8600,6 +8659,7 @@ fn push_pending_trigger_to_stack_with_firing_and_duration_events(
         trigger_event.as_ref(),
         EventContextSeedTiming::StackPush,
     );
+    bind_linked_battlefield_return_targets(&mut ability, trigger_event.as_ref());
 
     let entry_id = ObjectId(state.next_object_id);
     state.next_object_id += 1;
@@ -9578,7 +9638,11 @@ fn dispatch_pending_trigger_context_core(
             events,
         } => {
             commit_prepared_trigger_targets(state, rng, events, events_out);
-            if let Some(unit) = prepared_trigger.distribute.clone() {
+            if let Some(unit) = prepared_trigger
+                .distribute
+                .clone()
+                .filter(|unit| *unit != crate::types::game_state::DistributionUnit::EvenSplitDamage)
+            {
                 if let Some(total) = super::casting_targets::extract_distribution_total(
                     state,
                     &prepared_trigger.ability,
@@ -12256,6 +12320,7 @@ fn filter_binding_diverges(filter: &TargetFilter) -> bool {
         | TargetFilter::Owner
         | TargetFilter::AttachedTo
         | TargetFilter::SourceOrPaired
+        | TargetFilter::LinkedBattlefieldReturn
         // CR 613.1 + CR 607.2d: durable per-object / per-player choices persisted
         // on the source (`chosen_attributes`) or on the player, read live from
         // the same place on both legs — the filter-axis counterpart of
@@ -46635,6 +46700,7 @@ pub mod tests {
             is_cost_payment: false,
             enters_modified_if: None,
             duration: None,
+            same_zone_owner: false,
         };
 
         crate::game::engine::apply_as_current(

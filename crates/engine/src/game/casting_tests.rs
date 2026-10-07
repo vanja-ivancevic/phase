@@ -7206,7 +7206,6 @@ fn composite_mana_tap_sacrifice_activation_uses_alternate_mana_source() {
     let waiting = handle_activate_ability(&mut state, PlayerId(0), source, 1, &mut events).unwrap();
 
     assert!(matches!(waiting, WaitingFor::Priority { .. }));
-    assert!(state.objects[&source].tapped);
     assert_eq!(state.objects[&source].zone, Zone::Graveyard);
     assert!(state.objects[&alternate].tapped);
     assert_eq!(state.stack.len(), 1);
@@ -7222,6 +7221,7 @@ fn composite_tap_self_exile_activation_moves_battlefield_source_to_exile() {
                 count: 1,
                 zone: None,
                 filter: Some(TargetFilter::SelfRef),
+                same_zone_owner: false,
             },
         ],
     };
@@ -18193,6 +18193,56 @@ fn blitz_creature_offers_blitz_variant() {
     );
 }
 
+/// CR 601.2f-h regression (external adversarial review finding): when the
+/// PRINTED cast is unpayable but a casting variant is castable on its own
+/// transformed state, the offer verdict must carry the ADMITTING variant's
+/// prepared cost and transformed state. Returning the printed cost here made
+/// the auto-payer reject a spell the offer path had already admitted.
+#[test]
+fn blitz_variant_payable_when_printed_cost_is_not() {
+    use crate::types::keywords::Keyword;
+
+    let mut state = setup_game_at_main_phase();
+    // Exactly enough for the Blitz {2}, not enough for the printed {4}.
+    add_mana(&mut state, PlayerId(0), ManaType::Colorless, 2);
+
+    let spell = create_object(
+        &mut state,
+        CardId(9002),
+        PlayerId(0),
+        "Riveteers Bruiser".to_string(),
+        Zone::Hand,
+    );
+    {
+        let obj = state.objects.get_mut(&spell).unwrap();
+        obj.card_types.core_types.push(CoreType::Creature);
+        obj.base_card_types.core_types.push(CoreType::Creature);
+        obj.mana_cost = ManaCost::generic(4);
+        obj.base_mana_cost = ManaCost::generic(4);
+        obj.keywords
+            .push(Keyword::Blitz(BlitzCost::Mana(ManaCost::generic(2))));
+    }
+
+    assert!(
+        !can_pay_cost_after_auto_tap_with_probe(
+            &state,
+            PlayerId(0),
+            spell,
+            &ManaCost::generic(4),
+            None
+        ),
+        "the printed 4 generic must be unpayable with only 2 mana available"
+    );
+    assert!(
+        can_cast_object_now(&state, PlayerId(0), spell),
+        "the blitz variant must admit the cast the printed cost cannot"
+    );
+    assert!(
+        castable_spell_auto_payable_with_probe(&state, PlayerId(0), spell, None),
+        "the auto-payer must price the cast at the admitting blitz cost, not the printed 4 generic"
+    );
+}
+
 /// CR 702.152a + CR 604.1: Blitz granted to a hand creature by a battlefield
 /// `CastWithKeyword` static (the card itself prints no Blitz) must surface the
 /// Blitz alternative-cast option. The candidate read routes through
@@ -23405,6 +23455,7 @@ fn mana_leg_battlefield_exile_pays_mana_before_exile_prompt() {
                                     .controller(ControllerRef::You)
                                     .properties(vec![FilterProp::Another]),
                             )),
+                            same_zone_owner: false,
                         },
                     ],
                 },
@@ -32461,6 +32512,7 @@ fn chosen_muldrotha_variant_requests_and_consumes_permanent_type_slot() {
                     count: 3,
                     zone: Some(Zone::Graveyard),
                     filter: None,
+                    same_zone_owner: false,
                 },
             ],
         }));
@@ -33843,6 +33895,7 @@ fn ai_escape_cast_from_graveyard_pays_mana_and_exiles_five_cards() {
                     count: 5,
                     zone: Some(Zone::Graveyard),
                     filter: None,
+                    same_zone_owner: false,
                 },
             ],
         }));
@@ -34175,63 +34228,47 @@ fn escape_phyrexian_cost_deducts_life_after_exile() {
 
     let life_before = state.players[0].life;
     let card_id = state.objects.get(&obj_id).unwrap().card_id;
-    let mut events = Vec::new();
-
-    let waiting = handle_cast_spell(&mut state, PlayerId(0), obj_id, card_id, &mut events)
-        .expect("escape cast should begin");
-    let (exile_cards, pending_cast) = match waiting {
-        WaitingFor::PayCost {
-            kind: PayCostKind::ExileFromZone { .. },
-            choices: cards,
-            resume: CostResume::Spell {
-                spell: pending_cast,
-            },
-            count: 3,
-            ..
-        } => (cards, pending_cast),
-        other => panic!("expected PayCost ExileFromZone, got {other:?}"),
-    };
-
-    let chosen: Vec<ObjectId> = exile_cards.iter().copied().take(3).collect();
-    let waiting2 = super::casting_costs::handle_exile_for_cost(
+    let cast = apply_as_current(
         &mut state,
-        PlayerId(0),
-        crate::types::zones::ExileCostSourceZone::Graveyard,
-        *pending_cast,
-        3,
-        &exile_cards,
-        &chosen,
-        &mut events,
+        GameAction::CastSpell {
+            object_id: obj_id,
+            card_id,
+            targets: Vec::new(),
+            payment_mode: CastPaymentMode::Auto,
+        },
     )
-    .expect("exile cost payment should succeed");
-
-    // CR 107.4f + CR 601.2h: After the exile portion is paid, the Phyrexian
-    // {U/P} shard is `LifeOnly` (empty pool, 20 life), so the engine pauses to
-    // let the caster confirm or cancel rather than silently deducting life
-    // (issue #704). Submitting `PayLife` finalizes the cast and deducts 2 life.
-    match waiting2 {
-        WaitingFor::PhyrexianPayment { shards, .. } => {
-            assert_eq!(shards.len(), 1);
-            assert!(matches!(
-                shards[0].options,
-                crate::types::game_state::ShardOptions::LifeOnly
-            ));
-        }
-        other => panic!("expected PhyrexianPayment (LifeOnly), got {other:?}"),
-    }
+    .expect("escape cast should begin");
+    let mut events = cast.events;
+    let exile = apply_as_current(&mut state, GameAction::SelectCards { cards: filler_ids })
+        .expect("escape exile payment should succeed through the public resume");
+    events.extend(exile.events);
+    assert_eq!(
+        state
+            .objects
+            .values()
+            .filter(|object| object.zone == Zone::Exile)
+            .count(),
+        3,
+        "escape must exile all three other graveyard cards"
+    );
     assert_eq!(
         state.players[0].life, life_before,
         "CR 601.2h: life must not be deducted before the caster confirms"
     );
 
-    let choices = vec![crate::types::game_state::ShardChoice::PayLife];
-    super::casting_costs::finalize_mana_payment_with_phyrexian_choices(
+    let payment = apply_as_current(
         &mut state,
-        PlayerId(0),
-        &choices,
-        &mut events,
+        GameAction::SubmitPhyrexianChoices {
+            choices: vec![crate::types::game_state::ShardChoice::PayLife],
+        },
     )
-    .expect("resume with PayLife must succeed");
+    .expect("public PayLife confirmation must finish the escape cast");
+    events.extend(payment.events);
+    assert_eq!(
+        state.stack.len(),
+        1,
+        "the paid escape spell must reach the stack"
+    );
 
     assert_eq!(
         state.players[0].life,
@@ -40427,6 +40464,7 @@ mod alt_cost_reduction_509 {
             }],
         });
         let exile_cost = AbilityCost::Exile {
+            same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Hand),
             filter: Some(white_card_filter),
@@ -40512,6 +40550,7 @@ mod alt_cost_reduction_509 {
             }],
         });
         let exile_cost = AbilityCost::Exile {
+            same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Hand),
             filter: Some(white_card_filter),
@@ -40644,6 +40683,7 @@ mod alt_cost_reduction_509 {
             }],
         });
         let exile_cost = AbilityCost::Exile {
+            same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Hand),
             filter: Some(white_card_filter),
@@ -52068,6 +52108,7 @@ fn doc_aurlock_reduces_plot_special_action_cost() {
                     count: 1,
                     zone: Some(Zone::Hand),
                     filter: Some(TargetFilter::SelfRef),
+                    same_zone_owner: false,
                 },
             ],
         });
@@ -52694,6 +52735,7 @@ fn plot_special_action_ignores_generic_activated_ability_cost_modifiers() {
                     count: 1,
                     zone: Some(Zone::Hand),
                     filter: Some(TargetFilter::SelfRef),
+                    same_zone_owner: false,
                 },
             ],
         });
@@ -60440,6 +60482,616 @@ mod unreadable_additional_cost_is_refused_not_free {
             "an unpayable optional cost must be skipped, not offered — got {:?}",
             runner.state().waiting_for
         );
+    }
+}
+
+/// CR 601.2a-h: every surface that admits a cast — the priority cast offer and
+/// its payment carrier, the face-election verdict, and the madness offer
+/// verdict — must agree with the reducer that then announces and pays for it.
+/// Each scenario pairs a refused board (the offer is absent and a forged
+/// submission leaves the game untouched) with the nearest legal board (the
+/// offer is present and the cast pays its cost exactly once).
+mod cast_authority_consumer_regressions {
+    use super::*;
+    use crate::types::game_state::{ActionResult, CastPaymentMode, PayCostKind};
+
+    const P0: PlayerId = PlayerId(0);
+    const P1: PlayerId = PlayerId(1);
+
+    fn battlefield_object(
+        state: &mut GameState,
+        card: u64,
+        controller: PlayerId,
+        name: &str,
+        core_type: CoreType,
+    ) -> ObjectId {
+        let id = create_object(
+            state,
+            CardId(card),
+            controller,
+            name.to_string(),
+            Zone::Battlefield,
+        );
+        let obj = state.objects.get_mut(&id).unwrap();
+        obj.card_types.core_types.push(core_type);
+        if core_type == CoreType::Creature {
+            obj.power = Some(2);
+            obj.toughness = Some(2);
+            obj.base_power = Some(2);
+            obj.base_toughness = Some(2);
+        }
+        id
+    }
+
+    /// The `CastSpell` offers the legal-action surface issues for `object_id`.
+    fn cast_offers(state: &GameState, object_id: ObjectId) -> Vec<GameAction> {
+        crate::ai_support::legal_actions(state)
+            .into_iter()
+            .filter(|action| {
+                matches!(action, GameAction::CastSpell { object_id: offered, .. } if *offered == object_id)
+            })
+            .collect()
+    }
+
+    /// Submit an automatically paid `CastSpell` for `object_id`.
+    fn submit_cast(
+        state: &mut GameState,
+        object_id: ObjectId,
+    ) -> Result<ActionResult, EngineError> {
+        let card_id = state.objects[&object_id].card_id;
+        apply_as_current(
+            state,
+            GameAction::CastSpell {
+                object_id,
+                card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
+            },
+        )
+    }
+
+    /// Answer the announcement prompts a cast raises after it is accepted —
+    /// target choice, sacrifice choice, manual mana payment — until the spell
+    /// is on the stack.
+    fn finish_announcement(state: &mut GameState, target: Option<ObjectId>) {
+        for _ in 0..6 {
+            let action = match &state.waiting_for {
+                WaitingFor::TargetSelection { .. } => GameAction::ChooseTarget {
+                    target: Some(TargetRef::Object(
+                        target.expect("this cast must not ask for a target"),
+                    )),
+                },
+                WaitingFor::PayCost {
+                    kind: PayCostKind::Sacrifice,
+                    choices,
+                    ..
+                } => GameAction::SelectCards {
+                    cards: vec![choices[0]],
+                },
+                WaitingFor::ManaPayment { .. } => GameAction::PassPriority,
+                _ => return,
+            };
+            apply_as_current(state, action).expect("the announcement prompt must accept");
+        }
+        panic!(
+            "the cast never finished announcing, parked on {:?}",
+            state.waiting_for
+        );
+    }
+
+    /// Culling the Weak {B}, instant: "As an additional cost to cast this
+    /// spell, sacrifice a creature. Add {B}{B}{B}{B}."
+    fn culling_the_weak_in_hand(state: &mut GameState) -> ObjectId {
+        let spell = create_object(
+            state,
+            CardId(91_001),
+            P0,
+            "Culling the Weak".to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&spell).unwrap();
+        obj.card_types.core_types.push(CoreType::Instant);
+        obj.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Black],
+            generic: 0,
+        };
+        obj.additional_cost = Some(AdditionalCost::Required(AbilityCost::Sacrifice(
+            SacrificeCost::count(TargetFilter::Typed(TypedFilter::creature()), 1),
+        )));
+        Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Mana {
+                produced: ManaProduction::Fixed {
+                    colors: vec![ManaColor::Black; 4],
+                    contribution: ManaContribution::Base,
+                },
+                restrictions: vec![],
+                grants: vec![],
+                expiry: None,
+                target: None,
+            },
+        ));
+        spell
+    }
+
+    /// CR 601.2b + CR 601.2h + CR 118.3: a required sacrifice with nothing to
+    /// sacrifice is an unpayable cost, so the spell is not castable at all.
+    #[test]
+    fn required_sacrifice_without_a_creature_is_neither_offered_nor_accepted() {
+        let mut state = setup_game_at_main_phase();
+        let spell = culling_the_weak_in_hand(&mut state);
+        add_mana(&mut state, P0, ManaType::Black, 1);
+
+        assert!(
+            cast_offers(&state, spell).is_empty(),
+            "a required sacrifice with no creature must not be offered"
+        );
+        let before = state.clone();
+        submit_cast(&mut state, spell)
+            .expect_err("a forged cast with an unpayable required sacrifice must be refused");
+        assert_eq!(
+            state, before,
+            "a refused cast must leave the game untouched"
+        );
+    }
+
+    #[test]
+    fn required_sacrifice_with_a_creature_is_offered_and_paid_once() {
+        let mut state = setup_game_at_main_phase();
+        let spell = culling_the_weak_in_hand(&mut state);
+        let creature = battlefield_object(
+            &mut state,
+            91_002,
+            P0,
+            "Sacrificial Bear",
+            CoreType::Creature,
+        );
+        add_mana(&mut state, P0, ManaType::Black, 1);
+
+        assert!(
+            !cast_offers(&state, spell).is_empty(),
+            "a payable required sacrifice must leave the spell castable"
+        );
+        submit_cast(&mut state, spell).expect("the payable cast must be accepted");
+        finish_announcement(&mut state, None);
+
+        assert_eq!(state.objects[&spell].zone, Zone::Stack);
+        assert_eq!(state.objects[&creature].zone, Zone::Graveyard);
+        assert_eq!(
+            state.players[0].mana_pool.total(),
+            0,
+            "the {{B}} mana cost is paid exactly once"
+        );
+    }
+
+    /// A {B} spell whose required additional cost is itself mana: the declared
+    /// addition joins the total cost (CR 601.2f), so the whole total must be
+    /// payable, not just the printed mana cost.
+    fn required_mana_addition_in_hand(state: &mut GameState) -> ObjectId {
+        let spell = create_object(
+            state,
+            CardId(91_010),
+            P0,
+            "Required Mana Addition".to_string(),
+            Zone::Hand,
+        );
+        let obj = state.objects.get_mut(&spell).unwrap();
+        obj.card_types.core_types.push(CoreType::Sorcery);
+        obj.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Black],
+            generic: 0,
+        };
+        obj.additional_cost = Some(AdditionalCost::Required(AbilityCost::Mana {
+            cost: ManaCost::generic(2),
+        }));
+        Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::GainLife {
+                amount: QuantityExpr::Fixed { value: 1 },
+                player: TargetFilter::Controller,
+            },
+        ));
+        spell
+    }
+
+    #[test]
+    fn required_added_mana_gates_the_offer_on_the_full_total() {
+        let mut state = setup_game_at_main_phase();
+        let spell = required_mana_addition_in_hand(&mut state);
+        add_mana(&mut state, P0, ManaType::Black, 1);
+
+        assert!(
+            cast_offers(&state, spell).is_empty(),
+            "{{B}} alone cannot pay {{B}} plus a required {{2}}"
+        );
+        let before = state.clone();
+        submit_cast(&mut state, spell)
+            .expect_err("a forged cast short of the required mana must be refused");
+        assert_eq!(
+            state, before,
+            "a refused cast must leave the game untouched"
+        );
+
+        add_mana(&mut state, P0, ManaType::Colorless, 3);
+        assert!(
+            !cast_offers(&state, spell).is_empty(),
+            "the full {{2}}{{B}} total is payable"
+        );
+        submit_cast(&mut state, spell).expect("the payable cast must be accepted");
+        finish_announcement(&mut state, None);
+
+        assert_eq!(state.objects[&spell].zone, Zone::Stack);
+        assert_eq!(
+            state.players[0].mana_pool.total(),
+            1,
+            "the {{2}}{{B}} total is paid exactly once from four mana"
+        );
+    }
+
+    /// CR 720.3a + CR 601.2g-h: when only the Omen face is affordable, the cast
+    /// offer's payment carrier is that face's prepared cost. The creature face's
+    /// unpayable {5} would demand the self-sacrificing source; the {G} Omen face
+    /// is paid from the pool and leaves the source alone.
+    #[test]
+    fn alternate_face_only_affordable_carries_the_admitting_face_payment() {
+        let mut state = setup_game_at_main_phase();
+        let omen = create_omen_in_hand(&mut state, P0);
+        let blood_pet = battlefield_object(
+            &mut state,
+            91_020,
+            P0,
+            "Blood Pet Witness",
+            CoreType::Creature,
+        );
+        Arc::make_mut(&mut state.objects.get_mut(&blood_pet).unwrap().abilities).push(
+            AbilityDefinition::new(
+                AbilityKind::Activated,
+                Effect::Mana {
+                    produced: ManaProduction::Fixed {
+                        colors: vec![ManaColor::Green],
+                        contribution: ManaContribution::Base,
+                    },
+                    restrictions: vec![],
+                    grants: vec![],
+                    expiry: None,
+                    target: None,
+                },
+            )
+            .cost(AbilityCost::Sacrifice(SacrificeCost::count(
+                TargetFilter::SelfRef,
+                1,
+            ))),
+        );
+        add_mana(&mut state, P0, ManaType::Green, 1);
+
+        let offers = cast_offers(&state, omen);
+        assert_eq!(
+            offers,
+            vec![GameAction::CastSpell {
+                object_id: omen,
+                card_id: state.objects[&omen].card_id,
+                targets: vec![],
+                payment_mode: CastPaymentMode::Auto,
+            }],
+            "the Omen face is pool-payable, so its cast is a plain automatic payment"
+        );
+
+        apply_as_current(&mut state, offers[0].clone()).expect("the offered cast must announce");
+        assert!(
+            matches!(
+                state.waiting_for,
+                WaitingFor::CastOffer {
+                    kind: CastOfferKind::Adventure { .. },
+                    ..
+                }
+            ),
+            "the cast must ask which face to cast, got {:?}",
+            state.waiting_for
+        );
+        apply_as_current(
+            &mut state,
+            GameAction::ChooseAdventureFace { creature: false },
+        )
+        .expect("the affordable Omen face must cast");
+        finish_announcement(&mut state, None);
+
+        assert_eq!(state.objects[&omen].zone, Zone::Stack);
+        assert_eq!(state.players[0].mana_pool.total(), 0, "{{G}} is paid once");
+        assert_eq!(
+            state.objects[&blood_pet].zone,
+            Zone::Battlefield,
+            "the sacrificial source is never consumed for the {{G}} face"
+        );
+    }
+
+    /// Wax // Wane: Wax {G} instant, "Target creature gets +2/+2 until end of
+    /// turn."; Wane {W} instant, "Destroy target enchantment."
+    fn wax_wane_in_hand(state: &mut GameState) -> ObjectId {
+        let spell = create_object(state, CardId(91_030), P0, "Wax".to_string(), Zone::Hand);
+        let obj = state.objects.get_mut(&spell).unwrap();
+        obj.card_types.core_types.push(CoreType::Instant);
+        obj.color = vec![ManaColor::Green];
+        obj.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Green],
+            generic: 0,
+        };
+        Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Pump {
+                power: PtValue::Fixed(2),
+                toughness: PtValue::Fixed(2),
+                target: TargetFilter::Typed(TypedFilter::creature()),
+            },
+        ));
+        obj.back_face = Some(crate::game::game_object::BackFaceData {
+            is_swap_snapshot: false,
+            trigger_printed_origins: Vec::new(),
+            name: "Wane".to_string(),
+            power: None,
+            toughness: None,
+            loyalty: None,
+            printed_loyalty: None,
+            defense: None,
+            card_types: {
+                let mut card_types = crate::types::card_type::CardType::default();
+                card_types.core_types.push(CoreType::Instant);
+                card_types
+            },
+            mana_cost: ManaCost::Cost {
+                shards: vec![ManaCostShard::White],
+                generic: 0,
+            },
+            keywords: Vec::new(),
+            abilities: vec![AbilityDefinition::new(
+                AbilityKind::Spell,
+                Effect::Destroy {
+                    target: TargetFilter::Typed(TypedFilter::new(TypeFilter::Enchantment)),
+                    cant_regenerate: false,
+                },
+            )],
+            trigger_definitions: Default::default(),
+            replacement_definitions: Default::default(),
+            static_definitions: Default::default(),
+            color: vec![ManaColor::White],
+            printed_ref: None,
+            modal: None,
+            additional_cost: None,
+            strive_cost: None,
+            casting_restrictions: Vec::new(),
+            casting_options: Vec::new(),
+            layout_kind: Some(LayoutKind::Split),
+            parse_warnings: vec![],
+        });
+        spell
+    }
+
+    /// CR 709.3a + CR 601.2c: only the elected split half is evaluated, so the
+    /// face prompt admits a half exactly when that half has a legal target. A
+    /// forged election of a target-less half is refused without trace; once a
+    /// target exists the same election casts that half and pays its own cost.
+    #[test]
+    fn split_face_election_admits_a_half_only_with_a_legal_target() {
+        let mut state = setup_game_at_main_phase();
+        let card = wax_wane_in_hand(&mut state);
+        battlefield_object(&mut state, 91_031, P0, "Wax Target", CoreType::Creature);
+        add_mana(&mut state, P0, ManaType::Green, 1);
+        add_mana(&mut state, P0, ManaType::White, 1);
+
+        submit_cast(&mut state, card).expect("Wax is castable, so the split cast must announce");
+        assert!(
+            matches!(state.waiting_for, WaitingFor::ModalFaceChoice { .. }),
+            "a castable split card must ask which half to cast, got {:?}",
+            state.waiting_for
+        );
+        let faces = crate::ai_support::legal_actions(&state);
+        assert!(faces.contains(&GameAction::ChooseModalFace { back_face: false }));
+        assert!(
+            !faces.contains(&GameAction::ChooseModalFace { back_face: true }),
+            "Wane must not be issued without an enchantment to target"
+        );
+
+        let before = state.clone();
+        apply_as_current(&mut state, GameAction::ChooseModalFace { back_face: true })
+            .expect_err("electing a half with no legal target must be refused");
+        assert_eq!(
+            state, before,
+            "a refused election must leave the prompt untouched"
+        );
+
+        let enchantment =
+            battlefield_object(&mut state, 91_032, P1, "Wane Target", CoreType::Enchantment);
+        assert!(crate::ai_support::legal_actions(&state)
+            .contains(&GameAction::ChooseModalFace { back_face: true }));
+        apply_as_current(&mut state, GameAction::ChooseModalFace { back_face: true })
+            .expect("Wane now has a legal target");
+        finish_announcement(&mut state, Some(enchantment));
+
+        assert_eq!(state.objects[&card].zone, Zone::Stack);
+        assert_eq!(state.objects[&card].name, "Wane");
+        assert_eq!(state.players[0].mana_pool.count_color(ManaType::White), 0);
+        assert_eq!(
+            state.players[0].mana_pool.count_color(ManaType::Green),
+            1,
+            "only Wane's {{W}} is paid"
+        );
+    }
+
+    /// A Circular-Logic-shaped madness counterspell ({2}{U}, madness {U},
+    /// "Counter target spell ..."), exiled by its madness replacement and
+    /// offered to its owner.
+    fn madness_counterspell_offer(state: &mut GameState) -> ObjectId {
+        let spell = create_object(
+            state,
+            CardId(91_040),
+            P0,
+            "Madness Counterspell".to_string(),
+            Zone::Exile,
+        );
+        let madness_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 0,
+        };
+        let obj = state.objects.get_mut(&spell).unwrap();
+        obj.card_types.core_types.push(CoreType::Instant);
+        obj.color = vec![ManaColor::Blue];
+        obj.mana_cost = ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue],
+            generic: 2,
+        };
+        obj.base_keywords = vec![Keyword::Madness(madness_cost.clone())];
+        obj.keywords = obj.base_keywords.clone();
+        Arc::make_mut(&mut obj.abilities).push(AbilityDefinition::new(
+            AbilityKind::Spell,
+            Effect::Counter {
+                target: TargetFilter::StackSpell,
+                source_rider: None,
+                countered_spell_zone: None,
+            },
+        ));
+        state.waiting_for = WaitingFor::CastOffer {
+            player: P0,
+            kind: CastOfferKind::Madness {
+                object_id: spell,
+                cost: madness_cost,
+            },
+        };
+        spell
+    }
+
+    fn opposing_spell_on_stack(state: &mut GameState) -> ObjectId {
+        let spell = create_object(
+            state,
+            CardId(91_041),
+            P1,
+            "Opposing Spell".to_string(),
+            Zone::Stack,
+        );
+        state
+            .objects
+            .get_mut(&spell)
+            .unwrap()
+            .card_types
+            .core_types
+            .push(CoreType::Sorcery);
+        state.stack.push_back(StackEntry {
+            id: spell,
+            source_id: spell,
+            controller: P1,
+            kind: StackEntryKind::Spell {
+                card_id: CardId(91_041),
+                ability: None,
+                casting_variant: CastingVariant::Normal,
+                actual_mana_spent: 0,
+            },
+        });
+        spell
+    }
+
+    /// Accept the live madness offer for `object_id` with automatic payment.
+    fn submit_madness_cast(
+        state: &mut GameState,
+        object_id: ObjectId,
+    ) -> Result<ActionResult, EngineError> {
+        let card_id = state.objects[&object_id].card_id;
+        apply_as_current(
+            state,
+            GameAction::CastSpellAsMadness {
+                object_id,
+                card_id,
+                payment_mode: CastPaymentMode::Auto,
+            },
+        )
+    }
+
+    /// CR 702.35a + CR 601.2c: the madness cast is still a cast — with no
+    /// spell to target, the offer cannot be accepted however payable it is.
+    #[test]
+    fn madness_offer_without_a_target_is_refused() {
+        let mut state = setup_game_at_main_phase();
+        let spell = madness_counterspell_offer(&mut state);
+        add_mana(&mut state, P0, ManaType::Blue, 1);
+
+        assert!(crate::ai_support::legal_actions(&state).iter().all(|action|
+            !matches!(action, GameAction::CastSpellAsMadness { object_id, .. } if *object_id == spell)));
+        let before = state.clone();
+        submit_madness_cast(&mut state, spell)
+            .expect_err("a madness cast with no legal target must be refused");
+        assert_eq!(
+            state, before,
+            "a refused madness cast must leave the offer intact"
+        );
+    }
+
+    /// CR 702.35a + CR 601.2f: the madness offer is judged by the prepared
+    /// madness total after cost increases, not by the cost captured on the
+    /// offer, and an accepted offer pays that total exactly once.
+    #[test]
+    fn madness_offer_with_a_target_pays_the_full_prepared_cost_once() {
+        let mut state = setup_game_at_main_phase();
+        let spell = madness_counterspell_offer(&mut state);
+        let target = opposing_spell_on_stack(&mut state);
+        let taxing = battlefield_object(&mut state, 91_042, P1, "Tax Witness", CoreType::Creature);
+        state
+            .objects
+            .get_mut(&taxing)
+            .unwrap()
+            .static_definitions
+            .push(
+                parse_static_line("Noncreature spells cost {1} more to cast.")
+                    .expect("the tax static must parse"),
+            );
+        add_mana(&mut state, P0, ManaType::Blue, 1);
+
+        assert!(crate::ai_support::legal_actions(&state).iter().all(|action|
+            !matches!(action, GameAction::CastSpellAsMadness { object_id, .. } if *object_id == spell)),
+            "{{U}} alone cannot pay the taxed {{1}}{{U}} madness total");
+
+        add_mana(&mut state, P0, ManaType::Colorless, 2);
+        let offer = crate::ai_support::legal_actions(&state).into_iter()
+            .find(|action| matches!(action, GameAction::CastSpellAsMadness { object_id, .. } if *object_id == spell))
+            .expect("the fully payable madness cast must be issued");
+        apply_as_current(&mut state, offer)
+            .expect("the issued payable madness cast must be accepted");
+        finish_announcement(&mut state, Some(target));
+
+        assert_eq!(state.objects[&spell].zone, Zone::Stack);
+        assert_eq!(
+            state.players[0].mana_pool.total(),
+            1,
+            "the taxed {{1}}{{U}} madness total is paid exactly once from three mana"
+        );
+    }
+
+    #[test]
+    fn kicker_instead_using_the_parent_target_still_needs_a_base_target() {
+        let mut scenario = crate::game::scenario::GameScenario::new();
+        scenario.at_phase(Phase::PreCombatMain);
+        let spell = scenario.add_spell_to_hand_from_oracle(
+            P0, "Prohibit", true,
+            "Kicker {2}\nCounter target spell if its mana value is 2 or less. If this spell was kicked, counter that spell if its mana value is 4 or less instead.",
+        ).with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Blue], generic: 1,
+        }).id();
+        let mut state = scenario.build().state().clone();
+        add_mana(&mut state, P0, ManaType::Blue, 1);
+        add_mana(&mut state, P0, ManaType::Colorless, 1);
+        assert!(
+            cast_offers(&state, spell).is_empty(),
+            "a kicked override of that spell cannot invent a target on an empty stack"
+        );
+        let before = state.clone();
+        submit_cast(&mut state, spell).expect_err("a targetless forged Prohibit cast must refuse");
+        assert_eq!(state, before);
+
+        let target = opposing_spell_on_stack(&mut state);
+        let offer = cast_offers(&state, spell)
+            .into_iter()
+            .next()
+            .expect("Prohibit has a spell to target");
+        apply_as_current(&mut state, offer).expect("the offered Prohibit must announce");
+        finish_announcement(&mut state, Some(target));
+        assert_eq!(state.objects[&spell].zone, Zone::Stack);
+        assert_eq!(state.players[0].mana_pool.total(), 0);
     }
 }
 

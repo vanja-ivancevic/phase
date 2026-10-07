@@ -7,6 +7,7 @@ import { getOpponentDisplayName } from "../../stores/multiplayerStore";
 import { usePreferencesStore } from "../../stores/preferencesStore";
 import { useUiStore } from "../../stores/uiStore";
 import type { DiceRollPayload } from "../../stores/uiStore";
+import type { CoinFlipResult } from "../../adapter/types";
 
 // Code-split the WebGL renderer: `three` only loads when a die is actually
 // rolled, keeping it out of the main bundle.
@@ -21,6 +22,20 @@ const NEUTRAL = "148,163,184"; // slate-400 — a non-decisive die
 const IGNORED = "100,116,139"; // slate-500 — a dropped/ignored die, still shown so the roll stays auditable
 const COIN_WON = "52,211,153"; // emerald-400 — the flipper won
 const COIN_LOST = "251,113,133"; // rose-400 — the flipper lost
+
+/** Overlay depiction of an engine-authored coin result. A called flip
+ *  (`Won`/`Lost`) has no engine-named face, so a win is depicted as heads — a
+ *  pure display choice. A face-only flip (`Heads`/`Tails`, CR 705.2) shows the
+ *  engine's face and names no winner or loser. */
+const COIN_DEPICTION: Record<
+  CoinFlipResult,
+  { face: "heads" | "tails"; accent: string; outcomeKey: "wonCoinFlip" | "lostCoinFlip" | null }
+> = {
+  Won: { face: "heads", accent: COIN_WON, outcomeKey: "wonCoinFlip" },
+  Lost: { face: "tails", accent: COIN_LOST, outcomeKey: "lostCoinFlip" },
+  Heads: { face: "heads", accent: NEUTRAL, outcomeKey: null },
+  Tails: { face: "tails", accent: NEUTRAL, outcomeKey: null },
+};
 
 let nextRollKey = 1;
 const rollKeys = new WeakMap<DiceRollPayload, string>();
@@ -151,13 +166,11 @@ function DiceRollContent({ payload, animate }: { payload: DiceRollPayload; anima
     playerId === getPlayerId() ? t("diceRoll.you") : getOpponentDisplayName(playerId);
 
   if (payload.kind === "coin") {
-    // No engine-named face: `won` (relative to the flipping player) maps to a
-    // heads/tails depiction. We show "heads" on a win — a pure display choice.
-    const face = payload.won ? "heads" : "tails";
-    const accent = payload.won ? COIN_WON : COIN_LOST;
-    const outcome = payload.won
-      ? t("diceRoll.wonCoinFlip", { name: playerLabel(payload.playerId) })
-      : t("diceRoll.lostCoinFlip", { name: playerLabel(payload.playerId) });
+    const { face, accent, outcomeKey } = COIN_DEPICTION[payload.result];
+    const name = playerLabel(payload.playerId);
+    const outcome = outcomeKey
+      ? t(`diceRoll.${outcomeKey}`, { name })
+      : `${name}: ${t(`diceRoll.${face}`)}`;
     return (
       <div className="relative flex flex-col items-center gap-4 select-none">
         <span className="text-sm font-semibold uppercase tracking-[0.25em] text-slate-400">

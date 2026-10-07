@@ -16202,6 +16202,7 @@ fn lower_imperative_family_effect(ast: ImperativeFamilyAst) -> Effect {
             win_effect: None,
             lose_effect: None,
             flipper: TargetFilter::Controller,
+            result_is_face: false,
         },
         ImperativeFamilyAst::FlipCoins { count } => Effect::FlipCoins {
             count,

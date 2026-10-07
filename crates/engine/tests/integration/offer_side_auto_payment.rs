@@ -43,6 +43,7 @@ fn interactive_graveyard_mana_ability(color: ManaColor) -> AbilityDefinition {
         },
     )
     .cost(AbilityCost::Exile {
+        same_zone_owner: false,
         count: 1,
         zone: Some(Zone::Graveyard),
         filter: Some(TargetFilter::Typed(
