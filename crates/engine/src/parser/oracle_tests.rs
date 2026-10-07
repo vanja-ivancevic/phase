@@ -34679,6 +34679,7 @@ fn granted_escape_cost(exile_count: u32) -> Keyword {
                 cost: ManaCost::SelfManaCost,
             },
             AbilityCost::Exile {
+                from_top: false,
                 count: exile_count,
                 zone: Some(Zone::Graveyard),
                 filter: None,

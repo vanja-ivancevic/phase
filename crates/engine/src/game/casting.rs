@@ -18882,6 +18882,17 @@ fn continue_with_prepared(
     // CR 601.2a + CR 110.4: a cast still waiting for its per-type slot never
     // reaches announcement or payment.
     ensure_graveyard_slot_announced(&prepared)?;
+    // CR 118.9d + CR 601.2f-h: resource availability alone does not admit
+    // an alternative whose complete mana obligation is unpayable. The casting
+    // method menu omits ordinary casts, so judge this exact prepared cast instead.
+    if prepared.casting_variant == CastingVariant::Normal
+        && prepared_alternative_cost_payability(state, player, &prepared) == Some(false)
+        && !prepared_mana_cost_is_payable(state, player, &prepared, None)
+    {
+        return Err(EngineError::ActionNotAllowed(
+            "Cannot pay spell cost".to_string(),
+        ));
+    }
     if prepared.ability_def.is_none() {
         let obj = state.objects.get(&prepared.object_id);
         let is_aura = obj
@@ -20937,29 +20948,7 @@ fn can_cast_prepared_now_with_probe(
     // payment (issue #562: KCI must expose Ichor Wellspring as castable).
     let targets_ok = prepared.modal.is_some()
         || spell_has_legal_targets_with_probe(state, obj.id, player, probe);
-    let mana_payable = can_feasibly_pay_harmonize_mana_cost_with_probe(
-        state,
-        player,
-        prepared.object_id,
-        prepared.casting_variant,
-        &prepared.mana_cost,
-        probe,
-    ) || casting_costs::defiler_reduced_cost(
-        state,
-        player,
-        prepared.object_id,
-        &prepared.mana_cost,
-    )
-    .is_some_and(|reduced| {
-        can_feasibly_pay_harmonize_mana_cost_with_probe(
-            state,
-            player,
-            prepared.object_id,
-            prepared.casting_variant,
-            &reduced,
-            probe,
-        )
-    });
+    let mana_payable = prepared_mana_cost_is_payable(state, player, prepared, probe);
     let creature_face_ok = targets_ok && mana_payable;
 
     if creature_face_ok {
@@ -20986,9 +20975,33 @@ fn can_cast_prepared_now_with_probe(
     // (`castable_alternative_spell_face_verdict`) that carries that face's own
     // state and cost, so no caller can admit a cast through one face and then
     // price or pay it as the other.
-    (prepared.modal.is_some() || spell_has_legal_targets_with_probe(state, obj.id, player, probe))
-        && super::casting_costs::payable_spell_alternative_cost(state, player, prepared.object_id)
-            .is_some()
+    targets_ok && prepared_alternative_cost_payability(state, player, prepared) == Some(true)
+}
+
+fn prepared_mana_cost_is_payable(
+    state: &GameState,
+    player: PlayerId,
+    prepared: &PreparedSpellCast,
+    probe: Option<&PriorityCastProbe>,
+) -> bool {
+    can_feasibly_pay_harmonize_mana_cost_with_probe(
+        state,
+        player,
+        prepared.object_id,
+        prepared.casting_variant,
+        &prepared.mana_cost,
+        probe,
+    ) || casting_costs::defiler_reduced_cost(state, player, prepared.object_id, &prepared.mana_cost)
+        .is_some_and(|reduced| {
+            can_feasibly_pay_harmonize_mana_cost_with_probe(
+                state,
+                player,
+                prepared.object_id,
+                prepared.casting_variant,
+                &reduced,
+                probe,
+            )
+        })
 }
 
 /// CR 601.2b + CR 601.2f: The pending cast an additional-cost declaration
@@ -21037,6 +21050,53 @@ fn prepared_additional_cost_is_offerable(
     let pending = additional_cost_preview_pending(prepared, player);
     casting_costs::additional_cost_declaration_is_offerable(state, player, &pending, cost.clone())
         .unwrap_or(false)
+}
+
+/// CR 118.9d + CR 601.2f-h: Elect the alternative base before judging the
+/// complete mana obligation. `None` means no payable alternative resource set,
+/// not a refusal of an ordinary cast or its later reduction-order election.
+fn prepared_alternative_cost_payability(
+    state: &GameState,
+    player: PlayerId,
+    prepared: &PreparedSpellCast,
+) -> Option<bool> {
+    if prepared.casting_variant != CastingVariant::Normal {
+        return None;
+    }
+    // Price the same timing-granted election the payment continuation requires.
+    let alternative = prepared
+        .cast_timing_permission
+        .and_then(|permission| {
+            casting_costs::payable_spell_alternative_cost_for_timing(
+                state,
+                player,
+                prepared.object_id,
+                permission,
+            )
+        })
+        .or_else(|| {
+            casting_costs::payable_spell_alternative_cost_details(state, player, prepared.object_id)
+        })?;
+    let mut pending = additional_cost_preview_pending(prepared, player);
+    pending.ability.context.alternative_mana_cost_paid = true;
+    pending.alt_cost_grant_source = alternative.once_per_turn_source;
+    pending.ability.context.alt_cost_grant_source = alternative.once_per_turn_source;
+    let residual = match alternative.cost {
+        AbilityCost::Mana { cost } => {
+            pending.base_cost = Some(cost);
+            AbilityCost::Mana {
+                cost: ManaCost::zero(),
+            }
+        }
+        cost => {
+            pending.base_cost = Some(ManaCost::zero());
+            cost
+        }
+    };
+    Some(
+        casting_costs::additional_cost_declaration_is_offerable(state, player, &pending, residual)
+            .unwrap_or(false),
+    )
 }
 
 /// Returns true if the player can pay this mana cost after auto-tapping
@@ -24295,7 +24355,12 @@ pub(crate) fn stamp_self_ref_discard_cost_paid_object(
 /// cost-paid object. Recurses into `Composite`.
 pub(super) fn find_non_self_exile(
     cost: &AbilityCost,
-) -> Option<(u32, Zone, Option<&TargetFilter>, bool)> {
+) -> Option<(
+    u32,
+    Zone,
+    Option<&TargetFilter>,
+    super::cost_payability::ExileCostRules,
+)> {
     match cost {
         AbilityCost::Exile {
             filter: Some(TargetFilter::SelfRef),
@@ -24306,7 +24371,16 @@ pub(super) fn find_non_self_exile(
             zone: Some(z @ (Zone::Hand | Zone::Graveyard)),
             filter,
             same_zone_owner,
-        } => Some((*count, *z, filter.as_ref(), *same_zone_owner)),
+            from_top,
+        } => Some((
+            *count,
+            *z,
+            filter.as_ref(),
+            super::cost_payability::ExileCostRules {
+                same_zone_owner: *same_zone_owner,
+                from_top: *from_top,
+            },
+        )),
         AbilityCost::Composite { costs } => costs.iter().find_map(find_non_self_exile),
         _ => None,
     }
@@ -24627,10 +24701,13 @@ pub(crate) fn find_eligible_exile_for_cost_targets(
     zone: ExileCostSourceZone,
     filter: Option<&TargetFilter>,
     count: u32,
-    same_zone_owner: bool,
+    rules: super::cost_payability::ExileCostRules,
 ) -> Vec<ObjectId> {
     match zone {
         ExileCostSourceZone::Hand => {
+            if rules.from_top {
+                return Vec::new();
+            }
             let effective_filter =
                 super::cost_payability::cost_filter_before_x_announcement(filter);
             find_eligible_hand_cost_targets(state, player, source, effective_filter.as_ref())
@@ -24642,7 +24719,7 @@ pub(crate) fn find_eligible_exile_for_cost_targets(
             Zone::Graveyard,
             filter,
             count,
-            same_zone_owner,
+            rules,
         ),
     }
 }
@@ -27538,7 +27615,7 @@ fn activate_with_cost_carrier(
             // immediately; targeted abilities must choose their effect targets first
             // (CR 601.2c), then `casting_targets::pay_activation_costs_after_target_selection`
             // surfaces this same cost prompt before the ability reaches the stack.
-            if let Some((count, zone, filter, same_zone_owner)) = find_non_self_exile(cost) {
+            if let Some((count, zone, filter, rules)) = find_non_self_exile(cost) {
                 let narrow_zone = ExileCostSourceZone::try_from_zone(zone)
                     .expect("find_non_self_exile restricts zone to Hand or Graveyard");
                 let eligible = find_eligible_exile_for_cost_targets(
@@ -27548,7 +27625,7 @@ fn activate_with_cost_carrier(
                     narrow_zone,
                     filter,
                     count,
-                    same_zone_owner,
+                    rules,
                 );
                 if eligible.len() < count as usize {
                     return Err(EngineError::ActionNotAllowed(

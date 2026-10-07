@@ -1624,6 +1624,7 @@ mod tests {
         for n in [1u32, 2, 5] {
             let mut state = GameState::new_two_player(1);
             let exile = AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: n,
                 zone: Some(Zone::Graveyard),

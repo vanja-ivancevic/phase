@@ -1,6 +1,7 @@
 import type { TFunction } from "i18next";
 
 import type { SerializedAbilityCost } from "../../adapter/types.ts";
+import { formatAbilityCost } from "../../viewmodel/costLabel.ts";
 
 /**
  * CR 601.2f-h: Compact display copy for the non-mana portion of an
@@ -17,7 +18,9 @@ export function describeAdditionalCost(
 ): string {
   switch (cost.type) {
     case "Exile":
-      return t("alternativeCost.additionalExile");
+      return cost.from_top === true
+        ? formatAbilityCost(cost)
+        : t("alternativeCost.additionalExile");
     case "Sacrifice":
       return t("alternativeCost.additionalSacrifice");
     case "PayLife": {

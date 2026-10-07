@@ -2303,6 +2303,7 @@
       "zoneHand": "la tua mano",
       "discard": "Scarta {{count}} {{cards}}",
       "exile": "Esilia {{count}} {{cards}} da {{zone}}",
+      "exileFromTop": "Esilia le prime {{count}} {{cards}} corrispondenti da {{zone}}",
       "reveal": "Rivela {{count}} {{cards}} da {{zone}}"
     }
   },

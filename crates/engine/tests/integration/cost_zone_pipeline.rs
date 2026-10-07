@@ -932,6 +932,7 @@ fn mana_self_exile_cost_redirect_witness() -> (GameScenario, engine::types::iden
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -3071,6 +3072,7 @@ fn self_exile_activation_cost_pauses_for_moved_redirect_without_pending_cast() {
                 },
             )
             .cost(AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: None,
@@ -3456,6 +3458,7 @@ fn return_cost_keeps_selected_move_while_residual_self_move_pauses() {
                         from_zone: None,
                     },
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -3531,6 +3534,7 @@ fn modal_activation_self_exile_cost_resumes_after_moved_redirect() {
                 },
             )
             .cost(AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: None,
@@ -4268,6 +4272,7 @@ fn effect_pay_cost_rider_waits_for_scry_post_effect_before_typed_root_settles() 
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -4505,6 +4510,7 @@ fn repeated_exile_activation_witness(
     [engine::types::identifiers::ObjectId; 2],
 ) {
     let exile = AbilityCost::Exile {
+        from_top: false,
         same_zone_owner: false,
         count: 1,
         zone: Some(Zone::Hand),
@@ -4648,6 +4654,7 @@ fn mana_selected_exile_cost_redirect_resumes_after_the_paid_prefix_once() {
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 2,
                         zone: Some(Zone::Battlefield),
                         filter: None,
@@ -5151,6 +5158,7 @@ fn nested_costed_mana_source_serializes_parent_cursor_and_finishes_outer_payment
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -5390,6 +5398,7 @@ fn hostile_abcd_fixture(axis: HostileObserverAxis) -> HostileAbcdFixture {
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -8144,6 +8153,7 @@ fn two_source_assist_replacement_witness(
                     costs: vec![
                         AbilityCost::Tap,
                         AbilityCost::Exile {
+                            from_top: false,
                             count: 1,
                             zone: None,
                             filter: Some(TargetFilter::SelfRef),
@@ -8328,6 +8338,7 @@ fn committed_assist_phyrexian_choice_serializes_helper_cost_pause_and_charges_on
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -8497,6 +8508,7 @@ fn caster_phyrexian_finalization_serializes_costed_source_pause_and_retries_choi
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -8621,6 +8633,7 @@ fn committed_assist_mana_payment_serializes_helper_redirect_and_charges_once() {
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -8918,6 +8931,7 @@ fn mana_cost_post_replacement_named_choice_serializes_and_resumes_outer_payment_
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -9862,6 +9876,7 @@ fn targeted_mana_tap_hand_exile_cost_retries_after_source_cost_redirect_without_
                     },
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: Some(Zone::Hand),
                         filter: None,
@@ -9992,6 +10007,7 @@ fn committed_assist_source_cost_pause_rejects_cast_cancellation() {
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -10087,6 +10103,7 @@ fn mana_cost_scry_post_effect_serializes_until_answered_then_resumes_root_once()
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -10210,6 +10227,7 @@ fn mana_cost_proliferate_post_effect_serializes_until_answered_then_resumes_root
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -10332,6 +10350,7 @@ fn optional_post_effect_settles_before_resuming_the_parked_mana_root() {
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),

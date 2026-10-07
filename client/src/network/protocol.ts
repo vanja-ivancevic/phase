@@ -106,6 +106,10 @@ export function legalActionsFromWire(wire: LegalActionsWire): LegalActionsResult
  * seat or adopts reconnect state.
  *
  * Bumps to date:
+ *  87 — Serialized AbilityCost.Exile.from_top retains ordered matching-card
+ *       payment from the payer's own graveyard. A v86 peer drops the additive
+ *       rule and can pay a different cost; first contact rejects the skew.
+ *       Bumped in lockstep with full-game protocol 105.
  *  86 — game_setup and state_update carry GameState, whose events now carry
  *       CoinFlipped.result (Won/Lost/Heads/Tails) instead of won, plus the
  *       face-only coin and linked battlefield-return state, and the cost-owned
@@ -538,7 +542,7 @@ export type P2PInteractionPreviewAnswer =
   | { type: "preview"; preview: InteractionPreview }
   | { type: "failed"; message: string };
 
-export const WIRE_PROTOCOL_VERSION = 86 as const;
+export const WIRE_PROTOCOL_VERSION = 87 as const;
 
 export type P2PMessage = P2PAuthorityWire & (
   | {

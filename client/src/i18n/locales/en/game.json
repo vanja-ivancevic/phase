@@ -2341,6 +2341,7 @@
       "zoneHand": "your hand",
       "discard": "Discard {{count}} {{cards}}",
       "exile": "Exile {{count}} {{cards}} from {{zone}}",
+      "exileFromTop": "Exile the top {{count}} matching {{cards}} from {{zone}}",
       "reveal": "Reveal {{count}} {{cards}} from {{zone}}"
     }
   },

@@ -117,6 +117,7 @@ type SerializedCost = {
   cost?: { type: string; shards?: string[]; generic?: number };
   filter?: { type: string; type_filters?: unknown[] } | null;
   zone?: string | null;
+  from_top?: boolean;
 };
 
 function formatTypeFilter(filter: unknown): string {
@@ -348,7 +349,9 @@ export function formatKnownCost(cost: SerializedCost): string | null {
     case "Exile": {
       const count = formatQuantity(cost.count, 1);
       const cards = formatFilteredCard(cost.filter, quantityIsPlural(cost.count));
-      return i18n.t("game:resolutionOptionalPayment.cost.exile", {
+      return i18n.t(cost.from_top === true
+        ? "game:resolutionOptionalPayment.cost.exileFromTop"
+        : "game:resolutionOptionalPayment.cost.exile", {
         count,
         cards,
         zone: formatZone(cost.zone),

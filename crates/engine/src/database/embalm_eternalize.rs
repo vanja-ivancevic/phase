@@ -157,6 +157,7 @@ fn token_copy_ability(
     // `pay_ability_cost` (no player choice). An explicit `Zone::Graveyard`
     // validates the source's location when the cost is paid.
     let exile_self = AbilityCost::Exile {
+        from_top: false,
         same_zone_owner: false,
         count: 1,
         zone: Some(Zone::Graveyard),

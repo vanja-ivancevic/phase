@@ -1403,6 +1403,7 @@ fn curie_def() -> engine::types::ability::AbilityDefinition {
                 },
             },
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: None,
                 filter: Some(TargetFilter::Typed(

@@ -1326,6 +1326,7 @@ fn parse_as_enters_exile_any_number_from_graveyard(
     }
 
     let cost = AbilityCost::Exile {
+        from_top: false,
         count: EXILE_COST_ANY_NUMBER,
         zone: Some(Zone::Graveyard),
         filter: Some(filter),
@@ -1438,6 +1439,7 @@ fn parse_as_enters_exile_from_graveyards(
     }
 
     let cost = AbilityCost::Exile {
+        from_top: false,
         count,
         zone: Some(Zone::Graveyard),
         filter: Some(filter),

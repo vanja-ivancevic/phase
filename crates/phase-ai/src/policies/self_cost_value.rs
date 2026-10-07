@@ -1297,6 +1297,7 @@ mod tests {
         // (>=7 cards) would clear the reject floor.
         let mut state = GameState::new_two_player(42);
         let cost = AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Graveyard),
@@ -1325,6 +1326,7 @@ mod tests {
         // hand-exile clears the reject floor — proves Exile{Hand} reaches scoring.
         let mut state = GameState::new_two_player(42);
         let cost = AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Hand),

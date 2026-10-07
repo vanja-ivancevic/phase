@@ -4124,6 +4124,7 @@ mod tests {
             .with_mana_cost(ManaCost::zero())
             .from_oracle_text("Draw a card.")
             .with_additional_cost(AdditionalCost::Required(AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: Some(Zone::Graveyard),
@@ -5615,6 +5616,7 @@ mod tests {
                 }
                 MetadataCase::GraveyardExileCost => {
                     definition.cost = Some(AbilityCost::Exile {
+                        from_top: false,
                         same_zone_owner: false,
                         count: 1,
                         zone: Some(Zone::Graveyard),

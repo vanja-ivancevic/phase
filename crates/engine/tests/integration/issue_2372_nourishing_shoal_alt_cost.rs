@@ -13,11 +13,13 @@ use engine::types::actions::GameAction;
 use engine::types::card_type::CoreType;
 use engine::types::game_state::{CastPaymentMode, StackEntryKind, WaitingFor};
 use engine::types::identifiers::CardId;
-use engine::types::mana::{ManaColor, ManaCost, ManaCostShard};
+use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
 use engine::types::zones::Zone;
 
-fn setup_shoal_scenario() -> (
+fn setup_shoal_scenario(
+    taxed: bool,
+) -> (
     engine::game::scenario::GameRunner,
     engine::types::identifiers::ObjectId,
     CardId,
@@ -25,6 +27,22 @@ fn setup_shoal_scenario() -> (
 ) {
     let mut scenario = GameScenario::new();
     scenario.at_phase(Phase::PreCombatMain);
+    if taxed {
+        scenario.add_artifact_from_oracle(
+            P0,
+            "Sphere of Resistance",
+            "Spells cost {1} more to cast.",
+        );
+        scenario.with_mana_pool(
+            P0,
+            vec![ManaUnit::new(
+                ManaType::Colorless,
+                engine::types::identifiers::ObjectId(90_001),
+                false,
+                vec![],
+            )],
+        );
+    }
 
     let alt_cost = parse_oracle_cost("exile a green card with mana value X from your hand");
 
@@ -68,7 +86,7 @@ fn setup_shoal_scenario() -> (
 
 #[test]
 fn nourishing_shoal_cast_surfaces_pitch_alternative_choice() {
-    let (mut runner, shoal, card_id, _) = setup_shoal_scenario();
+    let (mut runner, shoal, card_id, _) = setup_shoal_scenario(false);
     let life_before = runner.life(P0);
 
     let result = runner
@@ -97,76 +115,79 @@ fn nourishing_shoal_cast_surfaces_pitch_alternative_choice() {
 
 #[test]
 fn nourishing_shoal_pitch_exile_binds_x_and_gains_life() {
-    let (mut runner, shoal, card_id, green_filler) = setup_shoal_scenario();
-    let life_before = runner.life(P0);
+    for taxed in [false, true] {
+        let (mut runner, shoal, card_id, green_filler) = setup_shoal_scenario(taxed);
+        let life_before = runner.life(P0);
 
-    runner
-        .act(GameAction::CastSpell {
-            object_id: shoal,
-            card_id,
-            targets: vec![],
+        runner
+            .act(GameAction::CastSpell {
+                object_id: shoal,
+                card_id,
+                targets: vec![],
 
-            payment_mode: CastPaymentMode::Auto,
-        })
-        .expect("cast");
+                payment_mode: CastPaymentMode::Auto,
+            })
+            .expect("cast");
 
-    runner
-        .act(GameAction::DecideOptionalCost { pay: true })
-        .expect("accept pitch cost");
+        runner
+            .act(GameAction::DecideOptionalCost { pay: true })
+            .expect("accept pitch cost");
 
-    assert!(
-        matches!(
-            runner.state().waiting_for,
-            WaitingFor::PayCost {
-                kind: engine::types::game_state::PayCostKind::ExileFromZone {
-                    zone: engine::types::zones::ExileCostSourceZone::Hand,
-                },
-                ..
-            }
-        ),
-        "expected exile-from-hand payment, got {:?}",
-        runner.state().waiting_for
-    );
-
-    let WaitingFor::PayCost { choices, .. } = &runner.state().waiting_for else {
-        unreachable!();
-    };
-    assert!(choices.contains(&green_filler));
-
-    runner
-        .act(GameAction::SelectCards {
-            cards: vec![green_filler],
-        })
-        .expect("exile green card for pitch");
-
-    assert!(
-        !runner.state().stack.is_empty(),
-        "Nourishing Shoal must reach the stack after paying the pitch cost"
-    );
-    if let StackEntryKind::Spell {
-        ability: Some(ability),
-        ..
-    } = &runner.state().stack.last().unwrap().kind
-    {
-        assert_eq!(
-            ability.chosen_x,
-            Some(3),
-            "X must be bound from the exiled card's mana value before resolution"
+        assert!(
+            matches!(
+                runner.state().waiting_for,
+                WaitingFor::PayCost {
+                    kind: engine::types::game_state::PayCostKind::ExileFromZone {
+                        zone: engine::types::zones::ExileCostSourceZone::Hand,
+                    },
+                    ..
+                }
+            ),
+            "expected exile-from-hand payment, got {:?}",
+            runner.state().waiting_for
         );
-    } else {
-        panic!("expected spell on stack after pitch payment");
+
+        let WaitingFor::PayCost { choices, .. } = &runner.state().waiting_for else {
+            unreachable!();
+        };
+        assert!(choices.contains(&green_filler));
+
+        runner
+            .act(GameAction::SelectCards {
+                cards: vec![green_filler],
+            })
+            .expect("exile green card for pitch");
+        assert_eq!(runner.state().players[0].mana_pool.total(), 0);
+
+        assert!(
+            !runner.state().stack.is_empty(),
+            "Nourishing Shoal must reach the stack after paying the pitch cost"
+        );
+        if let StackEntryKind::Spell {
+            ability: Some(ability),
+            ..
+        } = &runner.state().stack.last().unwrap().kind
+        {
+            assert_eq!(
+                ability.chosen_x,
+                Some(3),
+                "X must be bound from the exiled card's mana value before resolution"
+            );
+        } else {
+            panic!("expected spell on stack after pitch payment");
+        }
+
+        runner.advance_until_stack_empty();
+
+        assert_eq!(
+            runner.life(P0),
+            life_before + 3,
+            "X must equal the exiled card's mana value (3)"
+        );
+        assert_eq!(
+            runner.state().objects[&green_filler].zone,
+            Zone::Exile,
+            "pitched card must be exiled"
+        );
     }
-
-    runner.advance_until_stack_empty();
-
-    assert_eq!(
-        runner.life(P0),
-        life_before + 3,
-        "X must equal the exiled card's mana value (3)"
-    );
-    assert_eq!(
-        runner.state().objects[&green_filler].zone,
-        Zone::Exile,
-        "pitched card must be exiled"
-    );
 }

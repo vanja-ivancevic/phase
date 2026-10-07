@@ -2303,6 +2303,7 @@
       "zoneHand": "deiner Hand",
       "discard": "Wirf {{count}} {{cards}} ab",
       "exile": "Schicke {{count}} {{cards}} aus {{zone}} ins Exil",
+      "exileFromTop": "Schicke die obersten {{count}} passenden {{cards}} aus {{zone}} ins Exil",
       "reveal": "Zeige {{count}} {{cards}} aus {{zone}} vor"
     }
   },

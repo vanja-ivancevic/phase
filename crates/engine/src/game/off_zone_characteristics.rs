@@ -1083,6 +1083,7 @@ mod tests {
         );
 
         let exile_residual = AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 3,
             zone: Some(Zone::Graveyard),

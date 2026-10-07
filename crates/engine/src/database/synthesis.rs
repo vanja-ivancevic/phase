@@ -783,6 +783,7 @@ pub fn synthesize_craft(face: &mut CardFace) {
                     // CR 702.167a: "Exile this permanent" — the source self-exiles
                     // from the battlefield as part of the cost.
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: Some(Zone::Battlefield),
                         filter: Some(TargetFilter::SelfRef),
@@ -2225,6 +2226,7 @@ pub(crate) fn scavenge_ability_for_keyword(keyword: &Keyword) -> Option<AbilityD
             // CR 702.97a: "Exile this card from your graveyard" — SelfRef + Graveyard
             // is auto-paid by pay_ability_cost (no player choice needed).
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(Zone::Graveyard),
                 filter: Some(TargetFilter::SelfRef),
@@ -9060,6 +9062,7 @@ pub fn synthesize_suspend(face: &mut CardFace) {
                 },
                 // CR 702.62a: "exile it" — self-targeted exile from hand.
                 AbilityCost::Exile {
+                    from_top: false,
                     count: 1,
                     zone: Some(Zone::Hand),
                     filter: Some(TargetFilter::SelfRef),
@@ -9216,6 +9219,7 @@ pub(crate) fn build_plot_activation(
             // targeted exile from the zone the card is in. Mirrors Suspend's
             // self-exile cost component.
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(exile_zone),
                 filter: Some(TargetFilter::SelfRef),
@@ -17014,6 +17018,7 @@ mod cumulative_upkeep_synthesis_tests {
         // once the per-counter discard payment chain landed — CR 702.24a — so
         // Exile is now the canonical still-unsupported non-mana base shape.)
         let exile_kw = Keyword::CumulativeUpkeep(AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: None,
@@ -17033,6 +17038,7 @@ mod cumulative_upkeep_synthesis_tests {
                     cost: ManaCost::generic(1),
                 },
                 AbilityCost::Exile {
+                    from_top: false,
                     count: 1,
                     zone: None,
                     filter: None,
@@ -17051,6 +17057,7 @@ mod cumulative_upkeep_synthesis_tests {
         let mut face = CardFace::default();
         face.keywords
             .push(Keyword::CumulativeUpkeep(AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: None,

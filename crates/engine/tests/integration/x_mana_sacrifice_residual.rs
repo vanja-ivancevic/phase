@@ -676,6 +676,7 @@ fn x_mana_unsupported_siblings_refuse_before_count_payment() {
         (
             "graveyard exile",
             AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: Some(Zone::Graveyard),
@@ -1558,6 +1559,7 @@ fn x_mana_mixed_requirement_life_tap_and_exile_shapes_refuse_atomically() {
         (
             "hand exile",
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(Zone::Hand),
                 filter: None,
@@ -1568,6 +1570,7 @@ fn x_mana_mixed_requirement_life_tap_and_exile_shapes_refuse_atomically() {
         (
             "graveyard exile",
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(Zone::Graveyard),
                 filter: None,
@@ -1578,6 +1581,7 @@ fn x_mana_mixed_requirement_life_tap_and_exile_shapes_refuse_atomically() {
         (
             "battlefield exile",
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(Zone::Battlefield),
                 filter: Some(creature.clone()),

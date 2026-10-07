@@ -453,3 +453,120 @@ all 74 suites: 37,345 passed, 65 ignored, zero failed. It includes the resumed
 invocation-only symbol stripping keeps the final target at 12 GiB and leaves
 20 GiB free. The 2,822 Rust/config source bindings remain unchanged after
 verification. Receipt: `full-stripped-m4-gate-record-20261007.json`.
+
+### Ordered graveyard exile and complete alternative costs (C2, 2026-10-07)
+
+A graveyard `AbilityCost::Exile` with `from_top: true` pays from the caster's
+own graveyard, taking the newest matching cards rather than the newest physical
+cards. Spinning Darkness retains its fixed count of three and Black filter;
+interleaved nonmatching cards and the opponent's graveyard are not payment.
+The public prompt fixes both minimum and maximum to three and refuses an older
+matching set without committing resources. Omitted/false `from_top` keeps
+ordinary exile semantics; the existing physical-top library behavior is unchanged.
+
+Electing a nonmana alternative replaces the printed mana base with zero, not
+the complete cost with zero. Canonical total-cost computation still applies
+live increases, reductions and floors on every payment continuation. The
+timing-required route shares this election and repricing: the public Primal
+Prayers/Sphere probe previously paid one energy but left its one tax mana
+untouched; after repair it pays both and resolves the creature. Initial cast
+admission checks the actual prepared cast's alternative-total and ordinary
+mana routes. An empty casting-method menu is not an affordability verdict:
+ordinary casts deliberately need no casting-method election.
+
+Prepared admission prioritizes the latched timing-granted alternative exactly
+as the payment continuation does, rather than pricing an unrelated self-option.
+The public Primal/Sphere fixture with a competing self-mana option previously
+refused a payable energy-plus-tax cast; after repair the issued cast pays both
+and resolves. This does not expand the existing multi-alternative choice menu.
+
+Shoal-style pitch costs bind X from the pitched card's mana value using the
+spell's printed X and elected-alternative context. The elected zero mana base
+and a tax-inclusive payable total cannot serve as the printed-X predicate.
+The preserved Nourishing Shoal regression and actual public reducer now cover
+bare and Sphere-taxed payment: X is three before resolution, the pitched card
+is exiled, the tax is paid when present, and life increases from 20 to 23.
+
+Full-game protocol is 105 and P2P is 87; lobby 15 and draft 30 are unchanged.
+Exact-match refusal prevents an old gameplay peer from interpreting ordered
+costs as arbitrary exile. Cost labels distinguish the top matching cards in
+eight locales; the formatter does not yet spell out the color filter.
+The real optional-cost modal passed English desktop and German 390px mobile
+dispatch/clipping checks. Real WebSocket handshake refused full104 before
+ClientHello, accepted full105, and retained lobby15 compatibility with full104.
+The actual guest setup/reconnect handlers refused P2P86/88 using an in-memory
+session; this is not a PeerJS-network or initialized-WASM proof.
+
+The source8 focused M4 batch passes 165 tests: two existing Shoal consumers
+(including bare/taxed X binding), 14 public announcement contracts,
+11 activation contracts and the existing 101 manabrew contracts, plus the
+remaining old-border consumer contracts.
+
+The complete source8 M4 workspace gate passes 37,349 tests, with zero failures
+and 65 ignored across 74 suite results. Fmt/clippy passed before a 3600-second
+transport interruption during test compilation; the unchanged-source test
+continuation completed with exit 0. The failed source7 Shoal assertion was
+preserved, not re-pinned. Runtime mechanism probes and this gate do not qualify
+an entire deck for labeling.
+
+Five actual Phase/Forge runtime fixtures agree on admission, ordered exile,
+complete mana payment, damage, life and source zone: both seats resolve the
+untaxed spell, one mana pays Sphere's tax, and insufficient own Black cards
+or an unpaid tax refuse without mutation. This is bounded mechanism evidence,
+not complete-deck or all-683 Forge equivalence.
+
+The three saved selections in games 699–701 now issue, resume payment to the
+stack, and resolve through real priority passes, gaining three life. Their
+actual runtime export is `0825b7af…`, matching the retained C1 v20/v21 input
+receipts; `run.json`'s unverified caller metadata still names the older `f184…`.
+That legacy export loses Black, fixed cardinality and top order, so these
+resumed variable-size selections prove payment continuation only. Regenerate
+the complete canonical export before exercising corrected deck legality;
+never patch just Spinning Darkness or infer a functionality percentage here.
+
+The fresh unfiltered canonical export is
+`febe761967ead1670372d6ca8960c55d97044ee6f1ffdb9ef59798edfb14dda5`.
+The actual `oracle-gen` binary is
+`47f266d344d23f54cee7fd5589d8e7a4f9fa7e05bd4ca40bc83c3c929663ebab`;
+the production `deck-corpus` is
+`ce0d0df66e91cd73a17de8563f3c0c640cfe49ad99b7871ee9a1a848dee2710b`.
+The engine producer features are `cli` and `tracing-subscriber`, not
+`test-support`. Its actual Spinning Darkness definition retains fixed count3,
+Black filtering, graveyard zone and `from_top: true`.
+
+All 339 canonical inputs (663,765,907 bytes) match their original SHA256/size
+manifest before and after export. SMB made `CON.json` inaccessible and yielded
+an uncertified 333-set attempt; the complete Mac-local POSIX snapshot reads all
+334 sets. The full snapshot was transferred over SSH, not patched per card,
+and removed under an idle guard after proof. Export runtime requires the
+existing `RUST_MIN_STACK=67108864` setting; the launcher omission aborted
+before output and is preserved as negative evidence. No legacy `0825`, `f184`
+metadata, failed SMB output or mechanism verdict transfers to this new export.
+
+The actual production consumer then ran fresh corrected-data global legs
+699–701 (half-open range699–702), seed7, pair schedule and uniform-issued
+candidates. All three reached terminal wins with 1,698 accepted actions and no
+recorded failure. This is not the legacy replay, complete-corpus execution,
+gameplay correctness from completion, or paired Forge deck qualification.
+Receipt: `ordered-exile-corrected-corpus-smoke-record-20261007.json`.
+
+Receipts in the Patina analysis directory:
+`ordered-exile-m4-focused8-record-20261007.json`,
+`ordered-exile-m4-full8-record-20261007.json`,
+`ordered-exile-m4-workspace-resume8-record-20261007.json`,
+`spinning-darkness-phase-observer-after8-20261007-record.json`,
+`primal-prayers-timing-selector-phase-observer-before-20261007-record.json`,
+`primal-prayers-timing-selector-phase-observer-after8-20261007-record.json`,
+`nourishing-shoal-x-tax-phase-observer-after8-20261007-record.json`,
+`corpus-selection-replay-after-20261007-record.json`,
+`spinning-darkness-paired-source8-runtime-20261007.json`,
+`ordered-exile-ui-proof/proof.json`,
+`ordered-exile-canonical-local-export-after-stack64-record-20261007.json`,
+`ordered-exile-canonical-local-inputs-before-after-20261007.json`, and
+`ordered-exile-canonical-output-manifest-20261007.json`.
+Complete workspace verification is recorded above; fresh complete-corpus
+acceptance remains a separate gate.
+All Vast instances have been destroyed; no paid worker is retained or restarted
+for this M4-only gate. Collector qualification and launch remain independent:
+the first genuinely qualified deck-hash-bound subset suffices, and these
+mechanism fixtures are not a blanket admission.

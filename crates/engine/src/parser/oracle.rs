@@ -875,6 +875,7 @@ pub(crate) fn parse_graveyard_keyword_continuation(
                             cost: ManaCost::SelfManaCost,
                         },
                         AbilityCost::Exile {
+                            from_top: false,
                             count: exile_count,
                             zone: Some(Zone::Graveyard),
                             filter: None,

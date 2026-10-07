@@ -80534,6 +80534,7 @@ fn effect_target_graveyard_card_gains_escape_compound_cost() {
                     cost: ManaCost::SelfManaCost,
                 },
                 AbilityCost::Exile {
+                    from_top: false,
                     count,
                     zone: Some(Zone::Graveyard),
                     filter: None,

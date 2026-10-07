@@ -958,6 +958,7 @@ fn deferred_sacrifice_permanent_is_not_exile_cost_choice_for_mana_ability() {
                 },
             )
             .cost(AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: None,

@@ -20489,11 +20489,13 @@ fn expand_per_counter(base: &AbilityCost, n: u32) -> AbilityCost {
             zone: Some(Zone::Library),
             filter: None,
             same_zone_owner,
+            from_top,
         } => AbilityCost::Exile {
             count: count.saturating_mul(n),
             zone: Some(Zone::Library),
             filter: None,
             same_zone_owner: *same_zone_owner,
+            from_top: *from_top,
         },
         // CR 702.24a: Aboroth-class cumulative upkeep repeats the source
         // counter placement once for every age counter. Scaling its quantity
@@ -43099,6 +43101,7 @@ mod tests {
     fn expand_per_counter_top_library_exile_scales_count() {
         for same_zone_owner in [false, true] {
             let base = AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(Zone::Library),
                 filter: None,
@@ -43108,6 +43111,7 @@ mod tests {
             assert_eq!(
                 expand_per_counter(&base, 3),
                 AbilityCost::Exile {
+                    from_top: false,
                     count: 3,
                     zone: Some(Zone::Library),
                     filter: None,

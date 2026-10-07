@@ -335,6 +335,7 @@ fn a_paused_megamorph_payment_still_places_the_counter() {
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),

@@ -697,6 +697,7 @@ impl AbilityCost {
                 zone,
                 filter,
                 same_zone_owner,
+                from_top,
             } => {
                 // CR 107.1c: an "any number" choice includes zero, so the
                 // resource pre-gate is always satisfiable. The concrete
@@ -732,7 +733,10 @@ impl AbilityCost {
                     zone,
                     filter.as_ref(),
                     *count,
-                    *same_zone_owner,
+                    ExileCostRules {
+                        same_zone_owner: *same_zone_owner,
+                        from_top: *from_top,
+                    },
                 )
                 .len()
                     >= *count as usize
@@ -1099,6 +1103,12 @@ pub(super) fn exile_cost_effective_zone(zone: Option<Zone>, filter: Option<&Targ
     })
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ExileCostRules {
+    pub same_zone_owner: bool,
+    pub from_top: bool,
+}
+
 /// CR 117.1 + CR 118.3: Eligible objects for a non-self exile cost. Explicit
 /// graveyard filters retain their owner scope; an unfiltered legacy cost uses
 /// the payer's graveyard. A collective source constraint excludes piles that
@@ -1114,16 +1124,19 @@ pub(super) fn eligible_exile_cost_objects(
     zone: Zone,
     filter: Option<&TargetFilter>,
     count: u32,
-    same_zone_owner: bool,
+    rules: ExileCostRules,
 ) -> Vec<ObjectId> {
     let Some(p) = state.players.get(player.0 as usize) else {
         return Vec::new();
     };
+    if rules.from_top && zone != Zone::Graveyard {
+        return Vec::new();
+    }
     if zone == Zone::Graveyard {
         let effective_filter = cost_filter_before_x_announcement(filter);
         let filter_ref = effective_filter.as_ref();
-        let any_owner =
-            filter_ref.is_some_and(|filter| filter.extract_in_zone() == Some(Zone::Graveyard));
+        let any_owner = !rules.from_top
+            && filter_ref.is_some_and(|filter| filter.extract_in_zone() == Some(Zone::Graveyard));
         let ctx = FilterContext::from_source_with_controller(source, player);
         let mut eligible = Vec::new();
         for owner in &state.players {
@@ -1131,7 +1144,7 @@ pub(super) fn eligible_exile_cost_objects(
                 continue;
             }
             let start = eligible.len();
-            eligible.extend(owner.graveyard.iter().copied().filter(|&id| {
+            let matching = owner.graveyard.iter().copied().filter(|&id| {
                 id != source
                     && state
                         .objects
@@ -1140,8 +1153,13 @@ pub(super) fn eligible_exile_cost_objects(
                     && filter_ref.is_none_or(|filter| {
                         matches_target_filter_in_owner_zone(state, id, filter, &ctx)
                     })
-            }));
-            if same_zone_owner && eligible.len() - start < count as usize {
+            });
+            if rules.from_top {
+                eligible.extend(matching.rev().take(count as usize));
+            } else {
+                eligible.extend(matching);
+            }
+            if rules.same_zone_owner && eligible.len() - start < count as usize {
                 eligible.truncate(start);
             }
         }
@@ -1599,6 +1617,7 @@ mod tests {
         let mut scenario = GameScenario::new();
         let src = scenario.add_creature(P0, "Ominous Cemetery", 0, 0).id();
         let self_exile = AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: None,
@@ -1617,6 +1636,7 @@ mod tests {
         // An EXPLICIT zone still gates: a battlefield source cannot pay a
         // "from your graveyard" self-exile cost (Scavenge class).
         assert!(!AbilityCost::Exile {
+            from_top: false,
             count: 1,
             zone: Some(Zone::Graveyard),
             filter: Some(TargetFilter::SelfRef),
@@ -1904,6 +1924,7 @@ mod tests {
         let mut scenario = GameScenario::new();
         let source = scenario.add_creature(P0, "Harvest Pyre", 0, 1).id();
         let cost = AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: EXILE_COST_X,
             zone: Some(Zone::Graveyard),
@@ -2171,7 +2192,7 @@ mod tests {
             Zone::Hand,
             filter.as_ref(),
             1,
-            false,
+            super::ExileCostRules::default(),
         );
         assert!(
             eligible.contains(&green_two_drop),
@@ -2196,6 +2217,7 @@ mod tests {
             .add_creature_to_graveyard(P0, "Uro, Titan of Nature's Wrath", 6, 6)
             .id();
         let cost = AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 5,
             zone: Some(Zone::Graveyard),
@@ -2241,7 +2263,7 @@ mod tests {
                     ]),
             )),
             5,
-            false,
+            super::ExileCostRules::default(),
         );
         assert!(
             !eligible.contains(&uro),

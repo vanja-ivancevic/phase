@@ -7218,6 +7218,7 @@ fn composite_tap_self_exile_activation_moves_battlefield_source_to_exile() {
         costs: vec![
             AbilityCost::Tap,
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: None,
                 filter: Some(TargetFilter::SelfRef),
@@ -23448,6 +23449,7 @@ fn mana_leg_battlefield_exile_pays_mana_before_exile_prompt() {
                             },
                         },
                         AbilityCost::Exile {
+                            from_top: false,
                             count: 1,
                             zone: None,
                             filter: Some(TargetFilter::Typed(
@@ -32509,6 +32511,7 @@ fn chosen_muldrotha_variant_requests_and_consumes_permanent_type_slot() {
                     cost: ManaCost::generic(0),
                 },
                 AbilityCost::Exile {
+                    from_top: false,
                     count: 3,
                     zone: Some(Zone::Graveyard),
                     filter: None,
@@ -33892,6 +33895,7 @@ fn ai_escape_cast_from_graveyard_pays_mana_and_exiles_five_cards() {
                     cost: escape_mana.clone(),
                 },
                 AbilityCost::Exile {
+                    from_top: false,
                     count: 5,
                     zone: Some(Zone::Graveyard),
                     filter: None,
@@ -40464,6 +40468,7 @@ mod alt_cost_reduction_509 {
             }],
         });
         let exile_cost = AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Hand),
@@ -40550,6 +40555,7 @@ mod alt_cost_reduction_509 {
             }],
         });
         let exile_cost = AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Hand),
@@ -40683,6 +40689,7 @@ mod alt_cost_reduction_509 {
             }],
         });
         let exile_cost = AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Hand),
@@ -52105,6 +52112,7 @@ fn doc_aurlock_reduces_plot_special_action_cost() {
                     },
                 },
                 AbilityCost::Exile {
+                    from_top: false,
                     count: 1,
                     zone: Some(Zone::Hand),
                     filter: Some(TargetFilter::SelfRef),
@@ -52732,6 +52740,7 @@ fn plot_special_action_ignores_generic_activated_ability_cost_modifiers() {
                     },
                 },
                 AbilityCost::Exile {
+                    from_top: false,
                     count: 1,
                     zone: Some(Zone::Hand),
                     filter: Some(TargetFilter::SelfRef),

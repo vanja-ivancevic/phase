@@ -27,7 +27,9 @@ use crate::types::zones::Zone;
 use std::collections::HashSet;
 use std::ops::ControlFlow;
 
-use super::cost_payability::{eligible_exile_cost_objects, exile_cost_effective_zone};
+use super::cost_payability::{
+    eligible_exile_cost_objects, exile_cost_effective_zone, ExileCostRules,
+};
 use super::effects::mana::resolve_restrictions;
 use super::engine::EngineError;
 use super::filter::{matches_target_filter, FilterContext};
@@ -2708,7 +2710,7 @@ fn pay_selected_mana_ability_exile_cost(
     count: u32,
     zone: Option<Zone>,
     filter: Option<&TargetFilter>,
-    same_zone_owner: bool,
+    rules: ExileCostRules,
     events: &mut Vec<GameEvent>,
     cost_event_start: usize,
 ) -> Result<ManaAbilityPaymentProgress, EngineError> {
@@ -2740,7 +2742,7 @@ fn pay_selected_mana_ability_exile_cost(
             effective_zone,
             filter,
             count,
-            same_zone_owner,
+            rules,
         );
         if effective_zone == Zone::Library {
             if selected != legal {
@@ -2755,7 +2757,7 @@ fn pay_selected_mana_ability_exile_cost(
                 "Selected card does not match the exile cost".to_string(),
             ));
         }
-        if same_zone_owner
+        if rules.same_zone_owner
             && !super::cost_payability::exile_selection_has_same_zone_owner(
                 state,
                 effective_zone,
@@ -2935,6 +2937,7 @@ fn pay_mana_ability_cost_component(
             zone,
             filter,
             same_zone_owner,
+            from_top,
         } if !matches!(filter, Some(TargetFilter::SelfRef)) => {
             pay_selected_mana_ability_exile_cost(
                 state,
@@ -2943,7 +2946,10 @@ fn pay_mana_ability_cost_component(
                 *count,
                 *zone,
                 filter.as_ref(),
-                *same_zone_owner,
+                ExileCostRules {
+                    same_zone_owner: *same_zone_owner,
+                    from_top: *from_top,
+                },
                 events,
                 cost_event_start,
             )
@@ -5122,19 +5128,25 @@ fn discard_cost_choice(
 }
 
 /// CR 117.1 + CR 118.3: Match non-self `AbilityCost::Exile` shapes. Returns
-/// `(count, effective_zone, filter, same_zone_owner)` if found, else `None`.
-fn find_exile_cost(cost: &AbilityCost) -> Option<(u32, Zone, Option<&TargetFilter>, bool)> {
+/// `(count, effective_zone, filter, rules)` if found, else `None`.
+fn find_exile_cost(
+    cost: &AbilityCost,
+) -> Option<(u32, Zone, Option<&TargetFilter>, ExileCostRules)> {
     match cost {
         AbilityCost::Exile {
             count,
             zone,
             filter,
             same_zone_owner,
+            from_top,
         } if !matches!(filter, Some(TargetFilter::SelfRef)) => Some((
             *count,
             exile_cost_effective_zone(*zone, filter.as_ref()),
             filter.as_ref(),
-            *same_zone_owner,
+            ExileCostRules {
+                same_zone_owner: *same_zone_owner,
+                from_top: *from_top,
+            },
         )),
         AbilityCost::Composite { costs } => costs.iter().find_map(find_exile_cost),
         _ => None,
@@ -5150,22 +5162,14 @@ fn exile_cost_choice(
     source_id: ObjectId,
     cost: &Option<AbilityCost>,
 ) -> Option<(usize, Zone, Vec<ObjectId>)> {
-    let (count, zone, filter, same_zone_owner) = find_exile_cost(cost.as_ref()?)?;
+    let (count, zone, filter, rules) = find_exile_cost(cost.as_ref()?)?;
     if zone == Zone::Library {
         return None;
     }
-    let cards = eligible_exile_cost_objects(
-        state,
-        player,
-        source_id,
-        zone,
-        filter,
-        count,
-        same_zone_owner,
-    )
-    .into_iter()
-    .filter(|id| !deferred_spell_sacrifice_reserved(state, *id))
-    .collect();
+    let cards = eligible_exile_cost_objects(state, player, source_id, zone, filter, count, rules)
+        .into_iter()
+        .filter(|id| !deferred_spell_sacrifice_reserved(state, *id))
+        .collect();
     Some((count as usize, zone, cards))
 }
 
@@ -5174,8 +5178,7 @@ fn prepare_deterministic_exile_cost_selection(
     pending: &PendingManaAbility,
     cost: &Option<AbilityCost>,
 ) -> Result<Option<PendingManaAbility>, EngineError> {
-    let Some((count, Zone::Library, filter, same_zone_owner)) =
-        cost.as_ref().and_then(find_exile_cost)
+    let Some((count, Zone::Library, filter, rules)) = cost.as_ref().and_then(find_exile_cost)
     else {
         return Ok(None);
     };
@@ -5194,7 +5197,7 @@ fn prepare_deterministic_exile_cost_selection(
         Zone::Library,
         None,
         count,
-        same_zone_owner,
+        rules,
     );
     if chosen.len() < count as usize {
         return Err(EngineError::ActionNotAllowed(
@@ -5218,8 +5221,8 @@ pub(super) fn exile_cost_prompt_same_zone_owner(
     pending: &PendingManaAbility,
 ) -> Option<Zone> {
     let definition = mana_ability_definition(state, pending).ok()?;
-    let (_, zone, _, same_zone_owner) = find_exile_cost(definition.cost.as_ref()?)?;
-    same_zone_owner.then_some(zone)
+    let (_, zone, _, rules) = find_exile_cost(definition.cost.as_ref()?)?;
+    rules.same_zone_owner.then_some(zone)
 }
 
 /// CR 117.1 + CR 118.3 + CR 605.3b: Surface eligible battlefield permanents
@@ -5968,6 +5971,7 @@ mod tests {
 
     fn exile_cost(zone: Option<Zone>) -> AbilityCost {
         AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone,
@@ -6332,6 +6336,7 @@ mod tests {
                 contribution: ManaContribution::Base,
             })
             .cost(AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone,
@@ -8260,6 +8265,7 @@ mod tests {
             },
         )
         .cost(AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             filter: Some(TargetFilter::SelfRef),
             zone: Some(Zone::Hand),
@@ -14997,6 +15003,7 @@ mod tests {
             },
         )
         .cost(AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: None,
@@ -15047,6 +15054,7 @@ mod tests {
             },
         )
         .cost(AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Graveyard),

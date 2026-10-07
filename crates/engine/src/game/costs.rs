@@ -77,8 +77,19 @@ fn find_eligible_exile_targets(
     source_id: ObjectId,
     zone: Zone,
     filter: Option<&TargetFilter>,
-    minimum_group_size: usize,
+    count: u32,
+    rules: super::cost_payability::ExileCostRules,
 ) -> Vec<ObjectId> {
+    if rules.from_top {
+        return super::cost_payability::eligible_exile_cost_objects(
+            state, player, source_id, zone, filter, count, rules,
+        );
+    }
+    let minimum_group_size = if rules.same_zone_owner {
+        count as usize
+    } else {
+        0
+    };
     let ctx = FilterContext::from_source(state, source_id);
     let player_state = state.players.get(player.0 as usize);
 
@@ -1238,6 +1249,7 @@ fn pay_ability_cost_inner(
             zone,
             filter,
             same_zone_owner,
+            from_top,
         } if !matches!(filter, Some(TargetFilter::SelfRef))
             && matches!(scope, PaymentScope::Resolution { .. }) =>
         {
@@ -1250,7 +1262,11 @@ fn pay_ability_cost_inner(
                 source_id,
                 effective_zone,
                 filter.as_ref(),
-                if *same_zone_owner { count } else { 0 },
+                count as u32,
+                super::cost_payability::ExileCostRules {
+                    same_zone_owner: *same_zone_owner,
+                    from_top: *from_top,
+                },
             );
             let count = if any_number { eligible.len() } else { count };
             if eligible.len() < count {
@@ -2415,6 +2431,7 @@ fn can_pay_resolution(
             zone,
             filter,
             same_zone_owner,
+            from_top,
         } if !matches!(filter, Some(TargetFilter::SelfRef)) => {
             // CR 107.1c: zero is a legal choice for "any number", so this
             // cost never fails the resolution-time resource pre-gate.
@@ -2429,7 +2446,11 @@ fn can_pay_resolution(
                 ability.source_id,
                 effective_zone,
                 filter.as_ref(),
-                if *same_zone_owner { count } else { 0 },
+                count as u32,
+                super::cost_payability::ExileCostRules {
+                    same_zone_owner: *same_zone_owner,
+                    from_top: *from_top,
+                },
             );
             eligible.len() >= count
         }
@@ -2721,6 +2742,7 @@ mod tests {
                 self_scope: DiscardSelfScope::FromHand,
             },
             AbilityCost::Exile { .. } => AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: None,
@@ -2846,6 +2868,7 @@ mod tests {
                 self_scope: DiscardSelfScope::FromHand,
             },
             AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: None,
@@ -2969,6 +2992,7 @@ mod tests {
                 self_scope: DiscardSelfScope::FromHand,
             },
             AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: Some(Zone::Graveyard),
@@ -2993,6 +3017,7 @@ mod tests {
                 self_scope: DiscardSelfScope::FromHand,
             },
             AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: None,
@@ -3610,6 +3635,7 @@ mod tests {
                     zone: None,
                     filter: Some(card_filter),
                     same_zone_owner: false,
+                    from_top: false,
                 },
             ],
         };
@@ -3651,6 +3677,7 @@ mod tests {
                     zone: Some(Zone::Battlefield),
                     filter: Some(TargetFilter::Typed(TypedFilter::new(TypeFilter::Artifact))),
                     same_zone_owner: false,
+                    from_top: false,
                 },
             ],
         };
@@ -3694,6 +3721,7 @@ mod tests {
     #[test]
     fn self_ref_removal_legs_are_out_of_scope() {
         let self_exile = AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: None,

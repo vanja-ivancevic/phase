@@ -423,6 +423,7 @@ fn setup_escape_scenario(
                         },
                     },
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 2,
                         zone: Some(Zone::Graveyard),
                         filter: None,
@@ -610,12 +611,14 @@ fn escape_multi_clause_exiles_land_then_graveyard_cards() {
                         },
                     },
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(land_you_control),
                         same_zone_owner: false,
                     },
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 2,
                         zone: Some(Zone::Graveyard),
                         filter: None,
@@ -762,12 +765,14 @@ fn escape_multi_clause_not_castable_without_land() {
                         cost: ManaCost::NoCost,
                     },
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(land_you_control),
                         same_zone_owner: false,
                     },
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 2,
                         zone: Some(Zone::Graveyard),
                         filter: None,
@@ -835,6 +840,7 @@ fn escape_variant_preserved_through_mana_payment() {
                         },
                     },
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 2,
                         zone: Some(Zone::Graveyard),
                         filter: None,
@@ -1017,6 +1023,7 @@ fn setup_pitch_scenario() -> (
             countered_spell_zone: None,
         })
         .with_additional_cost(AdditionalCost::Required(AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: Some(engine::types::zones::Zone::Hand),

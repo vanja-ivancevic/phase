@@ -168,6 +168,7 @@ mod tests {
                             cost: engine::types::mana::ManaCost::zero(),
                         },
                         engine::types::ability::AbilityCost::Exile {
+                            from_top: false,
                             count: 3,
                             zone: Some(Zone::Graveyard),
                             filter: None,
@@ -252,6 +253,7 @@ mod tests {
                             cost: engine::types::mana::ManaCost::zero(),
                         },
                         engine::types::ability::AbilityCost::Exile {
+                            from_top: false,
                             count: 3,
                             zone: Some(Zone::Graveyard),
                             filter: None,

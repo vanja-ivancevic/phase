@@ -683,6 +683,7 @@ fn collective_grouping_does_not_widen_unfiltered_payer_graveyard_scope() {
                                     cost: ManaCost::generic(1),
                                 },
                                 AbilityCost::Exile {
+                                    from_top: false,
                                     count: 2,
                                     zone: Some(Zone::Graveyard),
                                     filter: None,
@@ -773,6 +774,7 @@ fn resolution_exile_payment_retains_its_collective_rule_across_the_pause() {
                 AbilityKind::Activated,
                 Effect::PayCost {
                     cost: AbilityCost::Exile {
+                        from_top: false,
                         count,
                         zone: Some(Zone::Graveyard),
                         filter: None,

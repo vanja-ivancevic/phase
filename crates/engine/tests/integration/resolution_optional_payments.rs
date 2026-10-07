@@ -660,6 +660,7 @@ fn resolution_optional_oneof_surfaces_only_live_immediate_branches() {
                 costs: vec![discard()],
             },
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(Zone::Hand),
                 filter: None,
@@ -764,6 +765,7 @@ fn selecting_root_branch_does_not_substitute_nested_oneof() {
         vec![
             discard(),
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(Zone::Hand),
                 filter: None,
@@ -958,6 +960,7 @@ fn resolution_optional_oneof_routes_exile_through_existing_payment() {
     let ability = optional_payment(
         source,
         vec![AbilityCost::Exile {
+            from_top: false,
             count: 1,
             zone: Some(Zone::Hand),
             filter: None,

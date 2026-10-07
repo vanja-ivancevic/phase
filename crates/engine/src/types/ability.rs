@@ -13945,6 +13945,12 @@ pub enum AbilityCost {
         /// This constrains the complete cost payment, not individual objects.
         #[serde(default)]
         same_zone_owner: bool,
+        /// CR 404.2 + CR 118.3: Pay with the top `count` matching cards of
+        /// the payer's graveyard, skipping nonmatching cards without rearranging it.
+        /// Ordinary exile costs let the payer choose; library costs already
+        /// select their physical top cards deterministically.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        from_top: bool,
     },
     /// CR 702.167a/b: Craft's "Exile [materials] from among permanents you
     /// control and/or cards in your graveyard" component. Distinct from
@@ -38254,6 +38260,7 @@ mod tests {
         }
         .supports_cumulative_upkeep_payment());
         assert!(AbilityCost::Exile {
+            from_top: false,
             count: 1,
             zone: Some(Zone::Library),
             filter: None,
@@ -38261,6 +38268,7 @@ mod tests {
         }
         .supports_cumulative_upkeep_payment());
         assert!(!AbilityCost::Exile {
+            from_top: false,
             count: 1,
             zone: Some(Zone::Graveyard),
             filter: None,
@@ -39231,6 +39239,7 @@ mod tests {
                 self_scope: DiscardSelfScope::FromHand,
             },
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: None,
                 filter: Some(TypedFilter::creature().into()),
@@ -40561,6 +40570,7 @@ mod tests {
                 (
                     "exile_cards",
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: None,

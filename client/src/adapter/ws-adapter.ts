@@ -210,6 +210,10 @@ export class NativeEngineVersionMismatchError extends Error {
  * `crates/server-core/src/protocol.rs`. Bump in lockstep when either side
  * adds, removes, renames, or changes the type of a protocol variant field.
  *
+ * 105 — AbilityCost.Exile.from_top requires the top matching cards of the
+ *      payer's own graveyard. A v104 peer silently drops the rule and can
+ *      pay a different cost; exact-match refuses that pairing before state
+ *      exchange. P2P moves in lockstep (wire 87); lobby stays 15.
  * 104 — GameEvent.CoinFlipped replaces `won: boolean` with a typed
  *      `result` ("Won" | "Lost" | "Heads" | "Tails"; CR 705.2 face-only flips
  *      have no winner); serialized state gains Effect.FlipCoin.result_is_face,
@@ -690,7 +694,7 @@ export class NativeEngineVersionMismatchError extends Error {
  *      every spell frame is byte-identical to v78.
  *
  */
-export const PROTOCOL_VERSION = 104;
+export const PROTOCOL_VERSION = 105;
 
 /**
  * Lowest server protocol version this client will accept in the handshake.

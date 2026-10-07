@@ -60,6 +60,12 @@ pub struct TournamentRequestId(pub u64);
 /// rather than a parse error, and the handshake is the only place that pairing
 /// can be refused. See 24.
 ///
+/// 105 — `AbilityCost::Exile.from_top` preserves ordered, matching-card payment
+///      from the payer's own graveyard. A v104 peer silently drops this additive
+///      field and can pay a different cost, so full-game sessions reject that
+///      pairing before state exchange. P2P moves in lockstep to wire 87;
+///      lobby-only messages remain version 15.
+///
 /// 104 — `GameEvent::CoinFlipped` replaces `won: bool` with a typed
 ///      `result: CoinFlipResult`, which gains `Heads`/`Tails` (CR 705.2: a
 ///      face-only flip has no winner); `Effect::FlipCoin` gains
@@ -876,7 +882,7 @@ pub struct TournamentRequestId(pub u64);
 ///      payload; mulligan bottoming folded into a
 ///      `MulliganDecisionPhase::BottomCards` sub-phase on
 ///      `WaitingFor::MulliganDecision`.
-pub const PROTOCOL_VERSION: u32 = 104;
+pub const PROTOCOL_VERSION: u32 = 105;
 
 /// Minimum protocol version accepted by lobby-only brokers at the hello
 /// handshake **from clients that predate [`LOBBY_PROTOCOL_VERSION`]** — the

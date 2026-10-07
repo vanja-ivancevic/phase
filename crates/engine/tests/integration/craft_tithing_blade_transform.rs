@@ -96,6 +96,7 @@ fn craft_ability(cost: ManaCost) -> AbilityDefinition {
         costs: vec![
             AbilityCost::Mana { cost },
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(Zone::Battlefield),
                 filter: Some(TargetFilter::SelfRef),

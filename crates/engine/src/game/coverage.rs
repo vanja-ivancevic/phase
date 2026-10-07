@@ -20552,6 +20552,7 @@ At the beginning of the next end step, destroy all non-Wall creatures that playe
         let mut face = make_face();
         face.keywords
             .push(Keyword::CumulativeUpkeep(AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: Some(Zone::Graveyard),
@@ -20576,6 +20577,7 @@ At the beginning of the next end step, destroy all non-Wall creatures that playe
         let mut face = make_face();
         face.keywords
             .push(Keyword::CumulativeUpkeep(AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: Some(Zone::Library),

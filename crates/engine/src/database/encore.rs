@@ -67,6 +67,7 @@ fn encore_ability(mana_cost: ManaCost) -> AbilityDefinition {
         costs: vec![
             AbilityCost::Mana { cost: mana_cost },
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(Zone::Graveyard),
                 filter: Some(crate::types::ability::TargetFilter::SelfRef),

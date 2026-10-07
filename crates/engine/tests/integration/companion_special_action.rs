@@ -240,6 +240,7 @@ fn paused_companion_payment_resumes_the_locked_cost_and_commits_once() {
                     costs: vec![
                         AbilityCost::Tap,
                         AbilityCost::Exile {
+                            from_top: false,
                             count: 1,
                             zone: None,
                             filter: Some(TargetFilter::SelfRef),

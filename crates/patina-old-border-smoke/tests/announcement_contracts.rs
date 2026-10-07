@@ -10,8 +10,8 @@ use engine::ai_support::{
 use engine::game::engine::apply_interaction;
 use engine::game::scenario::{GameRunner, GameScenario, P0, P1};
 use engine::types::ability::{
-    ContinuousModification, ControllerRef, Duration, FilterProp, StaticDefinition, TargetFilter,
-    TargetRef, TypedFilter,
+    AbilityCost, CastTimingPermission, Comparator, ContinuousModification, ControllerRef, Duration,
+    FilterProp, QuantityExpr, StaticDefinition, TargetFilter, TargetRef, TypedFilter,
 };
 use engine::types::actions::GameAction;
 use engine::types::events::GameEvent;
@@ -21,7 +21,8 @@ use engine::types::game_state::{
 use engine::types::identifiers::ObjectId;
 use engine::types::mana::{ManaColor, ManaCost, ManaCostShard, ManaType, ManaUnit};
 use engine::types::phase::Phase;
-use engine::types::statics::{CostModifyMode, CostReductionReach, StaticMode};
+use engine::types::player::PlayerId;
+use engine::types::statics::{CastFrequency, CostModifyMode, CostReductionReach, StaticMode};
 use engine::types::zones::Zone;
 
 fn mana(kind: ManaType) -> ManaUnit {
@@ -727,5 +728,289 @@ fn target_dependent_rebate_keeps_a_payable_completion(player_wide: bool) {
     resolve_top(&mut runner);
     for target in [first, second, friendly] {
         assert_eq!(runner.state().objects[&target].damage_marked, 1);
+    }
+}
+
+const SPINNING_DARKNESS: &str = "You may exile the top three black cards of your graveyard rather than pay this spell's mana cost.\nSpinning Darkness deals 3 damage to target nonblack creature. You gain 3 life.";
+
+fn spinning_darkness(
+    hero: PlayerId,
+    black_count: usize,
+    tax_payment: Option<usize>,
+) -> (GameRunner, ObjectId, ObjectId, Vec<ObjectId>) {
+    let opponent = if hero == P0 { P1 } else { P0 };
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    if let Some(units) = tax_payment {
+        scenario.add_artifact_from_oracle(
+            opponent,
+            "Sphere of Resistance",
+            "Spells cost {1} more to cast.",
+        );
+        scenario.with_mana_pool(hero, vec![mana(ManaType::Colorless); units]);
+    }
+    let mut black = Vec::new();
+    for index in 0..black_count {
+        black.push(
+            scenario
+                .add_creature_to_graveyard(hero, &format!("Black {index}"), 1, 1)
+                .with_color(vec![ManaColor::Black])
+                .id(),
+        );
+        scenario
+            .add_creature_to_graveyard(hero, &format!("Interleaved white {index}"), 1, 1)
+            .with_color(vec![ManaColor::White]);
+    }
+    for index in 0..3 {
+        scenario
+            .add_creature_to_graveyard(opponent, &format!("Opponent black {index}"), 1, 1)
+            .with_color(vec![ManaColor::Black]);
+    }
+    let target = scenario
+        .add_creature(opponent, "Nonblack target", 2, 4)
+        .with_color(vec![ManaColor::Blue])
+        .id();
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(hero, "Spinning Darkness", true, SPINNING_DARKNESS)
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+            generic: 4,
+        })
+        .with_color(vec![ManaColor::Black])
+        .id();
+    let mut runner = scenario.build();
+    if hero == P1 {
+        submit(&mut runner, GameAction::PassPriority);
+    }
+    (runner, spell, target, black)
+}
+
+fn submit_card_set(runner: &mut GameRunner, expected: &[ObjectId]) {
+    let owner = runner.state().waiting_for.acting_player().unwrap();
+    let contract = AiDecisionContract::issue(runner.state(), owner);
+    let selected = contract
+        .candidates
+        .iter()
+        .find(|candidate| {
+            matches!(&candidate.action, GameAction::SelectCards { cards }
+            if cards.len() == expected.len() && cards.iter().all(|id| expected.contains(id)))
+        })
+        .expect("the exact cost set must be issued")
+        .action
+        .clone();
+    submit(runner, selected);
+}
+
+#[test]
+fn spinning_darkness_exiles_only_the_top_three_matching_owned_cards_and_resolves() {
+    for hero in [P0, P1] {
+        let opponent = if hero == P0 { P1 } else { P0 };
+        let (mut runner, spell, target, black) = spinning_darkness(hero, 4, None);
+        let original = runner.state().players[hero.0 as usize].graveyard.clone();
+        let opposing = runner.state().players[opponent.0 as usize]
+            .graveyard
+            .clone();
+        let top = [black[3], black[2], black[1]];
+        cast(&mut runner, spell, vec![target]);
+        submit(&mut runner, GameAction::DecideOptionalCost { pay: true });
+        match &runner.state().waiting_for {
+            WaitingFor::PayCost {
+                choices,
+                count,
+                min_count,
+                ..
+            } => {
+                assert_eq!(choices, &top);
+                assert_eq!((*count, *min_count), (3, 3));
+            }
+            other => panic!("expected a fixed ordered exile cost, got {other:?}"),
+        }
+        for wrong in [vec![black[3], black[2]], vec![black[3], black[2], black[0]]] {
+            let before = serde_json::to_value(runner.state()).unwrap();
+            assert!(runner
+                .act(GameAction::SelectCards { cards: wrong })
+                .is_err());
+            assert_eq!(serde_json::to_value(runner.state()).unwrap(), before);
+        }
+        submit_card_set(&mut runner, &top);
+        assert_eq!(runner.state().objects[&spell].zone, Zone::Stack);
+        assert_eq!(
+            runner.state().players[hero.0 as usize].graveyard,
+            original
+                .iter()
+                .copied()
+                .filter(|id| !top.contains(id))
+                .collect::<engine::im::Vector<_>>(),
+        );
+        assert_eq!(
+            runner.state().players[opponent.0 as usize].graveyard,
+            opposing
+        );
+        for id in top {
+            assert_eq!(runner.state().objects[&id].zone, Zone::Exile);
+        }
+        resolve_top(&mut runner);
+        assert_eq!(runner.state().objects[&target].damage_marked, 3);
+        assert_eq!(runner.state().players[hero.0 as usize].life, 23);
+        assert_eq!(runner.state().objects[&spell].zone, Zone::Graveyard);
+    }
+}
+
+#[test]
+fn spinning_darkness_rejects_insufficient_quality_and_retains_a_generic_tax() {
+    for (black_count, tax_payment) in [(2, None), (3, Some(0))] {
+        let (mut runner, spell, target, _) = spinning_darkness(P0, black_count, tax_payment);
+        let before = serde_json::to_value(runner.state()).unwrap();
+        let card_id = runner.state().objects[&spell].card_id;
+        assert!(
+            runner
+                .act(GameAction::CastSpell {
+                    object_id: spell,
+                    card_id,
+                    targets: vec![target],
+                    payment_mode: CastPaymentMode::Auto,
+                })
+                .is_err(),
+            "unpayable control: black_count={black_count}, tax_payment={tax_payment:?}"
+        );
+        assert_eq!(serde_json::to_value(runner.state()).unwrap(), before);
+    }
+    let (mut runner, spell, target, black) = spinning_darkness(P0, 3, Some(1));
+    cast(&mut runner, spell, vec![target]);
+    submit(&mut runner, GameAction::DecideOptionalCost { pay: true });
+    submit_card_set(&mut runner, &black);
+    assert_eq!(runner.state().players[0].mana_pool.total(), 0);
+    assert_eq!(runner.state().objects[&spell].zone, Zone::Stack);
+    resolve_top(&mut runner);
+    assert_eq!(runner.state().objects[&target].damage_marked, 3);
+    assert_eq!(runner.state().players[0].life, 23);
+}
+
+#[test]
+fn nonmana_alternative_base_survives_tracked_exile_cost_recomputation() {
+    let mut scenario = GameScenario::new();
+    scenario.at_phase(Phase::PreCombatMain);
+    scenario.add_artifact_from_oracle(P1, "Sphere of Resistance", "Spells cost {1} more to cast.");
+    scenario.with_mana_pool(P0, vec![mana(ManaType::Colorless)]);
+    scenario.with_graveyard(P0, &["Chosen cost card"]);
+    let spell = scenario
+        .add_spell_to_hand_from_oracle(P0, "Any-exile alternative", true, "You gain 3 life.")
+        .with_mana_cost(ManaCost::Cost {
+            shards: vec![ManaCostShard::Black, ManaCostShard::Black],
+            generic: 4,
+        })
+        .id();
+    let mut runner = scenario.build();
+    // Consume the legacy exported effect-cost representation. Its tracked-set
+    // payment recomputes mana; that must use the elected zero base plus the tax.
+    runner
+        .state_mut()
+        .objects
+        .get_mut(&spell)
+        .unwrap()
+        .casting_options = vec![serde_json::from_value(serde_json::json!({
+        "kind": "AlternativeCost",
+        "cost": {
+            "type": "EffectCost",
+            "effect": {
+                "type": "ChangeZone",
+                "origin": "Graveyard",
+                "destination": "Exile",
+                "target": { "type": "Any" },
+                "owner_library": false,
+                "enter_transformed": false,
+                "enter_tapped": false,
+                "enters_attacking": false
+            }
+        }
+    }))
+    .unwrap()];
+    let cost_card = runner.state().players[0].graveyard[0];
+    cast(&mut runner, spell, vec![]);
+    submit(&mut runner, GameAction::DecideOptionalCost { pay: true });
+    submit_card_set(&mut runner, std::slice::from_ref(&cost_card));
+    assert_eq!(runner.state().objects[&cost_card].zone, Zone::Exile);
+    assert_eq!(runner.state().players[0].mana_pool.total(), 0);
+    assert_eq!(runner.state().objects[&spell].zone, Zone::Stack);
+    resolve_top(&mut runner);
+    assert_eq!(runner.state().players[0].life, 23);
+}
+
+#[test]
+fn timing_required_nonmana_alternative_replaces_printed_base_but_retains_the_tax() {
+    for (mana_units, expected_accept) in [(0, false), (1, true)] {
+        let mut scenario = GameScenario::new();
+        scenario.at_phase(Phase::End);
+        scenario
+            .add_creature(P0, "Primal Prayers grant carrier", 1, 1)
+            .with_static_definition(
+                StaticDefinition::new(StaticMode::CastWithAlternativeCost {
+                    cost: AbilityCost::PayEnergy {
+                        amount: QuantityExpr::Fixed { value: 1 },
+                    },
+                    timing_permission: Some(CastTimingPermission::AsThoughHadFlash),
+                    frequency: CastFrequency::Unlimited,
+                })
+                .affected(TargetFilter::Typed(
+                    TypedFilter::creature()
+                        .controller(ControllerRef::You)
+                        .properties(vec![FilterProp::Cmc {
+                            comparator: Comparator::LE,
+                            value: QuantityExpr::Fixed { value: 3 },
+                        }]),
+                ))
+                .active_zones(vec![Zone::Battlefield]),
+            );
+        scenario.add_artifact_from_oracle(
+            P1,
+            "Sphere of Resistance",
+            "Spells cost {1} more to cast.",
+        );
+        scenario.with_mana_pool(P0, vec![mana(ManaType::Colorless); mana_units]);
+        let spell = scenario
+            .add_creature_to_hand(P0, "Creature consuming granted energy cost", 2, 2)
+            .with_mana_cost(ManaCost::generic(2))
+            .id();
+        let mut runner = scenario.build();
+        let state = runner.state_mut();
+        state.active_player = P1;
+        state.priority_player = P0;
+        state.waiting_for = WaitingFor::Priority { player: P0 };
+        state.players[0].energy = 1;
+        state.objects.get_mut(&spell).unwrap().casting_options.push(
+            engine::types::ability::SpellCastingOption::alternative_cost(AbilityCost::Mana {
+                cost: ManaCost::generic(1),
+            }),
+        );
+        let before = serde_json::to_value(runner.state()).unwrap();
+        let action = GameAction::CastSpell {
+            object_id: spell,
+            card_id: runner.state().objects[&spell].card_id,
+            targets: vec![],
+            payment_mode: CastPaymentMode::Auto,
+        };
+        let contract = AiDecisionContract::issue(runner.state(), P0);
+        assert_eq!(
+            contract.contains_action(runner.state(), &action),
+            expected_accept
+        );
+        if !expected_accept {
+            assert!(runner.act(action).is_err());
+            assert_eq!(serde_json::to_value(runner.state()).unwrap(), before);
+            continue;
+        }
+        submit(&mut runner, action);
+        assert_eq!(runner.state().players[0].energy, 0);
+        assert_eq!(runner.state().players[0].mana_pool.total(), 0);
+        assert_eq!(runner.state().objects[&spell].zone, Zone::Stack);
+        assert_eq!(
+            runner.state().objects[&spell].cast_timing_permission,
+            Some((
+                CastTimingPermission::AsThoughHadFlash,
+                runner.state().turn_number
+            ))
+        );
+        resolve_top(&mut runner);
+        assert_eq!(runner.state().objects[&spell].zone, Zone::Battlefield);
     }
 }

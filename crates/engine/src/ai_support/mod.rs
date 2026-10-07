@@ -7016,6 +7016,7 @@ mod tests {
             },
         )
         .cost(AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Graveyard),

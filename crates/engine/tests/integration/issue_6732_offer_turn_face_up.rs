@@ -315,6 +315,7 @@ fn a_paused_mana_source_resumes_the_locked_turn_face_up() {
                 costs: vec![
                     AbilityCost::Tap,
                     AbilityCost::Exile {
+                        from_top: false,
                         count: 1,
                         zone: None,
                         filter: Some(TargetFilter::SelfRef),
@@ -603,6 +604,7 @@ fn a_resumed_payment_still_surfaces_the_turn_up_replacement_choice() {
                     costs: vec![
                         AbilityCost::Tap,
                         AbilityCost::Exile {
+                            from_top: false,
                             count: 1,
                             zone: None,
                             filter: Some(TargetFilter::SelfRef),

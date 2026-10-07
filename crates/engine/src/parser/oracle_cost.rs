@@ -445,6 +445,7 @@ fn fixup_bare_noun_continuations(costs: &mut [AbilityCost]) {
                                 AbilityCost::Sacrifice(SacrificeCost::count(filter, count))
                             }
                             PrecedingVerb::Exile { zone } => AbilityCost::Exile {
+                                from_top: false,
                                 same_zone_owner: false,
                                 count,
                                 zone: extract_filter_zone(&filter).or(zone),
@@ -484,6 +485,7 @@ fn fixup_bare_noun_continuations(costs: &mut [AbilityCost]) {
                         AbilityCost::Sacrifice(SacrificeCost::count(filter, 1))
                     }
                     PrecedingVerb::Exile { zone } => AbilityCost::Exile {
+                        from_top: false,
                         same_zone_owner: false,
                         count: 1,
                         zone,
@@ -1149,6 +1151,7 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
         // → GrantingObject).
         if let Some((filter, zone)) = try_parse_self_exile_cost(&rest_lower) {
             return AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone,
@@ -1158,10 +1161,20 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
         // "Exile the top card of your library" / "Exile the top N cards of your library"
         if let Some(count) = try_parse_exile_top_library(&rest_lower) {
             return AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count,
                 zone: Some(Zone::Library),
                 filter: None,
+            };
+        }
+        if let Some((count, filter)) = try_parse_exile_top_graveyard(&rest_lower) {
+            return AbilityCost::Exile {
+                count,
+                zone: Some(Zone::Graveyard),
+                filter: Some(filter),
+                same_zone_owner: false,
+                from_top: true,
             };
         }
         // CR 107.3a + CR 118.8: "Exile X card(s) from your graveyard" — variable
@@ -1184,6 +1197,7 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
             .is_some()
             {
                 return AbilityCost::Exile {
+                    from_top: false,
                     same_zone_owner: false,
                     count: EXILE_COST_X,
                     zone: Some(Zone::Graveyard),
@@ -1207,6 +1221,7 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
             .is_some()
             {
                 return AbilityCost::Exile {
+                    from_top: false,
                     same_zone_owner: false,
                     count,
                     zone: Some(Zone::Graveyard),
@@ -1230,6 +1245,7 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
                     .trim_end_matches('.')
                     .ends_with(" from a single graveyard");
             return AbilityCost::Exile {
+                from_top: false,
                 count,
                 zone,
                 filter: Some(filter),
@@ -1365,6 +1381,7 @@ pub fn parse_single_cost(text: &str) -> AbilityCost {
         return AbilityCost::OneOf {
             costs: vec![
                 AbilityCost::Exile {
+                    from_top: false,
                     count: 3,
                     zone: Some(Zone::Graveyard),
                     filter: None,
@@ -2169,6 +2186,27 @@ fn try_parse_self_exile_cost(rest: &str) -> Option<(TargetFilter, Option<Zone>)>
         }
     }
     None
+}
+
+/// CR 404.2 + CR 118.3: Preserve the fixed count and quality in
+/// "the top N [quality] cards of your graveyard"; order is a cost constraint.
+fn try_parse_exile_top_graveyard(rest: &str) -> Option<(u32, TargetFilter)> {
+    let ((), after_top) = nom_on_lower(rest, rest, |i| value((), tag("the top ")).parse(i))?;
+    let after_top = after_top.trim();
+    let (count, remainder) = parse_number(after_top).unwrap_or((1, after_top));
+    let remainder = remainder.trim();
+    let (noun_len, _) = nom_on_lower(remainder, remainder, |i| {
+        map(
+            terminated(
+                take_until(" of your graveyard"),
+                (tag(" of your graveyard"), opt(tag(".")), multispace0, eof),
+            ),
+            str::len,
+        )
+        .parse(i)
+    })?;
+    let (filter, unparsed) = parse_type_phrase_folding(&remainder[..noun_len]);
+    unparsed.trim().is_empty().then_some((count, filter))
 }
 
 /// Parse "the top card of your library" / "the top N cards of your library".
@@ -3876,6 +3914,7 @@ mod tests {
         assert_eq!(
             parse_oracle_cost("Exile X cards from your graveyard"),
             AbilityCost::Exile {
+                from_top: false,
                 count: EXILE_COST_X,
                 zone: Some(Zone::Graveyard),
                 filter: None,
@@ -3889,6 +3928,7 @@ mod tests {
         assert_eq!(
             parse_oracle_cost("Exile two cards from your graveyard"),
             AbilityCost::Exile {
+                from_top: false,
                 count: 2,
                 zone: Some(Zone::Graveyard),
                 filter: None,
@@ -4544,6 +4584,7 @@ mod tests {
         assert_eq!(
             parse_oracle_cost("Exile this card from your graveyard"),
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(Zone::Graveyard),
                 filter: Some(TargetFilter::SelfRef),
@@ -4557,6 +4598,7 @@ mod tests {
         assert_eq!(
             parse_oracle_cost("Exile this artifact"),
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: None,
                 filter: Some(TargetFilter::SelfRef),
@@ -4570,6 +4612,7 @@ mod tests {
         assert_eq!(
             parse_oracle_cost("Exile this creature"),
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: None,
                 filter: Some(TargetFilter::SelfRef),
@@ -4583,6 +4626,7 @@ mod tests {
         assert_eq!(
             parse_oracle_cost("Exile this card from your hand"),
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(Zone::Hand),
                 filter: Some(TargetFilter::SelfRef),
@@ -4596,6 +4640,7 @@ mod tests {
         assert_eq!(
             parse_oracle_cost("Exile the top card of your library"),
             AbilityCost::Exile {
+                from_top: false,
                 count: 1,
                 zone: Some(Zone::Library),
                 filter: None,

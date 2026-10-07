@@ -688,7 +688,15 @@ pub(crate) fn handle_decide_additional_cost(
                             recompute_choice_cost = true;
                             None
                         }
-                        _ => Some(preferred.clone()),
+                        _ => {
+                            // CR 118.9d: a nonmana alternative replaces the
+                            // printed mana base, not later increases or reductions.
+                            // Preserve that election when a payment pause
+                            // recomputes the total after selected objects are known.
+                            alternative_base_override = Some(ManaCost::zero());
+                            recompute_choice_cost = true;
+                            Some(preferred.clone())
+                        }
                     }
                 } else {
                     Some(preferred.clone())
@@ -5277,14 +5285,57 @@ pub fn exile_cost_prompt_same_zone_owner(state: &GameState) -> Option<Zone> {
         return super::mana_abilities::exile_cost_prompt_same_zone_owner(state, mana_ability);
     }
     let (_, cost) = exile_cost_in_prompt(state)?;
-    let (_, zone, _, same_zone_owner) = super::casting::find_non_self_exile(cost)?;
-    same_zone_owner.then_some(zone)
+    let (_, zone, _, rules) = super::casting::find_non_self_exile(cost)?;
+    rules.same_zone_owner.then_some(zone)
 }
 
 pub fn exile_cost_prompt_selection_is_legal(state: &GameState, chosen: &[ObjectId]) -> bool {
-    exile_cost_prompt_same_zone_owner(state).is_none_or(|zone| {
-        super::cost_payability::exile_selection_has_same_zone_owner(state, zone, chosen)
-    })
+    if exile_cost_prompt_same_zone_owner(state).is_some_and(|zone| {
+        !super::cost_payability::exile_selection_has_same_zone_owner(state, zone, chosen)
+    }) {
+        return false;
+    }
+    let Some((source, cost)) = exile_cost_in_prompt(state) else {
+        return true;
+    };
+    let Some((count, zone, filter, rules)) = super::casting::find_non_self_exile(cost) else {
+        return true;
+    };
+    if !rules.from_top {
+        return true;
+    }
+    let Some(player) = state.waiting_for.acting_player() else {
+        return false;
+    };
+    if zone != Zone::Graveyard || chosen.len() != count as usize {
+        return false;
+    }
+    let Some(payer) = state.players.get(player.0 as usize) else {
+        return false;
+    };
+    let ctx = super::filter::FilterContext::from_source_with_controller(source, player);
+    let mut matched = 0;
+    let correct = payer
+        .graveyard
+        .iter()
+        .rev()
+        .copied()
+        .filter(|&id| {
+            id != source
+                && state
+                    .objects
+                    .get(&id)
+                    .is_some_and(|object| object.zone == Zone::Graveyard && object.owner == player)
+                && filter.is_none_or(|filter| {
+                    super::filter::matches_target_filter_in_owner_zone(state, id, filter, &ctx)
+                })
+        })
+        .take(count as usize)
+        .all(|id| {
+            matched += 1;
+            chosen.contains(&id)
+        });
+    correct && matched == count as usize
 }
 
 /// CR 118.9a + CR 601.2b + CR 601.2h: Complete the exile-for-cost cost after
@@ -5306,7 +5357,7 @@ pub(crate) fn handle_exile_for_cost(
 ) -> Result<WaitingFor, EngineError> {
     if !exile_cost_prompt_selection_is_legal(state, chosen) {
         return Err(EngineError::InvalidAction(
-            "Exile cost must be paid from a single player's zone".to_string(),
+            "Selected cards do not satisfy the exile cost's source constraints".to_string(),
         ));
     }
     let mut any_owner = false;
@@ -5529,12 +5580,15 @@ fn finish_exile_selection_for_cost(
     );
     if let Some(&first) = chosen.first() {
         if let Some(obj) = state.objects.get(&first) {
-            // CR 107.3a + CR 118.9: Shoal-style alternative costs ("exile a
-            // [color] card with mana value X") define X from the pitched card's
-            // mana value rather than a prior announcement.
+            // CR 107.3a + CR 118.9: Shoal-style pitch costs define the printed
+            // X from the exiled card. The elected mana base is zero and the
+            // complete mana obligation may still include taxes.
             if pending.ability.chosen_x.is_none()
-                && pending.cost == crate::types::mana::ManaCost::NoCost
-                && pending.base_cost.as_ref().is_some_and(cost_has_x)
+                && pending.ability.context.alternative_mana_cost_paid
+                && state
+                    .objects
+                    .get(&pending.object_id)
+                    .is_some_and(|spell| cost_has_x(&spell.mana_cost))
             {
                 // CR 202.3d + CR 709.4b: the pitched card is exiled from hand
                 // (off the stack), so a split card defines X from its combined
@@ -6013,18 +6067,11 @@ pub(crate) fn surface_next_unpaid_interactive_activation_cost(
         }));
     }
 
-    if let Some((count, zone, filter, same_zone_owner)) = super::casting::find_non_self_exile(cost)
-    {
+    if let Some((count, zone, filter, rules)) = super::casting::find_non_self_exile(cost) {
         let zone = ExileCostSourceZone::try_from_zone(zone)
             .expect("non-self activation exile costs use hand or graveyard");
         let eligible = super::casting::find_eligible_exile_for_cost_targets(
-            state,
-            player,
-            source_id,
-            zone,
-            filter,
-            count,
-            same_zone_owner,
+            state, player, source_id, zone, filter, count, rules,
         );
         if eligible.len() < count as usize {
             return Err(EngineError::ActionNotAllowed(
@@ -6147,7 +6194,7 @@ pub(crate) fn surface_next_unpaid_interactive_activation_cost(
             Zone::Battlefield,
             effective_filter.as_ref(),
             count,
-            false,
+            super::cost_payability::ExileCostRules::default(),
         );
         if eligible.len() < count as usize {
             return Err(EngineError::ActionNotAllowed(
@@ -7036,11 +7083,13 @@ fn concretize_chosen_x_cost(cost: &AbilityCost, chosen_x: u32) -> AbilityCost {
             zone: Some(Zone::Graveyard),
             filter,
             same_zone_owner,
+            from_top,
         } => AbilityCost::Exile {
             count: chosen_x,
             zone: Some(Zone::Graveyard),
             filter: filter.clone(),
             same_zone_owner: *same_zone_owner,
+            from_top: *from_top,
         },
         // CR 107.3a + CR 601.2b: once X is announced, a variable "Pay X {E}"
         // activation cost (Chthonian Nightmare, issue #1092) becomes a fixed
@@ -8042,33 +8091,32 @@ fn check_additional_cost_or_pay_with_kept_cost(
             let alt_cost_required_for_timing = cast_timing_permission.is_some()
                 && alt_cost.timing_permission == cast_timing_permission;
             if alt_cost_required_for_timing {
-                match alt_cost.cost {
-                    AbilityCost::Mana { cost: alt_mana } => {
-                        pending.ability.context.alternative_mana_cost_paid = true;
-                        // CR 118.9 + CR 601.2b: timing-immediate-pay branch skips
-                        // the accept handler, so stamp the grant source directly on
-                        // the ability context for finalize to consume.
-                        pending.ability.context.alt_cost_grant_source = alt_cost_grant_source;
-                        pending.base_cost = Some(alt_mana);
-                        pending.cost = super::casting::recompute_pending_mana_total(
-                            state,
-                            player,
-                            &pending,
-                            pending.ability.chosen_x,
-                        );
-                        return finish_pending_cost_or_cast(state, player, pending, events);
-                    }
-                    cost => {
-                        return pay_additional_cost_with_source(
-                            state,
-                            player,
-                            cost,
-                            SpellCostSource::Other,
-                            pending,
-                            events,
-                        );
-                    }
-                }
+                // The timing-immediate path skips the optional accept handler,
+                // but has the same elected base and complete-cost obligation.
+                pending.ability.context.alternative_mana_cost_paid = true;
+                pending.ability.context.alt_cost_grant_source = alt_cost_grant_source;
+                let (elected_base, residual) = match alt_cost.cost {
+                    AbilityCost::Mana { cost } => (cost, None),
+                    cost => (ManaCost::generic(0), Some(cost)),
+                };
+                pending.base_cost = Some(elected_base);
+                pending.cost = super::casting::recompute_pending_mana_total(
+                    state,
+                    player,
+                    &pending,
+                    pending.ability.chosen_x,
+                );
+                return match residual {
+                    Some(cost) => pay_additional_cost_with_source(
+                        state,
+                        player,
+                        cost,
+                        SpellCostSource::Other,
+                        pending,
+                        events,
+                    ),
+                    None => finish_pending_cost_or_cast(state, player, pending, events),
+                };
             }
             return Ok(make_optional_cost_choice(
                 state,
@@ -9454,7 +9502,7 @@ fn pay_additional_cost_with_source(
             zone,
             Some(filter),
             0,
-            false,
+            super::cost_payability::ExileCostRules::default(),
         );
         return Ok(WaitingFor::PayCost {
             player,
@@ -9905,7 +9953,7 @@ fn pay_additional_cost_with_source(
                 Zone::Battlefield,
                 effective_filter.as_ref(),
                 count,
-                false,
+                super::cost_payability::ExileCostRules::default(),
             );
             if eligible.len() < count as usize {
                 return Err(EngineError::ActionNotAllowed(
@@ -9932,6 +9980,7 @@ fn pay_additional_cost_with_source(
             zone: Some(zone),
             ref filter,
             same_zone_owner,
+            from_top,
         } if matches!(zone, Zone::Hand | Zone::Graveyard) => {
             // CR 118.9a + CR 601.2b + CR 601.2h: Exile N cards from `zone` as
             // part of an alternative or additional casting cost. Covers escape
@@ -9950,7 +9999,10 @@ fn pay_additional_cost_with_source(
                 narrow_zone,
                 filter.as_ref(),
                 count,
-                same_zone_owner,
+                super::cost_payability::ExileCostRules {
+                    same_zone_owner,
+                    from_top,
+                },
             );
             if eligible.len() < count as usize {
                 return Err(EngineError::ActionNotAllowed(format!(
@@ -9970,6 +10022,7 @@ fn pay_additional_cost_with_source(
                         zone: Some(zone),
                         filter: filter.clone(),
                         same_zone_owner,
+                        from_top,
                     }),
                     source: cost_source,
                 },
@@ -10398,7 +10451,7 @@ fn additional_cost_x_max(
                     ExileCostSourceZone::Graveyard,
                     filter.as_ref(),
                     0,
-                    false,
+                    super::cost_payability::ExileCostRules::default(),
                 )
                 .len()
                 .try_into()
@@ -11165,7 +11218,7 @@ fn exile_any_number_cost_reduction_capacity(
         zone,
         Some(cost_filter),
         0,
-        false,
+        super::cost_payability::ExileCostRules::default(),
     );
     let ctx = super::filter::FilterContext::from_source(state, spell_id);
 
@@ -17009,6 +17062,7 @@ mod tests {
             },
         )
         .cost(AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: 1,
             zone: Some(Zone::Graveyard),
@@ -17684,6 +17738,7 @@ mod tests {
             );
         }
         let cost = AbilityCost::Exile {
+            from_top: false,
             same_zone_owner: false,
             count: EXILE_COST_X,
             zone: Some(Zone::Graveyard),
@@ -17747,6 +17802,7 @@ mod tests {
             &mut state,
             caster,
             AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: EXILE_COST_X,
                 zone: Some(Zone::Graveyard),
@@ -23887,6 +23943,7 @@ mod tests {
             &mut state,
             caster,
             AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: Some(Zone::Hand),
@@ -24031,6 +24088,7 @@ mod tests {
             &mut state,
             caster,
             AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: Some(Zone::Hand),
@@ -24375,6 +24433,7 @@ mod tests {
             &mut state,
             caster,
             AbilityCost::Exile {
+                from_top: false,
                 same_zone_owner: false,
                 count: 1,
                 zone: Some(Zone::Graveyard),
@@ -27729,6 +27788,7 @@ its replicate cost was paid.)\nDraw a card.";
             (
                 "exile",
                 AbilityCost::Exile {
+                    from_top: false,
                     count: 1,
                     zone: Some(Zone::Graveyard),
                     filter: None,
@@ -27972,6 +28032,7 @@ its replicate cost was paid.)\nDraw a card.";
             (
                 "hand",
                 AbilityCost::Exile {
+                    from_top: false,
                     same_zone_owner: false,
                     count: 1,
                     zone: Some(Zone::Hand),
@@ -27981,6 +28042,7 @@ its replicate cost was paid.)\nDraw a card.";
             (
                 "graveyard",
                 AbilityCost::Exile {
+                    from_top: false,
                     same_zone_owner: false,
                     count: 1,
                     zone: Some(Zone::Graveyard),
@@ -27990,6 +28052,7 @@ its replicate cost was paid.)\nDraw a card.";
             (
                 "battlefield",
                 AbilityCost::Exile {
+                    from_top: false,
                     same_zone_owner: false,
                     count: 1,
                     zone: Some(Zone::Battlefield),

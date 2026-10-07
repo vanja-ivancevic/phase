@@ -2303,6 +2303,7 @@
       "zoneHand": "votre main",
       "discard": "Défaussez-vous de {{count}} {{cards}}",
       "exile": "Exilez {{count}} {{cards}} depuis {{zone}}",
+      "exileFromTop": "Exilez les {{count}} {{cards}} correspondantes les plus proches du dessus de {{zone}}",
       "reveal": "Révélez {{count}} {{cards}} de {{zone}}"
     }
   },

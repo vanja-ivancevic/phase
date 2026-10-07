@@ -2345,6 +2345,7 @@
       "zoneHand": "あなたの手札",
       "discard": "{{count}}{{cards}}を捨てる",
       "exile": "{{zone}}から{{count}}{{cards}}を追放",
+      "exileFromTop": "{{zone}}にある該当する{{cards}}のうち上から{{count}}枚を追放",
       "reveal": "{{zone}}から{{count}}{{cards}}を公開する"
     }
   },

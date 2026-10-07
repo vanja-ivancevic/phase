@@ -4982,6 +4982,7 @@ fn parse_unless_tap_untapped_cost(rest: &str) -> Option<AbilityCost> {
 fn parse_unless_exile_cost(rest: &str) -> Option<AbilityCost> {
     let (count, filter) = parse_unless_counted_target_filter(rest)?;
     Some(AbilityCost::Exile {
+        from_top: false,
         same_zone_owner: false,
         count,
         zone: filter.extract_in_zone(),

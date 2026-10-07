@@ -920,6 +920,7 @@ mod tests {
                             self_scope: crate::types::ability::DiscardSelfScope::FromHand,
                         },
                         AbilityCost::Exile {
+                            from_top: false,
                             count: 1,
                             zone: Some(Zone::Graveyard),
                             filter: None,

@@ -4994,6 +4994,7 @@ fn declare_blockers_grants_ap_priority_when_no_legal_blockers() {
 
 fn cumulative_upkeep_exile_top_trigger() -> TriggerDefinition {
     crate::database::synthesis::build_cumulative_upkeep_trigger(AbilityCost::Exile {
+        from_top: false,
         same_zone_owner: false,
         count: 1,
         zone: Some(Zone::Library),
