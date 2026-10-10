@@ -223,6 +223,18 @@ mod tests {
     use crate::types::replacements::ReplacementEvent;
     use crate::types::zones::Zone;
 
+    fn answer_graveyard_orders(state: &mut GameState, events: &mut Vec<GameEvent>) {
+        while let crate::types::game_state::WaitingFor::GraveyardOrderChoice {
+            player, cards, ..
+        } = state.waiting_for.clone()
+        {
+            crate::game::zone_pipeline::graveyard_order::submit(
+                state, player, &cards, &cards, events,
+            )
+            .expect("owner may keep the offered complete arrival order");
+        }
+    }
+
     fn make_mill_ability(
         num_cards: u32,
         targets: Vec<TargetRef>,
@@ -368,6 +380,15 @@ mod tests {
             !delivered,
             "a per-card CR 616.1 pause must be reported as a non-delivery (false)"
         );
+        assert!(matches!(
+            state.waiting_for,
+            crate::types::game_state::WaitingFor::GraveyardOrderChoice {
+                player: PlayerId(1),
+                ..
+            }
+        ));
+        assert!(library_departures(&events).is_empty());
+        answer_graveyard_orders(&mut state, &mut events);
         assert!(
             matches!(
                 state.waiting_for,
@@ -408,6 +429,7 @@ mod tests {
             let ability = make_mill_ability(3, vec![TargetRef::Player(PlayerId(1))], destination);
             let mut events = Vec::new();
             resolve(&mut state, &ability, &mut events).unwrap();
+            answer_graveyard_orders(&mut state, &mut events);
             events
         };
 
@@ -473,6 +495,7 @@ mod tests {
 
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        answer_graveyard_orders(&mut state, &mut events);
 
         let milled = milled_events(&events);
         assert_eq!(milled.len(), 6, "three cards milled from each opponent");
@@ -667,6 +690,7 @@ mod tests {
         let mut events = Vec::new();
 
         resolve(&mut state, &ability, &mut events).unwrap();
+        answer_graveyard_orders(&mut state, &mut events);
 
         assert_eq!(state.players[1].library.len(), 2);
         assert_eq!(state.players[1].graveyard.len(), 3);
@@ -705,6 +729,7 @@ mod tests {
         let mut events = Vec::new();
 
         resolve(&mut state, &ability, &mut events).unwrap();
+        answer_graveyard_orders(&mut state, &mut events);
 
         assert!(state.players[1].library.is_empty());
         assert_eq!(state.players[1].graveyard.len(), 2);
@@ -753,6 +778,7 @@ mod tests {
         let ability = make_mill_ability(3, vec![TargetRef::Player(PlayerId(1))], Zone::Graveyard);
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).unwrap();
+        answer_graveyard_orders(&mut state, &mut events);
 
         assert_eq!(state.players[1].library.len(), 2);
         assert_eq!(state.players[1].graveyard.len(), 6);
@@ -801,6 +827,7 @@ mod tests {
         let ability = make_mill_ability(3, vec![TargetRef::Player(PlayerId(0))], Zone::Graveyard);
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).unwrap();
+        answer_graveyard_orders(&mut state, &mut events);
 
         assert_eq!(state.players[0].library.len(), 5);
         assert_eq!(state.players[0].graveyard.len(), 3);
@@ -846,6 +873,7 @@ mod tests {
 
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        answer_graveyard_orders(&mut state, &mut events);
 
         assert_eq!(state.players[0].graveyard.len(), 0, "caster not milled");
         assert_eq!(state.players[1].graveyard.len(), 3, "opponent 1 milled");
@@ -886,6 +914,7 @@ mod tests {
 
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        answer_graveyard_orders(&mut state, &mut events);
 
         // Controller (PlayerId(0)) MUST NOT be milled — only opponents.
         assert_eq!(
@@ -962,6 +991,7 @@ mod tests {
 
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        answer_graveyard_orders(&mut state, &mut events);
 
         assert_eq!(
             state.players[0].graveyard.len(),
@@ -1049,6 +1079,7 @@ mod tests {
 
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        answer_graveyard_orders(&mut state, &mut events);
 
         assert_eq!(state.players[0].graveyard.len(), 0, "caster not milled");
         assert_eq!(
@@ -1140,6 +1171,7 @@ mod tests {
         let ability = renegade_reaper_chain();
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        answer_graveyard_orders(&mut state, &mut events);
 
         assert_eq!(state.players[0].graveyard.len(), 4, "all 4 cards milled");
         assert_eq!(
@@ -1163,6 +1195,7 @@ mod tests {
         let ability = renegade_reaper_chain();
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        answer_graveyard_orders(&mut state, &mut events);
 
         assert_eq!(state.players[0].graveyard.len(), 4, "all 4 cards milled");
         assert_eq!(
@@ -1246,6 +1279,7 @@ mod tests {
         );
         let mut events = Vec::new();
         resolve(&mut state, &ability, &mut events).unwrap();
+        answer_graveyard_orders(&mut state, &mut events);
 
         assert_eq!(
             state.players[0].library.len(),

@@ -2048,6 +2048,7 @@ impl GameRunner {
             WaitingFor::ArrangePlanarDeckTopChoice { .. } => "ArrangePlanarDeckTopChoice",
             WaitingFor::RepeatPaidLibraryLookPayment { .. } => "RepeatPaidLibraryLookPayment",
             WaitingFor::ReorderLibraryChoice { .. } => "ReorderLibraryChoice",
+            WaitingFor::GraveyardOrderChoice { .. } => "GraveyardOrderChoice",
             WaitingFor::RedistributeLifeTotals { .. } => "RedistributeLifeTotals",
             WaitingFor::CoinFlipKeepChoice { .. } => "CoinFlipKeepChoice",
             WaitingFor::DieKeepChoice { .. } => "DieKeepChoice",

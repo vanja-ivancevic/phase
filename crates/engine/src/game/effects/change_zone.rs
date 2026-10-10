@@ -2356,6 +2356,57 @@ pub fn resolve_all(
         );
         return Ok(());
     }
+    // CR 404.3: mass graveyard arrivals use the same owner-permutation and
+    // replacement-aware batch as destruction and mill. Freeze the complete
+    // instruction before prompting; never rerun its filter after an answer.
+    if dest_zone == Zone::Graveyard {
+        let requests = matching
+            .iter()
+            .map(|&object_id| {
+                let mut request = crate::game::zone_pipeline::ZoneMoveRequest::effect(
+                    object_id,
+                    dest_zone,
+                    ability.source_id,
+                );
+                request.putter = Some(ability.controller);
+                request.mods.enter_tapped = enter_tapped;
+                request.mods.enters_attacking = enters_attacking;
+                request.mods.controller_override = enters_under_player;
+                request.mods.enter_with_counters = enter_with_counters.clone();
+                request.mods.face_down_profile = face_down_profile.clone();
+                request.mods.performed_by = Some(ability.controller);
+                request.face_down_in_exile = ability.context.face_down_in_exile;
+                request.exile_links.duration = ability.duration.clone();
+                request.exile_links.controller = Some(ability.controller);
+                request.exile_links.tracking = if track_exiled_by_source {
+                    crate::types::game_state::ZoneDeliveryExileTracking::TrackBySource
+                } else {
+                    crate::types::game_state::ZoneDeliveryExileTracking::None
+                };
+                request
+            })
+            .collect();
+        let instruction_count = Some(matching.len() as i32);
+        let consume_exile_links = if matches!(effective_filter, TargetFilter::ExiledBySource) {
+            matching
+        } else {
+            Vec::new()
+        };
+        crate::game::zone_pipeline::move_objects_simultaneously_then(
+            state,
+            requests,
+            Some(
+                crate::types::game_state::BatchCompletion::ZoneInstructionComplete {
+                    source_id: ability.source_id,
+                    kind: EffectKind::from(&ability.effect),
+                    instruction_count,
+                    consume_exile_links,
+                },
+            ),
+            events,
+        );
+        return Ok(());
+    }
 
     // CR 401.4: When placing objects on the bottom of a library "in a random
     // order", randomize the processing order so the final bottom-to-top sequence

@@ -1281,7 +1281,8 @@ pub fn candidate_actions_broad_with_probe(
             }
         }
         WaitingFor::ScryChoice { player, cards } => select_cards_variants(*player, cards, None),
-        WaitingFor::ReorderLibraryChoice { player, cards, .. } => {
+        WaitingFor::ReorderLibraryChoice { player, cards, .. }
+        | WaitingFor::GraveyardOrderChoice { player, cards, .. } => {
             // The legal surface is every permutation. The heuristic needs one
             // deterministic representative; human/API input is validated as a
             // freeform full permutation by the resolver.

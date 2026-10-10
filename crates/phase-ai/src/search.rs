@@ -1878,7 +1878,8 @@ pub fn fallback_action(
         // CR 401.2 + CR 701.20e: the reorder prompt requires a complete
         // permutation. Preserve the engine-provided card set as the
         // deterministic fallback; tactical candidates may choose another order.
-        WaitingFor::ReorderLibraryChoice { cards, .. } => Some(GameAction::SelectCards {
+        WaitingFor::ReorderLibraryChoice { cards, .. }
+        | WaitingFor::GraveyardOrderChoice { cards, .. } => Some(GameAction::SelectCards {
             cards: cards.clone(),
         }),
 

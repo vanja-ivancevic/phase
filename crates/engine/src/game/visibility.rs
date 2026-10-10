@@ -114,6 +114,7 @@ fn redact_paid_cast_cleanup_authority(waiting_for: &mut WaitingFor) {
         | WaitingFor::ScryChoice { .. }
         | WaitingFor::RepeatPaidLibraryLookPayment { .. }
         | WaitingFor::ReorderLibraryChoice { .. }
+        | WaitingFor::GraveyardOrderChoice { .. }
         | WaitingFor::RippleRevealChoice { .. }
         | WaitingFor::RippleBottomOrder { .. }
         | WaitingFor::RevealUntilBottomOrder { .. }
@@ -1402,6 +1403,10 @@ fn filter_state_for_scope(state: &GameState, viewer: Option<PlayerId>) -> GameSt
     // `EffectZoneChoice` is projected below; its execution-only successor
     // carrier must never be shipped to any viewer, including a future owner.
     filtered.pending_mass_library_order_choice = None;
+    // CR 404.3: queued owner orders and the full delivery instruction are
+    // execution authority, not a viewer payload. Only the current prompt is
+    // projected; future owners' private origins remain authoritative.
+    filtered.pending_graveyard_order_choice = None;
     // CR 400.2 + CR 616.1: the replacement-suspended exile iterator retains
     // the exact remaining library order and current-resolution incarnation
     // pins. The ReplacementChoice prompt is its complete public surface.

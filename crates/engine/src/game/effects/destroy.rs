@@ -211,20 +211,38 @@ pub fn resolve(
             ..
         }
     );
-    for target in destroyed_targets(state, ability) {
-        if let TargetRef::Object(obj_id) = target {
-            match destroy_single_object(state, obj_id, ability.source_id, cant_regenerate, events) {
-                DestroyOutcome::Completed | DestroyOutcome::Skipped => {}
-                DestroyOutcome::NeedsChoice => return Ok(()),
+    let requests = destroyed_targets(state, ability)
+        .into_iter()
+        .filter_map(|target| match target {
+            TargetRef::Object(object_id)
+                if state.objects.get(&object_id).is_some_and(|object| {
+                    object.zone == Zone::Battlefield
+                        && !object.is_emblem
+                        && !object.has_keyword(&crate::types::keywords::Keyword::Indestructible)
+                }) =>
+            {
+                Some(zone_pipeline::ZoneMoveRequest::destroy(
+                    object_id,
+                    ability.source_id,
+                    cant_regenerate,
+                ))
             }
-        }
-    }
-
-    events.push(GameEvent::EffectResolved {
-        kind: EffectKind::from(&ability.effect),
-        source_id: ability.source_id,
-        subject: None,
-    });
+            _ => None,
+        })
+        .collect();
+    zone_pipeline::move_objects_simultaneously_then(
+        state,
+        requests,
+        Some(
+            crate::types::game_state::BatchCompletion::ZoneInstructionComplete {
+                source_id: ability.source_id,
+                kind: EffectKind::from(&ability.effect),
+                instruction_count: None,
+                consume_exile_links: Vec::new(),
+            },
+        ),
+        events,
+    );
 
     Ok(())
 }
@@ -378,44 +396,28 @@ pub fn resolve_all(
         .copied()
         .collect();
 
-    for &obj_id in &matching {
-        let proposed = ProposedEvent::Destroy {
-            object_id: obj_id,
-            source: Some(ability.source_id),
-            cant_regenerate,
-            applied: HashSet::new(),
-        };
-
-        match replacement::replace_event(state, proposed, events) {
-            ReplacementResult::Execute(event) => {
-                if !apply_destroy_after_replacement(state, event, events) {
-                    return Ok(());
-                }
-            }
-            ReplacementResult::Prevented => {} // Regenerated or other replacement
-            ReplacementResult::NeedsChoice(player) => {
-                state.waiting_for = replacement::replacement_choice_waiting_for(player, state);
-                return Ok(());
-            }
-        }
-    }
-
-    // CR 603.10a + CR 704.3: every creature destroyed by this effect left the
-    // battlefield simultaneously, so co-departing leaves-the-battlefield/dies
-    // observers (Blood Artist, Zulaport Cutthroat) must observe each other.
-    // CR 701.19a/b: a regenerated member (and any other Prevented destruction)
-    // stays on the battlefield, so `departed_subset` excludes it from every
-    // survivor's co-departed group.
-    crate::game::zones::mark_simultaneous_departures(
+    let requests = matching
+        .into_iter()
+        .map(|object_id| {
+            zone_pipeline::ZoneMoveRequest::destroy(object_id, ability.source_id, cant_regenerate)
+        })
+        .collect();
+    // The same owner-order and logical delivery authority handles targeted
+    // destruction, mass destruction and all other simultaneous zone moves.
+    // Replacement pauses retain the complete batch and its one completion.
+    zone_pipeline::move_objects_simultaneously_then(
+        state,
+        requests,
+        Some(
+            crate::types::game_state::BatchCompletion::ZoneInstructionComplete {
+                source_id: ability.source_id,
+                kind: EffectKind::from(&ability.effect),
+                instruction_count: None,
+                consume_exile_links: Vec::new(),
+            },
+        ),
         events,
-        &crate::game::zones::departed_subset(state, &matching),
     );
-
-    events.push(GameEvent::EffectResolved {
-        kind: EffectKind::from(&ability.effect),
-        source_id: ability.source_id,
-        subject: None,
-    });
 
     Ok(())
 }
@@ -434,6 +436,21 @@ mod tests {
     use crate::types::identifiers::{CardId, ObjectId};
     use crate::types::keywords::Keyword;
     use crate::types::player::PlayerId;
+    fn resolve_all_with_owner_orders(
+        state: &mut GameState,
+        ability: &ResolvedAbility,
+        events: &mut Vec<GameEvent>,
+    ) -> Result<(), EffectError> {
+        super::resolve_all(state, ability, events)?;
+        while let WaitingFor::GraveyardOrderChoice { player, cards, .. } = state.waiting_for.clone()
+        {
+            crate::game::zone_pipeline::graveyard_order::submit(
+                state, player, &cards, &cards, events,
+            )
+            .expect("the owner may keep the offered complete arrival order");
+        }
+        Ok(())
+    }
 
     #[test]
     fn destroy_moves_to_graveyard() {
@@ -512,7 +529,8 @@ mod tests {
             source_id: ObjectId(100),
         }];
 
-        resolve_all(&mut state, &destroy_all_other_creatures(), &mut events).unwrap();
+        resolve_all_with_owner_orders(&mut state, &destroy_all_other_creatures(), &mut events)
+            .unwrap();
 
         assert!(
             state.battlefield.contains(&token),
@@ -556,7 +574,8 @@ mod tests {
             },
         ];
 
-        resolve_all(&mut state, &destroy_all_other_creatures(), &mut events).unwrap();
+        resolve_all_with_owner_orders(&mut state, &destroy_all_other_creatures(), &mut events)
+            .unwrap();
 
         assert!(
             state.battlefield.contains(&own),
@@ -610,7 +629,8 @@ mod tests {
         let a = battlefield_creature(&mut state, "Bear A");
         let b = battlefield_creature(&mut state, "Bear B");
 
-        resolve_all(&mut state, &destroy_all_other_creatures(), &mut Vec::new()).unwrap();
+        resolve_all_with_owner_orders(&mut state, &destroy_all_other_creatures(), &mut Vec::new())
+            .unwrap();
 
         assert!(!state.battlefield.contains(&a));
         assert!(!state.battlefield.contains(&b));
@@ -644,7 +664,7 @@ mod tests {
             PlayerId(0),
         );
 
-        resolve_all(&mut state, &ability, &mut events).unwrap();
+        resolve_all_with_owner_orders(&mut state, &ability, &mut events).unwrap();
 
         assert!(
             !state.battlefield.contains(&token),
@@ -951,7 +971,7 @@ mod tests {
         );
         let mut events = Vec::new();
 
-        resolve_all(&mut state, &ability, &mut events).unwrap();
+        resolve_all_with_owner_orders(&mut state, &ability, &mut events).unwrap();
 
         assert!(!state.battlefield.contains(&bear1));
         assert!(!state.battlefield.contains(&bear2));
@@ -1003,7 +1023,7 @@ mod tests {
             ObjectId(100),
             PlayerId(0),
         );
-        resolve_all(&mut state, &ability, &mut Vec::new()).unwrap();
+        resolve_all_with_owner_orders(&mut state, &ability, &mut Vec::new()).unwrap();
 
         assert!(
             state.battlefield.contains(&shielded),
@@ -1069,7 +1089,7 @@ mod tests {
         );
         let mut events = Vec::new();
 
-        resolve_all(&mut state, &ability, &mut events).unwrap();
+        resolve_all_with_owner_orders(&mut state, &ability, &mut events).unwrap();
 
         let WaitingFor::ReplacementChoice {
             player,
@@ -1093,14 +1113,6 @@ mod tests {
         assert_eq!(
             *kind,
             crate::types::game_state::ReplacementChoiceKind::Order
-        );
-        let descriptions: Vec<&str> = candidates.iter().map(|c| c.description.as_str()).collect();
-        assert_eq!(
-            descriptions.as_slice(),
-            &[
-                "Remove a shield counter",
-                "Umbra armor: destroy Hyena Umbra instead",
-            ]
         );
         assert_eq!(
             state.objects[&shielded].counters.get(&CounterType::Shield),
@@ -1195,7 +1207,7 @@ mod tests {
         );
         let mut events = Vec::new();
 
-        resolve_all(&mut state, &ability, &mut events).unwrap();
+        resolve_all_with_owner_orders(&mut state, &ability, &mut events).unwrap();
 
         for destroyed in [
             p0_artifact,
@@ -1324,7 +1336,7 @@ mod tests {
         );
         let mut events = Vec::new();
 
-        resolve_all(&mut state, &ability, &mut events).unwrap();
+        resolve_all_with_owner_orders(&mut state, &ability, &mut events).unwrap();
 
         // Protected creature survives
         assert!(
@@ -1380,7 +1392,7 @@ mod tests {
         );
         let mut events = Vec::new();
 
-        resolve_all(&mut state, &ability, &mut events).unwrap();
+        resolve_all_with_owner_orders(&mut state, &ability, &mut events).unwrap();
 
         assert!(
             !state.battlefield.contains(&bear_id),

@@ -4774,6 +4774,34 @@ pub struct PendingMassLibraryOrderChoice {
     pub remaining_batches: PendingMassLibraryOrderBatches,
 }
 
+/// CR 404.3: An exact incarnation in a simultaneous graveyard-arrival order.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraveyardOrderMember {
+    pub identity: ObjectIncarnationRef,
+    pub origin: Zone,
+    pub owner: PlayerId,
+}
+
+/// One owner's complete permutation domain, frozen before any delivery.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraveyardOrderOwnerBatch {
+    pub owner: PlayerId,
+    pub members: Vec<ObjectId>,
+}
+
+/// CR 101.4 + CR 404.3: APNAP owner choices precede the simultaneous action.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingGraveyardOrderChoice {
+    pub current: GraveyardOrderOwnerBatch,
+    pub remaining: std::collections::VecDeque<GraveyardOrderOwnerBatch>,
+    pub requests: Vec<PendingBatchZoneMoveRequest>,
+    /// All announced objects, including singleton owners and non-graveyard
+    /// requests, retain their exact pre-choice identity and origin.
+    pub announced_members: Vec<GraveyardOrderMember>,
+    pub completion: Option<Box<BatchCompletion>>,
+    pub resume_player: PlayerId,
+}
+
 /// CR 101.4: If players make choices for one instruction, they choose in
 /// APNAP order before the simultaneous action happens.
 /// CR 701.21a: To sacrifice a permanent, its controller moves it from the
@@ -5953,6 +5981,11 @@ pub enum PendingBatchZoneChangeCause {
     Effect {
         source: ObjectId,
     },
+    /// CR 701.8: consult Destroy before its inner zone change.
+    Destroy {
+        source: ObjectId,
+        cant_regenerate: bool,
+    },
     Cost {
         source: ObjectId,
     },
@@ -6288,6 +6321,15 @@ impl BatchCompletion {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BatchCompletion {
+    /// A zone instruction completes once, after all owner choices and
+    /// replacement-aware deliveries. Mass zone moves retain their count and
+    /// consumed exile-link epilogue; destruction has neither.
+    ZoneInstructionComplete {
+        source_id: ObjectId,
+        kind: EffectKind,
+        instruction_count: Option<i32>,
+        consume_exile_links: Vec<ObjectId>,
+    },
     /// CR 608.2c + CR 614.6 + CR 616.1: Publish one instruction's exact
     /// replacement-settled zone-change results, including the empty result.
     RecordInstructionZoneResult {
@@ -14478,6 +14520,14 @@ pub enum WaitingFor {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         source_id: Option<ObjectId>,
     },
+    /// CR 404.3: Submit every candidate exactly once, bottom-to-top in its
+    /// owner's graveyard. All owner choices finish before the first move.
+    GraveyardOrderChoice {
+        player: PlayerId,
+        cards: Vec<ObjectId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<ObjectId>,
+    },
     /// CR 401.2 + CR 701.20e + CR 608.2c: After a `DigChoice`'s keep-selection
     /// has been routed to its destination, a Telling Time-class dig partitions
     /// the FIXED remainder pile between the top and the bottom of the SAME
@@ -16860,6 +16910,7 @@ impl WaitingFor {
             WaitingFor::DigChoice { .. } => "DigChoice",
             WaitingFor::RepeatPaidLibraryLookPayment { .. } => "RepeatPaidLibraryLookPayment",
             WaitingFor::ReorderLibraryChoice { .. } => "ReorderLibraryChoice",
+            WaitingFor::GraveyardOrderChoice { .. } => "GraveyardOrderChoice",
             WaitingFor::DigRestSplitChoice { .. } => "DigRestSplitChoice",
             WaitingFor::SurveilChoice { .. } => "SurveilChoice",
             WaitingFor::RevealChoice { .. } => "RevealChoice",
@@ -17026,6 +17077,7 @@ impl WaitingFor {
             | WaitingFor::DigChoice { player, .. }
             | WaitingFor::RepeatPaidLibraryLookPayment { player, .. }
             | WaitingFor::ReorderLibraryChoice { player, .. }
+            | WaitingFor::GraveyardOrderChoice { player, .. }
             | WaitingFor::DigRestSplitChoice { player, .. }
             | WaitingFor::SurveilChoice { player, .. }
             | WaitingFor::RevealChoice { player, .. }
@@ -17381,6 +17433,7 @@ impl WaitingFor {
             | WaitingFor::DigChoice { .. }
             | WaitingFor::RepeatPaidLibraryLookPayment { .. }
             | WaitingFor::ReorderLibraryChoice { .. }
+            | WaitingFor::GraveyardOrderChoice { .. }
             | WaitingFor::DigRestSplitChoice { .. }
             | WaitingFor::SurveilChoice { .. }
             | WaitingFor::RevealChoice { .. }
@@ -17651,6 +17704,7 @@ impl WaitingFor {
                 | WaitingFor::SurveilChoice { .. }
                 | WaitingFor::DigChoice { .. }
                 | WaitingFor::ReorderLibraryChoice { .. }
+                | WaitingFor::GraveyardOrderChoice { .. }
                 // CR 401.2 + CR 401.4: the split response names which cards go
                 // on top, and when two or more do, their owner may arrange
                 // them in any order — a free permutation the combination
@@ -21581,6 +21635,9 @@ declare_game_state! {
     /// (`types/game_state_size.rs`): it is populated only between the batches of
     /// one mass library-order resolution, and inline it cost 328 B.
     pub pending_mass_library_order_choice: Option<Box<PendingMassLibraryOrderChoice>>,
+    /// CR 404.3: Exact simultaneous instruction and APNAP owner permutations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_graveyard_order_choice: Option<Box<PendingGraveyardOrderChoice>>,
     /// CR 101.4 + CR 701.23i: Pending private selections for a simultaneous
     /// scoped self-library search. Kept separate from the generic continuation
     /// so the action phase cannot begin before every player has chosen.
@@ -27727,6 +27784,7 @@ impl GameState {
             pending_discard_batch: None,
             pending_exile_from_top_until: None,
             pending_mass_library_order_choice: None,
+            pending_graveyard_order_choice: None,
             pending_scoped_library_search: None,
             pending_library_search_delivery: None,
             completed_hidden_search_audiences: Vec::new(),
@@ -30268,6 +30326,7 @@ fn _gamestate_partition_is_total(s: &GameState) {
         pending_discard_batch: _,
         pending_exile_from_top_until: _,
         pending_mass_library_order_choice: _,
+        pending_graveyard_order_choice: _,
         pending_scoped_library_search: _,
         pending_library_search_delivery: _,
         completed_hidden_search_audiences: _,
@@ -30513,6 +30572,7 @@ impl PartialEq for GameState {
             && self.pending_combat_lifelink == other.pending_combat_lifelink
             && self.pending_mass_library_order_choice
                 == other.pending_mass_library_order_choice
+            && self.pending_graveyard_order_choice == other.pending_graveyard_order_choice
             && self.pending_scoped_library_search == other.pending_scoped_library_search
             && self.pending_library_search_delivery == other.pending_library_search_delivery
             && self.completed_hidden_search_audiences

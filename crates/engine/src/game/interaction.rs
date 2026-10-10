@@ -233,6 +233,7 @@ fn human_response_model(waiting_for: &WaitingFor, semantic_owner: PlayerId) -> H
         | WaitingFor::KeepExactPermanentsChoice { .. }
         | WaitingFor::ScryChoice { .. }
         | WaitingFor::ReorderLibraryChoice { .. }
+        | WaitingFor::GraveyardOrderChoice { .. }
         | WaitingFor::RippleBottomOrder { .. }
         | WaitingFor::RevealUntilBottomOrder { .. }
         | WaitingFor::ArrangePlanarDeckTopChoice { .. }
@@ -530,6 +531,7 @@ fn classify_waiting_for(waiting_for: &WaitingFor) -> WaitingClassification {
         | WaitingFor::KeepExactPermanentsChoice { .. }
         | WaitingFor::ScryChoice { .. }
         | WaitingFor::ReorderLibraryChoice { .. }
+        | WaitingFor::GraveyardOrderChoice { .. }
         | WaitingFor::RippleBottomOrder { .. }
         | WaitingFor::RevealUntilBottomOrder { .. }
         | WaitingFor::ArrangePlanarDeckTopChoice { .. }
@@ -4154,6 +4156,7 @@ fn selection_projection(
         WaitingFor::ChooseUntapSubset { group, .. } => group.len(),
         WaitingFor::ScryChoice { cards, .. }
         | WaitingFor::ReorderLibraryChoice { cards, .. }
+        | WaitingFor::GraveyardOrderChoice { cards, .. }
         | WaitingFor::ArrangePlanarDeckTopChoice { cards, .. }
         | WaitingFor::SurveilChoice { cards, .. }
         | WaitingFor::SearchChoice { cards, .. }
@@ -4484,6 +4487,9 @@ fn selection_projection(
             })
         }
         WaitingFor::ReorderLibraryChoice {
+            cards, source_id, ..
+        }
+        | WaitingFor::GraveyardOrderChoice {
             cards, source_id, ..
         } => Some(SelectionProjection {
             object_ids: cards.clone(),

@@ -882,6 +882,7 @@ pub(super) fn handles(waiting_for: &WaitingFor) -> bool {
             | WaitingFor::MeldAttackTargetChoice { .. }
             | WaitingFor::EntryAttackTargetChoice { .. }
             | WaitingFor::ScryChoice { .. }
+            | WaitingFor::GraveyardOrderChoice { .. }
             | WaitingFor::ArrangePlanarDeckTopChoice { .. }
             | WaitingFor::RedistributeLifeTotals { .. }
             | WaitingFor::CoinFlipKeepChoice { .. }
@@ -2046,6 +2047,12 @@ pub(super) fn handle_resolution_choice(
         ));
     }
     let outcome = match (waiting_for, action) {
+        (
+            WaitingFor::GraveyardOrderChoice { player, cards, .. },
+            GameAction::SelectCards { cards: chosen },
+        ) => ResolutionChoiceOutcome::WaitingFor(super::zone_pipeline::graveyard_order::submit(
+            state, player, &cards, &chosen, events,
+        )?),
         // CR 608.2d: the resolving effect offers only its legal optional payment choices; CR 118.12: choosing a payable branch continues the payment whose success governs the reflexive "If you do" result.
         (
             WaitingFor::ResolutionOptionalPaymentChoice {
@@ -9541,6 +9548,27 @@ pub(crate) fn run_batch_completion(
 ) -> crate::game::zone_pipeline::BatchMoveResult {
     use crate::types::game_state::BatchCompletion;
     match completion {
+        BatchCompletion::ZoneInstructionComplete {
+            source_id,
+            kind,
+            instruction_count,
+            consume_exile_links,
+        } => {
+            if let Some(count) = instruction_count {
+                state.last_effect_count = Some(count);
+            }
+            if !consume_exile_links.is_empty() {
+                state
+                    .exile_links
+                    .retain(|link| !consume_exile_links.contains(&link.exiled_id));
+            }
+            events.push(GameEvent::EffectResolved {
+                kind,
+                source_id,
+                subject: None,
+            });
+            crate::game::zone_pipeline::BatchMoveResult::Done
+        }
         BatchCompletion::RecordInstructionZoneResult {
             occurrence_id,
             result_id,

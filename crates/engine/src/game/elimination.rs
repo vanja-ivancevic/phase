@@ -532,6 +532,7 @@ pub fn eliminate_players_simultaneously(
         {
             debug_assert!(false, "scoped search elimination resume failed: {error}");
         }
+        super::zone_pipeline::graveyard_order::reconcile_after_elimination(state, events);
 
         if let Some(waiting_pid) = state.waiting_for.acting_player() {
             if !players::is_alive(state, waiting_pid) {
@@ -594,6 +595,7 @@ fn clear_terminal_trigger_scaffolding(state: &mut GameState, winner: Option<Play
     state.pending_trigger_entry = None;
     state.pending_trigger_event_batch.clear();
     state.pending_trigger_construction_priority_recipient = None;
+    state.pending_graveyard_order_choice = None;
     for firing in terminal_firings {
         crate::game::lifecycle::record_delayed_terminal(
             firing,

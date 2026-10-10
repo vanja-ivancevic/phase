@@ -629,7 +629,8 @@ fn cheap_reject_candidate(state: &GameState, action: &GameAction) -> bool {
             })
         }
         (
-            WaitingFor::ReorderLibraryChoice { cards, .. },
+            WaitingFor::ReorderLibraryChoice { cards, .. }
+            | WaitingFor::GraveyardOrderChoice { cards, .. },
             GameAction::SelectCards { cards: chosen },
         ) => selection_mismatch(chosen, cards, Some(cards.len())),
         (

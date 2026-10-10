@@ -34,6 +34,8 @@ use crate::game::effects::change_zone::shuffle_library;
 use crate::game::game_object::{AttachTarget, GameObject};
 use crate::types::ability::FaceDownProfile;
 
+pub(crate) mod graveyard_order;
+
 /// Why this zone change is happening. Determines pipeline engagement (PLAN §3)
 /// and is carried onto `ProposedEvent::ZoneChange.cause` / `ZoneChangeRecord`.
 ///
@@ -45,6 +47,12 @@ pub enum ZoneChangeCause {
     /// Resolving effect or ability instruction. `source` feeds
     /// `ProposedEvent::ZoneChange.cause`.
     Effect { source: ObjectId },
+    /// CR 701.8: destruction has an outer Destroy replacement pass before
+    /// its inner Battlefield-to-Graveyard zone-change pass.
+    Destroy {
+        source: ObjectId,
+        cant_regenerate: bool,
+    },
     /// Cost payment (delve exile, "as an additional cost" discards/exiles).
     Cost { source: ObjectId },
     /// CR 608.2n / CR 608.3: post-resolution default move of the spell object
@@ -117,6 +125,7 @@ impl ZoneChangeCause {
     fn is_exempt(&self) -> bool {
         match self {
             ZoneChangeCause::Effect { .. }
+            | ZoneChangeCause::Destroy { .. }
             | ZoneChangeCause::Cost { .. }
             | ZoneChangeCause::SpellResolutionDefault
             | ZoneChangeCause::StateBasedAction
@@ -220,6 +229,13 @@ impl ZoneMoveRequest {
     fn into_pending(self) -> PendingBatchZoneMoveRequest {
         let cause = match self.cause {
             ZoneChangeCause::Effect { source } => PendingBatchZoneChangeCause::Effect { source },
+            ZoneChangeCause::Destroy {
+                source,
+                cant_regenerate,
+            } => PendingBatchZoneChangeCause::Destroy {
+                source,
+                cant_regenerate,
+            },
             ZoneChangeCause::Cost { source } => PendingBatchZoneChangeCause::Cost { source },
             ZoneChangeCause::SpellResolutionDefault => {
                 PendingBatchZoneChangeCause::SpellResolutionDefault
@@ -267,6 +283,13 @@ impl ZoneMoveRequest {
     fn from_pending(pending: PendingBatchZoneMoveRequest) -> Self {
         let cause = match pending.cause {
             PendingBatchZoneChangeCause::Effect { source } => ZoneChangeCause::Effect { source },
+            PendingBatchZoneChangeCause::Destroy {
+                source,
+                cant_regenerate,
+            } => ZoneChangeCause::Destroy {
+                source,
+                cant_regenerate,
+            },
             PendingBatchZoneChangeCause::Cost { source } => ZoneChangeCause::Cost { source },
             PendingBatchZoneChangeCause::SpellResolutionDefault => {
                 ZoneChangeCause::SpellResolutionDefault
@@ -328,6 +351,16 @@ impl ZoneMoveRequest {
             replacement_applied: HashSet::new(),
             face_down_in_exile: ExileConcealment::Public,
         }
+    }
+
+    /// CR 701.8: a guarded destruction, including both replacement passes.
+    pub fn destroy(object_id: ObjectId, source: ObjectId, cant_regenerate: bool) -> Self {
+        let mut request = Self::effect(object_id, Zone::Graveyard, source);
+        request.cause = ZoneChangeCause::Destroy {
+            source,
+            cant_regenerate,
+        };
+        request
     }
 
     /// Cost-payment move (delve exile, additional-cost discard/exile).
@@ -582,6 +615,7 @@ impl ZoneMoveRequest {
         // than silently inherit `None`.
         match &self.cause {
             ZoneChangeCause::Effect { source }
+            | ZoneChangeCause::Destroy { source, .. }
             | ZoneChangeCause::Cost { source }
             | ZoneChangeCause::CastingToStack { source } => Some(*source),
             // CR 504.1: a draw-step draw is a turn-based action with no causing
@@ -805,6 +839,36 @@ pub(crate) fn move_object_with_terminal(
         if from_zone == Zone::Battlefield && req.to == Zone::Battlefield {
             return ZoneMoveTerminalResult::Completed(ZoneMoveCompletion::Remained);
         }
+    }
+
+    if let ZoneChangeCause::Destroy {
+        source,
+        cant_regenerate,
+    } = &req.cause
+    {
+        let delivery_start = events.len();
+        return match crate::game::effects::destroy::destroy_single_object(
+            state,
+            req.object_id,
+            *source,
+            *cant_regenerate,
+            events,
+        ) {
+            crate::game::effects::destroy::DestroyOutcome::Completed
+            | crate::game::effects::destroy::DestroyOutcome::Skipped => {
+                ZoneMoveTerminalResult::Completed(zone_move_completion_from_delivery(
+                    member,
+                    &events[delivery_start..],
+                ))
+            }
+            crate::game::effects::destroy::DestroyOutcome::NeedsChoice => {
+                if matches!(state.waiting_for, WaitingFor::ReturnAsAuraTarget { .. }) {
+                    ZoneMoveTerminalResult::NeedsAuraAttachmentChoice
+                } else {
+                    ZoneMoveTerminalResult::NeedsChoice(state.waiting_for.acting_players()[0])
+                }
+            }
+        };
     }
 
     // Library-placement arm (W3). A `Some(placement)` request lands the object at
@@ -1215,6 +1279,25 @@ pub(crate) fn move_objects_simultaneously(
 /// settled; `NeedsChoice` means a CR 616.1 replacement choice parked it. Callers
 /// may therefore restore priority or run their own tail only after `Done`.
 pub(crate) fn move_objects_simultaneously_then(
+    state: &mut GameState,
+    reqs: Vec<ZoneMoveRequest>,
+    completion: Option<BatchCompletion>,
+    events: &mut Vec<GameEvent>,
+) -> BatchMoveResult {
+    if let Some(batches) = graveyard_order::plan(
+        state,
+        reqs.iter()
+            .filter(|request| request.to == Zone::Graveyard)
+            .map(|request| request.object_id),
+    ) {
+        graveyard_order::pause(state, batches, reqs, completion);
+        return BatchMoveResult::NeedsChoice;
+    }
+    move_owner_ordered_objects_simultaneously_then(state, reqs, completion, events)
+}
+
+/// The shared physical batch, entered only after every required owner order.
+fn move_owner_ordered_objects_simultaneously_then(
     state: &mut GameState,
     reqs: Vec<ZoneMoveRequest>,
     completion: Option<BatchCompletion>,
