@@ -1,0 +1,102 @@
+name: CR404.3 graveyard-order verification
+
+on:
+  push:
+    branches: [patina/graveyard-order-20261007]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: graveyard-order-verify-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'vanja-ivancevic/phase'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 4
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_TERM_COLOR: never
+      RUST_MIN_STACK: 33554432
+      INPUT_RELEASE: https://github.com/vanja-ivancevic/phase/releases/download/verification-data-d7d3ef839c3f-20261010
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and verify frozen inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p receipts verification-inputs
+          for asset in card-data.json native-smoke.rs owned-hashes.txt; do
+            curl --fail --location --silent --show-error "$INPUT_RELEASE/$asset" --output "verification-inputs/$asset"
+          done
+          printf '%s  %s\n' \
+            d7d3ef839c3fbd0424e12edf995fcb46cfbc6be66e770a90d52f6234e7e4603a verification-inputs/card-data.json \
+            f9f3a1e03545283488592ce97edfe836147dbc640d1a09b952d9e3bd037cfb2c verification-inputs/native-smoke.rs \
+            5db7e9c262af3a98373e7949b00bf9bec0b3d678363ded4327c1125270b3c299 verification-inputs/owned-hashes.txt \
+            | sha256sum --check - | tee receipts/input-hashes.log
+          sha256sum --check verification-inputs/owned-hashes.txt | tee receipts/owned-hashes.log
+          printf 'verification_head=%s\ncandidate_commit=9ada3ed34970eca6c5316c9ad849b7e6eb18a892\ncandidate_tree=7aedfbe96f1f5b40b9e008bfd952072cf2bbd12c\n' "$GITHUB_SHA" | tee receipts/provenance.log
+
+      - name: Install repository-pinned toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel=$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')
+          rustup toolchain install --profile minimal "$channel"
+          rustc --version --verbose | tee receipts/toolchain.log
+          cargo --version | tee -a receipts/toolchain.log
+
+      - name: Test zone pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p phase-engine --lib zone_pipeline 2>&1 | tee receipts/test.log
+
+      - name: Locate smoke library artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The smoke uses the existing scenario harness, gated by test-support.
+          # A normal library build produces linkable rlibs, unlike a test binary.
+          cargo build --locked -p phase-engine --lib --features test-support --message-format=json > receipts/library-artifacts.jsonl
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          artifacts = [json.loads(line) for line in Path("receipts/library-artifacts.jsonl").read_text().splitlines()]
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              for name, variable in [("engine", "ENGINE_RLIB"), ("serde_json", "SERDE_JSON_RLIB")]:
+                  paths = {path for artifact in artifacts
+                           if artifact.get("reason") == "compiler-artifact" and artifact["target"]["name"] == name
+                           for path in artifact["filenames"] if path.endswith(".rlib")}
+                  if len(paths) != 1:
+                      raise RuntimeError(f"Expected one {name} rlib, got {sorted(paths)}")
+                  path = paths.pop()
+                  print(f"{variable}={path}")
+                  output.write(f"{variable}={path}\n")
+          PY
+
+      - name: Compile and run canonical-export Armageddon smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --edition 2021 -O verification-inputs/native-smoke.rs -o verification-inputs/armageddon-smoke \
+            --extern "engine=$ENGINE_RLIB" --extern "serde_json=$SERDE_JSON_RLIB" \
+            -L dependency=target/debug/deps 2>&1 | tee receipts/smoke-build.log
+          timeout 120 verification-inputs/armageddon-smoke verification-inputs/card-data.json 2>&1 | tee receipts/smoke.log
+
+      - name: Preserve raw verification receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: graveyard-order-raw-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: receipts/
+          retention-days: 1
+          if-no-files-found: warn
