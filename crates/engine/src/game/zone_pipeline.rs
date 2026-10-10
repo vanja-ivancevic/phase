@@ -1336,6 +1336,28 @@ fn move_owner_ordered_objects_simultaneously_then(
                     state,
                     &logical_zone_change_group,
                 );
+                // CR 701.8a: Publish the replacement-settled, actually-arrived
+                // Graveyard members so a downstream TrackedSetSize rider
+                // (Fumigate class) counts real deaths. Publishes even an empty
+                // set so stale prior sets are never reused.
+                if matches!(
+                    completion,
+                    crate::types::game_state::BatchCompletion::ZoneInstructionComplete {
+                        kind: crate::types::ability::EffectKind::DestroyAll,
+                        ..
+                    }
+                ) {
+                    crate::game::effects::publish_tracked_set(
+                        state,
+                        crate::types::game_state::settled_logical_zone_change_records(
+                            &logical_zone_change_group,
+                        )
+                        .iter()
+                        .filter(|record| record.to_zone == Zone::Graveyard)
+                        .map(|record| record.object_id)
+                        .collect(),
+                    );
+                }
                 run_batch_completion(state, completion, events)
             })
         }
@@ -1771,6 +1793,29 @@ pub(crate) fn drain_pending_batch_deliveries(state: &mut GameState, events: &mut
                         state,
                         &logical_zone_change_group,
                     );
+                    // CR 701.8a: Same publication as the synchronous path —
+                    // the CR 404.3 deferred drain runs after physical
+                    // delivery, so the "destroyed this way" tracked set a
+                    // Fumigate rider counts is settled here, before
+                    // run_batch_completion resumes any stashed chain tail.
+                    if matches!(
+                        completion,
+                        crate::types::game_state::BatchCompletion::ZoneInstructionComplete {
+                            kind: crate::types::ability::EffectKind::DestroyAll,
+                            ..
+                        }
+                    ) {
+                        crate::game::effects::publish_tracked_set(
+                            state,
+                            crate::types::game_state::settled_logical_zone_change_records(
+                                &logical_zone_change_group,
+                            )
+                            .iter()
+                            .filter(|record| record.to_zone == Zone::Graveyard)
+                            .map(|record| record.object_id)
+                            .collect(),
+                        );
+                    }
                     let _ = run_batch_completion(state, completion, events);
                 }
             }

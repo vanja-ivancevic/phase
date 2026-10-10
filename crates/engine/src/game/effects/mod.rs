@@ -17253,6 +17253,19 @@ fn resolve_chain_body(
     // This allows sub-abilities like "its controller gains life" to access the object
     // targeted by the parent (e.g. the exiled creature in Swords to Plowshares).
     if let Some(ref sub) = ability.sub_ability {
+        // CR 404.3 + CR 616.1: When the root instruction deferred its graveyard
+        // batch — an owner-permutation pause or a parked replacement-aware
+        // delivery — the remaining chain is a CONTINUATION of that batch, not a
+        // sibling of a finished instruction. Stash it so the batch drain resumes
+        // it after physical delivery, when completion-derived state (the
+        // "destroyed this way" tracked set a Fumigate rider counts) exists.
+        // Resolving the sibling here would read that state before it exists.
+        if state.active_batch_delivery().is_some()
+            || matches!(state.waiting_for, WaitingFor::GraveyardOrderChoice { .. })
+        {
+            append_to_pending_continuation(state, Some(sub.clone()));
+            return Ok(());
+        }
         // CR 614.1a + CR 608.2c: CastFromZone consumes the Torrential/Kylox
         // graveyard-redirect rider by stamping the granted casting permission. Do
         // not also execute the parser's structural rider (`ChangeZone` /

@@ -1409,6 +1409,25 @@ mod tests {
 
     use crate::types::ability::{QuantityRef, TypeFilter, TypedFilter};
 
+    /// CR 404.3: Drive a deferred batch to completion the way the real
+    /// reducer does — submit each pending owner's graveyard order through
+    /// the public submit path (which delivers the parked batch and resumes
+    /// any stashed chain tail), then run the stack drain so parked
+    /// continuations resolve exactly as the live resolution loop would.
+    fn drive_deferred_batch_continuations(
+        state: &mut GameState,
+        events: &mut Vec<GameEvent>,
+    ) {
+        while let WaitingFor::GraveyardOrderChoice { player, cards, .. } = state.waiting_for.clone()
+        {
+            crate::game::zone_pipeline::graveyard_order::submit(
+                state, player, &cards, &cards, events,
+            )
+            .expect("the owner may keep the offered complete arrival order");
+        }
+        crate::game::effects::drain_pending_continuation(state, events);
+    }
+
     /// Builds the Fumigate-shape chain: `DestroyAll(creatures)` followed by
     /// `GainLife(amount = TrackedSetSize, player = Controller)`.
     fn fumigate_chain(source_id: ObjectId, controller: PlayerId) -> ResolvedAbility {
@@ -1506,6 +1525,7 @@ mod tests {
         let ability = fumigate_chain(ObjectId(100), PlayerId(0));
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        drive_deferred_batch_continuations(&mut state, &mut events);
 
         assert_eq!(state.players[0].life, starting_life + 5);
     }
@@ -1537,6 +1557,7 @@ mod tests {
         let ability = fumigate_chain(ObjectId(100), PlayerId(0));
         let mut events = Vec::new();
         resolve_ability_chain(&mut state, &ability, &mut events, 0).unwrap();
+        drive_deferred_batch_continuations(&mut state, &mut events);
 
         // Life gained must equal *actually destroyed* count (2), not filter-matched (3).
         assert_eq!(state.players[0].life, starting_life + 2);

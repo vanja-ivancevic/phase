@@ -2127,13 +2127,24 @@ pub fn resolve_all(
         crate::game::effects::controller_for_relative_filter(state, ability, &target_filter);
     let target_filter = owner_scoped_nonbattlefield_mass_filter(target_filter, &origin_zones);
 
-    // Use a permissive default filter if the effect's target is None
+    // Use a permissive default filter if the effect's target is None. On the
+    // battlefield that means "all permanents". A mass move whose origin zones
+    // exclude the battlefield has no permanents to match — hand, library,
+    // graveyard and exile hold cards, not permanents (CR 110.1) — so an
+    // unqualified filter there means every card in those zones. CR 404.3: a
+    // nonempty such batch still owes graveyard owner-order choices, and even a
+    // zero-card batch must not be manufactured by filtering out the entire
+    // population the effect was given.
     let effective_filter = if matches!(target_filter, crate::types::ability::TargetFilter::None) {
-        crate::types::ability::TargetFilter::Typed(TypedFilter {
-            type_filters: vec![crate::types::ability::TypeFilter::Permanent],
-            controller: None,
-            properties: vec![],
-        })
+        if origin_zones.contains(&Zone::Battlefield) {
+            crate::types::ability::TargetFilter::Typed(TypedFilter {
+                type_filters: vec![crate::types::ability::TypeFilter::Permanent],
+                controller: None,
+                properties: vec![],
+            })
+        } else {
+            crate::types::ability::TargetFilter::Any
+        }
     } else {
         crate::game::effects::resolved_object_filter(state, ability, &target_filter)
     };
@@ -2353,6 +2364,57 @@ pub fn resolve_all(
                 .expect("library-order branch requires an explicit library position"),
             track_exiled_by_source,
             ability.duration.clone(),
+        );
+        return Ok(());
+    }
+    // CR 404.3: mass graveyard arrivals use the same owner-permutation and
+    // replacement-aware batch as destruction and mill. Freeze the complete
+    // instruction before prompting; never rerun its filter after an answer.
+    if dest_zone == Zone::Graveyard {
+        let requests = matching
+            .iter()
+            .map(|&object_id| {
+                let mut request = crate::game::zone_pipeline::ZoneMoveRequest::effect(
+                    object_id,
+                    dest_zone,
+                    ability.source_id,
+                );
+                request.putter = Some(ability.controller);
+                request.mods.enter_tapped = enter_tapped;
+                request.mods.enters_attacking = enters_attacking;
+                request.mods.controller_override = enters_under_player;
+                request.mods.enter_with_counters = enter_with_counters.clone();
+                request.mods.face_down_profile = face_down_profile.clone();
+                request.mods.performed_by = Some(ability.controller);
+                request.face_down_in_exile = ability.context.face_down_in_exile;
+                request.exile_links.duration = ability.duration.clone();
+                request.exile_links.controller = Some(ability.controller);
+                request.exile_links.tracking = if track_exiled_by_source {
+                    crate::types::game_state::ZoneDeliveryExileTracking::TrackBySource
+                } else {
+                    crate::types::game_state::ZoneDeliveryExileTracking::None
+                };
+                request
+            })
+            .collect();
+        let instruction_count = Some(matching.len() as i32);
+        let consume_exile_links = if matches!(effective_filter, TargetFilter::ExiledBySource) {
+            matching
+        } else {
+            Vec::new()
+        };
+        crate::game::zone_pipeline::move_objects_simultaneously_then(
+            state,
+            requests,
+            Some(
+                crate::types::game_state::BatchCompletion::ZoneInstructionComplete {
+                    source_id: ability.source_id,
+                    kind: EffectKind::from(&ability.effect),
+                    instruction_count,
+                    consume_exile_links,
+                },
+            ),
+            events,
         );
         return Ok(());
     }
